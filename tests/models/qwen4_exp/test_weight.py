@@ -409,7 +409,7 @@ def test_disk_ple_fixed_buffers_capture_and_replay_different_rows(checkpoint):
         raw = pinned.tensor.view(torch.uint8).index_select(0, ids.reshape(-1))
         want = (
             raw.view(torch.float8_e4m3fn).to(torch.bfloat16) * backend.scale
-        ).view_as(got)
+        ).view_as(got).to(got.device)
         assert torch.equal(got, want)
 
 
