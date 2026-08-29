@@ -166,7 +166,7 @@ def test_engine_config_rejects_invalid_disk_prefill_mode():
         )
 
 
-@pytest.mark.parametrize("backend", ["pinned", "disk"])
+@pytest.mark.parametrize("backend", ["pinned", "disk", "hmm"])
 def test_engine_config_accepts_ple_backends(backend):
     import torch
 
@@ -202,7 +202,7 @@ def test_engine_config_rejects_invalid_ple_backend():
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
 
-    with pytest.raises(ValueError, match="--ple-backend.*pinned.*disk"):
+    with pytest.raises(ValueError, match="--ple-backend.*pinned.*disk.*hmm"):
         EngineConfig(
             model_path="/tmp/model",
             tp_info=DistributedInfo(0, 1),
@@ -211,7 +211,7 @@ def test_engine_config_rejects_invalid_ple_backend():
         )
 
 
-def _disk_ple_adjust_config():
+def _disk_ple_adjust_config(backend="disk"):
     import torch
 
     from freetoken.distributed import DistributedInfo
@@ -221,7 +221,7 @@ def _disk_ple_adjust_config():
         model_path="/tmp/model",
         tp_info=DistributedInfo(0, 1),
         dtype=torch.bfloat16,
-        ple_backend="disk",
+        ple_backend=backend,
         attention_backend="triton",
         cuda_graph_bs=[1, 2, 4],
         cuda_graph_max_bs=4,
@@ -247,6 +247,16 @@ def test_disk_ple_keeps_cuda_graph_config_enabled(monkeypatch):
 
     monkeypatch.delenv("FREETOKEN_PLE_DISK_NO_GRAPHS", raising=False)
     config = _disk_ple_adjust_config()
+    _adjust_config(config)
+    assert config.cuda_graph_bs == [1, 2, 4]
+    assert config.cuda_graph_max_bs == 4
+
+
+def test_hmm_ple_keeps_cuda_graph_config_enabled(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.setenv("FREETOKEN_PLE_DISK_NO_GRAPHS", "1")
+    config = _disk_ple_adjust_config("hmm")
     _adjust_config(config)
     assert config.cuda_graph_bs == [1, 2, 4]
     assert config.cuda_graph_max_bs == 4

@@ -12,9 +12,9 @@ HF reference: ``Qwen4ExpTextNGramEmbedding`` (modeling_qwen4_exp.py:1018) and
     R += D                                       # before the attention hyper-connection mix
 
 The table is the 47.7 GiB FP8 n-gram store. ``PinnedUVATable`` gathers from a fully pinned host
-bank, while ``DiskStagedTable`` maps the checkpoint and copies only requested rows into a small
-pinned bank before using the same UVA gather kernel. ``GpuResidentTable`` is the small-table
-oracle the host backends are diffed against.
+bank, ``HMMMappedTable`` gathers directly from read-only file mappings, and
+``DiskStagedTable`` copies requested mapped rows through a small pinned bank. ``GpuResidentTable``
+is the small-table oracle the host backends are diffed against.
 """
 
 from __future__ import annotations
@@ -71,7 +71,11 @@ if _MADVISE is not None:
 
 
 def process_major_faults() -> int | None:
-    """Process major-fault count from Linux procfs, or ``None`` elsewhere."""
+    """Process major faults from Linux procfs, or ``None`` elsewhere.
+
+    This includes host-side servicing attributable to HMM, but procfs does not
+    expose the GPU residency of file-backed pages directly.
+    """
     try:
         with open("/proc/self/stat", encoding="utf-8") as f:
             tail = f.read().rpartition(") ")[2].split()
@@ -83,8 +87,10 @@ def process_major_faults() -> int | None:
 class PLETableBackend(Protocol):
     """Row store for one PLE layer's n-gram embedding table (Qwen3.8: 40M rows x 160, FP8 + one scalar scale).
 
-    Frozen contract. ``GpuResidentTable`` (oracle, small tables) and ``PinnedUVATable`` (the real 47.7 GiB pinned-host table) implement it. Rows are addressed by the
-    GLOBAL hashed id, i.e. the per-head vocab offset is already added by ``NGramEmbedding``.
+    Frozen contract. ``GpuResidentTable`` is the small-table oracle;
+    ``PinnedUVATable``, ``HMMMappedTable``, and ``DiskStagedTable`` serve the real
+    47.7 GiB host table. Rows are addressed by the GLOBAL hashed id, i.e. the
+    per-head vocab offset is already added by ``NGramEmbedding``.
 
     ``lookup`` gets ``row_ids [T, num_ngram_heads]`` (int64, device) and returns
     ``[T, num_ngram_heads * head_dim]`` in ``dtype``, already dequantized (fp8 -> dtype, times the
@@ -272,6 +278,135 @@ class PinnedUVATable:
             return rows
         out.copy_(rows)
         return out
+
+
+def hmm_row_address(
+    shard_bases: Sequence[int], row_id: int, rows_per_shard: int, row_nbytes: int
+) -> int:
+    """Resolve a global row id through the HMM backend's per-shard base table."""
+    if rows_per_shard < 1 or row_nbytes < 1:
+        raise ValueError("rows_per_shard and row_nbytes must be positive")
+    num_rows = len(shard_bases) * rows_per_shard
+    if row_id < 0 or row_id >= num_rows:
+        raise IndexError(f"PLE row id must be in [0, {num_rows}), got {row_id}")
+    shard, local_row = divmod(row_id, rows_per_shard)
+    return int(shard_bases[shard]) + local_row * row_nbytes
+
+
+class HMMMappedTable(PinnedUVATable):
+    """Gather directly from read-only PLE shard mappings through Linux HMM.
+
+    Safetensors payload offsets need not be page-aligned or have the same page offset.
+    That prevents a generally correct back-to-back ``MAP_FIXED`` layout. A device int64
+    base-pointer table therefore selects the shard for each global row id. The mapped
+    shards remain unregistered and unpinned, while row ids and gather execution stay on
+    the GPU and remain CUDA-graph capturable.
+
+    The inherited prefetch overlaps the GPU gather on a private stream. There is no host
+    ``MADV_WILLNEED`` path because observing live device row ids would add the round trip
+    this backend is designed to avoid.
+    """
+
+    def __init__(
+        self,
+        table,
+        *,
+        device: torch.device | None = None,
+        prefetch: bool = True,
+    ) -> None:
+        if device is None:
+            if not torch.cuda.is_available():
+                raise RuntimeError("HMM PLE requires CUDA")
+            device = torch.device("cuda", torch.cuda.current_device())
+        if device.type != "cuda":
+            raise RuntimeError("HMM PLE requires a CUDA device")
+        if not table.banks or any(
+            not getattr(bank, "_disk", False) for bank in table.banks
+        ):
+            raise ValueError("HMM PLE requires read-only file-backed shard mappings")
+        self.table = table
+        self.weight = None
+        self.scale = float(table.weight_scale)
+        self.num_rows = int(table.num_rows)
+        self.head_dim = int(table.head_dim)
+        self.dtype = torch.bfloat16
+        self._is_fp8 = True
+        self._device = device
+        self._rows_per_shard = int(table.rows_per_shard)
+        self._row_nbytes = self.head_dim * torch.empty(
+            (), dtype=torch.float8_e4m3fn
+        ).element_size()
+        self._shard_bases_host = tuple(
+            int(bank.tensor.data_ptr()) for bank in table.banks
+        )
+        self._shard_bases = torch.tensor(
+            self._shard_bases_host, dtype=torch.int64, device=self._device
+        )
+        self._stream = torch.cuda.Stream(device=self._device) if prefetch else None
+        self._staging: torch.Tensor | None = None
+        self._graph_staging: dict[int, torch.Tensor] = {}
+        self._pending: Tuple[torch.Tensor, torch.Tensor] | None = None
+
+    @property
+    def prefetch_pages(self) -> int:
+        """Host page prefetch is intentionally disabled for device-only row ids."""
+        return 0
+
+    def reset_stats(self) -> None:
+        return None
+
+    def row_address(self, row_id: int) -> int:
+        """Return the host virtual address used for a global row id."""
+        return hmm_row_address(
+            self._shard_bases_host,
+            row_id,
+            self._rows_per_shard,
+            self._row_nbytes,
+        )
+
+    def _gather(self, row_ids: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.ple import ple_gather_rows_sharded
+
+        return ple_gather_rows_sharded(
+            self._shard_bases,
+            self._rows_per_shard,
+            self.num_rows,
+            self.head_dim,
+            row_ids.reshape(-1),
+            dst,
+            self.scale,
+            self._is_fp8,
+        )
+
+    def startup_probe(self) -> None:
+        """Verify that the GPU can fault in and read two rows from the first shard."""
+        row_nbytes = self._row_nbytes
+        second = min(
+            self._rows_per_shard - 1,
+            max(1, (2 * mmap.PAGESIZE) // row_nbytes),
+        )
+        local_ids = torch.tensor(
+            [[0], [second]], dtype=torch.int64, device=self._device
+        )
+        message = (
+            "HMM PLE startup probe failed: the GPU could not read the file-backed "
+            "mmap correctly. --ple-backend hmm requires the NVIDIA open GPU kernel "
+            "modules; use --ple-backend disk as the fallback."
+        )
+        try:
+            got = self.lookup(local_ids).clone()
+            torch.cuda.synchronize(self._device)
+            cpu_ids = local_ids.cpu().reshape(-1)
+            expected = self.table.banks[0].tensor.view(torch.uint8).index_select(
+                0, cpu_ids
+            ).view(torch.float8_e4m3fn)
+            expected = expected.to(self._device).to(torch.bfloat16)
+            if self.scale != 1.0:
+                expected.mul_(self.scale)
+            if not torch.equal(got, expected):
+                raise RuntimeError("gathered bytes did not match the CPU mapping")
+        except Exception as exc:
+            raise RuntimeError(message) from exc
 
 
 class DiskStagedTable:
@@ -1371,6 +1506,7 @@ class PLELayer(BaseOP):
 __all__ = [
     "DiskStagedTable",
     "GpuResidentTable",
+    "HMMMappedTable",
     "NGramEmbedding",
     "ZeroTable",
     "PLELayer",
@@ -1380,6 +1516,7 @@ __all__ = [
     "build_ple_metadata",
     "derive_decode_row_ids_host",
     "derive_ngram_hash_constants",
+    "hmm_row_address",
     "process_major_faults",
     "short_conv_reference",
 ]

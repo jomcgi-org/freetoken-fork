@@ -318,12 +318,12 @@ def parse_args(
 
     parser.add_argument(
         "--ple-backend",
-        choices=["pinned", "disk"],
+        choices=["pinned", "disk", "hmm"],
         default=ServerArgs.ple_backend,
         help=(
             "Qwen3.8 Flash-Next PLE table backend: 'pinned' keeps the full table in "
-            "pinned host RAM; 'disk' maps its safetensors shards and stages requested "
-            "rows (CUDA graph decode is disabled)."
+            "pinned host RAM; 'disk' stages rows from read-only mappings; 'hmm' lets "
+            "the GPU read those mappings directly and requires NVIDIA open kernel modules."
         ),
     )
 

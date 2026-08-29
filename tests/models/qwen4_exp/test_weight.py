@@ -338,6 +338,34 @@ def test_disk_ple_mapping_matches_pinned_rows(checkpoint):
         )
 
 
+def test_hmm_ple_loader_reuses_unpinned_disk_mappings(checkpoint):
+    from freetoken.models.qwen4_exp.ple import hmm_row_address
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    hmm = load_ple_table(folder, args, backend="hmm")
+
+    assert len(hmm.banks) == NGRAM_SHARDS
+    assert hmm.rows_per_shard == NGRAM_ROWS
+    assert all(bank._disk and not bank._pinned for bank in hmm.banks)
+    bases = tuple(bank.tensor.data_ptr() for bank in hmm.banks)
+    assert hmm_row_address(bases, NGRAM_ROWS, NGRAM_ROWS, NGRAM_DIM) == bases[1]
+
+
+def test_hmm_shard_base_addressing_crosses_boundaries():
+    from freetoken.models.qwen4_exp.ple import hmm_row_address
+
+    bases = (0x100000, 0x240000, 0x390000, 0x520000)
+    rows_per_shard = 7
+    row_nbytes = 160
+    assert hmm_row_address(bases, 0, rows_per_shard, row_nbytes) == bases[0]
+    assert hmm_row_address(bases, 6, rows_per_shard, row_nbytes) == bases[0] + 6 * 160
+    assert hmm_row_address(bases, 7, rows_per_shard, row_nbytes) == bases[1]
+    assert hmm_row_address(bases, 27, rows_per_shard, row_nbytes) == bases[3] + 6 * 160
+    with pytest.raises(IndexError):
+        hmm_row_address(bases, 28, rows_per_shard, row_nbytes)
+
+
 def test_disk_ple_staging_matches_direct_rows(checkpoint):
     from freetoken.models.qwen4_exp.ple import DiskStagedTable
 
@@ -554,6 +582,34 @@ def test_disk_ple_fixed_buffers_capture_and_replay_different_rows(checkpoint):
         assert torch.equal(got, want)
 
 
+@requires_cuda
+def test_hmm_startup_probe_and_cuda_graph_replay_match_pinned(checkpoint):
+    """HMM passes its startup probe and keeps device ids live across graph replay."""
+    from freetoken.models.qwen4_exp.ple import HMMMappedTable, PinnedUVATable
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    pinned = load_ple_table(folder, args, pin=False)
+    pinned.bank.pin()
+    reference = PinnedUVATable(
+        pinned.tensor, float(pinned.weight_scale), prefetch=False
+    )
+    mapped = load_ple_table(folder, args, backend="hmm")
+    hmm = HMMMappedTable(mapped, prefetch=False)
+    hmm.startup_probe()
+
+    ids = torch.tensor([[0, 6, 7], [27, 14, 1]], dtype=torch.int64, device="cuda")
+    assert torch.equal(hmm.lookup(ids), reference.lookup(ids))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = hmm.lookup(ids)
+    ids.copy_(torch.tensor([[26, 8, 3], [21, 13, 0]], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, reference.lookup(ids))
+
+
 def test_pinned_ple_backend_never_constructs_file_mapping(checkpoint, monkeypatch):
     import freetoken.models.qwen4_exp.weight as weight
 
@@ -597,6 +653,24 @@ def test_disk_ple_stats_report_pages_and_major_fault_delta(monkeypatch):
     assert [backend.prefetch_pages for backend in model._ple_disk_backends] == [0, 0]
     assert model._ple_major_fault_base == 25
     assert model._ple_staging_ns == 0
+
+
+def test_hmm_ple_stats_report_major_fault_delta_without_staging(monkeypatch):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    import freetoken.models.qwen4_exp.ple as ple
+
+    backend = SimpleNamespace(prefetch_pages=0, reset_stats=lambda: None)
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model._ple_hmm_backends = [backend]
+    model._ple_major_fault_base = 40
+    model._ple_staging_ns = 0
+    monkeypatch.setattr(ple, "process_major_faults", lambda: 43)
+
+    assert model.ple_disk_stats() == {
+        "ple_prefetch_pages": 0,
+        "ple_major_faults": 3,
+        "ple_staging_us": 0,
+    }
 
 
 def test_disk_ple_prepare_replay_batches_history_and_waits_once():
@@ -720,6 +794,50 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     assert selected == ["disk"]
     assert attached == [staged]
     assert snapshotted == [4]
+
+
+def test_hmm_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    import freetoken.models.qwen4_exp.ple as ple
+    import freetoken.models.qwen4_exp.weight as weight
+
+    attached = []
+    layer = SimpleNamespace(
+        ple_embedding=SimpleNamespace(attach_table=attached.append),
+    )
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model.model = SimpleNamespace(ple_layers=[layer])
+    model._config = SimpleNamespace(qwen4_args=SimpleNamespace())
+    mapped = SimpleNamespace(num_rows=32, head_dim=4)
+    probes = []
+    selected = []
+
+    class FakeHMM:
+        prefetch_pages = 0
+
+        def __init__(self, table):
+            assert table is mapped
+
+        def startup_probe(self):
+            probes.append(True)
+
+    def fake_load(model_path, args, *, backend):
+        selected.append(backend)
+        return mapped
+
+    monkeypatch.setattr(weight, "load_ple_table", fake_load)
+    monkeypatch.setattr(ple, "HMMMappedTable", FakeHMM)
+    engine_config = SimpleNamespace(
+        model_path="/tmp/model",
+        ple_backend="hmm",
+        use_dummy_weight=False,
+    )
+
+    assert model.load_host_tables(engine_config) == 0
+    assert selected == ["hmm"]
+    assert attached == model._ple_hmm_backends
+    assert probes == [True]
+    assert not hasattr(model, "_ple_disk_backends")
 
 
 def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):

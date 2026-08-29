@@ -62,6 +62,14 @@ before copying them through a small pinned staging bank. Disk PLE bytes are not
 reserved from the expert-bank pin budget, so automatic MoE spilling can keep more
 expert layers pinned.
 
+`--ple-backend hmm` uses the same read-only per-shard mappings and zero pin-budget
+reservation, but the in-graph GPU gather reads the mapped rows directly through Linux
+Heterogeneous Memory Management. It requires the NVIDIA open GPU kernel modules. If the
+startup readback probe fails, use `--ple-backend disk` as the staged fallback. HMM keeps
+row ids on the GPU, performs no host staging or sampled-token synchronization, and keeps
+CUDA graphs enabled. The reported `ple_major_faults` procfs delta includes host-side HMM
+fault servicing, but procfs does not directly expose GPU-side page residency.
+
 Disk PLE keeps CUDA graph decode enabled: a pre-replay host hook derives the next
 n-gram row ids from request token history, stages their deduplicated rows, and updates
 fixed pinned compact-id buffers read by the captured gather. Set

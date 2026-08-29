@@ -1374,11 +1374,14 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
 
-    if getattr(config, "ple_backend", "pinned") == "disk":
+    ple_backend = getattr(config, "ple_backend", "pinned")
+    if ple_backend in ("disk", "hmm"):
         if not has_ple:
             raise ValueError(
-                "--ple-backend disk is only supported for models with a PLE n-gram table"
+                f"--ple-backend {ple_backend} is only supported for models with a PLE "
+                "n-gram table"
             )
+    if ple_backend == "disk":
         no_graphs = os.getenv("FREETOKEN_PLE_DISK_NO_GRAPHS", "").strip().lower()
         if no_graphs in ("1", "true", "yes", "on"):
             override("cuda_graph_bs", [])

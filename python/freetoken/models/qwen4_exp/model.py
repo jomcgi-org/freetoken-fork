@@ -177,6 +177,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             engine_config.model_path, self._config.qwen4_args, backend=backend,
         )
         self._ple_table = table
+        if backend == "hmm":
+            from .ple import HMMMappedTable, process_major_faults
+
+            self._ple_hmm_backends = []
+            self._ple_major_fault_base = process_major_faults()
+            self._ple_staging_ns = 0
+            for ple in ple_layers:
+                mapped = HMMMappedTable(table)
+                if not self._ple_hmm_backends:
+                    mapped.startup_probe()
+                self._ple_hmm_backends.append(mapped)
+                ple.ple_embedding.attach_table(mapped)
+            return 0
         if backend == "disk":
             from .ple import DiskStagedTable, process_major_faults
 
@@ -227,8 +240,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         return table.bank.nbytes
 
     def ple_disk_stats(self, *, reset: bool = False) -> dict:
-        """Aggregate disk PLE page-prefetch and procfs major-fault counters."""
+        """Aggregate mapped PLE prefetch and procfs major-fault counters.
+
+        Procfs observes host-side major faults, including faults serviced through HMM,
+        but does not expose GPU-side page residency directly.
+        """
         backends = getattr(self, "_ple_disk_backends", None)
+        if not backends:
+            backends = getattr(self, "_ple_hmm_backends", None)
         if not backends:
             return {}
         from .ple import process_major_faults

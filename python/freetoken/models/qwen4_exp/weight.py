@@ -3,7 +3,7 @@
 Three separate paths, because the checkpoint's three weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_FUSIONS``.
-* :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, either concatenated into one pinned :class:`HostBank` or left as read-only shard mappings.
+* :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, either concatenated into one pinned :class:`HostBank` or left as read-only shard mappings for disk staging or HMM.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
 Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
@@ -204,7 +204,7 @@ class PleTable:
 
 @dataclass(frozen=True)
 class DiskPleTable:
-    """PLE shards mapped directly from their safetensors payload regions."""
+    """PLE shards mapped for the staged disk and direct HMM backends."""
 
     banks: tuple[HostBank, ...]
     rows_per_shard: int
@@ -283,15 +283,18 @@ def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
                    chunk: int = 8 << 20) -> PleTable | DiskPleTable:
     """Load the PLE table as one pinned bank or read-only safetensors mappings.
 
-    ``pinned`` preserves the original O_DIRECT concatenate, fill, then pin route. ``disk`` maps
-    each tensor payload from its safetensors file with ``MAP_SHARED`` and ``MADV_RANDOM``.
+    ``pinned`` preserves the original O_DIRECT concatenate, fill, then pin route. ``disk`` and
+    ``hmm`` map each tensor payload from its safetensors file with ``MAP_SHARED`` and
+    ``MADV_RANDOM``. HMM differs only in how the model gathers from these mappings.
     """
-    if backend not in ("pinned", "disk"):
-        raise ValueError(f"--ple-backend must be 'pinned' or 'disk', got {backend!r}")
+    if backend not in ("pinned", "disk", "hmm"):
+        raise ValueError(
+            f"--ple-backend must be 'pinned', 'disk', or 'hmm', got {backend!r}"
+        )
     parts, scale, rows, cols = _ple_table_layout(model_path, qwen4_args)
     expected = int(qwen4_args.split_ngram_parts)
     shard_bytes = rows * cols
-    if backend == "disk":
+    if backend in ("disk", "hmm"):
         banks = []
         for shard in range(expected):
             path, offset, nbytes = parts[shard]
