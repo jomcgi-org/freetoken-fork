@@ -106,13 +106,12 @@ class HostBank:
         if self._disk:
             if file_path is None:
                 raise ValueError("file-backed HostBank requires file_path")
-            if file_offset % _BLK:
-                raise ValueError(
-                    f"file-backed HostBank offset {file_offset} is not {_BLK}-byte aligned"
-                )
             map_off = file_offset // mmap.ALLOCATIONGRANULARITY * mmap.ALLOCATIONGRANULARITY
             self._view_offset = file_offset - map_off
-            map_len = self._view_offset + asize
+            # Safetensors tensor payloads are not necessarily page aligned. Map from the
+            # aligned floor, then expose the tensor at its byte offset within that mapping.
+            # Do not round the mapping past the payload because the tensor may end at EOF.
+            map_len = self._view_offset + self.nbytes
             fd = os.open(file_path, os.O_RDONLY)
             try:
                 self._buf = mmap.mmap(
@@ -221,8 +220,8 @@ class HostBank:
             return
         self._locked = True
 
-    def prefetch_experts(self, expert_ids) -> int:
-        """Issue one coalesced ``MADV_WILLNEED`` sweep for selected expert rows.
+    def prefetch_rows(self, row_ids) -> int:
+        """Issue one coalesced ``MADV_WILLNEED`` sweep for selected rows.
 
         Returns the number of distinct 4 KiB pages requested. Non-DISK banks are a
         no-op so callers can walk a layer's full bank schema without branching.
@@ -230,22 +229,30 @@ class HostBank:
         if not self._disk:
             return 0
         stride = self.tensor.stride(0) * self.tensor.element_size()
-        ranges = coalesced_page_ranges(expert_ids, stride, limit=self.nbytes)
-        for offset, length in ranges:
-            start = self._view_offset + offset
-            advise_start = start // mmap.PAGESIZE * mmap.PAGESIZE
-            advise_end = min(
-                len(self._buf),
-                (start + length + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE,
-            )
+        ranges = coalesced_page_ranges(
+            row_ids, stride, limit=self.nbytes, page_offset=self._view_offset,
+        )
+        pages = 0
+        for advise_start, length in ranges:
+            advise_end = min(len(self._buf), advise_start + length)
             self._buf.madvise(
                 mmap.MADV_WILLNEED, advise_start, advise_end - advise_start,
             )
-        return sum(length // _BLK for _, length in ranges)
+            pages += (advise_end - advise_start + _BLK - 1) // _BLK
+        return pages
+
+    def prefetch_experts(self, expert_ids) -> int:
+        """Compatibility name for expert-bank row prefetching."""
+        return self.prefetch_rows(expert_ids)
 
 
 def coalesced_page_ranges(
-    expert_ids, expert_stride: int, *, limit: int | None = None, page_size: int = _BLK,
+    expert_ids,
+    expert_stride: int,
+    *,
+    limit: int | None = None,
+    page_size: int = _BLK,
+    page_offset: int = 0,
 ) -> list[tuple[int, int]]:
     """Map expert rows to deduplicated, adjacent-coalesced page ranges.
 
@@ -263,6 +270,8 @@ def coalesced_page_ranges(
         hi = lo + expert_stride
         if limit is not None and (lo >= limit or hi > limit):
             raise ValueError(f"expert id {expert_id} exceeds bank size {limit}")
+        lo += page_offset
+        hi += page_offset
         pages.update(range(lo // page_size, (hi + page_size - 1) // page_size))
     if not pages:
         return []

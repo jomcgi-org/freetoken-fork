@@ -1329,6 +1329,8 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+    ple_args = getattr(model_config, "qwen4_args", None)
+    has_ple = bool(ple_args is not None and getattr(ple_args, "ple_layer_ids", ()))
     explicit_disk_layers = (
         _parse_disk_layers_spec(config.moe_disk_layers, model_config.num_moe_layers)
         if is_moe and config.moe_disk_layers else frozenset()
@@ -1366,6 +1368,18 @@ def _adjust_config(config: EngineConfig):
         if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs >= 1:
             override("cuda_graph_bs", [1])
             override("cuda_graph_max_bs", 1)
+
+    if getattr(config, "ple_backend", "pinned") == "disk":
+        if not has_ple:
+            raise ValueError(
+                "--ple-backend disk is only supported for models with a PLE n-gram table"
+            )
+        # PLE row ids are produced on CUDA inside the model in this branch. The disk
+        # backend synchronizes them to the host before page-prefetch and staging, which
+        # cannot run inside capture. Keep the explicitly allowed v1 eager fallback.
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        logger.info_rank0("--ple-backend disk: disabling CUDA graph decode for staged PLE reads")
 
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)

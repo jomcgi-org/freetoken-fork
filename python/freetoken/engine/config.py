@@ -60,6 +60,9 @@ class EngineConfig:
     # misses so the PCIe fetch and the CPU compute finish together (perfect overlap);
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
+    # Qwen3.8 Flash-Next PLE table storage. "pinned" is the original full-bank UVA
+    # path; "disk" maps safetensors shards and stages requested rows.
+    ple_backend: str = "pinned"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -88,6 +91,11 @@ class EngineConfig:
     num_token_override: int | None = None
 
     def __post_init__(self) -> None:
+        if self.ple_backend not in ("pinned", "disk"):
+            raise ValueError(
+                "--ple-backend must be 'pinned' or 'disk', got "
+                f"{self.ple_backend!r}"
+            )
         if self.moe_disk_prefill not in ("cpu", "copy"):
             raise ValueError(
                 "--moe-disk-prefill must be 'cpu' or 'copy', got "

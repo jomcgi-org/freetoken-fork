@@ -3,7 +3,7 @@
 Three separate paths, because the checkpoint's three weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_FUSIONS``.
-* :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
+* :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, either concatenated into one pinned :class:`HostBank` or left as read-only shard mappings.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
 Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
@@ -202,6 +202,23 @@ class PleTable:
         return self.bank.tensor
 
 
+@dataclass(frozen=True)
+class DiskPleTable:
+    """PLE shards mapped directly from their safetensors payload regions."""
+
+    banks: tuple[HostBank, ...]
+    rows_per_shard: int
+    weight_scale: torch.Tensor
+
+    @property
+    def num_rows(self) -> int:
+        return len(self.banks) * self.rows_per_shard
+
+    @property
+    def head_dim(self) -> int:
+        return int(self.banks[0].tensor.shape[1])
+
+
 _PLE_ST_DTYPE = "F8_E4M3"
 
 
@@ -222,17 +239,10 @@ def _ple_table_files(folder: str) -> list[str]:
     return sorted(os.path.join(folder, shard) for shard in files)
 
 
-def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
-                   workers: int = 8, chunk: int = 8 << 20) -> PleTable:
-    """Concatenate the checkpoint's ``ngram_embedding.shard_<i>`` tensors into one pinned host bank.
-
-    The checkpoint splits the table into ``split_ngram_parts`` equal row blocks named by shard
-    index and scattered over the ``model-plefp8-*`` shards in header (lexicographic) order, so the
-    bank is filled shard by shard at ``shard_index * rows_per_shard``. Each read is O_DIRECT: the
-    table is ~47.7 GiB and must not also sit in the page cache while the bank holds the same bytes.
-    """
+def _ple_table_layout(model_path: str, qwen4_args):
+    """Resolve and validate PLE tensor payloads without reading their table bytes."""
     folder = download_hf_weight(model_path)
-    parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
+    parts: dict[int, tuple[str, int, int]] = {}
     scale: torch.Tensor | None = None
     rows = cols = 0
     for path in _ple_table_files(folder):
@@ -265,9 +275,39 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
         raise ValueError(f"PLE table row is {cols} wide, config says {qwen4_args.ngram_head_dim}")
     if scale is None:
         raise ValueError("PLE table has no weight_scale")
+    return parts, scale, rows, cols
+
+
+def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
+                   pin: bool = True, workers: int = 8,
+                   chunk: int = 8 << 20) -> PleTable | DiskPleTable:
+    """Load the PLE table as one pinned bank or read-only safetensors mappings.
+
+    ``pinned`` preserves the original O_DIRECT concatenate, fill, then pin route. ``disk`` maps
+    each tensor payload from its safetensors file with ``MAP_SHARED`` and ``MADV_RANDOM``.
+    """
+    if backend not in ("pinned", "disk"):
+        raise ValueError(f"--ple-backend must be 'pinned' or 'disk', got {backend!r}")
+    parts, scale, rows, cols = _ple_table_layout(model_path, qwen4_args)
+    expected = int(qwen4_args.split_ngram_parts)
+    shard_bytes = rows * cols
+    if backend == "disk":
+        banks = []
+        for shard in range(expected):
+            path, offset, nbytes = parts[shard]
+            if nbytes != shard_bytes:
+                raise ValueError(
+                    f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
+                )
+            banks.append(
+                HostBank(
+                    (rows, cols), torch.float8_e4m3fn, backing="file",
+                    file_path=path, file_offset=offset,
+                )
+            )
+        return DiskPleTable(tuple(banks), rows, scale)
 
     bank = HostBank((expected * rows, cols), torch.float8_e4m3fn)
-    shard_bytes = rows * cols
     bar = byte_bar(expected * shard_bytes, "Loading PLE table")
     try:
         buf = bank.memoryview()

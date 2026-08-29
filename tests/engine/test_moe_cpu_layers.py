@@ -100,6 +100,27 @@ def test_auto_budget_spills_ftw_tail_layers_to_disk(tmp_path, monkeypatch):
     assert auto_layers(config, 4) == frozenset({2, 3})
 
 
+def test_ple_disk_zero_reservation_expands_expert_pin_budget(tmp_path, monkeypatch):
+    index = {
+        "format": "freetoken_weight",
+        "tensors": [
+            {"kind": "experts_bank", "nbytes": 100, "name": f"bank-{i}"}
+            for i in range(4)
+        ],
+    }
+    (tmp_path / "freetoken_weight.json").write_text(json.dumps(index))
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(201 / 2**30))
+    monkeypatch.setattr(
+        "freetoken.engine.engine._cpu_moe_executor_viable", lambda model_config: True,
+    )
+    config = SimpleNamespace(
+        model_path=str(tmp_path), model_config=SimpleNamespace(),
+    )
+
+    assert auto_layers(config, 4, reserved=0) == frozenset({2, 3})
+    assert auto_layers(config, 4, reserved=200) == frozenset(range(4))
+
+
 @pytest.mark.parametrize("mode", ["cpu", "copy"])
 def test_engine_config_accepts_disk_prefill_modes(mode):
     import torch
@@ -142,6 +163,51 @@ def test_engine_config_rejects_invalid_disk_prefill_mode():
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_disk_prefill="gpu",
+        )
+
+
+@pytest.mark.parametrize("backend", ["pinned", "disk"])
+def test_engine_config_accepts_ple_backends(backend):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        ple_backend=backend,
+    )
+    assert config.ple_backend == backend
+
+
+def test_engine_config_defaults_ple_backend_to_pinned():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+    )
+    assert config.ple_backend == "pinned"
+
+
+def test_engine_config_rejects_invalid_ple_backend():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--ple-backend.*pinned.*disk"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            ple_backend="ram",
         )
 
 

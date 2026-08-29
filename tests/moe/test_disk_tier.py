@@ -88,12 +88,22 @@ def test_ftw_writer_keeps_mmap_padding_in_one_shard(tmp_path):
         ([0, 4], 1024, [(0, 8192)]),
         ([0, 8], 1024, [(0, 4096), (8192, 4096)]),
         ([0, 1], 6000, [(0, 12288)]),
+        # Repeated tiny PLE rows sharing a page collapse to one advice range.
+        ([0, 1, 1], 160, [(0, 4096)]),
     ],
 )
 def test_disk_prefetch_page_dedup_and_coalescing(ids, stride, expected):
     from freetoken.moe.host_banks import coalesced_page_ranges
 
     assert coalesced_page_ranges(ids, stride) == expected
+
+
+def test_disk_prefetch_page_dedup_accounts_for_unaligned_tensor_view():
+    from freetoken.moe.host_banks import coalesced_page_ranges
+
+    assert coalesced_page_ranges(
+        [0, 1, 1], 160, page_offset=4032,
+    ) == [(0, 8192)]
 
 
 def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):

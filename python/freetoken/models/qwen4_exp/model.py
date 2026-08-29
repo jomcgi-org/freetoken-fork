@@ -144,7 +144,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         super().__init__()
 
     def load_host_tables(self, engine_config) -> int:
-        """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
+        """Attach the selected PLE backend and return bytes reserved from the pin budget."""
         ple_layers = self.model.ple_layers
         if not ple_layers:
             return 0
@@ -171,13 +171,52 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         from .weight import load_ple_table
 
-        table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
-        self._ple_table = table  # owns the pinned HostBank; keep it alive
+        backend = getattr(engine_config, "ple_backend", "pinned")
+        table = load_ple_table(
+            engine_config.model_path, self._config.qwen4_args, backend=backend,
+        )
+        self._ple_table = table
+        if backend == "disk":
+            from .ple import DiskStagedTable, process_major_faults
+
+            args = self._config.qwen4_args
+            max_tokens = max(
+                int(getattr(engine_config, "max_running_req", 1)),
+                int(engine_config.max_forward_len),
+            )
+            capacity = max_tokens * args.num_ngram_heads
+            self._ple_disk_backends = []
+            self._ple_major_fault_base = process_major_faults()
+            for ple in ple_layers:
+                staged = DiskStagedTable(table, capacity)
+                self._ple_disk_backends.append(staged)
+                ple.ple_embedding.attach_table(staged)
+            return 0
+
         for ple in ple_layers:
             ple.ple_embedding.attach_table(
                 PinnedUVATable(table.bank.tensor, float(table.weight_scale))
             )
         return table.bank.nbytes
+
+    def ple_disk_stats(self, *, reset: bool = False) -> dict:
+        """Aggregate disk PLE page-prefetch and procfs major-fault counters."""
+        backends = getattr(self, "_ple_disk_backends", None)
+        if not backends:
+            return {}
+        from .ple import process_major_faults
+
+        now = process_major_faults()
+        base = self._ple_major_fault_base
+        result = {
+            "ple_prefetch_pages": sum(table.prefetch_pages for table in backends),
+            "ple_major_faults": None if now is None or base is None else now - base,
+        }
+        if reset:
+            for table in backends:
+                table.reset_stats()
+            self._ple_major_fault_base = now
+        return result
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

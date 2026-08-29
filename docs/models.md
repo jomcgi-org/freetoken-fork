@@ -52,11 +52,27 @@ not supported. When expert banks exceed `FREETOKEN_PIN_BUDGET_GB`, an FTW checkp
 automatically spills enough tail layers to DISK. Non-FTW checkpoints retain the
 existing OS-locked fallback.
 
+### File-backed PLE table
+
+Qwen3.8-Flash-Next defaults to `--ple-backend pinned`, which keeps its 47.7 GiB
+PLE n-gram table in pinned host RAM and preserves the original CUDA graph path.
+`--ple-backend disk` instead maps each PLE safetensors payload read-only, applies
+random-access advice, and page-prefetches the deduplicated union of requested rows
+before copying them through a small pinned staging bank. Disk PLE bytes are not
+reserved from the expert-bank pin budget, so automatic MoE spilling can keep more
+expert layers pinned.
+
+The current disk PLE implementation uses eager decode because its hash row ids are
+produced on CUDA inside the model and must be synchronized to the host for staging.
+CUDA graph decode is disabled automatically when this backend is selected. Prefill
+stages the full requested-row union for each chunk through the same path.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
-- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Qwen3.8-Flash-Next keeps its PLE table pinned by default; use
+  `--ple-backend disk` on memory-constrained hosts.
 - Multimodal checkpoints are served text-only.

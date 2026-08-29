@@ -318,6 +318,125 @@ def test_load_ple_table_concatenates_shards_in_index_order(checkpoint):
     assert float(table.weight_scale) == 0.125
 
 
+def test_disk_ple_mapping_matches_pinned_rows(checkpoint):
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    pinned = load_ple_table(folder, args, pin=False)
+    disk = load_ple_table(folder, args, backend="disk")
+
+    assert len(disk.banks) == NGRAM_SHARDS
+    assert disk.rows_per_shard == NGRAM_ROWS
+    assert any(bank._view_offset for bank in disk.banks)
+    for row in (0, 1, NGRAM_ROWS - 1, NGRAM_ROWS, disk.num_rows - 1):
+        shard, local = divmod(row, NGRAM_ROWS)
+        assert torch.equal(
+            disk.banks[shard].tensor[local].view(torch.uint8),
+            pinned.tensor[row].view(torch.uint8),
+        )
+
+
+def test_disk_ple_staging_matches_direct_rows(checkpoint):
+    from freetoken.models.qwen4_exp.ple import DiskStagedTable
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    pinned = load_ple_table(folder, args, pin=False)
+    disk = load_ple_table(folder, args, backend="disk")
+    backend = DiskStagedTable(
+        disk, stage_capacity_rows=8, device=torch.device("cpu"), prefetch=False,
+    )
+    ids = torch.tensor(
+        [[0, NGRAM_ROWS + 2, 0], [disk.num_rows - 1, NGRAM_ROWS + 2, 3]],
+        dtype=torch.int64,
+    )
+    staged, inverse = backend._stage_rows(ids)
+
+    got = staged.view(torch.uint8).index_select(0, inverse.reshape(-1)).view(
+        *ids.shape, NGRAM_DIM
+    )
+    want = pinned.tensor.view(torch.uint8).index_select(0, ids.reshape(-1)).view_as(got)
+    assert torch.equal(got, want)
+
+
+def test_pinned_ple_backend_never_constructs_file_mapping(checkpoint, monkeypatch):
+    import freetoken.models.qwen4_exp.weight as weight
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    real_host_bank = weight.HostBank
+    backings = []
+
+    def tracked_host_bank(*shape, **kwargs):
+        backings.append(kwargs.get("backing"))
+        return real_host_bank(*shape, **kwargs)
+
+    monkeypatch.setattr(weight, "HostBank", tracked_host_bank)
+    table = weight.load_ple_table(folder, args, backend="pinned", pin=False)
+    assert table.tensor.shape == (NGRAM_SHARDS * NGRAM_ROWS, NGRAM_DIM)
+    assert "file" not in backings
+
+
+def test_disk_ple_stats_report_pages_and_major_fault_delta(monkeypatch):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    import freetoken.models.qwen4_exp.ple as ple
+
+    class Backend:
+        def __init__(self, pages):
+            self.prefetch_pages = pages
+
+        def reset_stats(self):
+            self.prefetch_pages = 0
+
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model._ple_disk_backends = [Backend(7), Backend(11)]
+    model._ple_major_fault_base = 20
+    monkeypatch.setattr(ple, "process_major_faults", lambda: 25)
+
+    assert model.ple_disk_stats(reset=True) == {
+        "ple_prefetch_pages": 18,
+        "ple_major_faults": 5,
+    }
+    assert [backend.prefetch_pages for backend in model._ple_disk_backends] == [0, 0]
+    assert model._ple_major_fault_base == 25
+
+
+def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    import freetoken.models.qwen4_exp.ple as ple
+    import freetoken.models.qwen4_exp.weight as weight
+
+    attached = []
+    layer = SimpleNamespace(
+        ple_embedding=SimpleNamespace(attach_table=attached.append),
+    )
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model.model = SimpleNamespace(ple_layers=[layer])
+    model._config = SimpleNamespace(
+        qwen4_args=SimpleNamespace(num_ngram_heads=16),
+    )
+    mapped = SimpleNamespace(num_rows=32, head_dim=4)
+    staged = SimpleNamespace(prefetch_pages=0)
+    selected = []
+
+    def fake_load(model_path, args, *, backend):
+        selected.append(backend)
+        return mapped
+
+    monkeypatch.setattr(weight, "load_ple_table", fake_load)
+    monkeypatch.setattr(ple, "DiskStagedTable", lambda table, capacity: staged)
+    engine_config = SimpleNamespace(
+        model_path="/tmp/model",
+        ple_backend="disk",
+        use_dummy_weight=False,
+        max_running_req=4,
+        max_forward_len=8,
+    )
+
+    assert model.load_host_tables(engine_config) == 0
+    assert selected == ["disk"]
+    assert attached == [staged]
+
+
 def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
     folder, _raw = checkpoint
     args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS + 1, ngram_head_dim=NGRAM_DIM)

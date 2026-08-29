@@ -11,9 +11,10 @@ HF reference: ``Qwen4ExpTextNGramEmbedding`` (modeling_qwen4_exp.py:1018) and
     D = U + silu(conv1d(norm_conv(U)))           # depthwise, kernel 4, dilation ngram_size
     R += D                                       # before the attention hyper-connection mix
 
-The table is the 47.7 GiB FP8 n-gram store: ``PinnedUVATable`` keeps it in pinned host memory and
-gathers rows over UVA, optionally started early on a side stream (``PLELayer.start_prefetch``).
-``GpuResidentTable`` is the small-table oracle the pinned backend is diffed against.
+The table is the 47.7 GiB FP8 n-gram store. ``PinnedUVATable`` gathers from a fully pinned host
+bank, while ``DiskStagedTable`` maps the checkpoint and copies only requested rows into a small
+pinned bank before using the same UVA gather kernel. ``GpuResidentTable`` is the small-table
+oracle the host backends are diffed against.
 """
 
 from __future__ import annotations
@@ -42,6 +43,16 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
+
+
+def process_major_faults() -> int | None:
+    """Process major-fault count from Linux procfs, or ``None`` elsewhere."""
+    try:
+        with open("/proc/self/stat", encoding="utf-8") as f:
+            tail = f.read().rpartition(") ")[2].split()
+        return int(tail[9])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 class PLETableBackend(Protocol):
@@ -203,6 +214,127 @@ class PinnedUVATable:
         else:
             rows = self._gather(row_ids, self._stage(row_ids.numel()))
         rows = rows.view(*row_ids.shape[:-1], -1)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+
+class DiskStagedTable:
+    """Read PLE rows from file mappings through a fixed pinned staging bank.
+
+    Global row ids are synchronized to the host, deduplicated, grouped by safetensors shard,
+    page-prefetched, then copied once into the staging bank. The existing UVA kernel gathers
+    those unique staged rows with compact local ids, preserving duplicates and input order.
+    """
+
+    def __init__(
+        self,
+        table,
+        stage_capacity_rows: int,
+        *,
+        device: torch.device | None = None,
+        prefetch: bool = True,
+    ) -> None:
+        from freetoken.moe.host_banks import HostBank
+
+        if stage_capacity_rows < 1:
+            raise ValueError("PLE disk staging capacity must be positive")
+        self.table = table
+        self.num_rows = int(table.num_rows)
+        self.head_dim = int(table.head_dim)
+        self.dtype = torch.bfloat16
+        self.scale = float(table.weight_scale)
+        if device is None:
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available() else torch.device("cpu")
+            )
+        self._device = device
+        self._stage_bank = HostBank(
+            (int(stage_capacity_rows), self.head_dim), torch.float8_e4m3fn,
+        )
+        if self._device.type == "cuda":
+            self._stage_bank.pin()
+            self._uva = PinnedUVATable(
+                self._stage_bank.tensor,
+                self.scale,
+                device=self._device,
+                prefetch=prefetch,
+            )
+        else:
+            self._uva = None
+        self._capacity = int(stage_capacity_rows)
+        self._prefetch_pages = 0
+        self._pending: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    @property
+    def prefetch_pages(self) -> int:
+        return self._prefetch_pages
+
+    def reset_stats(self) -> None:
+        self._prefetch_pages = 0
+
+    def _stage_rows(
+        self, row_ids: torch.Tensor | Sequence[int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stage the unique row union and return ``(unique_rows, inverse_ids)`` on CPU."""
+        ids = torch.as_tensor(row_ids, dtype=torch.int64, device="cpu")
+        shape = ids.shape
+        flat = ids.reshape(-1)
+        unique, inverse = torch.unique(flat, sorted=True, return_inverse=True)
+        if unique.numel() > self._capacity:
+            raise ValueError(
+                f"PLE lookup needs {unique.numel()} unique rows, staging holds "
+                f"{self._capacity}"
+            )
+        if unique.numel() and (int(unique[0]) < 0 or int(unique[-1]) >= self.num_rows):
+            raise IndexError(
+                f"PLE row ids must be in [0, {self.num_rows}), got "
+                f"[{int(unique[0])}, {int(unique[-1])}]"
+            )
+
+        staged = self._stage_bank.tensor[: unique.numel()]
+        staged_bytes = staged.view(torch.uint8)
+        rows_per_shard = int(self.table.rows_per_shard)
+        pages = 0
+        shard_ids = torch.div(unique, rows_per_shard, rounding_mode="floor")
+        for shard in torch.unique(shard_ids).tolist():
+            bank = self.table.banks[shard]
+            lo = shard * rows_per_shard
+            positions = (shard_ids == shard).nonzero().reshape(-1)
+            local = unique.index_select(0, positions) - lo
+            pages += bank.prefetch_rows(local.tolist())
+            source = bank.tensor.view(torch.uint8).index_select(0, local)
+            staged_bytes.index_copy_(0, positions, source)
+        self._prefetch_pages += pages
+        return staged, inverse.view(shape)
+
+    def _prepare(self, row_ids: torch.Tensor) -> torch.Tensor:
+        _staged, inverse = self._stage_rows(row_ids.detach().cpu())
+        return inverse.to(row_ids.device)
+
+    def prefetch(self, row_ids: torch.Tensor) -> None:
+        local_ids = self._prepare(row_ids)
+        self._pending = (row_ids, local_ids)
+        if self._uva is not None:
+            self._uva.prefetch(local_ids)
+
+    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        pending, self._pending = self._pending, None
+        local_ids = pending[1] if pending is not None and pending[0] is row_ids else None
+        if local_ids is None:
+            local_ids = self._prepare(row_ids)
+        if self._uva is not None:
+            return self._uva.lookup(local_ids, out)
+
+        staged = self._stage_bank.tensor
+        rows = staged.view(torch.uint8).index_select(
+            0, local_ids.reshape(-1)
+        ).view(torch.float8_e4m3fn).to(torch.bfloat16)
+        if self.scale != 1.0:
+            rows.mul_(self.scale)
+        rows = rows.view(*local_ids.shape[:-1], -1)
         if out is None:
             return rows
         out.copy_(rows)
@@ -708,6 +840,7 @@ class PLELayer(BaseOP):
 
 
 __all__ = [
+    "DiskStagedTable",
     "GpuResidentTable",
     "NGramEmbedding",
     "ZeroTable",
@@ -717,5 +850,6 @@ __all__ = [
     "PinnedUVATable",
     "build_ple_metadata",
     "derive_ngram_hash_constants",
+    "process_major_faults",
     "short_conv_reference",
 ]
