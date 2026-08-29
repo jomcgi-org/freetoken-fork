@@ -121,35 +121,91 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert executor._disk_major_fault_base == 16
 
 
-def test_disk_layer_routes_to_cpu_and_uses_pageable_prefill_copy():
+def test_cpu_prefill_io_reuses_one_grow_to_largest_buffer():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.device = torch.device("cpu")
+    executor.H = 8
+    executor.top_k = 2
+    executor._prefill_io = None
+    executor._prefill_capacity = 0
+
+    first = executor._prefill_io_for(3)
+    first_ptr = first["x"].data_ptr()
+    smaller = executor._prefill_io_for(2)
+    assert smaller["x"].data_ptr() == first_ptr
+    assert executor._prefill_capacity == 3
+
+    larger = executor._prefill_io_for(5)
+    assert larger["x"].shape == (5, 8)
+    assert executor._prefill_capacity == 5
+    assert len(executor._prefill_io) == 4
+
+
+@pytest.mark.parametrize(
+    "mode", [pytest.param(None, id="default-cpu"), pytest.param("copy", id="copy")],
+)
+@pytest.mark.parametrize("residency", ["disk", "locked", "pageable"])
+def test_prefill_routing_changes_only_disk_cpu_mode(mode, residency):
     from freetoken.distributed import set_tp_info, try_get_tp_info
-    from freetoken.moe.host_banks import HostResidency
+    from freetoken.layers.moe import OffloadMoELayer
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     if try_get_tp_info() is None:
         set_tp_info(0, 1)
-    cache = OffloadMoeCache(
-        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
-        prefill_overlap=False,
-    )
-    cache.cpu_layer_ids = frozenset({1})
-    sources = {
-        "gate_up": [torch.randn(4, 16, 8) for _ in range(2)],
-        "down": [torch.randn(4, 8, 8) for _ in range(2)],
-    }
-    cache.set_bank_sources(
-        sources,
-        layer_residency=[HostResidency.PINNED.value, HostResidency.DISK.value],
-    )
-    assert cache.is_cpu_layer(1)
-    assert cache.is_unpinned_layer(1)
+    if mode is None:
+        mode = OffloadMoeCache.__dataclass_fields__["moe_disk_prefill"].default
+        assert mode == "cpu"
+    calls = []
+    cpu_out = torch.full((3, 8), 11, dtype=torch.bfloat16)
+    gpu_out = torch.full((3, 8), 22, dtype=torch.bfloat16)
 
-    cache._pending_src_layer = 1
-    cache._pending_whole_layer = True
-    cache.copy_missing()
-    gate_up_cache, down_cache = (bank for _, bank in cache.banks)
-    assert torch.equal(gate_up_cache[:4], sources["gate_up"][1])
-    assert torch.equal(down_cache[:4], sources["down"][1])
+    class Executor:
+        def prefill(self, layer_id, hidden_states, topk_weights, topk_ids):
+            calls.append(("cpu", layer_id, hidden_states, topk_weights, topk_ids))
+            return cpu_out
+
+    cache = SimpleNamespace(
+        layer_residency=[residency],
+        moe_disk_prefill=mode,
+        prefill_overlap=False,
+        cpu_executor=Executor(),
+        prefetch_disk_experts=lambda layer_id, ids: calls.append(
+            ("prefetch", layer_id, ids)
+        ),
+        materialize_layer=lambda layer_id: calls.append(("materialize", layer_id)),
+        copy_missing=lambda: calls.append(("copy",)),
+        bank_views=lambda n: (),
+        alphas_for_layer=lambda layer_id: None,
+    )
+    layer = OffloadMoELayer(
+        layer_id=0, num_experts=4, top_k=2,
+        hidden_size=8, intermediate_size=8,
+    )
+    layer.offload_cache = cache
+    layer._expert_gemm = lambda *args, **kwargs: calls.append(("gemm",)) or gpu_out
+    hidden = torch.randn(3, 8, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 1], [2, 3], [1, 3]], dtype=torch.int32)
+    weights = torch.tensor(
+        [[0.7, 0.3], [0.25, 0.75], [0.6, 0.4]], dtype=torch.float32,
+    )
+
+    out = layer._prefill_routed(hidden, weights, ids)
+    names = [call[0] for call in calls]
+
+    if residency == "disk" and mode == "cpu":
+        assert out is cpu_out
+        assert names == ["prefetch", "cpu"]
+        assert calls[1][2] is hidden
+        assert calls[1][3] is weights
+        assert calls[1][4] is ids
+    else:
+        assert out is gpu_out
+        expected = ["materialize", "copy", "gemm"]
+        if residency == "disk":
+            expected.insert(0, "prefetch")
+        assert names == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -187,11 +243,13 @@ def test_cpu_executor_disk_mapping_matches_anonymous_bank(tmp_path):
         pytest.skip("CPU MoE extension is not built")
     if not hasattr(_cpu_moe.CpuMoeExecutor, "set_pre_run_callback"):
         pytest.skip("CPU MoE extension needs rebuilding for DISK prefetch")
+    if not hasattr(_cpu_moe.CpuMoeExecutor, "run_task_sync"):
+        pytest.skip("CPU MoE extension needs rebuilding for DISK CPU prefill")
     from freetoken.moe.cpu_executor import CpuMoeExecutor
     from freetoken.moe.host_banks import HostBank, HostResidency
 
     torch.manual_seed(7)
-    experts, hidden, inter, top_k = 4, 32, 32, 2
+    experts, hidden, inter, top_k, tokens = 4, 32, 32, 2, 5
     gate_up = torch.randn(experts, 2 * inter, hidden, dtype=torch.bfloat16)
     down = torch.randn(experts, hidden, inter, dtype=torch.bfloat16)
     _write_bf16_ftw(tmp_path, [(gate_up, down)])
@@ -207,7 +265,7 @@ def test_cpu_executor_disk_mapping_matches_anonymous_bank(tmp_path):
     down_ram.tensor.copy_(down)
     ram_sources = {"gate_up": [gate_up_ram.tensor], "down": [down_ram.tensor]}
 
-    def run(sources):
+    def make_executor(sources):
         cache = SimpleNamespace(
             quant_format="bf16", bank_sources=sources,
             num_layers=1, num_experts=experts,
@@ -217,30 +275,28 @@ def test_cpu_executor_disk_mapping_matches_anonymous_bank(tmp_path):
             apply_router_weight_on_input=False, num_threads=1, max_tokens=2,
             device=torch.device("cpu"),
         )
-        x = torch.randn(2, hidden, dtype=torch.bfloat16)
-        ids = torch.tensor([[0, 2], [3, 1]], dtype=torch.int32)
-        weights = torch.tensor([[0.6, 0.4], [0.25, 0.75]], dtype=torch.float32)
-        out = torch.empty_like(x)
-        task = executor._ext.create_task(
-            0, 2, x.data_ptr(), ids.data_ptr(), weights.data_ptr(), out.data_ptr(),
-        )
-        executor._ext.run_task(task)
-        return x, ids, weights, out
+        return executor
 
-    x, ids, weights, ram_out = run(ram_sources)
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    ids = torch.tensor(
+        [[0, 2], [3, 1], [1, 0], [2, 3], [3, 0]], dtype=torch.int32,
+    )
+    weights = torch.tensor(
+        [[0.6, 0.4], [0.25, 0.75], [0.8, 0.2], [0.45, 0.55], [0.1, 0.9]],
+        dtype=torch.float32,
+    )
+    ram_executor = make_executor(ram_sources)
+    ram_out = ram_executor.prefill(0, x, weights, ids)
 
     disk_cache = SimpleNamespace(
         quant_format="bf16", bank_sources=disk.sources,
         num_layers=1, num_experts=experts,
     )
-    disk_executor = CpuMoeExecutor(
-        disk_cache, top_k=top_k, activation="silu",
-        apply_router_weight_on_input=False, num_threads=1, max_tokens=2,
-        device=torch.device("cpu"),
-    )
-    disk_out = torch.empty_like(x)
-    task = disk_executor._ext.create_task(
-        0, 2, x.data_ptr(), ids.data_ptr(), weights.data_ptr(), disk_out.data_ptr(),
-    )
-    disk_executor._ext.run_task(task)
+    disk_executor = make_executor(disk_cache.bank_sources)
+    disk_executor.prefetch_experts(0, ids, is_prefill=True)
+    disk_out = disk_executor.prefill(0, x, weights, ids)
+
+    assert disk_out.shape == x.shape
+    assert disk_out.dtype == x.dtype
     assert torch.equal(disk_out, ram_out)
+    assert disk_executor.disk_prefetch_stats()["prefetch_calls"] == 1

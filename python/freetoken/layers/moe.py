@@ -377,12 +377,22 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill movement: stream whole layers -- double-buffered behind the
-        previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
-        ``materialize_layer``. In both, position == expert id, so the routing ids
-        pass through unmapped."""
+        """Prefill movement: DISK layers default to routed CPU compute. Other layers,
+        and DISK under the copy escape hatch, stream whole layers to the GPU cache."""
         cache = self.offload_cache
         assert cache is not None
+        residency = getattr(cache, "layer_residency", ())
+        if self.layer_id < len(residency) and residency[self.layer_id] == "disk":
+            # Keep the union-of-routed-experts WILLNEED sweep ahead of either compute
+            # path. The CPU task suppresses its decode-time callback because this
+            # explicit prefetch already covered the whole prefill chunk.
+            cache.prefetch_disk_experts(self.layer_id, topk_ids)
+            if cache.moe_disk_prefill == "cpu":
+                executor = cache.cpu_executor
+                assert executor is not None, "DISK layer requires the CPU MoE executor"
+                return executor.prefill(
+                    self.layer_id, hidden_states, topk_weights, topk_ids
+                )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -397,7 +407,6 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
-        cache.prefetch_disk_experts(self.layer_id, topk_ids)
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
         return self._expert_gemm(

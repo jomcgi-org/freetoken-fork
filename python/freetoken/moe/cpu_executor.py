@@ -55,6 +55,20 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
 
+# MoeTask::num_tokens and CpuMoeExecutor::create_task use a signed C++ int.
+CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
+
+
+def validate_cpu_moe_task_tokens(num_tokens: int, *, source: str) -> int:
+    """Validate a batch size before pybind narrows it to C++ ``int``."""
+    num_tokens = int(num_tokens)
+    if not 1 <= num_tokens <= CPU_MOE_MAX_TASK_TOKENS:
+        raise ValueError(
+            f"{source} is {num_tokens}, outside the native CPU MoE task token-field "
+            f"range [1, {CPU_MOE_MAX_TASK_TOKENS}]"
+        )
+    return num_tokens
+
 # Activation ids must match ActKind in csrc/cpu_moe/cpu_moe_ext.cpp. Id 3 is the
 # clamped (up + 1) swiglu: "swigluoai" runs it in the generic GEMV epilogue,
 # "gpt_oss_swiglu" is the same math fused inside the mxfp4 kernel.
@@ -273,6 +287,8 @@ class CpuMoeExecutor:
 
         self._io: dict[int, dict[str, torch.Tensor]] = {}
         self._tasks: dict[tuple[int, int], int] = {}
+        self._prefill_io: dict[str, torch.Tensor] | None = None
+        self._prefill_capacity = 0
 
         # Flag-based handshake: mapped-pinned ready/done/err int64 arrays (one slot per
         # (MoE layer, decode batch size) pair, allocated as tasks are created) + a
@@ -512,13 +528,15 @@ class CpuMoeExecutor:
         return ptrs, (H, I)
 
     def _io_for(self, bs: int) -> dict[str, torch.Tensor]:
+        validate_cpu_moe_task_tokens(bs, source="CPU MoE batch size")
         io = self._io.get(bs)
         if io is None:
+            alloc = alloc_pinned_tensor if self.device.type == "cuda" else torch.empty
             io = {
-                "x": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
-                "ids": alloc_pinned_tensor(bs, self.top_k, dtype=torch.int32),
-                "w": alloc_pinned_tensor(bs, self.top_k, dtype=torch.float32),
-                "y": alloc_pinned_tensor(bs, self.H, dtype=torch.bfloat16),
+                "x": alloc(bs, self.H, dtype=torch.bfloat16),
+                "ids": alloc(bs, self.top_k, dtype=torch.int32),
+                "w": alloc(bs, self.top_k, dtype=torch.float32),
+                "y": alloc(bs, self.H, dtype=torch.bfloat16),
             }
             self._io[bs] = io
         return io
@@ -546,12 +564,27 @@ class CpuMoeExecutor:
                     self._ext.register_flag_task(slot, task)
         return task
 
+    def _prefill_io_for(self, bs: int) -> dict[str, torch.Tensor]:
+        """One reusable prefill buffer, grown only when a larger chunk arrives."""
+        validate_cpu_moe_task_tokens(bs, source="CPU MoE prefill batch size")
+        if bs > self._prefill_capacity:
+            alloc = alloc_pinned_tensor if self.device.type == "cuda" else torch.empty
+            self._prefill_io = {
+                "x": alloc(bs, self.H, dtype=torch.bfloat16),
+                "ids": alloc(bs, self.top_k, dtype=torch.int32),
+                "w": alloc(bs, self.top_k, dtype=torch.float32),
+                "y": alloc(bs, self.H, dtype=torch.bfloat16),
+            }
+            self._prefill_capacity = bs
+        assert self._prefill_io is not None
+        return {name: tensor[:bs] for name, tensor in self._prefill_io.items()}
+
     def prefetch_experts(self, layer_id: int, expert_ids, is_prefill: bool = False) -> int:
         """Prefetch the union of selected rows for one DISK layer.
 
         Decode invokes this after routing has reached the pinned host buffer and before
         the native executor wakes its GEMV workers. Prefill invokes it once with the
-        whole token block's route union before synchronous materialization.
+        whole token block's route union before the synchronous CPU task.
         """
         banks = self._disk_banks.get(int(layer_id))
         if not banks:
@@ -621,6 +654,49 @@ class CpuMoeExecutor:
         pinned buffers, which hold this step's real routing on replay)."""
         pending = self.decode_submit(layer_id, hidden_states, topk_weights, topk_ids)
         return self.decode_sync(pending)
+
+    def prefill(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one prefill chunk synchronously on the native CPU worker pool.
+
+        The caller performs the DISK expert-union prefetch before entering here.
+        Blocking copies make all task inputs visible before the native task starts, and
+        the returned tensor preserves the GPU path's input dtype, shape, and device.
+        """
+        bs = validate_cpu_moe_task_tokens(
+            hidden_states.shape[0], source="CPU MoE prefill batch size"
+        )
+        io = self._prefill_io_for(bs)
+        task_hidden = hidden_states
+        if self._gpu_prequant:
+            from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_roundtrip
+
+            task_hidden = act_quant_fp8_roundtrip(hidden_states, block=128)
+        io["x"].copy_(task_hidden, non_blocking=False)
+        io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=False)
+        io["w"].copy_(topk_weights.to(torch.float32), non_blocking=False)
+        if not hasattr(self._ext, "run_task_sync"):
+            raise RuntimeError(
+                "the CPU MoE extension needs rebuilding for DISK CPU prefill; run "
+                "`python setup.py build_ext --inplace` or reinstall the wheel"
+            )
+        self._ext.run_task_sync(
+            layer_id,
+            bs,
+            io["x"].data_ptr(),
+            io["ids"].data_ptr(),
+            io["w"].data_ptr(),
+            io["y"].data_ptr(),
+            False,
+        )
+        out = torch.empty_like(hidden_states)
+        out.copy_(io["y"], non_blocking=False)
+        return out
 
     def decode_submit(
         self,

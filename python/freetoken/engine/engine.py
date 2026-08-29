@@ -630,6 +630,7 @@ class Engine:
                 cache_policy=config.moe_cache_policy,
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
+                moe_disk_prefill=config.moe_disk_prefill,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -642,6 +643,30 @@ class Engine:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
             cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
+            if disk_layer_ids:
+                residency = getattr(cache, "layer_residency", None)
+                try:
+                    valid_disk_residency = (
+                        len(residency) == num_moe_layers
+                        and all(residency[i] == "disk" for i in disk_layer_ids)
+                    )
+                except (IndexError, KeyError, TypeError):
+                    valid_disk_residency = False
+                if not valid_disk_residency:
+                    raise TypeError(
+                        "a custom MoE cache serving --moe-disk-layers must expose "
+                        "one layer_residency entry per MoE layer and label every "
+                        "selected layer 'disk'"
+                    )
+                try:
+                    cache.moe_disk_prefill = config.moe_disk_prefill
+                except AttributeError as exc:
+                    raise TypeError(
+                        "a custom MoE cache serving --moe-disk-layers must expose "
+                        "an assignable moe_disk_prefill attribute"
+                    ) from exc
+            elif hasattr(cache, "moe_disk_prefill"):
+                cache.moe_disk_prefill = config.moe_disk_prefill
             cache.cpu_layer_ids = cpu_layer_ids
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
@@ -699,6 +724,8 @@ class Engine:
         """
         from freetoken.moe.cpu_executor import CpuMoeExecutor
 
+        _validate_disk_prefill_task_size(config, cache)
+
         sample = layers[0]
         required = ("top_k", "activation", "apply_router_weight_on_input")
         if not all(hasattr(sample, attr) for attr in required):
@@ -721,6 +748,15 @@ class Engine:
             swiglu_alpha=getattr(sample, "hidden_act_alpha", 1.702),
             swiglu_limit=getattr(sample, "swiglu_limit", None),
         )
+        if (
+            config.moe_disk_prefill == "cpu"
+            and "disk" in getattr(cache, "layer_residency", ())
+            and not hasattr(executor._ext, "run_task_sync")
+        ):
+            raise RuntimeError(
+                "the CPU MoE extension needs rebuilding for DISK CPU prefill; run "
+                "`python setup.py build_ext --inplace` or reinstall the wheel"
+            )
         cache.set_cpu_executor(executor)
         self.cpu_moe_executor = executor
 
@@ -1255,12 +1291,31 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
     "moe_disk_layers": None,
+    "moe_disk_prefill": "cpu",
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
 }
+
+
+def _validate_disk_prefill_task_size(config, cache) -> None:
+    """Reject scheduler chunks that cannot fit the native task token field."""
+    if (
+        config.moe_disk_prefill != "cpu"
+        or "disk" not in getattr(cache, "layer_residency", ())
+    ):
+        return
+    from freetoken.moe.cpu_executor import validate_cpu_moe_task_tokens
+
+    chunk = getattr(config, "max_extend_tokens", None)
+    if chunk is None:
+        chunk = config.max_forward_len
+    validate_cpu_moe_task_tokens(
+        chunk,
+        source="--max-prefill-length/--max-extend-length for DISK CPU prefill",
+    )
 
 
 def _adjust_config(config: EngineConfig):

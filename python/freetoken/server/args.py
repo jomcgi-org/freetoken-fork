@@ -575,6 +575,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-prefill",
+        choices=["cpu", "copy"],
+        default=ServerArgs.moe_disk_prefill,
+        help=(
+            "How DISK layers run prefill: 'cpu' computes routed experts through the "
+            "CPU executor (default); 'copy' restores the whole-layer pageable copy "
+            "to the GPU cache for benchmarking."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,

@@ -1882,8 +1882,8 @@ struct CpuMoeExecutor {
     }
   }
 
-  void submit(MoeTask* t) {
-    if (pre_run_callback) {
+  void submit(MoeTask* t, bool run_pre_callback = true) {
+    if (run_pre_callback && pre_run_callback) {
       std::vector<int32_t> ids(
           t->ids, t->ids + static_cast<size_t>(t->num_tokens) * top_k);
       pybind11::gil_scoped_acquire gil;
@@ -1892,8 +1892,8 @@ struct CpuMoeExecutor {
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
-    // construction-time hint (CUDA-graph capture warms the largest bs first, so
-    // this happens at most once, before any capture, while the pool is idle).
+    // construction-time hint. Decode graph warmup covers its fixed batch sizes;
+    // synchronous prefill can grow this further as larger chunks arrive.
     const size_t need = static_cast<size_t>(t->num_tokens) * top_k * I;
     if (need > g_scratch.size()) g_scratch.resize(need);
     p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
@@ -2098,6 +2098,23 @@ struct CpuMoeExecutor {
     sync();
   }
 
+  // Synchronous task whose descriptor lives only for this call. Prefill uses one
+  // grow-to-largest IO buffer and passes the current token count here, avoiding the
+  // persistent exact-batch task cache required by CUDA-graph decode.
+  void run_task_sync(int layer_id, int num_tokens, uintptr_t x_ptr,
+                     uintptr_t ids_ptr, uintptr_t w_ptr, uintptr_t y_ptr,
+                     bool run_pre_callback) {
+    MoeTask task{this,
+                 layer_id,
+                 num_tokens,
+                 reinterpret_cast<const bf16_t*>(x_ptr),
+                 reinterpret_cast<const int32_t*>(ids_ptr),
+                 reinterpret_cast<const float*>(w_ptr),
+                 reinterpret_cast<bf16_t*>(y_ptr)};
+    submit(&task, run_pre_callback);
+    sync();
+  }
+
   void set_pre_run_callback(pybind11::function callback) {
     pre_run_callback = std::move(callback);
   }
@@ -2138,6 +2155,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("stream"), py::arg("task"), py::call_guard<py::gil_scoped_release>())
       .def("run_task", &CpuMoeExecutor::run_task, py::arg("task"),
            py::call_guard<py::gil_scoped_release>())
+      .def("run_task_sync", &CpuMoeExecutor::run_task_sync,
+           py::arg("layer_id"), py::arg("num_tokens"), py::arg("x_ptr"),
+           py::arg("ids_ptr"), py::arg("w_ptr"), py::arg("y_ptr"),
+           py::arg("run_pre_callback"), py::call_guard<py::gil_scoped_release>())
       .def("set_pre_run_callback", &CpuMoeExecutor::set_pre_run_callback,
            py::arg("callback"))
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,

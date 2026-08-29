@@ -51,6 +51,9 @@ class EngineConfig:
     # File-backed FTW bank layers. Uses the same grammar as moe_cpu_layers and always
     # routes the selected layers through the CPU executor.
     moe_disk_layers: str | None = None
+    # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
+    # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
+    moe_disk_prefill: str = "cpu"
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
@@ -83,6 +86,13 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.moe_disk_prefill not in ("cpu", "copy"):
+            raise ValueError(
+                "--moe-disk-prefill must be 'cpu' or 'copy', got "
+                f"{self.moe_disk_prefill!r}"
+            )
 
     @cached_property
     def hf_config(self):

@@ -40,6 +40,12 @@ touched expert pages into the page cache. The flag accepts the same explicit id 
 count, or fraction grammar as `--moe-cpu-layers`, for example
 `--moe-disk-layers 48,49,50` or `--moe-disk-layers 0.25`.
 
+DISK layers also prefill on the CPU executor by default. FreeToken first prefetches
+the union of routed expert pages for the chunk, then computes only those routes without
+copying the whole bank to the GPU cache. `--moe-disk-prefill copy` restores the prior
+whole-layer pageable copy path for benchmarking. LOCKED and PAGEABLE layers keep their
+existing GPU prefill copy behavior.
+
 The DISK tier requires FreeToken's aligned, per-layer FTW layout. Convert a raw
 safetensors checkpoint first with `ft checkpoint`; raw safetensors and GGUF banks are
 not supported. When expert banks exceed `FREETOKEN_PIN_BUDGET_GB`, an FTW checkpoint

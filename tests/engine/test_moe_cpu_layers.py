@@ -15,6 +15,7 @@ from freetoken.engine.engine import _parse_disk_layers_spec as parse_disk
 from freetoken.engine.engine import _resolve_cpu_layers as resolve
 from freetoken.engine.engine import _resolve_disk_layers as resolve_disk
 from freetoken.engine.engine import _auto_cpu_layers as auto_layers
+from freetoken.engine.engine import _validate_disk_prefill_task_size as validate_chunk
 
 L = 40
 
@@ -97,6 +98,70 @@ def test_auto_budget_spills_ftw_tail_layers_to_disk(tmp_path, monkeypatch):
         model_path=str(tmp_path), model_config=SimpleNamespace(),
     )
     assert auto_layers(config, 4) == frozenset({2, 3})
+
+
+@pytest.mark.parametrize("mode", ["cpu", "copy"])
+def test_engine_config_accepts_disk_prefill_modes(mode):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        moe_disk_prefill=mode,
+    )
+    assert config.moe_disk_prefill == mode
+
+
+def test_engine_config_defaults_disk_prefill_to_cpu():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+    )
+    assert config.moe_disk_prefill == "cpu"
+
+
+def test_engine_config_rejects_invalid_disk_prefill_mode():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-disk-prefill.*cpu.*copy"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_disk_prefill="gpu",
+        )
+
+
+def test_disk_cpu_prefill_validates_scheduler_chunk_against_task_limit():
+    from freetoken.moe.cpu_executor import CPU_MOE_MAX_TASK_TOKENS
+
+    cache = SimpleNamespace(layer_residency=["pinned", "disk"])
+    config = SimpleNamespace(moe_disk_prefill="cpu", max_extend_tokens=8192)
+    validate_chunk(config, cache)
+
+    for invalid in (0, CPU_MOE_MAX_TASK_TOKENS + 1):
+        config.max_extend_tokens = invalid
+        with pytest.raises(ValueError, match="max-prefill-length.*token-field range"):
+            validate_chunk(config, cache)
+
+    config.moe_disk_prefill = "copy"
+    validate_chunk(config, cache)
+
+    config.moe_disk_prefill = "cpu"
+    validate_chunk(config, SimpleNamespace(layer_residency=["pinned"]))
 
 
 if __name__ == "__main__":
