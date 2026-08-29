@@ -158,9 +158,11 @@ class FTWWriter:
         t = tensor.detach().cpu().contiguous()
         raw = t.reshape(-1).view(torch.uint8)
         nbytes = int(raw.numel())
-        # A small tensor (<= shard) never splits: roll early so it lands whole in one shard.
+        # A small tensor (<= shard) never splits, including its alignment padding. DISK
+        # residency maps that full rounded region from one shard.
+        region_bytes = _align_up(nbytes)
         if self._f is None or (nbytes <= self.shard_limit
-                               and self._cur + nbytes > self.shard_limit):
+                               and self._cur + region_bytes > self.shard_limit):
             self._roll()
         global_off = self._global
         assert global_off % ALIGN == 0, "tensor start must be aligned (invariant)"
@@ -300,6 +302,34 @@ class FTWReader:
             remaining -= take
         if remaining:
             raise ValueError("tensor range exceeds FTW shards")
+
+    def file_region(self, entry: dict) -> tuple[str, int, int]:
+        """Return one mmap-ready ``(path, file_offset, mapped_length)`` for an entry.
+
+        File-backed banks require a single shard and page-aligned file offset. Current
+        per-layer FTW entries satisfy both writer invariants. Legacy flat banks and an
+        unusually large entry that spans shards are rejected by the DISK loader.
+        """
+        pieces = list(self._pieces(entry["global_off"], entry["nbytes"]))
+        if len(pieces) != 1:
+            raise RuntimeError(
+                f"FTW bank {entry.get('name')!r} spans {len(pieces)} shards and cannot "
+                "be file-mapped; reconvert it with `ft checkpoint`"
+            )
+        file, file_off, dest_off, length = pieces[0]
+        if dest_off or file_off % ALIGN:
+            raise RuntimeError(
+                f"FTW bank {entry.get('name')!r} is not {ALIGN}-byte aligned and cannot "
+                "be file-mapped; reconvert it with `ft checkpoint`"
+            )
+        path = os.path.join(self.dir, file)
+        mapped_length = _align_up(length)
+        if file_off + mapped_length > os.path.getsize(path):
+            raise RuntimeError(
+                f"FTW bank {entry.get('name')!r} has alignment padding in another "
+                "shard and cannot be file-mapped; reconvert it with `ft checkpoint`"
+            )
+        return path, file_off, mapped_length
 
     def read_into(self, dest: memoryview, entry: dict, *, workers: int = 8,
                   chunk: int = _DEFAULT_CHUNK) -> None:
@@ -452,11 +482,17 @@ def load_ftw_banks(
 
     residency = layer_residency or [HostResidency.PINNED.value] * num_layers
     assert len(residency) == num_layers, (len(residency), num_layers)
+    valid_residency = {r.value for r in HostResidency}
+    unknown = set(residency) - valid_residency
+    if unknown:
+        raise ValueError(f"unknown host residency label(s): {sorted(unknown)}")
 
     # PINNED layers are born-pinned (cudaHostAlloc) where that wins (see born_pinned_default); LOCKED/PAGEABLE layers stay lazy mmaps
     born = born_pinned_default()
 
     def _backing(layer_id: int) -> str:
+        if residency[layer_id] == HostResidency.DISK.value:
+            return "file"
         if born and residency[layer_id] == HostResidency.PINNED.value:
             return "cuda"
         return "mmap"
@@ -495,6 +531,12 @@ def load_ftw_banks(
 
     mixed = {e["name"] for e in flat_entries} & per_layer_groups.keys()
     assert not mixed, f"FTW bank(s) mix flat and per-layer row layouts: {sorted(mixed)}"
+    disk_layers = {i for i, r in enumerate(residency) if r == HostResidency.DISK.value}
+    if disk_layers and flat_entries:
+        raise RuntimeError(
+            "DISK residency requires per-layer, page-aligned FTW expert banks; this "
+            "checkpoint has legacy flat bank entries. Reconvert it with `ft checkpoint`."
+        )
 
     # Row banks: one padded-window HostBank per (name, layer_id) for the flat layout, plus
     # how to carve the real [num_experts, *row_shape] tensor out of its head; ``None`` marks
@@ -535,13 +577,28 @@ def load_ftw_banks(
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            kw = {}
+            if layer_id in disk_layers:
+                path_, file_off, mapped = reader.file_region(e)
+                if mapped < _align_up(e["nbytes"]):
+                    raise RuntimeError(f"FTW bank {e['name']!r} has a truncated mapped region")
+                kw = {"file_path": path_, "file_offset": file_off}
+            bank = HostBank(
+                tuple(e["shape"]), _dtype_of(e["dtype"]),
+                backing=_backing(layer_id), **kw,
+            )
             row_hb[base].append(bank)
             row_view_args[base].append(None)
-            layer_jobs.append((base, bank, e, layer_id))
+            if layer_id not in disk_layers:
+                layer_jobs.append((base, bank, e, layer_id))
 
     total_bytes = sum(e["nbytes"] for e in bank_entries)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
+    if disk_layers:
+        bar.update(sum(
+            e["nbytes"] for by_layer in per_layer_groups.values()
+            for layer_id, e in by_layer.items() if layer_id in disk_layers
+        ))
 
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins
     # as its read completes, overlapping cudaHostRegister with the remaining reads.
@@ -606,9 +663,17 @@ def load_ftw_banks(
             for layer_id, bank in enumerate(banks):
                 by_layer[layer_id] += bank.nbytes
         locked = [i for i in unpinned if applied[i] == HostResidency.LOCKED.value]
-        pageable = [i for i in unpinned if i not in set(locked)]
+        disk = [i for i in unpinned if applied[i] == HostResidency.DISK.value]
+        pageable = [i for i in unpinned if i not in set(locked) | set(disk)]
         pinned_b = sum(b for i, b in enumerate(by_layer) if i not in set(unpinned))
         locked_b = sum(by_layer[i] for i in locked)
+        disk_part = ""
+        if disk:
+            disk_b = sum(by_layer[i] for i in disk)
+            disk_part = (
+                f" + {disk_b / 2**30:.2f} GiB file-backed "
+                f"({len(disk)} DISK layers: {disk})"
+            )
         pageable_part = ""
         if pageable:
             pageable_b = sum(by_layer[i] for i in pageable)
@@ -621,6 +686,7 @@ def load_ftw_banks(
             f"({'born-pinned cudaHostAlloc' if born else 'cudaHostRegister'}, "
             f"{num_layers - len(unpinned)} GPU layers) + "
             f"{locked_b / 2**30:.2f} GiB OS-locked ({len(locked)} CPU layers: {locked})"
+            f"{disk_part}"
             f"{pageable_part}"
         )
 

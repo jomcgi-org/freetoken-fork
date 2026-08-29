@@ -21,6 +21,7 @@ import os
 import threading
 import time
 import weakref
+from functools import partial
 
 import torch
 
@@ -69,6 +70,16 @@ _ACT_IDS = {
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+
+
+def _major_faults() -> int | None:
+    """Process major-fault count from Linux procfs, or ``None`` when unavailable."""
+    try:
+        with open("/proc/self/stat", encoding="utf-8") as f:
+            tail = f.read().rpartition(") ")[2].split()
+        return int(tail[9])  # field 12 (majflt); tail[0] is field 3 (state)
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -192,6 +203,12 @@ class CpuMoeExecutor:
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
+        self._disk_banks: dict[int, list] = {}
+        self._disk_prefetch_calls = [0] * self.num_layers
+        self._disk_prefetch_pages = [0] * self.num_layers
+        self._disk_decode_steps = 0
+        self._disk_major_fault_base = _major_faults()
+        self._disk_prefetch_error: BaseException | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
@@ -238,6 +255,9 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        if self._disk_banks:
+            self._disk_callback = partial(_disk_prefetch_callback, weakref.ref(self))
+            self._ext.set_pre_run_callback(self._disk_callback)
         self.num_threads = nthreads
         self.core_ids = core_ids
         self.isa = self._ext.isa_name()
@@ -327,6 +347,12 @@ class CpuMoeExecutor:
         executor's lifetime.
         """
         assert len(layers) == self.num_layers, (len(layers), self.num_layers)
+        for layer_id, tensor in enumerate(layers):
+            bank = getattr(tensor, "_freetoken_host_bank", None)
+            if bank is not None and bank.residency.value == "disk":
+                layer_banks = self._disk_banks.setdefault(layer_id, [])
+                if bank not in layer_banks:
+                    layer_banks.append(bank)
         table = torch.tensor([t.data_ptr() for t in layers], dtype=torch.int64)
         self._banks.append(table)
         self._banks.extend(layers)
@@ -520,6 +546,67 @@ class CpuMoeExecutor:
                     self._ext.register_flag_task(slot, task)
         return task
 
+    def prefetch_experts(self, layer_id: int, expert_ids, is_prefill: bool = False) -> int:
+        """Prefetch the union of selected rows for one DISK layer.
+
+        Decode invokes this after routing has reached the pinned host buffer and before
+        the native executor wakes its GEMV workers. Prefill invokes it once with the
+        whole token block's route union before synchronous materialization.
+        """
+        banks = self._disk_banks.get(int(layer_id))
+        if not banks:
+            return 0
+        if not is_prefill:
+            self._disk_decode_steps += 1
+        if isinstance(expert_ids, torch.Tensor):
+            expert_ids = expert_ids.detach().cpu().reshape(-1).tolist()
+        selected = sorted({int(i) for i in expert_ids if int(i) >= 0})
+        if not selected:
+            return 0
+        pages = sum(bank.prefetch_experts(selected) for bank in banks)
+        self._disk_prefetch_calls[layer_id] += 1
+        self._disk_prefetch_pages[layer_id] += pages
+        return pages
+
+    def reset_disk_stats(self) -> None:
+        self._disk_prefetch_calls = [0] * self.num_layers
+        self._disk_prefetch_pages = [0] * self.num_layers
+        self._disk_decode_steps = 0
+        self._disk_major_fault_base = _major_faults()
+
+    def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
+        """Aggregate DISK counters, reading procfs only when stats are flushed."""
+        per_layer = [
+            {
+                "layer": layer_id,
+                "prefetch_calls": self._disk_prefetch_calls[layer_id],
+                "pages_requested": self._disk_prefetch_pages[layer_id],
+            }
+            for layer_id in sorted(self._disk_banks)
+        ]
+        now = _major_faults()
+        major_faults = None if now is None or self._disk_major_fault_base is None else (
+            now - self._disk_major_fault_base
+        )
+        disk_layers = len(self._disk_banks)
+        decode_steps = self._disk_decode_steps / disk_layers if disk_layers else 0
+        result = {
+            "prefetch_calls": sum(self._disk_prefetch_calls),
+            "pages_requested": sum(self._disk_prefetch_pages),
+            "major_faults": major_faults,
+            "major_faults_per_decode_step": (
+                major_faults / decode_steps
+                if major_faults is not None and decode_steps else 0.0
+            ),
+            "per_layer": per_layer,
+        }
+        if reset:
+            self._disk_prefetch_calls = [0] * self.num_layers
+            self._disk_prefetch_pages = [0] * self.num_layers
+            self._disk_decode_steps = 0
+            self._disk_major_fault_base = now
+        return result
+
     def decode(
         self,
         layer_id: int,
@@ -645,6 +732,8 @@ class CpuMoeExecutor:
         coordinator never responded). Called by the engine once per forward -- a single
         pinned read -- so a dead coordinator surfaces as a loud error on the next step
         instead of silently shipping stale expert outputs."""
+        if self._disk_prefetch_error is not None:
+            raise RuntimeError("DISK expert prefetch failed") from self._disk_prefetch_error
         if self._err is not None and bool((self._err != 0).any()):
             raise RuntimeError(
                 "CPU MoE flag-handshake watchdog fired: a decode step's doorbell was "
@@ -653,6 +742,19 @@ class CpuMoeExecutor:
                 "engine, or set FREETOKEN_CPU_MOE_FLAG_SYNC=0 to use the "
                 "cudaLaunchHostFunc sync."
             )
+
+
+def _disk_prefetch_callback(executor_ref, layer_id: int, expert_ids) -> None:
+    """No-throw native pre-run callback without a strong executor reference."""
+    executor = executor_ref()
+    if executor is None:
+        return
+    try:
+        executor.prefetch_experts(layer_id, expert_ids)
+    except BaseException as exc:
+        if executor._disk_prefetch_error is None:
+            executor._disk_prefetch_error = exc
+            logger.error(f"DISK expert prefetch failed: {exc}")
 
 
 def _watchdog_main(executor_ref) -> None:

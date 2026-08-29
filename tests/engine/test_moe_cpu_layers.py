@@ -5,12 +5,16 @@ CPU-only: exercises _parse_cpu_layers_spec / _resolve_cpu_layers without a GPU.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from freetoken.engine.engine import _parse_cpu_layers_spec as parse
+from freetoken.engine.engine import _parse_disk_layers_spec as parse_disk
 from freetoken.engine.engine import _resolve_cpu_layers as resolve
+from freetoken.engine.engine import _resolve_disk_layers as resolve_disk
+from freetoken.engine.engine import _auto_cpu_layers as auto_layers
 
 L = 40
 
@@ -34,6 +38,12 @@ def test_fraction():
     assert parse("0.0", L) == frozenset()
 
 
+def test_disk_layers_use_the_same_grammar():
+    assert parse_disk("3,7,11", L) == frozenset({3, 7, 11})
+    assert len(parse_disk("8", L)) == 8
+    assert len(parse_disk("0.5", L)) == L // 2
+
+
 def test_empty():
     assert parse("", L) == frozenset()
     assert parse("   ", L) == frozenset()
@@ -45,8 +55,10 @@ def test_out_of_range_raises(spec):
         parse(spec, L)
 
 
-def _cfg(backend, spec=None):
-    return SimpleNamespace(moe_backend=backend, moe_cpu_layers=spec)
+def _cfg(backend, spec=None, disk=None):
+    return SimpleNamespace(
+        moe_backend=backend, moe_cpu_layers=spec, moe_disk_layers=disk,
+    )
 
 
 def test_resolve_backend_dispatch():
@@ -59,6 +71,32 @@ def test_resolve_backend_dispatch():
     assert resolve(_cfg("offload", None), L) == frozenset()
     # non-offload backend ignores the spec (validation lives in _adjust_config)
     assert resolve(_cfg("fused", "8"), L) == frozenset()
+
+
+def test_resolve_disk_layers_always_targets_cpu_capable_backends():
+    assert resolve_disk(_cfg("offload", disk="3,7"), L) == frozenset({3, 7})
+    assert resolve_disk(_cfg("hybrid", disk="2"), L) == frozenset({0, 20})
+    assert resolve_disk(_cfg("cpu", disk="1.0"), L) == frozenset(range(L))
+    assert resolve_disk(_cfg("fused", disk="3,7"), L) == frozenset()
+
+
+def test_auto_budget_spills_ftw_tail_layers_to_disk(tmp_path, monkeypatch):
+    index = {
+        "format": "freetoken_weight",
+        "tensors": [
+            {"kind": "experts_bank", "nbytes": 100, "name": f"bank-{i}"}
+            for i in range(4)
+        ],
+    }
+    (tmp_path / "freetoken_weight.json").write_text(json.dumps(index))
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(201 / 2**30))
+    monkeypatch.setattr(
+        "freetoken.engine.engine._cpu_moe_executor_viable", lambda model_config: True,
+    )
+    config = SimpleNamespace(
+        model_path=str(tmp_path), model_config=SimpleNamespace(),
+    )
+    assert auto_layers(config, 4) == frozenset({2, 3})
 
 
 if __name__ == "__main__":

@@ -301,7 +301,7 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE/DISK) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch, which is why prefill overlap is incompatible with them.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -311,6 +311,8 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
+        for label in residency:
+            HostResidency(label)
         unpinned = frozenset(
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
@@ -536,9 +538,21 @@ class OffloadMoeCache:
         return layer_id in self.cpu_layer_ids
 
     def is_unpinned_layer(self, layer_id: int) -> bool:
-        """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE): the GPU slot-gather paths cannot serve it.
+        """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE/DISK): the GPU slot-gather paths cannot serve it.
         ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
         return layer_id in self._unpinned_layers
+
+    def prefetch_disk_experts(self, layer_id: int, expert_ids) -> int:
+        """Prefetch selected file-backed rows, or no-op for a RAM-resident layer."""
+        if self.layer_residency[layer_id] != "disk":
+            return 0
+        assert self.cpu_executor is not None, "DISK layer requires the CPU MoE executor"
+        return self.cpu_executor.prefetch_experts(layer_id, expert_ids, is_prefill=True)
+
+    def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
+        if self.cpu_executor is None or not self.cpu_executor._disk_banks:
+            return {}
+        return self.cpu_executor.disk_prefetch_stats(reset=reset)
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
@@ -867,6 +881,8 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        if self.cpu_executor is not None:
+            self.cpu_executor.reset_disk_stats()
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
@@ -900,7 +916,7 @@ class OffloadMoeCache:
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
         fetched = int(self.stat_fetched.item())
-        return {
+        result = {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
             "missing_per_layer": (missing / calls) if calls else 0.0,
@@ -914,6 +930,9 @@ class OffloadMoeCache:
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
         }
+        if disk := self.disk_prefetch_stats():
+            result["disk"] = disk
+        return result
 
     def decode_miss_stats_per_layer(self) -> dict:
         """Per-MoE-layer realized decode stats for one (reset_stats-delimited) window.

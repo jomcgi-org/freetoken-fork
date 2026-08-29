@@ -32,6 +32,20 @@ for them; other checkpoints of the same architectures work too.
   `offload`, upgraded to `hybrid` when a cached `ft bench bw` profile
   recommends it.
 
+### File-backed expert banks
+
+`--moe-disk-layers` keeps the selected MoE layers as read-only mappings of their
+checkpoint regions. Those layers decode on the CPU executor, while Linux loads only
+touched expert pages into the page cache. The flag accepts the same explicit id list,
+count, or fraction grammar as `--moe-cpu-layers`, for example
+`--moe-disk-layers 48,49,50` or `--moe-disk-layers 0.25`.
+
+The DISK tier requires FreeToken's aligned, per-layer FTW layout. Convert a raw
+safetensors checkpoint first with `ft checkpoint`; raw safetensors and GGUF banks are
+not supported. When expert banks exceed `FREETOKEN_PIN_BUDGET_GB`, an FTW checkpoint
+automatically spills enough tail layers to DISK. Non-FTW checkpoints retain the
+existing OS-locked fallback.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

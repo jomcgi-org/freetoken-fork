@@ -24,6 +24,7 @@ import mmap
 import os
 import queue
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
@@ -39,13 +40,15 @@ _BLK = 4096  # O_DIRECT alignment (page size)
 class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
-    Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths; LOCKED (mlock'd, no device address) and PAGEABLE layers must decode on the CPU executor.
-    The non-pinned classes exist for hosts that cap CUDA pin quota (WSL/WDDM: ~half of RAM).
+    Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths. LOCKED,
+    PAGEABLE, and file-backed DISK layers have no device address and decode on the CPU
+    executor.
     """
 
     PINNED = "pinned"
     LOCKED = "locked"
     PAGEABLE = "pageable"
+    DISK = "disk"
 
 
 _DEFAULT_CHUNK = 8 << 20
@@ -76,23 +79,55 @@ class HostBank:
 
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
+    * ``"file"`` -- a read-only shared mapping of one aligned FTW bank entry. It stays
+      DISK resident and applies ``MADV_RANDOM`` at creation.
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = (
+        "tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_disk",
+        "_view_offset",
+    )
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
+                 *, backing: str | None = None, file_path: str | None = None,
+                 file_offset: int = 0):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
             born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
-        assert backing in ("mmap", "cuda"), backing
+        assert backing in ("mmap", "cuda", "file"), backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        if backing == "cuda":
+        self._disk = backing == "file"
+        self._view_offset = 0
+        if self._disk:
+            if file_path is None:
+                raise ValueError("file-backed HostBank requires file_path")
+            if file_offset % _BLK:
+                raise ValueError(
+                    f"file-backed HostBank offset {file_offset} is not {_BLK}-byte aligned"
+                )
+            map_off = file_offset // mmap.ALLOCATIONGRANULARITY * mmap.ALLOCATIONGRANULARITY
+            self._view_offset = file_offset - map_off
+            map_len = self._view_offset + asize
+            fd = os.open(file_path, os.O_RDONLY)
+            try:
+                self._buf = mmap.mmap(
+                    fd, map_len, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ,
+                    offset=map_off,
+                )
+            finally:
+                os.close(fd)
+            try:
+                self._buf.madvise(mmap.MADV_RANDOM)
+            except (AttributeError, OSError):
+                pass
+            _LIVE_BUFFERS.append(self._buf)
+            self._pinned = False
+        elif backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
             # direct-IO readers need page alignment, but cudaHostAlloc only guarantees ~512 in practice
@@ -109,11 +144,27 @@ class HostBank:
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
-        self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
+        with warnings.catch_warnings():
+            if self._disk:
+                warnings.filterwarnings(
+                    "ignore", message="The given buffer is not writable",
+                    category=UserWarning,
+                )
+            self.tensor = torch.frombuffer(
+                self._buf, dtype=dtype, count=self.nbytes // elsize,
+                offset=self._view_offset,
+            ).view(*shape)
+        if self._disk:
+            self.addr = self.tensor.data_ptr()
+        # The CPU executor only receives tensors. Keep the owning mapping reachable from
+        # each direct FTW view so it can issue expert-granular prefetches.
+        self.tensor._freetoken_host_bank = self
         self._locked = False
 
     @property
     def residency(self) -> HostResidency:
+        if self._disk:
+            return HostResidency.DISK
         if self._pinned:
             return HostResidency.PINNED
         if self._locked:
@@ -127,6 +178,8 @@ class HostBank:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
 
         ``FREETOKEN_SKIP_BANK_PIN=1`` makes this a no-op for CPU-only tooling (the FTW converter); never set it when serving, the GPU paths need registered banks."""
+        if self._disk:
+            raise RuntimeError("a read-only file-backed DISK bank cannot be CUDA-pinned")
         if self._pinned:
             return
         if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
@@ -153,6 +206,8 @@ class HostBank:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
 
         Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
+        if self._disk:
+            raise RuntimeError("a file-backed DISK bank cannot be mlock'd")
         if self._locked or self._pinned:  # cudaHostRegister already page-locks
             return
         global _os_lock_failed
@@ -165,6 +220,63 @@ class HostBank:
             logger.warning(f"bank lock failed; leaving this and later banks pageable: {exc}")
             return
         self._locked = True
+
+    def prefetch_experts(self, expert_ids) -> int:
+        """Issue one coalesced ``MADV_WILLNEED`` sweep for selected expert rows.
+
+        Returns the number of distinct 4 KiB pages requested. Non-DISK banks are a
+        no-op so callers can walk a layer's full bank schema without branching.
+        """
+        if not self._disk:
+            return 0
+        stride = self.tensor.stride(0) * self.tensor.element_size()
+        ranges = coalesced_page_ranges(expert_ids, stride, limit=self.nbytes)
+        for offset, length in ranges:
+            start = self._view_offset + offset
+            advise_start = start // mmap.PAGESIZE * mmap.PAGESIZE
+            advise_end = min(
+                len(self._buf),
+                (start + length + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE,
+            )
+            self._buf.madvise(
+                mmap.MADV_WILLNEED, advise_start, advise_end - advise_start,
+            )
+        return sum(length // _BLK for _, length in ranges)
+
+
+def coalesced_page_ranges(
+    expert_ids, expert_stride: int, *, limit: int | None = None, page_size: int = _BLK,
+) -> list[tuple[int, int]]:
+    """Map expert rows to deduplicated, adjacent-coalesced page ranges.
+
+    Negative route sentinels are ignored. ``limit`` clips the final page range to the
+    mapping's page-rounded length while still returning page-aligned lengths.
+    """
+    if expert_stride <= 0 or page_size <= 0:
+        raise ValueError("expert_stride and page_size must be positive")
+    pages: set[int] = set()
+    for raw in expert_ids:
+        expert_id = int(raw)
+        if expert_id < 0:
+            continue
+        lo = expert_id * expert_stride
+        hi = lo + expert_stride
+        if limit is not None and (lo >= limit or hi > limit):
+            raise ValueError(f"expert id {expert_id} exceeds bank size {limit}")
+        pages.update(range(lo // page_size, (hi + page_size - 1) // page_size))
+    if not pages:
+        return []
+    ordered = sorted(pages)
+    out: list[tuple[int, int]] = []
+    start = prev = ordered[0]
+    for page in ordered[1:]:
+        if page == prev + 1:
+            prev = page
+            continue
+        out.append((start * page_size, (prev - start + 1) * page_size))
+        start = prev = page
+    out.append((start * page_size, (prev - start + 1) * page_size))
+    return out
 
 
 _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
@@ -261,6 +373,8 @@ def _settle(bank: HostBank, residency: str) -> None:
         bank.pin()
     elif residency == HostResidency.LOCKED.value:
         bank.lock()
+    elif residency == HostResidency.DISK.value and bank.residency is not HostResidency.DISK:
+        raise RuntimeError("DISK residency requires an FTW file-backed HostBank")
 
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
@@ -479,6 +593,7 @@ __all__ = [
     "alloc_banks",
     "alloc_layer_banks",
     "born_pinned_default",
+    "coalesced_page_ranges",
     "pin_banks",
     "read_file_into",
     "read_range_into",

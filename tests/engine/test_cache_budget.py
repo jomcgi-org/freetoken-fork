@@ -145,6 +145,7 @@ def _dsv4_adjust_cfg(**over):
         page_size = 1
         attention_backend = "dsv4_sparse"
         moe_cpu_layers = None
+        moe_disk_layers = None
         nvfp4_backend = "auto"
         num_page_override = None
         num_token_override = None

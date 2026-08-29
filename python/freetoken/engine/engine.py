@@ -514,31 +514,45 @@ class Engine:
         # cpu/hybrid both read experts on the CPU, so banks load in the native (CPU-readable)
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
-        cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
+        num_moe_layers = config.model_config.num_moe_layers
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        ftw_checkpoint = bool(config.model_path and is_ftw_checkpoint(config.model_path))
+        disk_layer_ids = _resolve_disk_layers(config, num_moe_layers)
+        if disk_layer_ids and not ftw_checkpoint:
+            raise ValueError(
+                "--moe-disk-layers requires an FTW checkpoint; convert this model with "
+                "`ft checkpoint` first"
+            )
+        cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers) | disk_layer_ids
         if (
             not cpu_layer_ids
             and config.moe_cpu_layers is None
+            and config.moe_disk_layers is None
             and config.moe_backend in ("offload", "hybrid")
             and _pin_budget_bytes(self._host_tables_bytes) is not None
         ):
             cpu_layer_ids = _auto_cpu_layers(
-                config, config.model_config.num_moe_layers, reserved=self._host_tables_bytes
+                config, num_moe_layers, reserved=self._host_tables_bytes
             )
+            if ftw_checkpoint:
+                disk_layer_ids = cpu_layer_ids
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
             decode_target = "cpu"
         else:
             decode_target = "gpu"
-        # split residency: where pinning is quota-capped (_pin_budget_bytes), pin only the GPU layers' banks and mlock the CPU layers'
-        # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
-        # not applied to plain --moe-backend cpu; all-locked under a cap = --moe-backend offload --moe-cpu-layers 1.0
-        split_residency = (
-            bool(cpu_layer_ids)
+        # Where pinning is quota-capped, pin only GPU layers and mlock CPU layers.
+        # DISK selections always request split residency, independent of pin quota.
+        locked_layer_ids = frozenset()
+        if (
+            cpu_layer_ids
             and config.moe_backend in ("offload", "hybrid")
             and _pin_budget_bytes(self._host_tables_bytes) is not None
-        )
-        if config.moe_backend == "cpu" and not split_residency:
+        ):
+            locked_layer_ids = cpu_layer_ids - disk_layer_ids
+        if config.moe_backend == "cpu":
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
@@ -547,16 +561,17 @@ class Engine:
             if budget is not None:
                 bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
             if bank_bytes and bank_bytes > budget:
-                split_residency = True
+                locked_layer_ids = cpu_layer_ids - disk_layer_ids
                 logger.info_rank0(
                     f"--moe-backend cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the "
                     f"pin budget; OS-locking all layers instead of pinning"
                 )
+        split_residency = bool(locked_layer_ids or disk_layer_ids)
         if split_residency and config.moe_prefill_overlap:
             # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
             logger.info_rank0(
-                "--moe-cpu-layers split residency: disabling MoE prefill overlap "
-                "(locked layers prefill via synchronous pageable copies)"
+                "split MoE bank residency: disabling prefill overlap "
+                "(non-pinned layers use synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
         if cache_factory is None:
@@ -571,9 +586,11 @@ class Engine:
                 from freetoken.moe.host_banks import HostResidency
 
                 requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
-                    else HostResidency.PINNED.value
-                    for i in range(config.model_config.num_moe_layers)
+                    HostResidency.DISK.value if i in disk_layer_ids else (
+                        HostResidency.LOCKED.value if i in locked_layer_ids
+                        else HostResidency.PINNED.value
+                    )
+                    for i in range(num_moe_layers)
                 ]
             banks = load_expert_banks(
                 config.model_path,
@@ -1091,8 +1108,8 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
             override("cuda_graph_bs", kept)
 
 
-def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
-    """Parse ``--moe-cpu-layers``: an explicit MoE-layer id list (``"3,7,11"``), a count
+def _parse_layer_spec(spec: str, num_moe_layers: int, flag: str) -> frozenset[int]:
+    """Parse a layer-selection flag: an explicit id list (``"3,7,11"``), a count
     (``"8"`` -> 8 layers evenly strided across depth), or a fraction (``"0.5"``). Ids are
     indices into the MoE layers, ``[0, num_moe_layers)``."""
     s = spec.strip()
@@ -1103,21 +1120,29 @@ def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
         for i in ids:
             if not 0 <= i < num_moe_layers:
                 raise ValueError(
-                    f"--moe-cpu-layers id {i} out of range [0, {num_moe_layers})"
+                    f"{flag} id {i} out of range [0, {num_moe_layers})"
                 )
         return frozenset(ids)
     if "." in s:
         frac = float(s)
         if not 0.0 <= frac <= 1.0:
-            raise ValueError(f"--moe-cpu-layers fraction {frac} must be in [0, 1]")
+            raise ValueError(f"{flag} fraction {frac} must be in [0, 1]")
         k = round(frac * num_moe_layers)
     else:
         k = int(s)
         if not 0 <= k <= num_moe_layers:
-            raise ValueError(f"--moe-cpu-layers count {k} must be in [0, {num_moe_layers}]")
+            raise ValueError(f"{flag} count {k} must be in [0, {num_moe_layers}]")
     # k layers spread evenly across depth (frozenset dedups any rounding collisions;
     # k == 0 yields an empty range, hence an empty set).
     return frozenset(round(i * num_moe_layers / k) for i in range(k))
+
+
+def _parse_cpu_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
+    return _parse_layer_spec(spec, num_moe_layers, "--moe-cpu-layers")
+
+
+def _parse_disk_layers_spec(spec: str, num_moe_layers: int) -> frozenset[int]:
+    return _parse_layer_spec(spec, num_moe_layers, "--moe-disk-layers")
 
 
 def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
@@ -1132,6 +1157,14 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
     if not spec or not is_offload_moe_backend(config.moe_backend):
         return frozenset()
     return _parse_cpu_layers_spec(spec, num_moe_layers)
+
+
+def _resolve_disk_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int]:
+    """Explicit FTW file-backed layers. Every selected layer is also a CPU layer."""
+    spec = config.moe_disk_layers
+    if not spec or config.moe_backend not in ("offload", "hybrid", "cpu"):
+        return frozenset()
+    return _parse_disk_layers_spec(spec, num_moe_layers)
 
 
 # expert activations the CPU MoE executor supports (csrc ActKind)
@@ -1175,9 +1208,12 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
 
 
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
-    """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
+    """Pick CPU MoE layers automatically when banks exceed the pin budget.
 
-    Locks just enough head+tail layers: per-layer decode miss rates are U-shaped, so the ends are the cheapest to move off the slot cache."""
+    FTW checkpoints spill tail layers to DISK. Other checkpoints retain the existing
+    head-and-tail LOCKED selection.
+    """
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
     from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
     bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
@@ -1194,12 +1230,19 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
         )
         return frozenset()
     n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
-    head = (n + 1) // 2
-    ids = frozenset(range(head)) | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
+    if config.model_path and is_ftw_checkpoint(config.model_path):
+        ids = frozenset(range(num_moe_layers - n, num_moe_layers))
+        action = f"mapping {n} tail MoE layers from FTW on DISK"
+    else:
+        head = (n + 1) // 2
+        ids = (
+            frozenset(range(head))
+            | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
+        )
+        action = f"locking {n} head+tail MoE layers"
     logger.info_rank0(
-        f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
-        f"{budget / 2**30:.2f} GiB; locking {n} head+tail MoE layers for CPU decode "
-        f"({sorted(ids)})"
+        f"MoE bank residency auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
+        f"{budget / 2**30:.2f} GiB; {action} for CPU decode ({sorted(ids)})"
     )
     return ids
 
@@ -1211,6 +1254,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_rate": None,
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
+    "moe_disk_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
@@ -1230,6 +1274,10 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
+    explicit_disk_layers = (
+        _parse_disk_layers_spec(config.moe_disk_layers, model_config.num_moe_layers)
+        if is_moe and config.moe_disk_layers else frozenset()
+    )
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -1346,10 +1394,15 @@ def _adjust_config(config: EngineConfig):
     if (
         is_moe
         and not _cpu_moe_act_ok
-        and (config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers)
+        and (
+            config.moe_backend in ("cpu", "hybrid")
+            or config.moe_cpu_layers
+            or explicit_disk_layers
+        )
     ):
         asked = (
-            f"--moe-cpu-layers={config.moe_cpu_layers!r}"
+            f"--moe-disk-layers={config.moe_disk_layers!r}"
+            if explicit_disk_layers else f"--moe-cpu-layers={config.moe_cpu_layers!r}"
             if config.moe_backend not in ("cpu", "hybrid")
             else f"--moe-backend {config.moe_backend!r}"
         )
@@ -1479,6 +1532,20 @@ def _adjust_config(config: EngineConfig):
             "--moe-cpu-layers requires --moe-backend offload or hybrid (got "
             f"{config.moe_backend!r}); use --moe-backend cpu to run all layers on CPU"
         )
+
+    if explicit_disk_layers:
+        if config.moe_backend not in ("offload", "hybrid", "cpu"):
+            raise ValueError(
+                "--moe-disk-layers requires --moe-backend offload, hybrid, or cpu "
+                f"(got {config.moe_backend!r})"
+            )
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        if not config.model_path or not is_ftw_checkpoint(config.model_path):
+            raise ValueError(
+                "--moe-disk-layers requires an FTW checkpoint; convert this model with "
+                "`ft checkpoint` first"
+            )
 
     if is_moe:
         object.__setattr__(model_config, "moe_backend", config.moe_backend)

@@ -1299,6 +1299,9 @@ struct CpuMoeExecutor {
 
   std::vector<MoeTask*> owned_tasks;  // persistent task descriptors (graph-stable)
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
+  // Optional Python pre-run hook. DISK banks use it to issue mmap.madvise after the
+  // routing D2H has completed and before worker threads first read expert weights.
+  pybind11::function pre_run_callback;
 
   // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----
   // A tiny GPU kernel bumps ready_flags[slot] at submit; this coordinator thread busy-polls
@@ -1880,6 +1883,12 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask* t) {
+    if (pre_run_callback) {
+      std::vector<int32_t> ids(
+          t->ids, t->ids + static_cast<size_t>(t->num_tokens) * top_k);
+      pybind11::gil_scoped_acquire gil;
+      pre_run_callback(t->layer_id, std::move(ids));
+    }
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
@@ -2089,6 +2098,10 @@ struct CpuMoeExecutor {
     sync();
   }
 
+  void set_pre_run_callback(pybind11::function callback) {
+    pre_run_callback = std::move(callback);
+  }
+
   static void CUDART_CB submit_cb(void* ud) {
     MoeTask* t = reinterpret_cast<MoeTask*>(ud);
     t->exec->submit(t);
@@ -2125,6 +2138,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("stream"), py::arg("task"), py::call_guard<py::gil_scoped_release>())
       .def("run_task", &CpuMoeExecutor::run_task, py::arg("task"),
            py::call_guard<py::gil_scoped_release>())
+      .def("set_pre_run_callback", &CpuMoeExecutor::set_pre_run_callback,
+           py::arg("callback"))
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,
            py::arg("slot"), py::arg("task"))
       .def("flag_served_count", &CpuMoeExecutor::flag_served_count, py::arg("slot"))

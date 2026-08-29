@@ -397,6 +397,7 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
+        cache.prefetch_disk_experts(self.layer_id, topk_ids)
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
         return self._expert_gemm(

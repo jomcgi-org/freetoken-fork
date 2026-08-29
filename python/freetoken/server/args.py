@@ -563,6 +563,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-layers",
+        type=str,
+        default=ServerArgs.moe_disk_layers,
+        help=(
+            "Which MoE layers keep expert banks as read-only file-backed FTW mappings "
+            "and decode on the CPU executor. Explicit id list ('3,7,11'), a count "
+            "('8' = 8 layers evenly strided), or a fraction ('0.5'). Requires a "
+            "checkpoint converted by `ft checkpoint`."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,

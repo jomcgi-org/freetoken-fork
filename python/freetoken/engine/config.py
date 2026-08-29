@@ -48,6 +48,9 @@ class EngineConfig:
     # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
+    # File-backed FTW bank layers. Uses the same grammar as moe_cpu_layers and always
+    # routes the selected layers through the CPU executor.
+    moe_disk_layers: str | None = None
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's

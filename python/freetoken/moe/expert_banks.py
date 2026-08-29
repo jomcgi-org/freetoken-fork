@@ -440,6 +440,17 @@ def load_expert_banks(
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
+    from freetoken.moe.host_banks import HostResidency
+
+    wants_disk = bool(
+        layer_residency
+        and HostResidency.DISK.value in layer_residency
+    )
+    if wants_disk and (not model_path or not is_ftw_checkpoint(model_path)):
+        raise ValueError(
+            "DISK expert-bank residency requires an FTW checkpoint; convert the model "
+            "with `ft checkpoint` first"
+        )
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(

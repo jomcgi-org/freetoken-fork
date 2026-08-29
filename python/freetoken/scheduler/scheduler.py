@@ -133,8 +133,25 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+
+        def _status_log(message: str) -> None:
+            cache = getattr(self.engine, "moe_offload_cache", None)
+            disk = (
+                cache.disk_prefetch_stats(reset=True)
+                if cache is not None and message.startswith("Decode batch") else {}
+            )
+            if disk:
+                message += (
+                    f", disk prefetch calls: {disk['prefetch_calls']}, "
+                    f"disk pages requested: {disk['pages_requested']}, "
+                    f"disk major faults: {disk['major_faults']}, "
+                    f"disk major faults/decode step: "
+                    f"{disk['major_faults_per_decode_step']:.2f}"
+                )
+            logger.info_rank0(message)
+
         self.status_reporter = SchedulerStatusReporter(
-            log=logger.info_rank0,
+            log=_status_log,
             decode_log_interval=config.decode_log_interval,
         )
 
