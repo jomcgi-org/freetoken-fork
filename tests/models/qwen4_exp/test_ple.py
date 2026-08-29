@@ -26,6 +26,7 @@ from freetoken.models.qwen4_exp.ple import (
     PLEMetadata,
     build_ple_metadata,
     commit_ngram_context,
+    derive_decode_row_ids_host,
     short_conv_reference,
 )
 
@@ -171,6 +172,40 @@ def test_decode_hash_matches_prefill_hash():
         )
         for i in range(len(sequences)):
             assert torch.equal(got[i], prefill[i * len(sequences[0]) + step])
+
+
+def test_host_decode_hash_matches_device_reference_for_random_histories():
+    """The pre-replay host arithmetic is bitwise equal to the shipping row-id oracle."""
+    config = _config()
+    layer = _make_layer(config)
+    args = config.qwen4_args
+    generator = torch.Generator().manual_seed(20260829)
+    for _ in range(40):
+        batch_size = int(torch.randint(1, 17, (), generator=generator))
+        contexts = torch.randint(
+            0, VOCAB, (batch_size, args.ngram_size - 1), generator=generator,
+        )
+        current = torch.randint(0, VOCAB, (batch_size,), generator=generator)
+        # Exercise boundary suppression as well as ordinary histories.
+        contexts[torch.rand(contexts.shape, generator=generator) < 0.2] = EOS
+        reference = layer.ple_embedding.row_ids(
+            _meta(
+                [[int(token)] for token in current],
+                contexts.tolist(),
+                decode=True,
+            )
+        )
+        host = derive_decode_row_ids_host(
+            contexts.tolist(),
+            current.tolist(),
+            layer_multipliers=layer.ple_embedding.layer_multipliers.tolist(),
+            vocab_sizes=layer.ple_embedding.ngram_heads_vocab_sizes.tolist(),
+            offsets=layer.ple_embedding.ngram_heads_offsets.tolist(),
+            ngram_size=args.ngram_size,
+            heads_per_ngram=args.heads_per_ngram,
+            eos_token_id=EOS,
+        )
+        assert torch.equal(host, reference)
 
 
 # --------------------------------------------------------------------------------------

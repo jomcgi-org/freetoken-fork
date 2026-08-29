@@ -22,6 +22,8 @@ from freetoken.models.qwen4_exp.weight import (
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
 
+from .common import requires_cuda
+
 H = 32  # hidden_size
 HC = 4  # hc_count
 LR = 320  # hc_lowrank; kept real so the merged HC pad is the real (-(320+4)) % 16 = 12
@@ -343,19 +345,72 @@ def test_disk_ple_staging_matches_direct_rows(checkpoint):
     pinned = load_ple_table(folder, args, pin=False)
     disk = load_ple_table(folder, args, backend="disk")
     backend = DiskStagedTable(
-        disk, stage_capacity_rows=8, device=torch.device("cpu"), prefetch=False,
+        disk,
+        stage_capacity_rows=8,
+        device=torch.device("cpu"),
+        prefetch=False,
+        max_decode_batch_size=2,
+        rows_per_token=3,
     )
     ids = torch.tensor(
         [[0, NGRAM_ROWS + 2, 0], [disk.num_rows - 1, NGRAM_ROWS + 2, 3]],
         dtype=torch.int64,
     )
-    staged, inverse = backend._stage_rows(ids)
+    backend.prepare_decode(ids)
+    inverse = backend.local_ids[: ids.shape[0]].long()
+    staged = backend._stage_bank.tensor[: torch.unique(ids).numel()]
 
     got = staged.view(torch.uint8).index_select(0, inverse.reshape(-1)).view(
         *ids.shape, NGRAM_DIM
     )
     want = pinned.tensor.view(torch.uint8).index_select(0, ids.reshape(-1)).view_as(got)
     assert torch.equal(got, want)
+    want_lookup = want.view(torch.float8_e4m3fn).to(torch.bfloat16) * backend.scale
+    want_lookup = want_lookup.view(ids.shape[0], -1)
+    assert torch.equal(backend.lookup(torch.zeros_like(ids)), want_lookup)
+    backend.finish_decode(record_event=False)
+
+
+@requires_cuda
+def test_disk_ple_fixed_buffers_capture_and_replay_different_rows(checkpoint):
+    """Two host-prepared row sets flow through one captured fixed-address UVA gather."""
+    from freetoken.models.qwen4_exp.ple import DiskStagedTable
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    pinned = load_ple_table(folder, args, pin=False)
+    disk = load_ple_table(folder, args, backend="disk")
+    backend = DiskStagedTable(
+        disk,
+        stage_capacity_rows=8,
+        device=torch.device("cuda"),
+        prefetch=False,
+        max_decode_batch_size=2,
+        rows_per_token=3,
+    )
+    row_sets = [
+        torch.tensor([[0, 3, 0], [8, 11, 8]], dtype=torch.int64),
+        torch.tensor([[27, 1, 15], [1, 27, 4]], dtype=torch.int64),
+    ]
+    dummy_ids = torch.zeros((2, 3), dtype=torch.int64, device="cuda")
+
+    backend.prepare_decode(row_sets[0])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = backend.lookup(dummy_ids)
+    backend.finish_decode(record_event=False)
+
+    for ids in row_sets:
+        backend.prepare_decode(ids)
+        graph.replay()
+        backend.finish_decode(record_event=True)
+        torch.cuda.synchronize()
+        got = captured.clone()
+        raw = pinned.tensor.view(torch.uint8).index_select(0, ids.reshape(-1))
+        want = (
+            raw.view(torch.float8_e4m3fn).to(torch.bfloat16) * backend.scale
+        ).view_as(got)
+        assert torch.equal(got, want)
 
 
 def test_pinned_ple_backend_never_constructs_file_mapping(checkpoint, monkeypatch):
@@ -406,8 +461,12 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     import freetoken.models.qwen4_exp.weight as weight
 
     attached = []
+    snapshotted = []
     layer = SimpleNamespace(
-        ple_embedding=SimpleNamespace(attach_table=attached.append),
+        ple_embedding=SimpleNamespace(
+            attach_table=attached.append,
+            snapshot_host_hash_constants=lambda: snapshotted.append(True),
+        ),
     )
     model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
     model.model = SimpleNamespace(ple_layers=[layer])
@@ -422,8 +481,11 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
         selected.append(backend)
         return mapped
 
+    def fake_staged_table(table, capacity, **kwargs):
+        return staged
+
     monkeypatch.setattr(weight, "load_ple_table", fake_load)
-    monkeypatch.setattr(ple, "DiskStagedTable", lambda table, capacity: staged)
+    monkeypatch.setattr(ple, "DiskStagedTable", fake_staged_table)
     engine_config = SimpleNamespace(
         model_path="/tmp/model",
         ple_backend="disk",
@@ -435,6 +497,7 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     assert model.load_host_tables(engine_config) == 0
     assert selected == ["disk"]
     assert attached == [staged]
+    assert snapshotted == [True]
 
 
 def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):

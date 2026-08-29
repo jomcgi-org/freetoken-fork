@@ -185,12 +185,24 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 int(engine_config.max_forward_len),
             )
             capacity = max_tokens * args.num_ngram_heads
+            graph_sizes = getattr(engine_config, "cuda_graph_bs", None) or ()
+            max_decode_batch_size = max(
+                int(getattr(engine_config, "max_running_req", 1)),
+                int(getattr(engine_config, "cuda_graph_max_bs", 0) or 0),
+                max(graph_sizes, default=0),
+            )
             self._ple_disk_backends = []
             self._ple_major_fault_base = process_major_faults()
             for ple in ple_layers:
-                staged = DiskStagedTable(table, capacity)
+                staged = DiskStagedTable(
+                    table,
+                    capacity,
+                    max_decode_batch_size=max_decode_batch_size,
+                    rows_per_token=args.num_ngram_heads,
+                )
                 self._ple_disk_backends.append(staged)
                 ple.ple_embedding.attach_table(staged)
+                ple.ple_embedding.snapshot_host_hash_constants()
             return 0
 
         for ple in ple_layers:
@@ -217,6 +229,58 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 table.reset_stats()
             self._ple_major_fault_base = now
         return result
+
+    def prepare_cuda_graph_replay(self, batch: Batch) -> None:
+        """Stage disk PLE rows and compact ids before a decode graph replay or capture."""
+        backends = getattr(self, "_ple_disk_backends", None)
+        if not backends:
+            return
+        args = self._config.qwen4_args
+        context_len = args.ngram_size - 1
+        contexts: list[list[int]] = []
+        current_ids: list[int] = []
+        waited: set[int] = set()
+        for req in batch.padded_reqs:
+            cached_len = int(req.cached_len)
+            history = req.input_ids
+            if history.numel() < cached_len:
+                raise RuntimeError(
+                    f"request {req.uid} host history ends before cached_len={cached_len}"
+                )
+            if cached_len < history.numel():
+                current = int(history[cached_len])
+            else:
+                token = req.pending_token_cpu
+                done = req.sample_copy_done
+                if token is None or done is None:
+                    # Graph capture uses the dedicated dummy request before any sample exists.
+                    if req.uid != -1 or not history.numel():
+                        raise RuntimeError(
+                            f"decode token for request {req.uid} is not available on the host"
+                        )
+                    current = int(history[-1])
+                else:
+                    event_key = id(done)
+                    if event_key not in waited:
+                        done.synchronize()
+                        waited.add(event_key)
+                    current = int(token)
+            prior = history[max(0, cached_len - context_len) : cached_len].tolist()
+            contexts.append(
+                [args.ngram_boundary_token_id] * (context_len - len(prior))
+                + [int(token_id) for token_id in prior]
+            )
+            current_ids.append(current)
+
+        ple_layers = self.model.ple_layers
+        assert len(ple_layers) == len(backends)
+        for ple, backend in zip(ple_layers, backends):
+            backend.prepare_decode(ple.ple_embedding.host_decode_row_ids(contexts, current_ids))
+
+    def finish_cuda_graph_replay(self, *, record_event: bool) -> None:
+        """Fence fixed host-buffer reuse after a submitted graph or eager warmup."""
+        for backend in getattr(self, "_ple_disk_backends", ()):
+            backend.finish_decode(record_event=record_event)
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

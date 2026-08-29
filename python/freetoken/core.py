@@ -64,6 +64,13 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Most recent sampled token copied asynchronously to the host. Overlap scheduling
+    # can prepare its decode before append_host() drains the prior forward. Host-side
+    # pre-step hooks use this result and sample_copy_done until input_ids catches up.
+    pending_token_cpu: torch.Tensor | None = field(default=None, init=False, repr=False)
+    sample_copy_done: torch.cuda.Event | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

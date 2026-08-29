@@ -32,10 +32,15 @@ def _ple_gather_kernel(
     num_rows,
     EMB_DIM: tl.constexpr,
     IS_FP8: tl.constexpr,
+    IDS_RAW_INT32: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row = tl.program_id(0)
-    idx = tl.load(ids_ptr + row).to(tl.int64)
+    if IDS_RAW_INT32:
+        ids_base = ids_ptr.to(tl.int64).to(tl.pointer_type(tl.int32))
+        idx = tl.load(ids_base + row).to(tl.int64)
+    else:
+        idx = tl.load(ids_ptr + row).to(tl.int64)
     in_range = (idx >= 0) & (idx < num_rows)
     idx = tl.where(in_range, idx, 0)
     offsets = tl.arange(0, BLOCK_D)
@@ -86,10 +91,43 @@ def ple_gather_rows(
             num_rows,
             EMB_DIM=embed_dim,
             IS_FP8=is_fp8,
+            IDS_RAW_INT32=False,
             BLOCK_D=triton.next_power_of_2(embed_dim),
             num_warps=_NUM_WARPS,
         )
     return out
 
 
-__all__ = ["ple_gather_rows"]
+def ple_gather_rows_from_ptr(
+    table_ptr: int,
+    num_rows: int,
+    embed_dim: int,
+    row_ids_ptr: int,
+    num_ids: int,
+    out: torch.Tensor,
+    scale: float = 1.0,
+    is_fp8: bool = True,
+) -> torch.Tensor:
+    """Gather int32 ids from a fixed mapped-host address.
+
+    This is the CUDA-graph disk-staging path. Both the staged table and compact ids live in
+    pinned host allocations whose addresses remain stable across replays.
+    """
+    assert out.shape == (num_ids, embed_dim) and out.is_contiguous(), out.shape
+    if num_ids:
+        _ple_gather_kernel[(num_ids,)](
+            table_ptr,
+            row_ids_ptr,
+            out,
+            float(scale),
+            num_rows,
+            EMB_DIM=embed_dim,
+            IS_FP8=is_fp8,
+            IDS_RAW_INT32=True,
+            BLOCK_D=triton.next_power_of_2(embed_dim),
+            num_warps=_NUM_WARPS,
+        )
+    return out
+
+
+__all__ = ["ple_gather_rows", "ple_gather_rows_from_ptr"]

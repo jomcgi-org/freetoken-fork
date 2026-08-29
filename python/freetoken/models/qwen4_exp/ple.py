@@ -193,6 +193,20 @@ class PinnedUVATable:
             self._is_fp8,
         )
 
+    def _gather_from_ptr(self, row_ids_ptr: int, num_ids: int, dst: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.ple import ple_gather_rows_from_ptr
+
+        return ple_gather_rows_from_ptr(
+            self._table_ptr,
+            self.num_rows,
+            self.head_dim,
+            row_ids_ptr,
+            num_ids,
+            dst,
+            self.scale,
+            self._is_fp8,
+        )
+
     def prefetch(self, row_ids: torch.Tensor) -> None:
         if self._stream is None or row_ids.numel() == 0:
             return
@@ -219,13 +233,29 @@ class PinnedUVATable:
         out.copy_(rows)
         return out
 
+    def lookup_from_ptr(
+        self,
+        row_ids_ptr: int,
+        shape: torch.Size | tuple[int, ...],
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Gather compact int32 ids from a fixed mapped-host buffer."""
+        num_ids = math.prod(shape)
+        rows = self._gather_from_ptr(row_ids_ptr, num_ids, self._stage(num_ids))
+        rows = rows.view(*shape[:-1], shape[-1] * self.head_dim)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
 
 class DiskStagedTable:
     """Read PLE rows from file mappings through a fixed pinned staging bank.
 
-    Global row ids are synchronized to the host, deduplicated, grouped by safetensors shard,
-    page-prefetched, then copied once into the staging bank. The existing UVA kernel gathers
-    those unique staged rows with compact local ids, preserving duplicates and input order.
+    Prefill synchronizes global row ids to the host as before. Captured decode instead receives
+    host-derived ids in ``prepare_decode``. Both paths deduplicate, group by safetensors shard,
+    page-prefetch, and copy once into the staging bank. Decode's fixed mapped-host compact-id
+    buffer lets the captured UVA kernel preserve duplicates and input order across replays.
     """
 
     def __init__(
@@ -235,6 +265,8 @@ class DiskStagedTable:
         *,
         device: torch.device | None = None,
         prefetch: bool = True,
+        max_decode_batch_size: int | None = None,
+        rows_per_token: int | None = None,
     ) -> None:
         from freetoken.moe.host_banks import HostBank
 
@@ -267,6 +299,23 @@ class DiskStagedTable:
         self._capacity = int(stage_capacity_rows)
         self._prefetch_pages = 0
         self._pending: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._local_ids_bank = None
+        self._local_ids_ptr: int | None = None
+        self._decode_shape: torch.Size | None = None
+        self._replay_done: torch.cuda.Event | None = None
+        if max_decode_batch_size is not None or rows_per_token is not None:
+            if not max_decode_batch_size or not rows_per_token:
+                raise ValueError(
+                    "max_decode_batch_size and rows_per_token must both be positive"
+                )
+            self._local_ids_bank = HostBank(
+                (int(max_decode_batch_size), int(rows_per_token)), torch.int32,
+            )
+            if self._device.type == "cuda":
+                from freetoken.kernel.pinned import device_ptr
+
+                self._local_ids_bank.pin()
+                self._local_ids_ptr = device_ptr(self._local_ids_bank.tensor)
 
     @property
     def prefetch_pages(self) -> int:
@@ -274,6 +323,11 @@ class DiskStagedTable:
 
     def reset_stats(self) -> None:
         self._prefetch_pages = 0
+
+    @property
+    def local_ids(self) -> torch.Tensor | None:
+        """Fixed compact-id buffer, exposed for CPU staging tests and diagnostics."""
+        return None if self._local_ids_bank is None else self._local_ids_bank.tensor
 
     def _stage_rows(
         self, row_ids: torch.Tensor | Sequence[int]
@@ -314,13 +368,73 @@ class DiskStagedTable:
         _staged, inverse = self._stage_rows(row_ids.detach().cpu())
         return inverse.to(row_ids.device)
 
+    def prepare_decode(self, row_ids: torch.Tensor) -> None:
+        """Run all disk and dedup work before a decode graph replay.
+
+        ``row_ids`` is the host-derived global-id matrix for the padded graph batch. The staging
+        bank and local-id bank are overwritten in place, then the captured gather reads both at
+        their fixed mapped addresses.
+        """
+        if self._local_ids_bank is None:
+            raise RuntimeError("disk PLE decode buffers were not provisioned")
+        ids = torch.as_tensor(row_ids, dtype=torch.int64, device="cpu")
+        local_ids = self.local_ids
+        assert local_ids is not None
+        if (
+            ids.ndim != 2
+            or ids.shape[0] > local_ids.shape[0]
+            or ids.shape[1] != local_ids.shape[1]
+        ):
+            raise ValueError(
+                f"PLE decode ids shape {tuple(ids.shape)} exceeds fixed buffer "
+                f"{tuple(local_ids.shape)}"
+            )
+        # Host writes must not race a previous replay that is still reading these mapped buffers.
+        if self._replay_done is not None:
+            self._replay_done.synchronize()
+        _staged, inverse = self._stage_rows(ids)
+        local_ids[: ids.shape[0]].copy_(inverse.to(torch.int32))
+        self._decode_shape = ids.shape
+
+    def finish_decode(self, *, record_event: bool) -> None:
+        """Release Python-side decode mode and optionally fence a submitted replay."""
+        self._decode_shape = None
+        if record_event and self._device.type == "cuda":
+            if self._replay_done is None:
+                self._replay_done = torch.cuda.Event()
+            self._replay_done.record(torch.cuda.current_stream(self._device))
+
     def prefetch(self, row_ids: torch.Tensor) -> None:
+        if self._decode_shape is not None:
+            # The graph's lookup launches the fixed-address gather. All host work is complete.
+            return
         local_ids = self._prepare(row_ids)
         self._pending = (row_ids, local_ids)
         if self._uva is not None:
             self._uva.prefetch(local_ids)
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if self._decode_shape is not None:
+            if row_ids.shape != self._decode_shape:
+                raise RuntimeError(
+                    f"prepared disk PLE shape {tuple(self._decode_shape)} does not match "
+                    f"forward shape {tuple(row_ids.shape)}"
+                )
+            if self._uva is not None:
+                assert self._local_ids_ptr is not None
+                return self._uva.lookup_from_ptr(self._local_ids_ptr, self._decode_shape, out)
+            local_ids = self.local_ids[: self._decode_shape[0]]
+            staged = self._stage_bank.tensor
+            rows = staged.view(torch.uint8).index_select(
+                0, local_ids.reshape(-1).long()
+            ).view(torch.float8_e4m3fn).to(torch.bfloat16)
+            if self.scale != 1.0:
+                rows.mul_(self.scale)
+            rows = rows.view(*self._decode_shape[:-1], -1)
+            if out is None:
+                return rows
+            out.copy_(rows)
+            return out
         pending, self._pending = self._pending, None
         local_ids = pending[1] if pending is not None and pending[0] is row_ids else None
         if local_ids is None:
@@ -346,6 +460,57 @@ def _splitmix64(value: int) -> int:
     value = ((value ^ (value >> 30)) * _SPLITMIX_M1) & _MASK64
     value = ((value ^ (value >> 27)) * _SPLITMIX_M2) & _MASK64
     return (value ^ (value >> 31)) & _MASK64
+
+
+def derive_decode_row_ids_host(
+    contexts: Sequence[Sequence[int]],
+    input_ids: Sequence[int],
+    *,
+    layer_multipliers: Sequence[int],
+    vocab_sizes: Sequence[int],
+    offsets: Sequence[int],
+    ngram_size: int,
+    heads_per_ngram: int,
+    eos_token_id: int,
+) -> torch.Tensor:
+    """Pure-host decode hash with signed-int64 overflow matching ``NGramEmbedding.row_ids``.
+
+    ``contexts`` contains the ``ngram_size - 1`` tokens immediately preceding each input id.
+    Multiplication and xor are performed modulo 2**64, then interpreted as signed int64 before
+    Python's positive-modulus remainder, exactly matching PyTorch int64 arithmetic.
+    """
+    if len(contexts) != len(input_ids):
+        raise ValueError("decode contexts and input ids must have the same batch size")
+    if len(layer_multipliers) != ngram_size:
+        raise ValueError("one hash multiplier is required per n-gram position")
+    expected_heads = (ngram_size - 1) * heads_per_ngram
+    if len(vocab_sizes) != expected_heads or len(offsets) != expected_heads:
+        raise ValueError(f"expected {expected_heads} hash heads")
+
+    rows: list[list[int]] = []
+    sign = 1 << 63
+    modulus = 1 << 64
+    for context, current in zip(contexts, input_ids):
+        if len(context) != ngram_size - 1:
+            raise ValueError(f"decode context must contain {ngram_size - 1} tokens")
+        tokens = [int(current)]
+        crossed_eos = False
+        for distance in range(1, ngram_size):
+            previous = int(context[-distance])
+            crossed_eos = crossed_eos or previous == eos_token_id
+            tokens.append(eos_token_id if crossed_eos else previous)
+
+        row: list[int] = []
+        for ngram in range(2, ngram_size + 1):
+            mixed = (tokens[0] * int(layer_multipliers[0])) & _MASK64
+            for position in range(1, ngram):
+                mixed ^= (tokens[position] * int(layer_multipliers[position])) & _MASK64
+            signed = mixed if mixed < sign else mixed - modulus
+            start = (ngram - 2) * heads_per_ngram
+            for head in range(start, start + heads_per_ngram):
+                row.append(signed % int(vocab_sizes[head]) + int(offsets[head]))
+        rows.append(row)
+    return torch.tensor(rows, dtype=torch.int64)
 
 
 def _is_prime(value: int) -> bool:
@@ -548,9 +713,35 @@ class NGramEmbedding(BaseOP):
         self.ngram_heads_vocab_sizes = torch.empty(self.num_heads, dtype=torch.int64)
         self.ngram_heads_offsets = torch.empty(self.num_heads, dtype=torch.int64)
         self._table = table
+        self._host_hash_constants: tuple[list[int], list[int], list[int]] | None = None
 
     def attach_table(self, table: PLETableBackend) -> None:
         self._table = table
+
+    def snapshot_host_hash_constants(self) -> None:
+        """Copy immutable checkpoint hash buffers once for disk decode host preparation."""
+        self._host_hash_constants = (
+            self.layer_multipliers.detach().cpu().tolist(),
+            self.ngram_heads_vocab_sizes.detach().cpu().tolist(),
+            self.ngram_heads_offsets.detach().cpu().tolist(),
+        )
+
+    def host_decode_row_ids(
+        self, contexts: Sequence[Sequence[int]], input_ids: Sequence[int]
+    ) -> torch.Tensor:
+        if self._host_hash_constants is None:
+            raise RuntimeError("PLE host hash constants were not snapshotted after weight load")
+        multipliers, sizes, offsets = self._host_hash_constants
+        return derive_decode_row_ids_host(
+            contexts,
+            input_ids,
+            layer_multipliers=multipliers,
+            vocab_sizes=sizes,
+            offsets=offsets,
+            ngram_size=self.ngram_size,
+            heads_per_ngram=self.heads_per_ngram,
+            eos_token_id=self.eos_token_id,
+        )
 
     @property
     def table(self) -> PLETableBackend:
@@ -849,6 +1040,7 @@ __all__ = [
     "PLETableBackend",
     "PinnedUVATable",
     "build_ple_metadata",
+    "derive_decode_row_ids_host",
     "derive_ngram_hash_constants",
     "process_major_faults",
     "short_conv_reference",

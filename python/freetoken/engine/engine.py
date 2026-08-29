@@ -988,6 +988,11 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        # Decode host hooks can run before overlap scheduling drains append_host(). Keep the
+        # sampled token and its readiness fence on each request until a newer sample replaces it.
+        for req, token in zip(batch.reqs, next_tokens_cpu):
+            req.pending_token_cpu = token
+            req.sample_copy_done = copy_done_event
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
@@ -1374,12 +1379,13 @@ def _adjust_config(config: EngineConfig):
             raise ValueError(
                 "--ple-backend disk is only supported for models with a PLE n-gram table"
             )
-        # PLE row ids are produced on CUDA inside the model in this branch. The disk
-        # backend synchronizes them to the host before page-prefetch and staging, which
-        # cannot run inside capture. Keep the explicitly allowed v1 eager fallback.
-        override("cuda_graph_bs", [])
-        override("cuda_graph_max_bs", 0)
-        logger.info_rank0("--ple-backend disk: disabling CUDA graph decode for staged PLE reads")
+        no_graphs = os.getenv("FREETOKEN_PLE_DISK_NO_GRAPHS", "").strip().lower()
+        if no_graphs in ("1", "true", "yes", "on"):
+            override("cuda_graph_bs", [])
+            override("cuda_graph_max_bs", 0)
+            logger.info_rank0(
+                "FREETOKEN_PLE_DISK_NO_GRAPHS=1: disabling disk PLE CUDA graph decode"
+            )
 
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)

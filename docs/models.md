@@ -62,10 +62,11 @@ before copying them through a small pinned staging bank. Disk PLE bytes are not
 reserved from the expert-bank pin budget, so automatic MoE spilling can keep more
 expert layers pinned.
 
-The current disk PLE implementation uses eager decode because its hash row ids are
-produced on CUDA inside the model and must be synchronized to the host for staging.
-CUDA graph decode is disabled automatically when this backend is selected. Prefill
-stages the full requested-row union for each chunk through the same path.
+Disk PLE keeps CUDA graph decode enabled: a pre-replay host hook derives the next
+n-gram row ids from request token history, stages their deduplicated rows, and updates
+fixed pinned compact-id buffers read by the captured gather. Set
+`FREETOKEN_PLE_DISK_NO_GRAPHS=1` to restore eager decode for debugging. Prefill stages
+the full requested-row union for each chunk through the unchanged eager path.
 
 ## Notes
 

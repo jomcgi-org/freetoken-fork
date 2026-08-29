@@ -118,7 +118,18 @@ class GraphRunner:
         self.moe_offload_cache = moe_offload_cache
         self.stream = stream
         self.device = device
+        self.model = model
         self._capture_graphs(max_seq_len, vocab_size, model)
+
+    def _prepare_model_replay(self, batch: Batch) -> None:
+        prepare = getattr(self.model, "prepare_cuda_graph_replay", None)
+        if prepare is not None:
+            prepare(batch)
+
+    def _finish_model_replay(self, *, record_event: bool) -> None:
+        finish = getattr(self.model, "finish_cuda_graph_replay", None)
+        if finish is not None:
+            finish(record_event=record_event)
 
     def _reset_moe_offload_cache(self) -> None:
         if self.moe_offload_cache is not None:
@@ -172,11 +183,16 @@ class GraphRunner:
                           else self.dummy_req.table_idx)
             self.buffer.table_idx[:bs].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
+                self._prepare_model_replay(batch)
                 self.buffer.logits[:bs] = model.forward()
+                self._finish_model_replay(record_event=True)
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
+                self._prepare_model_replay(batch)
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     self.buffer.logits[:bs] = model.forward()
+                # Capture recorded the fixed-address gather but did not submit it.
+                self._finish_model_replay(record_event=False)
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
@@ -192,9 +208,11 @@ class GraphRunner:
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
+        self._prepare_model_replay(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
         g.replay()
+        self._finish_model_replay(record_event=True)
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:

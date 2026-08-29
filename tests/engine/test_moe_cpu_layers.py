@@ -211,6 +211,57 @@ def test_engine_config_rejects_invalid_ple_backend():
         )
 
 
+def _disk_ple_adjust_config():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        ple_backend="disk",
+        attention_backend="triton",
+        cuda_graph_bs=[1, 2, 4],
+        cuda_graph_max_bs=4,
+    )
+    object.__setattr__(
+        config,
+        "model_config",
+        SimpleNamespace(
+            single_stream_only=False,
+            dsv4_args=None,
+            is_moe=False,
+            expert_quant="none",
+            has_swa_attention=False,
+            has_linear_attention=False,
+            qwen4_args=SimpleNamespace(ple_layer_ids=(2,)),
+        ),
+    )
+    return config
+
+
+def test_disk_ple_keeps_cuda_graph_config_enabled(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.delenv("FREETOKEN_PLE_DISK_NO_GRAPHS", raising=False)
+    config = _disk_ple_adjust_config()
+    _adjust_config(config)
+    assert config.cuda_graph_bs == [1, 2, 4]
+    assert config.cuda_graph_max_bs == 4
+
+
+def test_disk_ple_no_graphs_env_restores_eager_fallback(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    monkeypatch.setenv("FREETOKEN_PLE_DISK_NO_GRAPHS", "1")
+    config = _disk_ple_adjust_config()
+    _adjust_config(config)
+    assert config.cuda_graph_bs == []
+    assert config.cuda_graph_max_bs == 0
+
+
 def test_disk_cpu_prefill_validates_scheduler_chunk_against_task_limit():
     from freetoken.moe.cpu_executor import CPU_MOE_MAX_TASK_TOKENS
 
