@@ -20,6 +20,10 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
+    MoeLayerProfileBackendMsg,
+    MoeLayerProfileMsg,
+    MoeLayerProfileReply,
+    MoeLayerProfileResultMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -194,10 +198,28 @@ def tokenize_worker(
                             error=m.error,
                         )
                     )
+                elif isinstance(m, MoeLayerProfileMsg):
+                    send_backend.put(MoeLayerProfileBackendMsg(request_id=m.request_id))
+                elif isinstance(m, MoeLayerProfileResultMsg):
+                    send_frontend.put(
+                        MoeLayerProfileReply(
+                            request_id=m.request_id,
+                            status=m.status,
+                            profile=m.profile,
+                            error=m.error,
+                        )
+                    )
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (
+                        CacheRebuildMsg,
+                        CacheRebuildResultMsg,
+                        MoeLayerProfileMsg,
+                        MoeLayerProfileResultMsg,
+                        ErrorReplyMsg,
+                        PromptAdmittedMsg,
+                    ),
                 )
                 for m in pending_msg
             )

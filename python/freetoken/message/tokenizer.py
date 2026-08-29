@@ -103,6 +103,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class MoeLayerProfileMsg(BaseTokenizerMsg):
+    """API server -> tokenizer worker passthrough for an on-demand stats snapshot."""
+    request_id: str
+
+
+@dataclass
+class MoeLayerProfileResultMsg(BaseTokenizerMsg):
+    """Scheduler -> tokenizer worker profile snapshot passthrough."""
+    request_id: str
+    status: str
+    profile: Dict[str, float] | None = None
+    error: str | None = None
+
+
+@dataclass
 class ErrorReplyMsg(BaseTokenizerMsg):
     # scheduler -> tokenizer/detokenizer worker -> frontend: a request the scheduler cannot
     # serve (e.g. its prompt exceeds the KV budget). The worker translates it into a terminal

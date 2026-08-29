@@ -24,6 +24,8 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    MoeLayerProfileMsg,
+    MoeLayerProfileReply,
     TokenizeMsg,
     UserReply,
 )
@@ -143,6 +145,8 @@ class FrontendManager:
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # Independent read-only waiters for on-demand per-layer MoE traffic snapshots.
+    moe_profile_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -246,6 +250,9 @@ class FrontendManager:
             if isinstance(msg, CacheRebuildReply):
                 self._resolve_rebuild(msg)
                 continue
+            if isinstance(msg, MoeLayerProfileReply):
+                self._resolve_moe_layer_profile(msg)
+                continue
             for msg in _unwrap_msg(msg):
                 # Global accounting follows actual admitted/sampled work even after the HTTP
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
@@ -288,6 +295,13 @@ class FrontendManager:
             return
         self.maintenance_state = "failed" if msg.status == "failed" else "serving"
 
+    def _resolve_moe_layer_profile(self, msg: MoeLayerProfileReply) -> None:
+        fut = self.moe_profile_futures.pop(msg.request_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(
+                {"status": msg.status, "profile": msg.profile, "error": msg.error}
+            )
+
     def fail_pending_rebuilds(self, message: str) -> None:
         """Resolve every in-flight rebuild waiter as failed. Called from the supervisor thread
         when a worker death latches a fatal error: no CacheRebuildReply will ever arrive, so a
@@ -303,6 +317,11 @@ class FrontendManager:
         def _resolve_all() -> None:
             for request_id in list(self.rebuild_futures):
                 fut = self.rebuild_futures.pop(request_id, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(dict(result))
+            profile_futures = getattr(self, "moe_profile_futures", {})
+            for request_id in list(profile_futures):
+                fut = profile_futures.pop(request_id, None)
                 if fut is not None and not fut.done():
                     fut.set_result(dict(result))
 
@@ -497,6 +516,25 @@ class CacheRebuildRequest(BaseModel):
     timeout: float = 300.0
 
 
+async def dispatch_moe_layer_profile(
+    state: FrontendManager, *, timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Request one synchronized per-layer traffic snapshot from the scheduler."""
+    request_id = str(uuid.uuid4())
+    fut = asyncio.get_running_loop().create_future()
+    state.moe_profile_futures[request_id] = fut
+    try:
+        await state.send_one(MoeLayerProfileMsg(request_id=request_id))
+    except Exception as exc:  # noqa: BLE001
+        state.moe_profile_futures.pop(request_id, None)
+        return {"status": "failed", "error": f"failed to request MoE profile: {exc!r}"}
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        state.moe_profile_futures.pop(request_id, None)
+        return {"status": "timeout", "error": "timed out waiting for MoE profile"}
+
+
 async def dispatch_rebuild(
     state: FrontendManager,
     *,
@@ -564,6 +602,32 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
     swa_page_size = page_size if is_dsv4 else 1
     window_tokens = int(round(req.swa_full_tokens_ratio * num_pages * page_size))
     return max(1, -(-window_tokens // swa_page_size))  # ceil-div to the pool's page unit
+
+
+@app.get("/v1/moe-layer-profile")
+async def moe_layer_profile(timeout: float = 10.0):
+    """Return a JSON layer-to-misses-per-step mapping suitable for boot selection."""
+    state = get_global_state()
+    if state.maintenance_state != "serving":
+        return JSONResponse(
+            {
+                "status": state.maintenance_state,
+                "error": "the engine must be serving to read a MoE layer profile",
+            },
+            status_code=503,
+        )
+    result = await dispatch_moe_layer_profile(
+        state, timeout=max(0.1, min(float(timeout), 300.0))
+    )
+    if result.get("status") == "ok":
+        return result.get("profile") or {}
+    if result.get("status") == "unsupported":
+        status_code = 409
+    elif result.get("status") == "timeout":
+        status_code = 504
+    else:
+        status_code = 500
+    return JSONResponse(result, status_code=status_code)
 
 
 @app.post("/v1/cache/rebuild")

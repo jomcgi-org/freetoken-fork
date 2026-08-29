@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import math
 import os
 from datetime import timedelta
@@ -537,6 +538,11 @@ class Engine:
             )
             if ftw_checkpoint:
                 disk_layer_ids = cpu_layer_ids
+        if disk_layer_ids and config.moe_disk_layers is not None:
+            logger.info_rank0(
+                f"MoE DISK layers selected explicitly: {sorted(disk_layer_ids)}; "
+                "layer profile scores not consulted"
+            )
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -1248,11 +1254,62 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
     return max(0, cap - reserved)
 
 
+def _head_tail_layers(num_moe_layers: int, count: int) -> frozenset[int]:
+    """Select ``count`` layers from the two ends, with the extra layer at the head."""
+    head = (count + 1) // 2
+    return (
+        frozenset(range(head))
+        | frozenset(range(num_moe_layers - (count - head), num_moe_layers))
+    )
+
+
+def _load_disk_layer_profile(
+    path: str, num_moe_layers: int,
+) -> dict[int, float] | None:
+    """Load a complete layer-to-traffic mapping, warning on any unusable input."""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("top-level JSON value must be an object")
+        scores: dict[int, float] = {}
+        for raw_id, raw_score in raw.items():
+            if not isinstance(raw_id, str) or not raw_id.isdecimal():
+                raise ValueError(f"invalid layer id {raw_id!r}")
+            layer_id = int(raw_id)
+            if str(layer_id) != raw_id or not 0 <= layer_id < num_moe_layers:
+                raise ValueError(
+                    f"layer id {raw_id!r} is outside [0, {num_moe_layers})"
+                )
+            if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+                raise ValueError(
+                    f"traffic score for layer {layer_id} must be a finite non-negative number"
+                )
+            score = float(raw_score)
+            if not math.isfinite(score) or score < 0:
+                raise ValueError(
+                    f"traffic score for layer {layer_id} must be a finite non-negative number"
+                )
+            scores[layer_id] = score
+        expected = set(range(num_moe_layers))
+        if scores.keys() != expected:
+            missing = sorted(expected - scores.keys())
+            raise ValueError(f"profile does not cover every MoE layer; missing ids {missing}")
+        return scores
+    except (OSError, OverflowError, TypeError, ValueError) as exc:
+        logger.warning_rank0(
+            f"--moe-disk-layer-profile {path!r} is unusable: {exc}; "
+            "falling back to head+tail DISK selection"
+        )
+        return None
+
+
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
     """Pick CPU MoE layers automatically when banks exceed the pin budget.
 
-    FTW checkpoints spill tail layers to DISK. Other checkpoints retain the existing
-    head-and-tail LOCKED selection.
+    FTW checkpoints use the lowest-traffic layers from a complete profile, or the
+    U-shaped head-and-tail default. Other checkpoints use the same head-and-tail
+    selection for LOCKED residency.
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint
     from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
@@ -1272,15 +1329,29 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
         return frozenset()
     n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
     if config.model_path and is_ftw_checkpoint(config.model_path):
-        ids = frozenset(range(num_moe_layers - n, num_moe_layers))
-        action = f"mapping {n} tail MoE layers from FTW on DISK"
-    else:
-        head = (n + 1) // 2
-        ids = (
-            frozenset(range(head))
-            | frozenset(range(num_moe_layers - (n - head), num_moe_layers))
+        profile_path = getattr(config, "moe_disk_layer_profile", None)
+        scores = (
+            _load_disk_layer_profile(profile_path, num_moe_layers)
+            if profile_path else None
         )
-        action = f"locking {n} head+tail MoE layers"
+        if scores is not None:
+            ids = frozenset(
+                sorted(range(num_moe_layers), key=lambda layer_id: (scores[layer_id], layer_id))[:n]
+            )
+            score_log = {layer_id: scores[layer_id] for layer_id in sorted(ids)}
+            action = (
+                f"mapping {n} lowest-traffic MoE layers from FTW on DISK; "
+                f"layer scores {score_log}"
+            )
+        else:
+            ids = _head_tail_layers(num_moe_layers, n)
+            action = (
+                f"mapping {n} head+tail MoE layers from FTW on DISK; "
+                "layer scores unavailable"
+            )
+    else:
+        ids = _head_tail_layers(num_moe_layers, n)
+        action = f"locking {n} head+tail MoE layers; layer scores unavailable"
     logger.info_rank0(
         f"MoE bank residency auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
         f"{budget / 2**30:.2f} GiB; {action} for CPU decode ({sorted(ids)})"
@@ -1296,11 +1367,13 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_auto": False,
     "moe_cpu_layers": None,
     "moe_disk_layers": None,
+    "moe_disk_layer_profile": None,
     "moe_disk_prefill": "cpu",
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
+    "moe_collect_stats": False,
     "expert_load": "auto",
 }
 

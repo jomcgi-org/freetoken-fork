@@ -16,6 +16,10 @@ from freetoken.message import (
     CacheRebuildMsg,
     CacheRebuildReply,
     CacheRebuildResultMsg,
+    MoeLayerProfileBackendMsg,
+    MoeLayerProfileMsg,
+    MoeLayerProfileReply,
+    MoeLayerProfileResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
     UserReply,
@@ -51,6 +55,28 @@ def test_cache_rebuild_reply_roundtrip():
     out = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
     assert isinstance(out, CacheRebuildReply)
     assert (out.request_id, out.status, out.error) == ("r3", "failed", "boom")
+
+
+def test_moe_layer_profile_messages_roundtrip():
+    request = MoeLayerProfileMsg(request_id="p1")
+    decoded_request = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(request))
+    assert decoded_request == request
+
+    backend = MoeLayerProfileBackendMsg(request_id="p1")
+    decoded_backend = BaseBackendMsg.decoder(backend.encoder())
+    assert decoded_backend == backend
+
+    result = MoeLayerProfileResultMsg(
+        request_id="p1", status="ok", profile={"0": 1.5, "1": 0.25}
+    )
+    decoded_result = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(result))
+    assert decoded_result == result
+
+    reply = MoeLayerProfileReply(
+        request_id="p1", status="ok", profile={"0": 1.5, "1": 0.25}
+    )
+    decoded_reply = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(reply))
+    assert decoded_reply == reply
 
 
 def test_prompt_admitted_msg_roundtrip():

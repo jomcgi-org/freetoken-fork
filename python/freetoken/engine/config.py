@@ -51,6 +51,9 @@ class EngineConfig:
     # File-backed FTW bank layers. Uses the same grammar as moe_cpu_layers and always
     # routes the selected layers through the CPU executor.
     moe_disk_layers: str | None = None
+    # Optional per-MoE-layer traffic scores used only by automatic FTW DISK spill
+    # selection. Explicit moe_disk_layers remains authoritative.
+    moe_disk_layer_profile: str | None = None
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"

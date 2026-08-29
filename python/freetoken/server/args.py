@@ -586,6 +586,26 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-layer-profile",
+        type=str,
+        default=ServerArgs.moe_disk_layer_profile,
+        help=(
+            "JSON object mapping every MoE layer id to a traffic score. When the pin "
+            "budget automatically spills FTW layers to DISK, the lowest-score layers "
+            "are selected. Explicit --moe-disk-layers takes precedence."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect per-layer realized decode traffic for GET /v1/moe-layer-profile."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-disk-prefill",
         choices=["cpu", "copy"],
         default=ServerArgs.moe_disk_prefill,

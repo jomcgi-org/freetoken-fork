@@ -49,8 +49,23 @@ existing GPU prefill copy behavior.
 The DISK tier requires FreeToken's aligned, per-layer FTW layout. Convert a raw
 safetensors checkpoint first with `ft checkpoint`; raw safetensors and GGUF banks are
 not supported. When expert banks exceed `FREETOKEN_PIN_BUDGET_GB`, an FTW checkpoint
-automatically spills enough tail layers to DISK. Non-FTW checkpoints retain the
-existing OS-locked fallback.
+automatically spills enough head and tail layers to DISK, following the assumption that
+middle-layer traffic is higher. Non-FTW checkpoints use the same head and tail split for
+the existing OS-locked fallback.
+
+For traffic-aware selection, collect a representative decode window with
+`--moe-collect-stats --moe-disk-layers 0`, then save the running server's profile:
+
+```bash
+curl -s http://127.0.0.1:1919/v1/moe-layer-profile > moe-layer-profile.json
+```
+
+The file is a JSON object mapping every MoE layer id to realized decode misses per step.
+Pass it on later boots with `--moe-disk-layer-profile moe-layer-profile.json`; automatic
+spill then picks the lowest scores, with ties resolved by layer id. Explicit
+`--moe-disk-layers` always takes precedence. A malformed or incomplete profile produces
+a warning and falls back to the head and tail split. Startup logs include the selected
+layer ids and the available scores.
 
 ### File-backed PLE table
 

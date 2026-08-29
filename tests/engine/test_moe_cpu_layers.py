@@ -81,43 +81,80 @@ def test_resolve_disk_layers_always_targets_cpu_capable_backends():
     assert resolve_disk(_cfg("fused", disk="3,7"), L) == frozenset()
 
 
-def test_auto_budget_spills_ftw_tail_layers_to_disk(tmp_path, monkeypatch):
+def _write_ftw_index(path, num_layers):
     index = {
         "format": "freetoken_weight",
         "tensors": [
             {"kind": "experts_bank", "nbytes": 100, "name": f"bank-{i}"}
-            for i in range(4)
+            for i in range(num_layers)
         ],
     }
-    (tmp_path / "freetoken_weight.json").write_text(json.dumps(index))
+    (path / "freetoken_weight.json").write_text(json.dumps(index))
+
+
+def _auto_config(path, profile=None):
+    return SimpleNamespace(
+        model_path=str(path),
+        model_config=SimpleNamespace(),
+        moe_disk_layer_profile=str(profile) if profile is not None else None,
+    )
+
+
+def test_auto_budget_spills_ftw_head_and_tail_layers_to_disk(tmp_path, monkeypatch):
+    _write_ftw_index(tmp_path, 4)
     monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(201 / 2**30))
     monkeypatch.setattr(
         "freetoken.engine.engine._cpu_moe_executor_viable", lambda model_config: True,
     )
-    config = SimpleNamespace(
-        model_path=str(tmp_path), model_config=SimpleNamespace(),
+    assert auto_layers(_auto_config(tmp_path), 4) == frozenset({0, 3})
+
+
+def test_auto_budget_uses_lowest_profile_scores_with_stable_ties(tmp_path, monkeypatch):
+    _write_ftw_index(tmp_path, 6)
+    profile = tmp_path / "traffic.json"
+    profile.write_text(json.dumps({"0": 5, "1": 1, "2": 1, "3": 2, "4": 3, "5": 0}))
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(401 / 2**30))
+    monkeypatch.setattr(
+        "freetoken.engine.engine._cpu_moe_executor_viable", lambda model_config: True,
     )
-    assert auto_layers(config, 4) == frozenset({2, 3})
+    logs = []
+    monkeypatch.setattr("freetoken.engine.engine.logger.info_rank0", logs.append)
+
+    assert auto_layers(_auto_config(tmp_path, profile), 6) == frozenset({1, 5})
+    assert "layer scores {1: 1.0, 5: 0.0}" in logs[-1]
+    assert "([1, 5])" in logs[-1]
+
+
+@pytest.mark.parametrize(
+    "contents",
+    ["{not-json", json.dumps({"0": 1, "1": 2, "2": 3})],
+    ids=["malformed", "incomplete"],
+)
+def test_bad_profile_warns_and_falls_back(tmp_path, monkeypatch, caplog, contents):
+    import logging
+    import freetoken.engine.engine as engine
+
+    _write_ftw_index(tmp_path, 4)
+    profile = tmp_path / "traffic.json"
+    profile.write_text(contents)
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(201 / 2**30))
+    monkeypatch.setattr(engine, "_cpu_moe_executor_viable", lambda model_config: True)
+    monkeypatch.setattr(engine.logger, "propagate", True)
+    caplog.set_level(logging.WARNING, logger=engine.logger.name)
+
+    assert auto_layers(_auto_config(tmp_path, profile), 4) == frozenset({0, 3})
+    assert "falling back to head+tail DISK selection" in caplog.text
 
 
 def test_ple_disk_zero_reservation_expands_expert_pin_budget(tmp_path, monkeypatch):
-    index = {
-        "format": "freetoken_weight",
-        "tensors": [
-            {"kind": "experts_bank", "nbytes": 100, "name": f"bank-{i}"}
-            for i in range(4)
-        ],
-    }
-    (tmp_path / "freetoken_weight.json").write_text(json.dumps(index))
+    _write_ftw_index(tmp_path, 4)
     monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(201 / 2**30))
     monkeypatch.setattr(
         "freetoken.engine.engine._cpu_moe_executor_viable", lambda model_config: True,
     )
-    config = SimpleNamespace(
-        model_path=str(tmp_path), model_config=SimpleNamespace(),
-    )
+    config = _auto_config(tmp_path)
 
-    assert auto_layers(config, 4, reserved=0) == frozenset({2, 3})
+    assert auto_layers(config, 4, reserved=0) == frozenset({0, 3})
     assert auto_layers(config, 4, reserved=200) == frozenset(range(4))
 
 

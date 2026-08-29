@@ -17,6 +17,8 @@ from freetoken.message import (
     ErrorReplyMsg,
     ExitMsg,
     PromptAdmittedMsg,
+    MoeLayerProfileBackendMsg,
+    MoeLayerProfileResultMsg,
     UserMsg,
 )
 from freetoken.utils import (
@@ -606,6 +608,27 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, MoeLayerProfileBackendMsg):
+            cache = self.engine.moe_offload_cache
+            if cache is None:
+                self._reply_moe_layer_profile(
+                    msg.request_id, "unsupported", error="this model has no MoE offload cache"
+                )
+            elif not cache.collect_stats:
+                self._reply_moe_layer_profile(
+                    msg.request_id,
+                    "unsupported",
+                    error="restart the server with --moe-collect-stats",
+                )
+            else:
+                try:
+                    profile = cache.decode_miss_layer_profile()
+                except Exception as exc:  # noqa: BLE001
+                    self._reply_moe_layer_profile(
+                        msg.request_id, "failed", error=f"could not read MoE stats: {exc!r}"
+                    )
+                else:
+                    self._reply_moe_layer_profile(msg.request_id, "ok", profile=profile)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -650,6 +673,25 @@ class Scheduler(SchedulerIOMixin):
                     num_pages=geo["num_pages"],
                     mamba_slots=geo["num_mamba_slots"] or 0,
                     num_swa_pages=geo["num_swa_pages"] or 0,
+                    error=error,
+                )
+            ]
+        )
+
+    def _reply_moe_layer_profile(
+        self,
+        request_id: str,
+        status: str,
+        *,
+        profile: dict[str, float] | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.send_result(
+            [
+                MoeLayerProfileResultMsg(
+                    request_id=request_id,
+                    status=status,
+                    profile=profile,
                     error=error,
                 )
             ]

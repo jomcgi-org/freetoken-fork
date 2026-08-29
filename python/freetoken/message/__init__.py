@@ -4,9 +4,16 @@ from .backend import (
     BatchBackendMsg,
     CacheRebuildBackendMsg,
     ExitMsg,
+    MoeLayerProfileBackendMsg,
     UserMsg,
 )
-from .frontend import BaseFrontendMsg, BatchFrontendMsg, CacheRebuildReply, UserReply
+from .frontend import (
+    BaseFrontendMsg,
+    BatchFrontendMsg,
+    CacheRebuildReply,
+    MoeLayerProfileReply,
+    UserReply,
+)
 from .tokenizer import (
     AbortMsg,
     BaseTokenizerMsg,
@@ -16,6 +23,8 @@ from .tokenizer import (
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
+    MoeLayerProfileMsg,
+    MoeLayerProfileResultMsg,
     TokenizeMsg,
 )
 
@@ -25,6 +34,7 @@ __all__ = [
     "BaseBackendMsg",
     "BatchBackendMsg",
     "CacheRebuildBackendMsg",
+    "MoeLayerProfileBackendMsg",
     "ExitMsg",
     "UserMsg",
     "BaseTokenizerMsg",
@@ -38,5 +48,8 @@ __all__ = [
     "BaseFrontendMsg",
     "BatchFrontendMsg",
     "CacheRebuildReply",
+    "MoeLayerProfileMsg",
+    "MoeLayerProfileResultMsg",
+    "MoeLayerProfileReply",
     "UserReply",
 ]

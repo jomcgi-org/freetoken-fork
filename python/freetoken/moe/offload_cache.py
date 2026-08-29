@@ -29,6 +29,14 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
+
+def serialize_moe_layer_profile(stats: dict) -> dict[str, float]:
+    """Serialize per-layer decode stats as layer id to realized misses per step."""
+    profile: dict[str, float] = {}
+    for row in stats["per_layer"]:
+        profile[str(int(row["layer"]))] = float(row["missing_per_step"])
+    return profile
+
 # quant_format -> bank names, in registration order: the single place a format's bank
 # layout is declared. The cache machinery (copy_missing, the prefill double buffers,
 # bank_views) iterates banks in this order, the layers' kernel dispatch unpacks views
@@ -965,6 +973,10 @@ class OffloadMoeCache:
                 "fetched_per_step": (f / s) if s else 0.0,
             })
         return {"per_layer": per_layer}
+
+    def decode_miss_layer_profile(self) -> dict[str, float]:
+        """JSON-ready traffic profile for static DISK spill selection."""
+        return serialize_moe_layer_profile(self.decode_miss_stats_per_layer())
 
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.

@@ -404,6 +404,20 @@ def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     assert cache.src_indices[:256].tolist() == list(range(256))
 
 
+def test_moe_layer_profile_serializer_uses_realized_misses_per_step():
+    from freetoken.moe.offload_cache import serialize_moe_layer_profile
+
+    stats = {
+        "per_layer": [
+            {"layer": 0, "missing_per_step": 1.25, "miss_rate": 0.5},
+            {"layer": 1, "missing_per_step": 0, "miss_rate": 0.0},
+            {"layer": 2, "missing_per_step": 3.5, "miss_rate": 0.875},
+        ]
+    }
+
+    assert serialize_moe_layer_profile(stats) == {"0": 1.25, "1": 0.0, "2": 3.5}
+
+
 def test_adjust_config_converts_moe_cache_rate_to_cache_size():
     from types import SimpleNamespace
 
