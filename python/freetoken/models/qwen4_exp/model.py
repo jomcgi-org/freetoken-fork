@@ -15,6 +15,7 @@ immediate combine::
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -193,6 +194,19 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
             self._ple_disk_backends = []
             self._ple_major_fault_base = process_major_faults()
+            self._ple_staging_ns = 0
+            pin = torch.cuda.is_available()
+            self._ple_decode_contexts = torch.empty(
+                (max_decode_batch_size, args.ngram_size - 1),
+                dtype=torch.int64,
+                pin_memory=pin,
+            )
+            self._ple_decode_input_ids = torch.empty(
+                max_decode_batch_size, dtype=torch.int64, pin_memory=pin
+            )
+            self._ple_waited_events: list[torch.cuda.Event | None] = [
+                None
+            ] * max_decode_batch_size
             for ple in ple_layers:
                 staged = DiskStagedTable(
                     table,
@@ -202,7 +216,8 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 )
                 self._ple_disk_backends.append(staged)
                 ple.ple_embedding.attach_table(staged)
-                ple.ple_embedding.snapshot_host_hash_constants()
+                ple.ple_embedding.snapshot_host_hash_constants(max_decode_batch_size)
+            self._ple_disk_decode = tuple(zip(ple_layers, self._ple_disk_backends))
             return 0
 
         for ple in ple_layers:
@@ -223,11 +238,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         result = {
             "ple_prefetch_pages": sum(table.prefetch_pages for table in backends),
             "ple_major_faults": None if now is None or base is None else now - base,
+            "ple_staging_us": getattr(self, "_ple_staging_ns", 0) / 1_000.0,
         }
         if reset:
             for table in backends:
                 table.reset_stats()
             self._ple_major_fault_base = now
+            self._ple_staging_ns = 0
         return result
 
     def prepare_cuda_graph_replay(self, batch: Batch) -> None:
@@ -235,12 +252,21 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         backends = getattr(self, "_ple_disk_backends", None)
         if not backends:
             return
+        started = time.perf_counter_ns()
         args = self._config.qwen4_args
         context_len = args.ngram_size - 1
-        contexts: list[list[int]] = []
-        current_ids: list[int] = []
-        waited: set[int] = set()
-        for req in batch.padded_reqs:
+        batch_size = len(batch.padded_reqs)
+        if batch_size > self._ple_decode_input_ids.numel():
+            raise ValueError(
+                f"PLE decode batch {batch_size} exceeds fixed context buffer "
+                f"{self._ple_decode_input_ids.numel()}"
+            )
+        contexts = self._ple_decode_contexts[:batch_size]
+        current_ids = self._ple_decode_input_ids[:batch_size]
+        contexts.fill_(args.ngram_boundary_token_id)
+        waited = self._ple_waited_events
+        waited_count = 0
+        for batch_index, req in enumerate(batch.padded_reqs):
             cached_len = int(req.cached_len)
             history = req.input_ids
             if history.numel() < cached_len:
@@ -248,7 +274,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                     f"request {req.uid} host history ends before cached_len={cached_len}"
                 )
             if cached_len < history.numel():
-                current = int(history[cached_len])
+                current_ids[batch_index : batch_index + 1].copy_(
+                    history[cached_len : cached_len + 1]
+                )
             else:
                 token = req.pending_token_cpu
                 done = req.sample_copy_done
@@ -258,24 +286,32 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                         raise RuntimeError(
                             f"decode token for request {req.uid} is not available on the host"
                         )
-                    current = int(history[-1])
+                    current_ids[batch_index : batch_index + 1].copy_(history[-1:])
                 else:
-                    event_key = id(done)
-                    if event_key not in waited:
+                    already_waited = False
+                    for event_index in range(waited_count):
+                        prior_event = waited[event_index]
+                        if done is prior_event:
+                            already_waited = True
+                            break
+                    if not already_waited:
                         done.synchronize()
-                        waited.add(event_key)
-                    current = int(token)
-            prior = history[max(0, cached_len - context_len) : cached_len].tolist()
-            contexts.append(
-                [args.ngram_boundary_token_id] * (context_len - len(prior))
-                + [int(token_id) for token_id in prior]
-            )
-            current_ids.append(current)
+                        waited[waited_count] = done
+                        waited_count += 1
+                    current_ids[batch_index].copy_(token)
+            prior_len = min(context_len, cached_len)
+            if prior_len:
+                contexts[batch_index, context_len - prior_len :].copy_(
+                    history[cached_len - prior_len : cached_len]
+                )
 
-        ple_layers = self.model.ple_layers
-        assert len(ple_layers) == len(backends)
-        for ple, backend in zip(ple_layers, backends):
+        decode_layers = getattr(self, "_ple_disk_decode", None)
+        if decode_layers is None:
+            decode_layers = tuple(zip(self.model.ple_layers, backends))
+        assert len(decode_layers) == len(backends)
+        for ple, backend in decode_layers:
             backend.prepare_decode(ple.ple_embedding.host_decode_row_ids(contexts, current_ids))
+        self._ple_staging_ns += time.perf_counter_ns() - started
 
     def finish_cuda_graph_replay(self, *, record_event: bool) -> None:
         """Fence fixed host-buffer reuse after a submitted graph or eager warmup."""

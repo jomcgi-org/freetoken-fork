@@ -156,7 +156,8 @@ class Scheduler(SchedulerIOMixin):
             if ple_stats:
                 message += (
                     f", ple_prefetch_pages: {ple_stats['ple_prefetch_pages']}, "
-                    f"ple_major_faults: {ple_stats['ple_major_faults']}"
+                    f"ple_major_faults: {ple_stats['ple_major_faults']}, "
+                    f"ple_staging_us: {ple_stats['ple_staging_us']:.0f}"
                 )
             logger.info_rank0(message)
 

@@ -7,6 +7,7 @@ The tensors are tiny but the key names, dtypes and the fusion geometry that matt
 from __future__ import annotations
 
 import random
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -371,6 +372,146 @@ def test_disk_ple_staging_matches_direct_rows(checkpoint):
     backend.finish_decode(record_event=False)
 
 
+def test_disk_ple_decode_fast_path_microbenchmark():
+    """One thousand full host hash/stage steps stay bit-exact with the scalar oracle."""
+    from freetoken.models.qwen4_exp.ple import (
+        DiskStagedTable,
+        NGramEmbedding,
+        _derive_decode_row_ids_host_reference,
+    )
+
+    steps = 1000
+    rows_per_shard = 64
+    shard_count = 128
+    head_dim = 160
+    heads_per_ngram = 8
+    num_heads = 16
+    eos_token_id = 2
+    banks = tuple(
+        HostBank((rows_per_shard, head_dim), torch.float8_e4m3fn)
+        for _ in range(shard_count)
+    )
+    for shard, bank in enumerate(banks):
+        values = torch.arange(bank.tensor.numel(), dtype=torch.int64)
+        bank.tensor.view(torch.uint8).view(-1).copy_(
+            ((values + shard * 37) % 251).to(torch.uint8)
+        )
+    table = SimpleNamespace(
+        banks=banks,
+        rows_per_shard=rows_per_shard,
+        num_rows=rows_per_shard * shard_count,
+        head_dim=head_dim,
+        weight_scale=1.0,
+    )
+    reference_backend = DiskStagedTable(
+        table,
+        stage_capacity_rows=num_heads,
+        device=torch.device("cpu"),
+        prefetch=False,
+        max_decode_batch_size=1,
+        rows_per_token=num_heads,
+    )
+    fast_backend = DiskStagedTable(
+        table,
+        stage_capacity_rows=num_heads,
+        device=torch.device("cpu"),
+        prefetch=False,
+        max_decode_batch_size=1,
+        rows_per_token=num_heads,
+    )
+    args = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=heads_per_ngram,
+        num_ngram_heads=num_heads,
+        ngram_boundary_token_id=eos_token_id,
+    )
+    embedding = NGramEmbedding(args)
+    multipliers = torch.tensor(
+        [6_364_136_223_846_793_005, 1_442_695_040_888_963_407, 3_202_034_522_624_059_733],
+        dtype=torch.int64,
+    )
+    sizes = torch.tensor(
+        [487, 491, 499, 503, 509, 479, 467, 463] * 2, dtype=torch.int64
+    )
+    offsets = torch.zeros(num_heads, dtype=torch.int64)
+    offsets[1:] = sizes.cumsum(0)[:-1]
+    embedding.layer_multipliers.copy_(multipliers)
+    embedding.ngram_heads_vocab_sizes.copy_(sizes)
+    embedding.ngram_heads_offsets.copy_(offsets)
+    embedding.snapshot_host_hash_constants(max_batch_size=1)
+
+    generator = torch.Generator().manual_seed(20260829)
+    contexts = torch.randint(0, 50_000, (steps, 2), generator=generator)
+    current_ids = torch.randint(0, 50_000, (steps,), generator=generator)
+    contexts[::17, 0] = eos_token_id
+    contexts[::29, 1] = eos_token_id
+    multiplier_list = multipliers.tolist()
+    size_list = sizes.tolist()
+    offset_list = offsets.tolist()
+    row_ids_ptr = None
+
+    for step in range(steps):
+        context = contexts[step : step + 1]
+        current = current_ids[step : step + 1]
+        reference_ids = _derive_decode_row_ids_host_reference(
+            context.tolist(),
+            current.tolist(),
+            layer_multipliers=multiplier_list,
+            vocab_sizes=size_list,
+            offsets=offset_list,
+            ngram_size=3,
+            heads_per_ngram=heads_per_ngram,
+            eos_token_id=eos_token_id,
+        )
+        row_ids = embedding.host_decode_row_ids(context, current)
+        if row_ids_ptr is None:
+            row_ids_ptr = row_ids.data_ptr()
+        else:
+            assert row_ids.data_ptr() == row_ids_ptr
+        assert torch.equal(row_ids, reference_ids)
+        reference_staged, reference_inverse = reference_backend._stage_rows_reference(
+            reference_ids
+        )
+        fast_backend.prepare_decode(row_ids)
+        unique_count = torch.unique(reference_ids).numel()
+        assert torch.equal(
+            fast_backend.local_ids[:1].long(), reference_inverse
+        )
+        assert torch.equal(
+            fast_backend._stage_bank.tensor[:unique_count].view(torch.uint8),
+            reference_staged.view(torch.uint8),
+        )
+        fast_backend.finish_decode(record_event=False)
+
+    started = time.perf_counter()
+    for step in range(steps):
+        reference_ids = _derive_decode_row_ids_host_reference(
+            contexts[step : step + 1].tolist(),
+            current_ids[step : step + 1].tolist(),
+            layer_multipliers=multiplier_list,
+            vocab_sizes=size_list,
+            offsets=offset_list,
+            ngram_size=3,
+            heads_per_ngram=heads_per_ngram,
+            eos_token_id=eos_token_id,
+        )
+        reference_backend._stage_rows_reference(reference_ids)
+    reference_rate = steps / (time.perf_counter() - started)
+
+    started = time.perf_counter()
+    for step in range(steps):
+        row_ids = embedding.host_decode_row_ids(
+            contexts[step : step + 1], current_ids[step : step + 1]
+        )
+        fast_backend.prepare_decode(row_ids)
+        fast_backend.finish_decode(record_event=False)
+    fast_rate = steps / (time.perf_counter() - started)
+    print(
+        f"PLE staging micro-benchmark: before={reference_rate:.1f} steps/sec, "
+        f"after={fast_rate:.1f} steps/sec"
+    )
+
+
 @requires_cuda
 def test_disk_ple_fixed_buffers_capture_and_replay_different_rows(checkpoint):
     """Two host-prepared row sets flow through one captured fixed-address UVA gather."""
@@ -445,14 +586,93 @@ def test_disk_ple_stats_report_pages_and_major_fault_delta(monkeypatch):
     model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
     model._ple_disk_backends = [Backend(7), Backend(11)]
     model._ple_major_fault_base = 20
+    model._ple_staging_ns = 12_500
     monkeypatch.setattr(ple, "process_major_faults", lambda: 25)
 
     assert model.ple_disk_stats(reset=True) == {
         "ple_prefetch_pages": 18,
         "ple_major_faults": 5,
+        "ple_staging_us": 12.5,
     }
     assert [backend.prefetch_pages for backend in model._ple_disk_backends] == [0, 0]
     assert model._ple_major_fault_base == 25
+    assert model._ple_staging_ns == 0
+
+
+def test_disk_ple_prepare_replay_batches_history_and_waits_once():
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    class Event:
+        def __init__(self):
+            self.waits = 0
+
+        def synchronize(self):
+            self.waits += 1
+
+    class Embedding:
+        def __init__(self):
+            self.seen = None
+
+        def host_decode_row_ids(self, contexts, current_ids):
+            self.seen = (contexts.clone(), current_ids.clone())
+            return torch.zeros((contexts.shape[0], 16), dtype=torch.int64)
+
+    class Backend:
+        def __init__(self):
+            self.ids = None
+
+        def prepare_decode(self, ids):
+            self.ids = ids
+
+    done = Event()
+    reqs = [
+        SimpleNamespace(
+            uid=1,
+            cached_len=2,
+            input_ids=torch.tensor([10, 11, 12]),
+            pending_token_cpu=None,
+            sample_copy_done=None,
+        ),
+        SimpleNamespace(
+            uid=2,
+            cached_len=2,
+            input_ids=torch.tensor([20, 21]),
+            pending_token_cpu=torch.tensor(22),
+            sample_copy_done=done,
+        ),
+        SimpleNamespace(
+            uid=3,
+            cached_len=1,
+            input_ids=torch.tensor([31]),
+            pending_token_cpu=torch.tensor(32),
+            sample_copy_done=done,
+        ),
+    ]
+    embedding = Embedding()
+    backend = Backend()
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model._config = SimpleNamespace(
+        qwen4_args=SimpleNamespace(ngram_size=3, ngram_boundary_token_id=2)
+    )
+    model.model = SimpleNamespace(
+        ple_layers=[SimpleNamespace(ple_embedding=embedding)]
+    )
+    model._ple_disk_backends = [backend]
+    model._ple_decode_contexts = torch.empty((3, 2), dtype=torch.int64)
+    model._ple_decode_input_ids = torch.empty(3, dtype=torch.int64)
+    model._ple_waited_events = [None] * 3
+    model._ple_staging_ns = 0
+
+    model.prepare_cuda_graph_replay(SimpleNamespace(padded_reqs=reqs))
+
+    assert done.waits == 1
+    assert embedding.seen is not None
+    assert torch.equal(
+        embedding.seen[0], torch.tensor([[10, 11], [20, 21], [2, 31]])
+    )
+    assert torch.equal(embedding.seen[1], torch.tensor([12, 22, 32]))
+    assert backend.ids.shape == (3, 16)
+    assert model._ple_staging_ns > 0
 
 
 def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
@@ -465,13 +685,15 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     layer = SimpleNamespace(
         ple_embedding=SimpleNamespace(
             attach_table=attached.append,
-            snapshot_host_hash_constants=lambda: snapshotted.append(True),
+            snapshot_host_hash_constants=lambda max_batch_size: snapshotted.append(
+                max_batch_size
+            ),
         ),
     )
     model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
     model.model = SimpleNamespace(ple_layers=[layer])
     model._config = SimpleNamespace(
-        qwen4_args=SimpleNamespace(num_ngram_heads=16),
+        qwen4_args=SimpleNamespace(num_ngram_heads=16, ngram_size=3),
     )
     mapped = SimpleNamespace(num_rows=32, head_dim=4)
     staged = SimpleNamespace(prefetch_pages=0)
@@ -497,7 +719,7 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     assert model.load_host_tables(engine_config) == 0
     assert selected == ["disk"]
     assert attached == [staged]
-    assert snapshotted == [True]
+    assert snapshotted == [4]
 
 
 def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):
