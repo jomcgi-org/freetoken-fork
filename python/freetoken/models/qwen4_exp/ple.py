@@ -1241,6 +1241,60 @@ class CachedTable:
             device=self._device,
             prefetch=prefetch,
         )
+        # Cache misses already arrive unique and paired with their destination slots. Build one
+        # pair of iovec arrays for the whole install instead of staging and scattering data and
+        # scale rows separately. Packed rows interleave their data and scale entries, so Linux
+        # services the batch with one process_vm_readv call for each IOV_MAX entries.
+        install_rows = int(source_capacity_rows)
+        install_fields = 1 + int(scale is not None)
+        install_iovs = install_rows * install_fields
+        self._install_fields = install_fields
+        self._install_source_shards = torch.empty(install_rows, dtype=torch.int64)
+        self._install_source_rows = torch.empty(install_rows, dtype=torch.int64)
+        self._install_slab_ids = torch.empty(install_rows, dtype=torch.int64)
+        self._install_slab_rows = torch.empty(install_rows, dtype=torch.int64)
+        self._install_remote_iov = torch.empty((install_iovs, 2), dtype=torch.int64)
+        self._install_local_iov = torch.empty((install_iovs, 2), dtype=torch.int64)
+        self._install_remote_iov[0::install_fields, 1].fill_(self._reader._row_nbytes)
+        self._install_local_iov[0::install_fields, 1].fill_(self._reader._row_nbytes)
+        if scale is not None:
+            self._install_remote_iov[1::install_fields, 1].fill_(
+                self._reader._scale_row_nbytes
+            )
+            self._install_local_iov[1::install_fields, 1].fill_(
+                self._reader._scale_row_nbytes
+            )
+        self._install_source_bases = torch.empty(
+            (len(table.banks), install_fields), dtype=torch.int64
+        )
+        self._install_source_bases[:, 0].copy_(self._reader._shard_bases)
+        self._install_slab_bases = torch.empty(
+            (len(self._data_slabs), install_fields), dtype=torch.int64
+        )
+        self._install_slab_bases[:, 0] = torch.tensor(
+            [bank.tensor.data_ptr() for bank in self._data_slabs], dtype=torch.int64
+        )
+        self._install_row_strides = torch.tensor(
+            [self._reader._row_nbytes]
+            + ([self._reader._scale_row_nbytes] if scale is not None else []),
+            dtype=torch.int64,
+        )
+        if scale is not None:
+            assert self._reader._scale_shard_bases is not None
+            self._install_source_bases[:, 1].copy_(self._reader._scale_shard_bases)
+            self._install_slab_bases[:, 1] = torch.tensor(
+                [bank.tensor.data_ptr() for bank in self._scale_slabs], dtype=torch.int64
+            )
+        self._install_has_disk_scales = bool(scale_banks) and all(
+            getattr(bank, "_disk", False) for bank in scale_banks
+        )
+        page_slots = install_iovs * 2
+        self._install_page_candidates = torch.empty(page_slots, dtype=torch.int64)
+        self._install_page_sorted = torch.empty(page_slots, dtype=torch.int64)
+        self._install_page_order = torch.empty(page_slots, dtype=torch.int64)
+        self._install_page_flags = torch.empty(page_slots, dtype=torch.bool)
+        self._install_page_local_ids = torch.empty(page_slots, dtype=torch.int64)
+        self._install_unique_pages = torch.empty(page_slots, dtype=torch.int64)
         self._decode_shape: torch.Size | None = None
         self._replay_done: torch.cuda.Event | None = None
         self._pending: tuple[str, torch.Tensor, torch.Tensor | None, torch.Tensor | None] | None = None
@@ -1387,7 +1441,8 @@ class CachedTable:
         out.copy_(rows)
         return out
 
-    def _copy_installed(self, rows: torch.Tensor, slots: torch.Tensor) -> None:
+    def _copy_installed_reference(self, rows: torch.Tensor, slots: torch.Tensor) -> None:
+        """Allocation-heavy miss installer retained as a parity and benchmark oracle."""
         if not rows.numel():
             return
         if self._replay_done is not None:
@@ -1414,6 +1469,144 @@ class CachedTable:
                     local,
                     selected_scales.view(torch.uint8).reshape(selected_scales.shape[0], -1),
                 )
+
+    def _prefetch_install_pages(self, remote_iov: torch.Tensor) -> int:
+        """Deduplicate data and file-backed scale pages in one fixed-buffer sweep."""
+        if not self._reader._has_disk_banks or not remote_iov.numel() or _MADVISE is None:
+            return 0
+        if self._install_fields == 2 and not self._install_has_disk_scales:
+            remote_iov = remote_iov[0::2]
+        count = remote_iov.shape[0]
+        page_size = mmap.PAGESIZE
+        candidates = self._install_page_candidates[: count * 2]
+        candidates[:count].copy_(remote_iov[:, 0])
+        candidates[:count].floor_divide_(page_size).mul_(page_size)
+        candidates[count:].copy_(remote_iov[:, 0]).add_(remote_iov[:, 1]).sub_(1)
+        candidates[count:].floor_divide_(page_size).mul_(page_size)
+        torch.sort(
+            candidates,
+            out=(
+                self._install_page_sorted[: count * 2],
+                self._install_page_order[: count * 2],
+            ),
+        )
+        ordered = self._install_page_sorted[: count * 2]
+        flags = self._install_page_flags[: count * 2]
+        flags[0] = True
+        if ordered.numel() > 1:
+            torch.ne(ordered[1:], ordered[:-1], out=flags[1:])
+        torch.cumsum(
+            flags,
+            dim=0,
+            dtype=torch.int64,
+            out=self._install_page_local_ids[: count * 2],
+        )
+        page_ids = self._install_page_local_ids[: count * 2].sub_(1)
+        page_count = int(page_ids[-1]) + 1
+        pages = self._install_unique_pages[:page_count]
+        pages.scatter_(0, page_ids, ordered)
+
+        start = previous = int(pages[0])
+        for index in range(1, page_count + 1):
+            current = int(pages[index]) if index < page_count else -1
+            if current == previous + page_size:
+                previous = current
+                continue
+            length = previous - start + page_size
+            if _MADVISE(ctypes.c_void_p(start), length, mmap.MADV_WILLNEED):
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+            start = previous = current
+        return page_count
+
+    def _copy_install_iovecs(
+        self, local_iov: torch.Tensor, remote_iov: torch.Tensor
+    ) -> None:
+        """Copy a whole miss batch directly from source mappings into cache slots."""
+        entry_count = local_iov.shape[0]
+        process_vm_readv = self._reader._process_vm_readv
+        if process_vm_readv is None:
+            for local, remote in zip(local_iov.tolist(), remote_iov.tolist()):
+                ctypes.memmove(local[0], remote[0], local[1])
+            return
+
+        copied_entries = 0
+        iovec_size = ctypes.sizeof(_IOVec)
+        while copied_entries < entry_count:
+            chunk_entries = min(self._reader._iov_max, entry_count - copied_entries)
+            local = ctypes.cast(
+                local_iov.data_ptr() + copied_entries * iovec_size,
+                ctypes.POINTER(_IOVec),
+            )
+            remote = ctypes.cast(
+                remote_iov.data_ptr() + copied_entries * iovec_size,
+                ctypes.POINTER(_IOVec),
+            )
+            expected = int(
+                local_iov[copied_entries : copied_entries + chunk_entries, 1].sum()
+            )
+            copied = process_vm_readv(
+                os.getpid(), local, chunk_entries, remote, chunk_entries, 0
+            )
+            if copied != expected:
+                self._reader._process_vm_readv = None
+                for local_entry, remote_entry in zip(
+                    local_iov.tolist(), remote_iov.tolist()
+                ):
+                    ctypes.memmove(local_entry[0], remote_entry[0], local_entry[1])
+                return
+            copied_entries += chunk_entries
+
+    def _copy_installed(self, rows: torch.Tensor, slots: torch.Tensor) -> None:
+        count = rows.numel()
+        if not count:
+            return
+        if count > self._install_source_rows.numel():
+            raise ValueError(
+                f"PLE lookup needs {count} unique rows, staging holds "
+                f"{self._install_source_rows.numel()}"
+            )
+        if self._replay_done is not None:
+            self._replay_done.synchronize()
+
+        source_shards = self._install_source_shards[:count]
+        source_rows = self._install_source_rows[:count]
+        slab_ids = self._install_slab_ids[:count]
+        slab_rows = self._install_slab_rows[:count]
+        torch.div(
+            rows,
+            self._reader._rows_per_shard,
+            rounding_mode="floor",
+            out=source_shards,
+        )
+        torch.remainder(rows, self._reader._rows_per_shard, out=source_rows)
+        torch.div(slots, self._slab_rows, rounding_mode="floor", out=slab_ids)
+        torch.remainder(slots, self._slab_rows, out=slab_rows)
+
+        entry_count = count * self._install_fields
+        remote_iov = self._install_remote_iov[:entry_count]
+        local_iov = self._install_local_iov[:entry_count]
+        remote_addresses = remote_iov[:, 0].view(count, self._install_fields)
+        local_addresses = local_iov[:, 0].view(count, self._install_fields)
+        torch.index_select(
+            self._install_source_bases, 0, source_shards, out=remote_addresses
+        )
+        torch.addcmul(
+            remote_addresses,
+            source_rows.view(-1, 1),
+            self._install_row_strides.view(1, -1),
+            out=remote_addresses,
+        )
+        torch.index_select(self._install_slab_bases, 0, slab_ids, out=local_addresses)
+        torch.addcmul(
+            local_addresses,
+            slab_rows.view(-1, 1),
+            self._install_row_strides.view(1, -1),
+            out=local_addresses,
+        )
+
+        self._reader._prefetch_pages += self._prefetch_install_pages(remote_iov)
+        self._copy_install_iovecs(local_iov, remote_iov)
 
     def _resolve(self, ids: torch.Tensor, *, record: bool = True) -> torch.Tensor:
         resolution = self._allocator.resolve(ids)

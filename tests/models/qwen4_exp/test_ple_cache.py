@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import time
 from collections import Counter
 from types import SimpleNamespace
 
@@ -17,6 +19,7 @@ from freetoken.models.qwen4_exp.ple import (
     write_ple_row_profile,
 )
 from freetoken.models.qwen4_exp.weight import load_ple_table
+from freetoken.moe.host_banks import HostBank
 
 from .common import requires_cuda
 from .test_weight import (
@@ -104,6 +107,130 @@ def test_cache_miss_install_matches_reference_rows(tmp_path, table_format):
 
     cache.prepare_decode(ids)
     assert cache.cache_stats()["hit_rate"] == 0.5
+
+
+def test_packed_cache_miss_install_uses_one_interleaved_readv(tmp_path):
+    table, reference = _mapped_table(tmp_path, "int4g16")
+    cache = _cache(table, capacity=7)
+    ids = torch.tensor([[0, 9, 0], [table.num_rows - 1, 9, 3]])
+    calls = []
+
+    def process_vm_readv(_pid, local, local_count, remote, remote_count, _flags):
+        calls.append((local_count, remote_count))
+        copied = 0
+        for index in range(local_count):
+            assert local[index].length == remote[index].length
+            ctypes.memmove(local[index].base, remote[index].base, local[index].length)
+            copied += local[index].length
+        return copied
+
+    cache._reader._process_vm_readv = process_vm_readv
+    cache.prepare_decode(ids)
+    got = cache.lookup(torch.zeros_like(ids))
+    want = reference.index_select(0, ids.reshape(-1)).view(ids.shape[0], -1)
+
+    assert torch.equal(got, want)
+    assert calls == [(8, 8)]
+
+
+def test_packed_cache_miss_install_microbenchmark():
+    """Compare 1000 synthetic packed miss rounds with the retained install oracle."""
+    steps = 1000
+    rows_per_step = 16
+    rows_per_shard = 256
+    shard_count = 64
+    head_dim = 160
+    data_banks = tuple(
+        HostBank((rows_per_shard, head_dim // 2), torch.uint8)
+        for _ in range(shard_count)
+    )
+    scale_banks = tuple(
+        HostBank((rows_per_shard, head_dim // 16), torch.float16)
+        for _ in range(shard_count)
+    )
+    for shard, (data, scales) in enumerate(zip(data_banks, scale_banks)):
+        data.tensor.copy_(
+            (
+                torch.arange(data.tensor.numel(), dtype=torch.int64).view_as(data.tensor)
+                + shard * 17
+            ).to(torch.uint8)
+        )
+        scales.tensor.copy_(
+            torch.arange(scales.tensor.numel(), dtype=torch.float32)
+            .view_as(scales.tensor)
+            .add_(shard + 1)
+            .mul_(0.001)
+        )
+    table = SimpleNamespace(
+        banks=data_banks,
+        scale_banks=scale_banks,
+        rows_per_shard=rows_per_shard,
+        num_rows=rows_per_shard * shard_count,
+        head_dim=head_dim,
+        row_nbytes=head_dim // 2,
+        weight_scale=1.0,
+        format="int4g16",
+    )
+
+    def make_cache(source):
+        return CachedTable(
+            source,
+            capacity_rows=rows_per_step * 2,
+            source_capacity_rows=rows_per_step,
+            device=torch.device("cpu"),
+            prefetch=False,
+            max_decode_batch_size=1,
+            rows_per_token=rows_per_step,
+            slab_rows=rows_per_step,
+        )
+
+    row_ids = torch.arange(steps * rows_per_step, dtype=torch.int64).view(
+        steps, 1, rows_per_step
+    )
+    reference = make_cache(table)
+    optimized = make_cache(table)
+    slots = torch.arange(rows_per_step, dtype=torch.int64)
+
+    started = time.perf_counter()
+    for ids in row_ids:
+        reference._copy_installed_reference(ids.reshape(-1), slots)
+    reference_rate = steps / (time.perf_counter() - started)
+
+    started = time.perf_counter()
+    for ids in row_ids:
+        optimized._copy_installed(ids.reshape(-1), slots)
+    optimized_rate = steps / (time.perf_counter() - started)
+    assert torch.equal(
+        reference._data_slabs[0].tensor, optimized._data_slabs[0].tensor
+    )
+    assert torch.equal(
+        reference._scale_slabs[0].tensor, optimized._scale_slabs[0].tensor
+    )
+
+    fp8_banks = tuple(
+        HostBank((rows_per_shard, head_dim), torch.uint8)
+        for _ in range(shard_count)
+    )
+    fp8_table = SimpleNamespace(
+        banks=fp8_banks,
+        scale_banks=(),
+        rows_per_shard=rows_per_shard,
+        num_rows=rows_per_shard * shard_count,
+        head_dim=head_dim,
+        row_nbytes=head_dim,
+        weight_scale=1.0,
+        format="fp8",
+    )
+    fp8 = make_cache(fp8_table)
+    started = time.perf_counter()
+    for ids in row_ids:
+        fp8._copy_installed(ids.reshape(-1), slots)
+    fp8_rate = steps / (time.perf_counter() - started)
+    print(
+        f"PLE packed miss-install micro-benchmark: before={reference_rate:.1f} steps/sec, "
+        f"after={optimized_rate:.1f} steps/sec, speedup={optimized_rate / reference_rate:.2f}x, "
+        f"fp8={fp8_rate:.1f} steps/sec, packed/fp8 cost={fp8_rate / optimized_rate:.2f}x"
+    )
 
 
 def test_prefill_union_over_capacity_uses_pure_staged_fallback(tmp_path, caplog):
