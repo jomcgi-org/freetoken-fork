@@ -205,8 +205,8 @@ class Qwen4ExpMTPHead(BaseOP):
                 [seed_position + step], dtype=torch.int32, device=token.device
             )
             hidden = layer.forward(hidden, position)
-            # The surrounding target verify batch is a width>1 prefill. Its
-            # last-token index is invalid for this one-row draft tensor.
+            # The surrounding target verifier reserves several decode positions, while
+            # each draft call owns only one hidden row. Keep LM-head row selection explicit.
             logits = lm_head.forward(
                 self.hyper_connection_mixer.mix(hidden)[0], select_last=False
             )

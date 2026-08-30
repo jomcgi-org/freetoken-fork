@@ -169,6 +169,32 @@ def test_decode_mtp_acceptance_stats():
     assert "tokens/step: 3.00" in line
 
 
+def test_decode_mtp_timing_is_logged_per_window():
+    rep, logs, clock = _reporter(interval=40)
+    batch = _decode_batch(1)
+    batch.mtp_drafted = 3
+    batch.mtp_accepted = 1
+    batch.generated_tokens = 2
+    batch.mtp_verify_us = 2300
+    batch.mtp_snapshot_us = 0
+    batch.mtp_draft_us = 700
+    clock["t"] = 1.0
+
+    rep.report_batch(
+        batch,
+        running_reqs=1,
+        queue_reqs=0,
+        kv_used_pages=1,
+        kv_total_pages=2,
+        page_size=1,
+    )
+
+    assert logs == [
+        "MTP verify window, route: decode, width: 4, accepted: 1, "
+        "verify_us: 2300, snapshot_us: 0, draft_us: 700"
+    ]
+
+
 def test_interval_is_clamped_to_at_least_one():
     rep, _, _ = _reporter(interval=0)
     assert rep.decode_log_interval == 1

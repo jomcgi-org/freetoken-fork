@@ -5,6 +5,7 @@ import itertools
 import json
 import math
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -31,6 +32,21 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
+
+
+def _mtp_timing_mark(device: torch.device):
+    """Record an asynchronous CUDA mark, with a CPU clock fallback for unit tests."""
+    if device.type == "cuda":
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+    return time.perf_counter_ns()
+
+
+def _mtp_elapsed_us(start, end) -> float:
+    if isinstance(start, int):
+        return (end - start) / 1000.0
+    return float(start.elapsed_time(end) * 1000.0)
 
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
@@ -395,6 +411,23 @@ class Engine:
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
             self.linear_state_pool = None
+
+        if config.speculative_mtp == "on":
+            linear_bytes = (
+                self.linear_state_pool.bytes_per_slot()
+                if self.linear_state_pool is not None else 0
+            )
+            pending = getattr(self.kv_cache, "_pending_ring", None)
+            pending_bytes = (
+                pending[0].numel() * pending.element_size() if pending is not None else 0
+            )
+            mutable_bytes = linear_bytes + pending_bytes
+            logger.info_rank0(
+                "MTP mutable state per request: "
+                f"{mutable_bytes} bytes ({mem_GB(mutable_bytes)}), "
+                f"linear={linear_bytes}, qsa_pending={pending_bytes}; "
+                "decode-stepped verification does not snapshot it"
+            )
 
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
@@ -1082,81 +1115,98 @@ class Engine:
             offset += length
 
     def _snapshot_verify_state(self, req: Req) -> dict[str, Any]:
-        slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-        snapshot: dict[str, Any] = {"slot": slot}
-        pool = self.linear_state_pool
-        if pool is not None:
-            snapshot["conv"] = pool.conv_states[:, slot].clone()
-            snapshot["recurrent"] = pool.recurrent_states[:, slot].clone()
-            snapshot["slot_states"] = {
-                name: value[:, slot].clone() for name, value in pool.slot_states.items()
-            }
-        pending = getattr(self.kv_cache, "_pending_ring", None)
-        if pending is not None:
-            snapshot["qsa_pending"] = pending[req.table_idx].clone()
-        return snapshot
+        """Copy all request-local mutable state.
+
+        This remains a tested recovery primitive for callers that must run past a
+        decision point. The decode-stepped MTP verifier stops at the first rejection,
+        so it does not call this path.
+        """
+        from freetoken.spec_decode import snapshot_verify_state
+
+        return snapshot_verify_state(self.linear_state_pool, self.kv_cache, req)
 
     def _restore_verify_state(self, req: Req, snapshot: dict[str, Any]) -> None:
-        slot = int(snapshot["slot"])
-        pool = self.linear_state_pool
-        if pool is not None and "conv" in snapshot:
-            pool.conv_states[:, slot].copy_(snapshot["conv"])
-            pool.recurrent_states[:, slot].copy_(snapshot["recurrent"])
-            for name, value in snapshot["slot_states"].items():
-                pool.slot_states[name][:, slot].copy_(value)
-        pending = getattr(self.kv_cache, "_pending_ring", None)
-        if pending is not None and "qsa_pending" in snapshot:
-            pending[req.table_idx].copy_(snapshot["qsa_pending"])
+        from freetoken.spec_decode import restore_verify_state
+
+        restore_verify_state(self.linear_state_pool, self.kv_cache, req, snapshot)
+
+    def resolve_mtp_timing(self, batch: Batch) -> None:
+        """Resolve phase events after the scheduler synchronizes the output fence."""
+        marks = getattr(batch, "_mtp_timing_marks", None)
+        if marks is None:
+            return
+        batch.mtp_draft_us = _mtp_elapsed_us(*marks["draft"])
+        batch.mtp_verify_us = _mtp_elapsed_us(*marks["verify"])
+        # The verifier never advances beyond the accepted prefix, so no save or
+        # restore traffic occurs.
+        batch.mtp_snapshot_us = 0.0
+        del batch._mtp_timing_marks
 
     def _forward_mtp_verify(self, batch: Batch) -> torch.Tensor:
-        """Draft three tokens and greedily verify four positions for one request."""
+        """Draft three tokens and greedily verify with width-1 decode operations.
+
+        A multi-position target forward was previously labeled prefill. That routed
+        every offloaded MoE layer through whole-layer prefill staging, including DISK
+        layers. A decode operation cannot advance GDN and PLE state for several positions
+        in parallel, so verify one position at a time and stop at the first mismatch. The
+        state then ends exactly at the accepted prefix and no rollback snapshot is needed.
+        """
         from freetoken.attention.linear import build_fla_metadata
-        from freetoken.spec_decode import greedy_accept_prefix
+        from freetoken.spec_decode import configure_mtp_decode_step, greedy_accept_decode
 
         req = batch.reqs[0]
         width = batch.positions.numel()
         steps = width - 1
         assert steps > 0 and req.mtp_hidden is not None
         seed = batch.input_ids[:1]
+        draft_start = _mtp_timing_mark(self.device)
         drafts = self.model.mtp.draft(
             seed,
             req.mtp_hidden,
-            int(batch.positions[0].item()),
+            int(batch.mtp_original_cached_len),
             embed_tokens=self.model.model.embed_tokens,
             lm_head=self.model.lm_head,
             steps=steps,
         )
+        draft_end = _mtp_timing_mark(self.device)
         verify_ids = torch.cat((seed, drafts)).to(torch.int32)
-        batch.input_ids = verify_ids
-        snapshot = self._snapshot_verify_state(req)
+        verify_positions = batch.positions
+        verify_out_loc = batch.out_loc
+        original_cached_len = int(batch.mtp_original_cached_len)
+        original_device_len = int(batch.mtp_original_device_len)
+        assert original_device_len == original_cached_len + 1
 
-        # Verification needs one prediction per chain position. The ordinary
-        # prefill LM-head policy keeps only each request's final row.
-        logits = self.model.forward(select_last=False)
-        target = torch.argmax(logits, dim=-1).to(torch.int32)
-        accepted, matched = greedy_accept_prefix(drafts, target)
-        committed_inputs = matched + 1
-        full_hidden = self.model.model._last_hc_hidden
+        verify_start = _mtp_timing_mark(self.device)
 
-        if committed_inputs < width:
-            self._restore_verify_state(req, snapshot)
-            req.device_len = int(batch.mtp_original_device_len) + committed_inputs - 1
-            batch.input_ids = verify_ids[:committed_inputs]
-            batch.positions = batch.positions[:committed_inputs]
-            if batch.out_loc is not None:
-                batch.out_loc = batch.out_loc[:committed_inputs]
+        def target_step(step: int):
+            # Present exactly one continuing token as one decode request. This keeps PLE,
+            # GDN, QSA and MoE on their decode implementations and advances recurrent state
+            # in order.
+            configure_mtp_decode_step(
+                batch, verify_ids, verify_positions, verify_out_loc, step
+            )
             batch.fla_metadata = build_fla_metadata(batch, self.device)
             self.attn_backend.prepare_metadata(batch)
-            self.model.forward(select_last=False)
+            logits = self.model.forward(select_last=False)
             full_hidden = self.model.model._last_hc_hidden
+            target = torch.argmax(logits, dim=-1).to(torch.int32)
+            return target, full_hidden
 
-        req.cached_len = int(batch.mtp_original_cached_len) + committed_inputs
-        req.device_len = int(batch.mtp_original_device_len) + accepted.numel()
-        req.mtp_hidden = full_hidden[committed_inputs - 1].detach().clone()
+        accepted, matched, full_hidden = greedy_accept_decode(drafts, target_step)
+        verify_end = _mtp_timing_mark(self.device)
+
+        committed_inputs = matched + 1
+        req.cached_len = original_cached_len + committed_inputs
+        req.device_len = original_device_len + accepted.numel()
+        req.mtp_hidden = full_hidden[-1].detach().clone()
         batch.mtp_drafted = steps
         batch.mtp_accepted = matched
         batch.generated_tokens = accepted.numel()
         batch.phase = "decode"
+        batch._mtp_timing_marks = {
+            "draft": (draft_start, draft_end),
+            "verify": (verify_start, verify_end),
+        }
         return accepted
 
     @torch.inference_mode()

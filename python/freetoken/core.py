@@ -165,6 +165,11 @@ class Batch:
     mtp_drafted: int = field(default=0, init=False)
     mtp_accepted: int = field(default=0, init=False)
     generated_tokens: int = field(default=0, init=False)
+    # Per-window MTP timings. CUDA events are resolved by the scheduler after the
+    # sampled-token fence completes, so recording does not synchronize the model stream.
+    mtp_draft_us: float = field(default=0.0, init=False)
+    mtp_verify_us: float = field(default=0.0, init=False)
+    mtp_snapshot_us: float = field(default=0.0, init=False)
 
     @property
     def is_prefill(self) -> bool:

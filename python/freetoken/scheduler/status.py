@@ -110,6 +110,15 @@ class SchedulerStatusReporter:
         )
         self._decode_drafted_tokens += getattr(batch, "mtp_drafted", 0)
         self._decode_accepted_tokens += getattr(batch, "mtp_accepted", 0)
+        if getattr(batch, "mtp_drafted", 0):
+            self.log(
+                "MTP verify window, route: decode, "
+                f"width: {batch.mtp_drafted + 1}, "
+                f"accepted: {batch.mtp_accepted}, "
+                f"verify_us: {getattr(batch, 'mtp_verify_us', 0.0):.0f}, "
+                f"snapshot_us: {getattr(batch, 'mtp_snapshot_us', 0.0):.0f}, "
+                f"draft_us: {getattr(batch, 'mtp_draft_us', 0.0):.0f}"
+            )
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 

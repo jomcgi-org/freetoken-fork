@@ -344,6 +344,8 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        if getattr(batch, "mtp_verify", False):
+            self.engine.resolve_mtp_timing(batch)
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
@@ -850,9 +852,10 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        # Native MTP v1 verifies one greedy request at a time. Shape the decode
-        # as a short eager extend so every existing PLE, QSA, GDN, and DISK-MoE
-        # prefill primitive sees its already-supported multi-token layout.
+        # Native MTP verifies one greedy request at a time. Reserve the whole candidate
+        # window in the paged cache, but keep the batch classified as decode. The engine
+        # presents the reserved positions as ordered width-1 decode operations so recurrent
+        # state is correct and offloaded MoE never enters whole-layer prefill staging.
         mtp_verify = (
             self.config.speculative_mtp == "on"
             and batch.is_decode
@@ -861,17 +864,12 @@ class Scheduler(SchedulerIOMixin):
             and batch.reqs[0].mtp_hidden is not None
         )
         if mtp_verify:
-            from freetoken.spec_decode import MTP_DRAFT_STEPS
+            from freetoken.spec_decode import MTP_DRAFT_STEPS, reserve_mtp_window
 
             req = batch.reqs[0]
             width = min(MTP_DRAFT_STEPS + 1, req.remain_len)
             if width > 1:
-                batch.mtp_verify = True
-                batch.mtp_original_device_len = req.device_len
-                batch.mtp_original_cached_len = req.cached_len
-                batch.mtp_allocated_end = req.device_len + width - 1
-                req.device_len = batch.mtp_allocated_end
-                batch.phase = "prefill"
+                reserve_mtp_window(batch, width)
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
         if batch.is_decode:
