@@ -194,17 +194,22 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             from .ple import DiskStagedTable, process_major_faults
 
             args = self._config.qwen4_args
-            max_tokens = max(
-                int(getattr(engine_config, "max_running_req", 1)),
-                int(engine_config.max_forward_len),
-            )
-            capacity = max_tokens * args.num_ngram_heads
             graph_sizes = getattr(engine_config, "cuda_graph_bs", None) or ()
             max_decode_batch_size = max(
                 int(getattr(engine_config, "max_running_req", 1)),
                 int(getattr(engine_config, "cuda_graph_max_bs", 0) or 0),
                 max(graph_sizes, default=0),
             )
+            # Prefill can need one row set per forwarded token, while decode can be
+            # padded to an explicitly captured graph size larger than max_running_req.
+            # Size the shared staging bank for both bounds, just like the fixed decode
+            # id and hash buffers below. Dummy padding usually deduplicates, but capacity
+            # must not depend on that incidental property.
+            max_tokens = max(
+                max_decode_batch_size,
+                int(engine_config.max_forward_len),
+            )
+            capacity = max_tokens * args.num_ngram_heads
             self._ple_disk_backends = []
             self._ple_major_fault_base = process_major_faults()
             self._ple_staging_ns = 0

@@ -584,7 +584,7 @@ def test_disk_ple_fixed_buffers_capture_and_replay_different_rows(checkpoint):
 
 @requires_cuda
 def test_hmm_startup_probe_and_cuda_graph_replay_match_pinned(checkpoint):
-    """HMM passes its startup probe and keeps device ids live across graph replay."""
+    """HMM keeps live ids and a valid padded dummy row across graph replay."""
     from freetoken.models.qwen4_exp.ple import HMMMappedTable, PinnedUVATable
 
     folder, _raw = checkpoint
@@ -598,13 +598,19 @@ def test_hmm_startup_probe_and_cuda_graph_replay_match_pinned(checkpoint):
     hmm = HMMMappedTable(mapped, prefetch=False)
     hmm.startup_probe()
 
-    ids = torch.tensor([[0, 6, 7], [27, 14, 1]], dtype=torch.int64, device="cuda")
+    ids = torch.tensor(
+        [[0, 6, 7], [27, 14, 1], [0, 0, 0]],
+        dtype=torch.int64,
+        device="cuda",
+    )
     assert torch.equal(hmm.lookup(ids), reference.lookup(ids))
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = hmm.lookup(ids)
-    ids.copy_(torch.tensor([[26, 8, 3], [21, 13, 0]], device="cuda"))
+    ids.copy_(
+        torch.tensor([[26, 8, 3], [21, 13, 0], [0, 0, 0]], device="cuda")
+    )
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(captured, reference.lookup(ids))
@@ -673,7 +679,7 @@ def test_hmm_ple_stats_report_major_fault_delta_without_staging(monkeypatch):
     }
 
 
-def test_disk_ple_prepare_replay_batches_history_and_waits_once():
+def test_disk_ple_prepare_replay_handles_mixed_history_abort_and_padding():
     from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
 
     class Event:
@@ -706,6 +712,7 @@ def test_disk_ple_prepare_replay_batches_history_and_waits_once():
             input_ids=torch.tensor([10, 11, 12]),
             pending_token_cpu=None,
             sample_copy_done=None,
+            aborted=False,
         ),
         SimpleNamespace(
             uid=2,
@@ -713,6 +720,7 @@ def test_disk_ple_prepare_replay_batches_history_and_waits_once():
             input_ids=torch.tensor([20, 21]),
             pending_token_cpu=torch.tensor(22),
             sample_copy_done=done,
+            aborted=False,
         ),
         SimpleNamespace(
             uid=3,
@@ -720,6 +728,16 @@ def test_disk_ple_prepare_replay_batches_history_and_waits_once():
             input_ids=torch.tensor([31]),
             pending_token_cpu=torch.tensor(32),
             sample_copy_done=done,
+            # An abort received after launch still has to finish the in-flight row.
+            aborted=True,
+        ),
+        SimpleNamespace(
+            uid=-1,
+            cached_len=0,
+            input_ids=torch.tensor([0]),
+            pending_token_cpu=None,
+            sample_copy_done=None,
+            aborted=False,
         ),
     ]
     embedding = Embedding()
@@ -732,9 +750,9 @@ def test_disk_ple_prepare_replay_batches_history_and_waits_once():
         ple_layers=[SimpleNamespace(ple_embedding=embedding)]
     )
     model._ple_disk_backends = [backend]
-    model._ple_decode_contexts = torch.empty((3, 2), dtype=torch.int64)
-    model._ple_decode_input_ids = torch.empty(3, dtype=torch.int64)
-    model._ple_waited_events = [None] * 3
+    model._ple_decode_contexts = torch.empty((4, 2), dtype=torch.int64)
+    model._ple_decode_input_ids = torch.empty(4, dtype=torch.int64)
+    model._ple_waited_events = [None] * 4
     model._ple_staging_ns = 0
 
     model.prepare_cuda_graph_replay(SimpleNamespace(padded_reqs=reqs))
@@ -742,10 +760,10 @@ def test_disk_ple_prepare_replay_batches_history_and_waits_once():
     assert done.waits == 1
     assert embedding.seen is not None
     assert torch.equal(
-        embedding.seen[0], torch.tensor([[10, 11], [20, 21], [2, 31]])
+        embedding.seen[0], torch.tensor([[10, 11], [20, 21], [2, 31], [2, 2]])
     )
-    assert torch.equal(embedding.seen[1], torch.tensor([12, 22, 32]))
-    assert backend.ids.shape == (3, 16)
+    assert torch.equal(embedding.seen[1], torch.tensor([12, 22, 32, 0]))
+    assert backend.ids.shape == (4, 16)
     assert model._ple_staging_ns > 0
 
 
@@ -772,12 +790,14 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     mapped = SimpleNamespace(num_rows=32, head_dim=4)
     staged = SimpleNamespace(prefetch_pages=0)
     selected = []
+    staging_args = []
 
     def fake_load(model_path, args, *, backend):
         selected.append(backend)
         return mapped
 
     def fake_staged_table(table, capacity, **kwargs):
+        staging_args.append((capacity, kwargs))
         return staged
 
     monkeypatch.setattr(weight, "load_ple_table", fake_load)
@@ -786,14 +806,21 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
         model_path="/tmp/model",
         ple_backend="disk",
         use_dummy_weight=False,
-        max_running_req=4,
-        max_forward_len=8,
+        max_running_req=3,
+        max_forward_len=2,
+        cuda_graph_bs=[1, 8],
+        cuda_graph_max_bs=6,
     )
 
     assert model.load_host_tables(engine_config) == 0
     assert selected == ["disk"]
     assert attached == [staged]
-    assert snapshotted == [4]
+    assert staging_args == [
+        (8 * 16, {"max_decode_batch_size": 8, "rows_per_token": 16})
+    ]
+    assert model._ple_decode_contexts.shape == (8, 2)
+    assert model._ple_decode_input_ids.shape == (8,)
+    assert snapshotted == [8]
 
 
 def test_hmm_ple_load_reserves_zero_expert_pin_budget(monkeypatch):

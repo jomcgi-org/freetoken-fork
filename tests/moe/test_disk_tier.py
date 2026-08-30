@@ -153,6 +153,74 @@ def test_cpu_prefill_io_reuses_one_grow_to_largest_buffer():
     assert len(executor._prefill_io) == 4
 
 
+def test_disk_prefetch_deduplicates_route_union_across_batch():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    class Bank:
+        def __init__(self, pages):
+            self.pages = pages
+            self.calls = []
+
+        def prefetch_experts(self, expert_ids):
+            self.calls.append(expert_ids)
+            return self.pages
+
+    gate_up = Bank(5)
+    down = Bank(7)
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_layers = 2
+    executor._disk_banks = {1: [gate_up, down]}
+    executor._disk_prefetch_calls = [0, 0]
+    executor._disk_prefetch_pages = [0, 0]
+    executor._disk_decode_steps = 0
+
+    routes = torch.tensor(
+        [[3, 1], [3, -1], [2, 1], [2, 3]], dtype=torch.int32
+    )
+    assert executor.prefetch_experts(1, routes, is_prefill=True) == 12
+    assert gate_up.calls == [[1, 2, 3]]
+    assert down.calls == [[1, 2, 3]]
+    assert executor._disk_prefetch_calls == [0, 1]
+    assert executor._disk_prefetch_pages == [0, 12]
+    assert executor._disk_decode_steps == 0
+
+
+def test_disk_decode_tasks_are_cached_per_layer_and_batch_size():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    class Extension:
+        def __init__(self):
+            self.calls = []
+
+        def create_task(self, *args):
+            self.calls.append(args)
+            return len(self.calls)
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.device = torch.device("cpu")
+    executor.H = 8
+    executor.top_k = 2
+    executor._io = {}
+    executor._tasks = {}
+    executor._disk_banks = {0: [object()], 1: [object()]}
+    executor._ext = Extension()
+    executor._flag_sync = False
+
+    layer0_bs3 = executor._task_for(0, 3)
+    assert executor._task_for(0, 3) == layer0_bs3
+    layer1_bs3 = executor._task_for(1, 3)
+    layer0_bs2 = executor._task_for(0, 2)
+
+    assert (layer0_bs3, layer1_bs3, layer0_bs2) == (1, 2, 3)
+    assert [(call[0], call[1]) for call in executor._ext.calls] == [
+        (0, 3), (1, 3), (0, 2)
+    ]
+    # Layers at the same batch size intentionally share one fixed IO bank. Stream
+    # ordering and each layer's submit/sync pair prevent simultaneous reuse.
+    assert executor._ext.calls[0][2:] == executor._ext.calls[1][2:]
+    assert executor._ext.calls[0][2:] != executor._ext.calls[2][2:]
+
+
 @pytest.mark.parametrize(
     "mode", [pytest.param(None, id="default-cpu"), pytest.param("copy", id="copy")],
 )
@@ -207,6 +275,7 @@ def test_prefill_routing_changes_only_disk_cpu_mode(mode, residency):
     if residency == "disk" and mode == "cpu":
         assert out is cpu_out
         assert names == ["prefetch", "cpu"]
+        assert calls[0][2] is ids
         assert calls[1][2] is hidden
         assert calls[1][3] is weights
         assert calls[1][4] is ids
