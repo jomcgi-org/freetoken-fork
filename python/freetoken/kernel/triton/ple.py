@@ -103,16 +103,12 @@ def _ple_gather_kernel(
             group_scale = tl.load(scales + scale_index, mask=mask, other=0.0).to(tl.float32)
             values = (codes.to(tl.float32) - 8.0) * group_scale
         else:
-            if e4m3_native_cx():
-                scales = scale_address.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
-                group_scale = tl.load(
-                    scales + scale_index, mask=mask, other=0.0
-                ).to(tl.float32)
-            else:
-                scales = scale_address.to(tl.int64).to(tl.pointer_type(tl.uint8))
-                group_scale = e4m3_u8_to_f32(
-                    tl.load(scales + scale_index, mask=mask, other=0)
-                )
+            # The loader folds each shard's FP32 weight_scale_2 into its native FP8
+            # group scales and widens the serving bank to FP16.
+            scales = scale_address.to(tl.int64).to(tl.pointer_type(tl.float16))
+            group_scale = tl.load(
+                scales + scale_index, mask=mask, other=0.0
+            ).to(tl.float32)
             values = _e2m1_to_f32(codes) * group_scale * global_scale
     else:
         base = table_address.to(tl.int64).to(tl.pointer_type(tl.bfloat16))

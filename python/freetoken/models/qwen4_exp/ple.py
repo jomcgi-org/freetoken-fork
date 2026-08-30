@@ -395,7 +395,11 @@ class HMMMappedTable(PinnedUVATable):
             not getattr(bank, "_disk", False) for bank in table.banks
         ):
             raise ValueError("HMM PLE requires read-only file-backed shard mappings")
-        if any(not getattr(bank, "_disk", False) for bank in table.scale_banks):
+        # Folded E2M1 scales live in anonymous pageable banks. Linux HMM can fault
+        # those system allocations in just as it does the file-backed data mappings.
+        if table.format != "e2m1g16" and any(
+            not getattr(bank, "_disk", False) for bank in table.scale_banks
+        ):
             raise ValueError("HMM PLE requires read-only file-backed scale mappings")
         self.table = table
         self.weight = None

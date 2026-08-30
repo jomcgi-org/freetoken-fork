@@ -70,7 +70,7 @@ def test_clock_allocator_evicts_without_displacing_current_batch_rows():
 
 @pytest.mark.parametrize(
     "table_format, expected_row_bytes",
-    [("fp8", 36), ("int4g16", 20), ("e2m1g16", 18)],
+    [("fp8", 36), ("int4g16", 20), ("e2m1g16", 20)],
 )
 def test_cache_budget_math_counts_packed_data_and_scales(
     tmp_path, table_format, expected_row_bytes
@@ -138,8 +138,9 @@ def test_warm_profile_installs_only_cache_capacity(tmp_path):
 
 
 @requires_cuda
-def test_cached_ple_capture_replay_tracks_evolving_row_sets(tmp_path):
-    table, reference = _mapped_table(tmp_path, "fp8")
+@pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
+def test_cached_ple_capture_replay_tracks_evolving_row_sets(tmp_path, table_format):
+    table, reference = _mapped_table(tmp_path, table_format)
     cache = _cache(table, capacity=8, device="cuda")
     placeholder = torch.zeros((2, 3), dtype=torch.int64, device="cuda")
     first = torch.tensor([[0, 1, 2], [3, 4, 0]])

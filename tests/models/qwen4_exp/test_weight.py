@@ -18,6 +18,7 @@ from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
+    _ple_table_layout,
     iter_weights,
     load_ple_table,
 )
@@ -148,7 +149,9 @@ def _ngram_table() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     return shards, scale
 
 
-def _quantized_ple_checkpoint(folder, table_format: str):
+def _quantized_ple_checkpoint(
+    folder, table_format: str, *, identical_global_scales: bool = False
+):
     """Write published-layout sidecar shards and return a torch dequant reference."""
     generator = torch.Generator().manual_seed(31)
     references = []
@@ -178,7 +181,10 @@ def _quantized_ple_checkpoint(folder, table_format: str):
                         NGRAM_ROWS, QUANT_NGRAM_DIM // 16, generator=generator
                     ) * 0.5 + 0.25
                 ).to(torch.float8_e4m3fn)
-                global_scale = torch.tensor(0.75, dtype=torch.float32)
+                global_scale = torch.tensor(
+                    0.75 if identical_global_scales else 0.5 + shard * 0.25,
+                    dtype=torch.float32,
+                )
                 tensors = {
                     "weight_e2m1": data,
                     "weight_scale": scales,
@@ -384,6 +390,33 @@ def test_quantized_ple_layout_detection_and_cpu_reference(tmp_path, table_format
     expected_row_nbytes = QUANT_NGRAM_DIM if table_format == "fp8" else QUANT_NGRAM_DIM // 2
     assert table.row_nbytes == expected_row_nbytes
     assert table.scales is not None
+    if table_format == "e2m1g16":
+        layout = _ple_table_layout(str(tmp_path), args)
+        assert torch.equal(
+            layout.global_scales,
+            torch.tensor([0.5, 0.75, 1.0, 1.25], dtype=torch.float32),
+        )
+        assert table.scales.dtype is torch.float16
+        assert float(table.weight_scale) == 1.0
+    got = dequantize_ple_rows(
+        table.tensor, table.scales, table.format, float(table.weight_scale)
+    )
+    assert torch.equal(got, reference)
+
+
+def test_e2m1_ple_identical_global_scales_are_folded(tmp_path):
+    from freetoken.models.qwen4_exp.ple import dequantize_ple_rows
+
+    reference = _quantized_ple_checkpoint(
+        tmp_path, "e2m1g16", identical_global_scales=True
+    )
+    args = SimpleNamespace(
+        split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=QUANT_NGRAM_DIM
+    )
+    table = load_ple_table(str(tmp_path), args, pin=False)
+
+    assert table.scales is not None and table.scales.dtype is torch.float16
+    assert float(table.weight_scale) == 1.0
     got = dequantize_ple_rows(
         table.tensor, table.scales, table.format, float(table.weight_scale)
     )
