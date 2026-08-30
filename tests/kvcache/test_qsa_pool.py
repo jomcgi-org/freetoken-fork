@@ -184,6 +184,12 @@ def test_kv_cost_prices_ring_and_scratch_as_fixed():
     row = 32 * 4 * 2
     assert fixed == 4 * row * (QSAKVCache.ring_capacity_for(4) + 1)
 
+    config.speculative_mtp = "on"
+    _, speculative_fixed, _, _ = QSAKVCache.kv_cost(config)
+    assert speculative_fixed == 4 * row * (
+        QSAKVCache.ring_capacity_for(4, num_speculative_tokens=3) + 1
+    )
+
 
 def test_unit_bytes_matches_the_cost_model():
     spec = _spec()
@@ -213,6 +219,18 @@ def test_resolve_pool_class_and_factory():
     assert isinstance(pool, QSAKVCache)
     assert pool._kv_buffer.shape[1] == 4  # not the model's 8 layers
     assert pool.cmp_k_cache(0).shape == (4 * 64 // 4 + 4, 32)
+
+    speculative = create_kvcache_pool(
+        mc,
+        num_pages=4,
+        page_size=64,
+        dtype=torch.bfloat16,
+        device=DEV,
+        num_req_slots=4,
+        num_speculative_tokens=3,
+    )
+    assert isinstance(speculative, QSAKVCache)
+    assert speculative.ring_capacity == 8
 
     with pytest.raises(ValueError, match="num_req_slots"):
         create_kvcache_pool(mc, num_pages=4, page_size=64, dtype=torch.bfloat16, device=DEV)

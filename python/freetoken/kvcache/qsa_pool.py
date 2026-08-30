@@ -153,6 +153,11 @@ class QSAKVCache(MHAKVCache):
         from freetoken.attention import AttnType
 
         num_req_slots = config.max_running_req + 1
+        num_speculative_tokens = 0
+        if getattr(config, "speculative_mtp", "off") == "on":
+            from freetoken.spec_decode import MTP_DRAFT_STEPS
+
+            num_speculative_tokens = MTP_DRAFT_STEPS
         per_token = 0
         fixed = 0
         for spec in config.model_config.kv_cache_group_specs():
@@ -162,7 +167,8 @@ class QSAKVCache(MHAKVCache):
             if spec.attn_type is AttnType.QSA:
                 # One index-key row = all index layers at one position.
                 row = spec.index_head_dim * spec.num_index_layers * _INDEX_DTYPE_BYTES
-                fixed += num_req_slots * row * (cls.ring_capacity_for(spec.index_ratio) + 1)
+                ring = cls.ring_capacity_for(spec.index_ratio, num_speculative_tokens)
+                fixed += num_req_slots * row * (ring + 1)
         return per_token * config.page_size, fixed, config.page_size, 0
 
     def unit_bytes(self) -> tuple[int, int]:

@@ -194,7 +194,11 @@ class Qwen4ExpMTPHead(BaseOP):
                 [seed_position + step], dtype=torch.int32, device=token.device
             )
             hidden = layer.forward(hidden, position)
-            logits = lm_head.forward(self.hyper_connection_mixer.mix(hidden)[0])
+            # The surrounding target verify batch is a width>1 prefill. Its
+            # last-token index is invalid for this one-row draft tensor.
+            logits = lm_head.forward(
+                self.hyper_connection_mixer.mix(hidden)[0], select_last=False
+            )
             token = torch.argmax(logits, dim=-1).to(torch.int32)
             drafts.append(token)
         return torch.cat(drafts) if drafts else token[:0]

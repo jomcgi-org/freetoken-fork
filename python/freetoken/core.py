@@ -28,7 +28,10 @@ class SamplingParams:
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        # Temperature zero is argmax sampling. Nucleus filtering cannot change that
+        # result, so a client-supplied top_p must not disable greedy-only paths such
+        # as lossless MTP verification.
+        return self.temperature <= 0.0 or (self.top_k == 1 and self.top_p == 1.0)
 
 
 @dataclass(eq=False)
@@ -178,6 +181,26 @@ class Batch:
     @property
     def padded_size(self) -> int:
         return len(self.padded_reqs)
+
+
+def select_lm_head_rows(
+    hidden: torch.Tensor,
+    batch: Batch,
+    *,
+    select_last: bool = True,
+) -> torch.Tensor:
+    """Apply the ordinary prefill last-token projection policy when requested.
+
+    MTP target verification deliberately uses the prefill model path for a short
+    multi-position chain, but needs logits for every chain position. Its one-row
+    draft calls also run while that wider prefill batch is active. Keeping the
+    policy explicit prevents the surrounding batch's ``width - 1`` last-row index
+    from being applied to a one-row draft tensor.
+    """
+    if select_last and batch.is_prefill:
+        indices = batch.attn_metadata.get_last_indices(batch.size)
+        return hidden[indices].contiguous()
+    return hidden
 
 
 @dataclass

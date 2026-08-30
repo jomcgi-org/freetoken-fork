@@ -103,6 +103,11 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             if config.cache_type == "swa_radix"
             else _naive_swa_num_tokens(config)
         )
+    num_speculative_tokens = 0
+    if getattr(config, "speculative_mtp", "off") == "on":
+        from freetoken.spec_decode import MTP_DRAFT_STEPS
+
+        num_speculative_tokens = MTP_DRAFT_STEPS
     return create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
@@ -111,6 +116,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        num_speculative_tokens=num_speculative_tokens,
     )
 
 
@@ -122,6 +128,7 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    num_speculative_tokens: int = 0,
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -190,6 +197,9 @@ def create_kvcache_pool(
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        ring_capacity = QSAKVCache.ring_capacity_for(
+            spec.index_ratio, num_speculative_tokens
+        )
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -202,6 +212,7 @@ def create_kvcache_pool(
             num_index_layers=spec.num_index_layers,
             index_ratio=spec.index_ratio,
             num_req_slots=num_req_slots,
+            ring_capacity=ring_capacity,
             layer_ids=spec.layer_ids,
         )
 

@@ -1111,7 +1111,9 @@ class Engine:
         batch.input_ids = verify_ids
         snapshot = self._snapshot_verify_state(req)
 
-        logits = self.model.forward()
+        # Verification needs one prediction per chain position. The ordinary
+        # prefill LM-head policy keeps only each request's final row.
+        logits = self.model.forward(select_last=False)
         target = torch.argmax(logits, dim=-1).to(torch.int32)
         accepted, matched = greedy_accept_prefix(drafts, target)
         committed_inputs = matched + 1
@@ -1126,7 +1128,7 @@ class Engine:
                 batch.out_loc = batch.out_loc[:committed_inputs]
             batch.fla_metadata = build_fla_metadata(batch, self.device)
             self.attn_backend.prepare_metadata(batch)
-            self.model.forward()
+            self.model.forward(select_last=False)
             full_hidden = self.model.model._last_hc_hidden
 
         req.cached_len = int(batch.mtp_original_cached_len) + committed_inputs

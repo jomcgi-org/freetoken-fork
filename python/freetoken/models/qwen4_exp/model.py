@@ -457,9 +457,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         for backend in getattr(self, "_ple_disk_backends", ()):
             backend.finish_decode(record_event=record_event)
 
-    def forward(self) -> torch.Tensor:
+    def forward(self, *, select_last: bool = True) -> torch.Tensor:
         batch = get_global_ctx().batch
-        return self.lm_head.forward(self.model.forward(batch.input_ids, batch))
+        return self.lm_head.forward(
+            self.model.forward(batch.input_ids, batch), select_last=select_last
+        )
 
 
 __all__ = ["Qwen4ExpDecoderLayer", "Qwen4ExpForCausalLM", "Qwen4ExpModel", "build_linear_mixer"]
