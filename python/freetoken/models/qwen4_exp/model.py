@@ -240,9 +240,11 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
         for ple in ple_layers:
             ple.ple_embedding.attach_table(
-                PinnedUVATable(table.bank.tensor, float(table.weight_scale))
+                PinnedUVATable(table)
             )
-        return table.bank.nbytes
+        return table.bank.nbytes + (
+            0 if table.scale_bank is None else table.scale_bank.nbytes
+        )
 
     def ple_disk_stats(self, *, reset: bool = False) -> dict:
         """Aggregate mapped PLE prefetch and procfs major-fault counters.

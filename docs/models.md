@@ -69,8 +69,8 @@ layer ids and the available scores.
 
 ### File-backed PLE table
 
-Qwen3.8-Flash-Next defaults to `--ple-backend pinned`, which keeps its 47.7 GiB
-PLE n-gram table in pinned host RAM and preserves the original CUDA graph path.
+Qwen3.8-Flash-Next defaults to `--ple-backend pinned`, which keeps its PLE n-gram
+table in pinned host RAM and preserves the original CUDA graph path.
 `--ple-backend disk` instead maps each PLE safetensors payload read-only, applies
 random-access advice, and page-prefetches the deduplicated union of requested rows
 before copying them through a small pinned staging bank. Disk PLE bytes are not
@@ -84,6 +84,12 @@ startup readback probe fails, use `--ple-backend disk` as the staged fallback. H
 row ids on the GPU, performs no host staging or sampled-token synchronization, and keeps
 CUDA graphs enabled. The reported `ple_major_faults` procfs delta includes host-side HMM
 fault servicing, but procfs does not directly expose GPU-side page residency.
+
+The PLE format is detected from the checkpoint tensors. Supported layouts are FP8 e4m3
+with scalar or per-row scales, INT4 group-16 with fp16 scales, and NVFP4-style e2m1
+group-16 with e4m3 scales plus `weight_scale_2`. Packed 4-bit rows use low-nibble-first
+storage. All three formats support `pinned`, `disk`, and `hmm`; the backend flag does not
+select or override precision.
 
 Disk PLE keeps CUDA graph decode enabled: a pre-replay host hook derives the next
 n-gram row ids from request token history, stages their deduplicated rows, and updates

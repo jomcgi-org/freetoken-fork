@@ -85,16 +85,16 @@ def process_major_faults() -> int | None:
 
 
 class PLETableBackend(Protocol):
-    """Row store for one PLE layer's n-gram embedding table (Qwen3.8: 40M rows x 160, FP8 + one scalar scale).
+    """Row store for one PLE layer's 40M-row by 160-wide n-gram embedding table.
 
     Frozen contract. ``GpuResidentTable`` is the small-table oracle;
     ``PinnedUVATable``, ``HMMMappedTable``, and ``DiskStagedTable`` serve the real
-    47.7 GiB host table. Rows are addressed by the GLOBAL hashed id, i.e. the
+    host table. Rows are addressed by the GLOBAL hashed id, i.e. the
     per-head vocab offset is already added by ``NGramEmbedding``.
 
     ``lookup`` gets ``row_ids [T, num_ngram_heads]`` (int64, device) and returns
-    ``[T, num_ngram_heads * head_dim]`` in ``dtype``, already dequantized (fp8 -> dtype, times the
-    scalar weight_scale). ``out``, when given, is the destination and is returned as-is (CUDA-graph
+    ``[T, num_ngram_heads * head_dim]`` in ``dtype``, already dequantized from the table's
+    detected format. ``out``, when given, is the destination and is returned as-is (CUDA-graph
     decode reuses a fixed buffer).
 
     ``prefetch`` may start the gather early on a side stream (the model issues it before layer 0 and
@@ -108,6 +108,53 @@ class PLETableBackend(Protocol):
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor: ...
 
     def prefetch(self, row_ids: torch.Tensor) -> None: ...
+
+
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def dequantize_ple_rows(
+    data: torch.Tensor,
+    scales: torch.Tensor | None,
+    table_format: str,
+    global_scale: float = 1.0,
+) -> torch.Tensor:
+    """Torch CPU reference dequant for raw PLE rows."""
+    if table_format == "fp8":
+        values = data.to(torch.float32)
+        if scales is not None:
+            if scales.numel() != data.shape[0]:
+                raise ValueError(
+                    f"FP8 PLE rows need one scale per row, got shape {tuple(scales.shape)}"
+                )
+            values.mul_(scales.to(torch.float32).reshape(-1, 1))
+        else:
+            values.mul_(float(global_scale))
+        return values.to(torch.bfloat16)
+    if table_format not in ("int4g16", "e2m1g16"):
+        raise ValueError(f"unsupported PLE table format {table_format!r}")
+    if data.dtype is not torch.uint8 or scales is None:
+        raise ValueError(f"{table_format} PLE rows require uint8 data and group scales")
+    expected_scale_shape = (data.shape[0], data.shape[1] // 8)
+    if scales.shape != expected_scale_shape:
+        raise ValueError(
+            f"{table_format} PLE scales have shape {tuple(scales.shape)}, "
+            f"expected {expected_scale_shape}"
+        )
+    codes = torch.empty(
+        (data.shape[0], data.shape[1] * 2), dtype=torch.uint8, device=data.device
+    )
+    codes[:, 0::2] = data & 0xF
+    codes[:, 1::2] = data >> 4
+    group_scales = scales.to(torch.float32).repeat_interleave(16, dim=1)
+    if table_format == "int4g16":
+        values = (codes.to(torch.float32) - 8.0) * group_scales
+    else:
+        magnitudes = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=data.device)
+        values = magnitudes[(codes & 7).long()]
+        values = torch.where((codes & 8).bool(), -values, values)
+        values.mul_(group_scales).mul_(float(global_scale))
+    return values.to(torch.bfloat16)
 
 
 class GpuResidentTable:
@@ -161,11 +208,10 @@ class ZeroTable:
 class PinnedUVATable:
     """PLE table left in pinned host memory; rows are gathered over UVA by a Triton kernel.
 
-    ``weight`` must be the filled and ``pin()``ed ``HostBank.tensor`` from
-    ``weight.load_ple_table`` (``[num_rows, head_dim]``, fp8-e4m3 or bf16); an unregistered host
-    buffer is not device-addressable and the kernel faults on it. ``scale`` is the checkpoint's
-    scalar ``weight_scale``. Gathers emit bf16 into a staging buffer, one per captured decode size
-    and one growable buffer for everything else.
+    ``weight`` may be a loaded ``PleTable`` or a legacy fp8-e4m3/bf16 host tensor. Every
+    underlying bank must be filled and pinned. An unregistered host buffer is not
+    device-addressable and the kernel faults on it. Gathers emit bf16 into a staging buffer,
+    one per captured decode size and one growable buffer for everything else.
 
     ``prefetch`` runs the gather on a private stream and the next ``lookup`` joins it. ``lookup``
     returns a view of that staging buffer, so the rows must be consumed before the next lookup.
@@ -173,24 +219,38 @@ class PinnedUVATable:
 
     def __init__(
         self,
-        weight: torch.Tensor,
+        weight: torch.Tensor | object,
         scale: float = 1.0,
         *,
         device: torch.device | None = None,
         prefetch: bool = True,
     ) -> None:
-        assert weight.device.type == "cpu" and weight.is_contiguous()
-        assert weight.dtype in (torch.float8_e4m3fn, torch.bfloat16), weight.dtype
+        table = weight if hasattr(weight, "bank") else None
+        raw = table.bank.tensor if table is not None else weight
+        assert isinstance(raw, torch.Tensor)
+        assert raw.device.type == "cpu" and raw.is_contiguous()
+        table_format = getattr(table, "format", None)
+        if table_format is None:
+            assert raw.dtype in (torch.float8_e4m3fn, torch.bfloat16), raw.dtype
+            table_format = "fp8" if raw.dtype == torch.float8_e4m3fn else "bf16"
+        elif table_format == "fp8":
+            assert raw.dtype == torch.float8_e4m3fn, raw.dtype
+        else:
+            assert raw.dtype == torch.uint8, raw.dtype
         from freetoken.kernel.pinned import device_ptr
 
-        self.weight = weight
-        self.scale = float(scale)
-        self.num_rows, self.head_dim = weight.shape
+        self.weight = raw
+        self.scales = getattr(table, "scales", None)
+        self.scale = float(getattr(table, "weight_scale", scale))
+        self.format = table_format
+        self.num_rows = int(raw.shape[0])
+        self.head_dim = int(getattr(table, "head_dim", raw.shape[1]))
         self.dtype = torch.bfloat16
-        self._is_fp8 = weight.dtype == torch.float8_e4m3fn
+        self._is_fp8 = raw.dtype == torch.float8_e4m3fn
         self._device = device or torch.device("cuda", torch.cuda.current_device())
         # WDDM maps registered host memory at a different device address; on Linux/UVA this is data_ptr
-        self._table_ptr = device_ptr(weight)
+        self._table_ptr = device_ptr(raw)
+        self._scale_ptr = 0 if self.scales is None else device_ptr(self.scales)
         self._stream = torch.cuda.Stream(device=self._device) if prefetch else None
         self._staging: torch.Tensor | None = None
         self._graph_staging: dict[int, torch.Tensor] = {}
@@ -222,6 +282,8 @@ class PinnedUVATable:
             dst,
             self.scale,
             self._is_fp8,
+            table_format=None if self.format == "bf16" else self.format,
+            scale_ptr=self._scale_ptr,
         )
 
     def _gather_from_ptr(self, row_ids_ptr: int, num_ids: int, dst: torch.Tensor) -> torch.Tensor:
@@ -236,6 +298,8 @@ class PinnedUVATable:
             dst,
             self.scale,
             self._is_fp8,
+            table_format=None if self.format == "bf16" else self.format,
+            scale_ptr=self._scale_ptr,
         )
 
     def prefetch(self, row_ids: torch.Tensor) -> None:
@@ -324,24 +388,33 @@ class HMMMappedTable(PinnedUVATable):
             not getattr(bank, "_disk", False) for bank in table.banks
         ):
             raise ValueError("HMM PLE requires read-only file-backed shard mappings")
+        if any(not getattr(bank, "_disk", False) for bank in table.scale_banks):
+            raise ValueError("HMM PLE requires read-only file-backed scale mappings")
         self.table = table
         self.weight = None
         self.scale = float(table.weight_scale)
+        self.format = getattr(table, "format", "fp8")
         self.num_rows = int(table.num_rows)
         self.head_dim = int(table.head_dim)
         self.dtype = torch.bfloat16
-        self._is_fp8 = True
+        self._is_fp8 = self.format == "fp8"
         self._device = device
         self._rows_per_shard = int(table.rows_per_shard)
-        self._row_nbytes = self.head_dim * torch.empty(
-            (), dtype=torch.float8_e4m3fn
-        ).element_size()
+        self._row_nbytes = int(table.row_nbytes)
         self._shard_bases_host = tuple(
             int(bank.tensor.data_ptr()) for bank in table.banks
         )
         self._shard_bases = torch.tensor(
             self._shard_bases_host, dtype=torch.int64, device=self._device
         )
+        self._scale_shard_bases_host = tuple(
+            int(bank.tensor.data_ptr()) for bank in table.scale_banks
+        )
+        self._scale_shard_bases = None
+        if self._scale_shard_bases_host:
+            self._scale_shard_bases = torch.tensor(
+                self._scale_shard_bases_host, dtype=torch.int64, device=self._device
+            )
         self._stream = torch.cuda.Stream(device=self._device) if prefetch else None
         self._staging: torch.Tensor | None = None
         self._graph_staging: dict[int, torch.Tensor] = {}
@@ -376,6 +449,8 @@ class HMMMappedTable(PinnedUVATable):
             dst,
             self.scale,
             self._is_fp8,
+            table_format=self.format,
+            scale_shard_bases=self._scale_shard_bases,
         )
 
     def startup_probe(self) -> None:
@@ -397,12 +472,13 @@ class HMMMappedTable(PinnedUVATable):
             got = self.lookup(local_ids).clone()
             torch.cuda.synchronize(self._device)
             cpu_ids = local_ids.cpu().reshape(-1)
-            expected = self.table.banks[0].tensor.view(torch.uint8).index_select(
-                0, cpu_ids
-            ).view(torch.float8_e4m3fn)
-            expected = expected.to(self._device).to(torch.bfloat16)
-            if self.scale != 1.0:
-                expected.mul_(self.scale)
+            data = self.table.banks[0].tensor.index_select(0, cpu_ids)
+            scales = None
+            if self.table.scale_banks:
+                scales = self.table.scale_banks[0].tensor.index_select(0, cpu_ids)
+            expected = dequantize_ple_rows(
+                data, scales, self.format, self.scale
+            ).to(self._device)
             if not torch.equal(got, expected):
                 raise RuntimeError("gathered bytes did not match the CPU mapping")
         except Exception as exc:
@@ -437,20 +513,40 @@ class DiskStagedTable:
         self.head_dim = int(table.head_dim)
         self.dtype = torch.bfloat16
         self.scale = float(table.weight_scale)
+        self.format = getattr(table, "format", "fp8")
         if device is None:
             device = (
                 torch.device("cuda", torch.cuda.current_device())
                 if torch.cuda.is_available() else torch.device("cpu")
             )
         self._device = device
+        data = table.banks[0].tensor
         self._stage_bank = HostBank(
-            (int(stage_capacity_rows), self.head_dim), torch.float8_e4m3fn,
+            (int(stage_capacity_rows), *data.shape[1:]), data.dtype,
         )
+        self._stage_scale_bank = None
+        scale_banks = getattr(table, "scale_banks", ())
+        if scale_banks:
+            source_scales = scale_banks[0].tensor
+            self._stage_scale_bank = HostBank(
+                (int(stage_capacity_rows), *source_scales.shape[1:]),
+                source_scales.dtype,
+            )
         if self._device.type == "cuda":
+            from .weight import PleTable
+
             self._stage_bank.pin()
+            if self._stage_scale_bank is not None:
+                self._stage_scale_bank.pin()
+            stage_table = PleTable(
+                self._stage_bank,
+                table.weight_scale,
+                self.format,
+                self.head_dim,
+                self._stage_scale_bank,
+            )
             self._uva = PinnedUVATable(
-                self._stage_bank.tensor,
-                self.scale,
+                stage_table,
                 device=self._device,
                 prefetch=prefetch,
             )
@@ -464,12 +560,22 @@ class DiskStagedTable:
         self._decode_shape: torch.Size | None = None
         self._replay_done: torch.cuda.Event | None = None
         self._rows_per_shard = int(table.rows_per_shard)
-        self._row_nbytes = self.head_dim * torch.empty(
-            (), dtype=torch.float8_e4m3fn
-        ).element_size()
+        self._row_nbytes = int(getattr(
+            table,
+            "row_nbytes",
+            data.stride(0) * data.element_size(),
+        ))
         self._shard_bases = torch.tensor(
             [bank.tensor.data_ptr() for bank in table.banks], dtype=torch.int64
         )
+        self._scale_row_nbytes = 0
+        self._scale_shard_bases = None
+        if scale_banks:
+            scale_tensor = scale_banks[0].tensor
+            self._scale_row_nbytes = scale_tensor.stride(0) * scale_tensor.element_size()
+            self._scale_shard_bases = torch.tensor(
+                [bank.tensor.data_ptr() for bank in scale_banks], dtype=torch.int64
+            )
         self._has_disk_banks = any(getattr(bank, "_disk", False) for bank in table.banks)
         self._iov_max = max(1, int(os.sysconf("SC_IOV_MAX")))
         self._process_vm_readv = _PROCESS_VM_READV
@@ -495,6 +601,10 @@ class DiskStagedTable:
             # exactly struct iovec on the supported 64-bit serving platforms.
             self._remote_iov = torch.empty((scratch_rows, 2), dtype=torch.int64)
             self._remote_iov[:, 1].fill_(self._row_nbytes)
+            self._scale_remote_iov = None
+            if self._scale_row_nbytes:
+                self._scale_remote_iov = torch.empty((scratch_rows, 2), dtype=torch.int64)
+                self._scale_remote_iov[:, 1].fill_(self._scale_row_nbytes)
             self._page_candidates = torch.empty(scratch_rows * 2, dtype=torch.int64)
             self._page_sorted = torch.empty(scratch_rows * 2, dtype=torch.int64)
             self._page_order = torch.empty(scratch_rows * 2, dtype=torch.int64)
@@ -540,6 +650,9 @@ class DiskStagedTable:
 
         staged = self._stage_bank.tensor[: unique.numel()]
         staged_bytes = staged.view(torch.uint8)
+        staged_scales = None
+        if self._stage_scale_bank is not None:
+            staged_scales = self._stage_scale_bank.tensor[: unique.numel()]
         rows_per_shard = int(self.table.rows_per_shard)
         pages = 0
         shard_ids = torch.div(unique, rows_per_shard, rounding_mode="floor")
@@ -551,6 +664,11 @@ class DiskStagedTable:
             pages += bank.prefetch_rows(local.tolist())
             source = bank.tensor.view(torch.uint8).index_select(0, local)
             staged_bytes.index_copy_(0, positions, source)
+            if staged_scales is not None:
+                scale_bank = self.table.scale_banks[shard]
+                pages += scale_bank.prefetch_rows(local.tolist())
+                source_scales = scale_bank.tensor.index_select(0, local)
+                staged_scales.index_copy_(0, positions, source_scales)
         self._prefetch_pages += pages
         return staged, inverse.view(shape)
 
@@ -560,16 +678,19 @@ class DiskStagedTable:
         """Compatibility entry point for the prefill slow path."""
         return self._stage_rows_reference(row_ids)
 
-    def _prefetch_decode_pages(self, addresses: torch.Tensor) -> int:
+    def _prefetch_decode_pages(
+        self, addresses: torch.Tensor, row_nbytes: int | None = None
+    ) -> int:
         """Deduplicate row pages with fixed tensor buffers, then issue WILLNEED."""
         if not self._has_disk_banks or not addresses.numel() or _MADVISE is None:
             return 0
         count = addresses.numel()
+        row_nbytes = self._row_nbytes if row_nbytes is None else row_nbytes
         page_size = mmap.PAGESIZE
         candidates = self._page_candidates[: count * 2]
         candidates[:count].copy_(addresses)
         candidates[:count].floor_divide_(page_size).mul_(page_size)
-        candidates[count:].copy_(addresses).add_(self._row_nbytes - 1)
+        candidates[count:].copy_(addresses).add_(row_nbytes - 1)
         candidates[count:].floor_divide_(page_size).mul_(page_size)
         torch.sort(
             candidates,
@@ -606,27 +727,37 @@ class DiskStagedTable:
             start = previous = current
         return page_count
 
-    def _copy_decode_rows(self, addresses: torch.Tensor, row_count: int) -> None:
+    def _copy_decode_rows(
+        self,
+        addresses: torch.Tensor,
+        row_count: int,
+        *,
+        dst: int | None = None,
+        row_nbytes: int | None = None,
+        remote_iov: torch.Tensor | None = None,
+    ) -> None:
         """Copy discontiguous source rows into the fixed contiguous staging bank."""
-        dst = self._stage_bank.tensor.data_ptr()
+        dst = self._stage_bank.tensor.data_ptr() if dst is None else dst
+        row_nbytes = self._row_nbytes if row_nbytes is None else row_nbytes
+        remote_iov = self._remote_iov if remote_iov is None else remote_iov
         if self._process_vm_readv is None:
             for index in range(row_count):
                 ctypes.memmove(
-                    dst + index * self._row_nbytes,
+                    dst + index * row_nbytes,
                     int(addresses[index]),
-                    self._row_nbytes,
+                    row_nbytes,
                 )
             return
 
         copied_rows = 0
         while copied_rows < row_count:
             chunk_rows = min(self._iov_max, row_count - copied_rows)
-            chunk_bytes = chunk_rows * self._row_nbytes
+            chunk_bytes = chunk_rows * row_nbytes
             local = _IOVec(
-                ctypes.c_void_p(dst + copied_rows * self._row_nbytes), chunk_bytes
+                ctypes.c_void_p(dst + copied_rows * row_nbytes), chunk_bytes
             )
             remote = ctypes.cast(
-                self._remote_iov.data_ptr()
+                remote_iov.data_ptr()
                 + copied_rows * ctypes.sizeof(_IOVec),
                 ctypes.POINTER(_IOVec),
             )
@@ -639,9 +770,9 @@ class DiskStagedTable:
                 self._process_vm_readv = None
                 for index in range(row_count):
                     ctypes.memmove(
-                        dst + index * self._row_nbytes,
+                        dst + index * row_nbytes,
                         int(addresses[index]),
-                        self._row_nbytes,
+                        row_nbytes,
                     )
                 return
             copied_rows += chunk_rows
@@ -705,6 +836,24 @@ class DiskStagedTable:
         addresses.add_(local_rows, alpha=self._row_nbytes)
         self._prefetch_pages += self._prefetch_decode_pages(addresses)
         self._copy_decode_rows(addresses, unique_count)
+        if self._scale_shard_bases is not None:
+            assert self._scale_remote_iov is not None
+            assert self._stage_scale_bank is not None
+            scale_addresses = self._scale_remote_iov[:unique_count, 0]
+            torch.index_select(
+                self._scale_shard_bases, 0, shard_ids, out=scale_addresses
+            )
+            scale_addresses.add_(local_rows, alpha=self._scale_row_nbytes)
+            self._prefetch_pages += self._prefetch_decode_pages(
+                scale_addresses, self._scale_row_nbytes
+            )
+            self._copy_decode_rows(
+                scale_addresses,
+                unique_count,
+                dst=self._stage_scale_bank.tensor.data_ptr(),
+                row_nbytes=self._scale_row_nbytes,
+                remote_iov=self._scale_remote_iov,
+            )
         return unique_count
 
     def _prepare(self, row_ids: torch.Tensor) -> torch.Tensor:
@@ -767,11 +916,12 @@ class DiskStagedTable:
                 return self._uva.lookup_from_ptr(self._local_ids_ptr, self._decode_shape, out)
             local_ids = self.local_ids[: self._decode_shape[0]]
             staged = self._stage_bank.tensor
-            rows = staged.view(torch.uint8).index_select(
-                0, local_ids.reshape(-1).long()
-            ).view(torch.float8_e4m3fn).to(torch.bfloat16)
-            if self.scale != 1.0:
-                rows.mul_(self.scale)
+            flat_ids = local_ids.reshape(-1).long()
+            data = staged.index_select(0, flat_ids)
+            scales = None
+            if self._stage_scale_bank is not None:
+                scales = self._stage_scale_bank.tensor.index_select(0, flat_ids)
+            rows = dequantize_ple_rows(data, scales, self.format, self.scale)
             rows = rows.view(*self._decode_shape[:-1], -1)
             if out is None:
                 return rows
@@ -785,11 +935,12 @@ class DiskStagedTable:
             return self._uva.lookup(local_ids, out)
 
         staged = self._stage_bank.tensor
-        rows = staged.view(torch.uint8).index_select(
-            0, local_ids.reshape(-1)
-        ).view(torch.float8_e4m3fn).to(torch.bfloat16)
-        if self.scale != 1.0:
-            rows.mul_(self.scale)
+        flat_ids = local_ids.reshape(-1)
+        data = staged.index_select(0, flat_ids)
+        scales = None
+        if self._stage_scale_bank is not None:
+            scales = self._stage_scale_bank.tensor.index_select(0, flat_ids)
+        rows = dequantize_ple_rows(data, scales, self.format, self.scale)
         rows = rows.view(*local_ids.shape[:-1], -1)
         if out is None:
             return rows
@@ -1514,6 +1665,7 @@ __all__ = [
     "PLETableBackend",
     "PinnedUVATable",
     "build_ple_metadata",
+    "dequantize_ple_rows",
     "derive_decode_row_ids_host",
     "derive_ngram_hash_constants",
     "hmm_row_address",

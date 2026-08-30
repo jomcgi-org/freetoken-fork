@@ -34,6 +34,7 @@ QH, KVH, AHD = 4, 2, 16  # QSA q / kv heads, head dim
 IHD = 8  # indexer head dim
 E, I = 3, 6  # routed experts, moe_intermediate_size
 NGRAM_DIM, NGRAM_ROWS, NGRAM_SHARDS = 4, 7, 4
+QUANT_NGRAM_DIM = 32
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -145,6 +146,52 @@ def _ngram_table() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     scale = torch.tensor([0.125], dtype=torch.bfloat16)
     shards[f"{prefix}.weight_scale"] = scale
     return shards, scale
+
+
+def _quantized_ple_checkpoint(folder, table_format: str):
+    """Write published-layout sidecar shards and return a torch dequant reference."""
+    generator = torch.Generator().manual_seed(31)
+    references = []
+    for shard in range(NGRAM_SHARDS):
+        if table_format == "fp8":
+            data = (
+                torch.randn(NGRAM_ROWS, QUANT_NGRAM_DIM, generator=generator) * 0.5
+            ).to(torch.float8_e4m3fn)
+            scales = torch.rand(NGRAM_ROWS, generator=generator, dtype=torch.float32) + 0.25
+            tensors = {"weight_fp8": data, "weight_scale": scales}
+            reference = data.float() * scales[:, None]
+        else:
+            codes = torch.randint(
+                0, 16, (NGRAM_ROWS, QUANT_NGRAM_DIM), generator=generator, dtype=torch.uint8
+            )
+            data = codes[:, 0::2] | (codes[:, 1::2] << 4)
+            if table_format == "int4g16":
+                scales = torch.rand(
+                    NGRAM_ROWS, QUANT_NGRAM_DIM // 16, generator=generator,
+                    dtype=torch.float16,
+                )
+                tensors = {"weight_i4": data, "weight_scale": scales}
+                reference = (codes.float() - 8) * scales.float().repeat_interleave(16, 1)
+            else:
+                scales = (
+                    torch.rand(
+                        NGRAM_ROWS, QUANT_NGRAM_DIM // 16, generator=generator
+                    ) * 0.5 + 0.25
+                ).to(torch.float8_e4m3fn)
+                global_scale = torch.tensor(0.75, dtype=torch.float32)
+                tensors = {
+                    "weight_e2m1": data,
+                    "weight_scale": scales,
+                    "weight_scale_2": global_scale,
+                }
+                lut = torch.tensor(
+                    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
+                )
+                reference = lut[codes.long()] * scales.float().repeat_interleave(16, 1)
+                reference *= global_scale
+        save_file(tensors, str(folder / f"shard_{shard}.safetensors"))
+        references.append(reference.to(torch.bfloat16))
+    return torch.cat(references)
 
 
 @pytest.fixture(scope="module")
@@ -319,6 +366,59 @@ def test_load_ple_table_concatenates_shards_in_index_order(checkpoint):
                            raw[f"{prefix}.shard_{shard}.weight"].view(torch.uint8))
     assert table.weight_scale.dtype is torch.bfloat16
     assert float(table.weight_scale) == 0.125
+
+
+@pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
+def test_quantized_ple_layout_detection_and_cpu_reference(tmp_path, table_format):
+    from freetoken.models.qwen4_exp.ple import dequantize_ple_rows
+
+    reference = _quantized_ple_checkpoint(tmp_path, table_format)
+    args = SimpleNamespace(
+        split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=QUANT_NGRAM_DIM
+    )
+    table = load_ple_table(str(tmp_path), args, pin=False)
+
+    assert table.format == table_format
+    assert table.num_rows == NGRAM_SHARDS * NGRAM_ROWS
+    assert table.head_dim == QUANT_NGRAM_DIM
+    expected_row_nbytes = QUANT_NGRAM_DIM if table_format == "fp8" else QUANT_NGRAM_DIM // 2
+    assert table.row_nbytes == expected_row_nbytes
+    assert table.scales is not None
+    got = dequantize_ple_rows(
+        table.tensor, table.scales, table.format, float(table.weight_scale)
+    )
+    assert torch.equal(got, reference)
+
+
+@pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
+def test_quantized_ple_staging_uses_packed_stride_and_matches_reference(
+    tmp_path, table_format
+):
+    from freetoken.models.qwen4_exp.ple import DiskStagedTable
+
+    reference = _quantized_ple_checkpoint(tmp_path, table_format)
+    args = SimpleNamespace(
+        split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=QUANT_NGRAM_DIM
+    )
+    table = load_ple_table(str(tmp_path), args, backend="disk")
+    backend = DiskStagedTable(
+        table,
+        stage_capacity_rows=8,
+        device=torch.device("cpu"),
+        prefetch=False,
+        max_decode_batch_size=2,
+        rows_per_token=3,
+    )
+    ids = torch.tensor([[0, 9, 0], [table.num_rows - 1, 9, 3]])
+
+    assert backend._row_nbytes == table.row_nbytes
+    if table_format != "fp8":
+        assert backend._row_nbytes == QUANT_NGRAM_DIM // 2
+    backend.prepare_decode(ids)
+    got = backend.lookup(torch.zeros_like(ids))
+    want = reference.index_select(0, ids.reshape(-1)).view(ids.shape[0], -1)
+    assert torch.equal(got, want)
+    backend.finish_decode(record_event=False)
 
 
 def test_disk_ple_mapping_matches_pinned_rows(checkpoint):
@@ -538,6 +638,50 @@ def test_disk_ple_decode_fast_path_microbenchmark():
         f"PLE staging micro-benchmark: before={reference_rate:.1f} steps/sec, "
         f"after={fast_rate:.1f} steps/sec"
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
+def test_quantized_ple_pinned_kernel_matches_torch(tmp_path, table_format):
+    from freetoken.models.qwen4_exp.ple import (
+        DiskStagedTable,
+        PinnedUVATable,
+        dequantize_ple_rows,
+    )
+
+    _quantized_ple_checkpoint(tmp_path, table_format)
+    args = SimpleNamespace(
+        split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=QUANT_NGRAM_DIM
+    )
+    table = load_ple_table(str(tmp_path), args, pin=False)
+    table.bank.pin()
+    assert table.scale_bank is not None
+    table.scale_bank.pin()
+    backend = PinnedUVATable(table, prefetch=False)
+    ids = torch.tensor([[0, 9, 0], [table.num_rows - 1, 9, 3]], device="cuda")
+
+    got = backend.lookup(ids).cpu()
+    want = dequantize_ple_rows(
+        table.tensor.index_select(0, ids.cpu().reshape(-1)),
+        table.scales.index_select(0, ids.cpu().reshape(-1)),
+        table.format,
+        float(table.weight_scale),
+    ).view_as(got)
+    assert torch.equal(got, want)
+
+    disk = load_ple_table(str(tmp_path), args, backend="disk")
+    staged = DiskStagedTable(
+        disk,
+        stage_capacity_rows=8,
+        device=torch.device("cuda"),
+        prefetch=False,
+        max_decode_batch_size=2,
+        rows_per_token=3,
+    )
+    staged.prepare_decode(ids.cpu())
+    staged_got = staged.lookup(torch.zeros_like(ids)).cpu()
+    staged.finish_decode(record_event=False)
+    assert torch.equal(staged_got, want)
 
 
 @requires_cuda
