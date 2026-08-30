@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -64,8 +65,12 @@ class EngineConfig:
     # falls back to a fixed cap of 1 without a usable `ft bench bw` profile.
     moe_hybrid_max_fetch: int = -1
     # Qwen3.8 Flash-Next PLE table storage. "pinned" is the original full-bank UVA
-    # path; "disk" stages mapped rows; "hmm" gathers from mapped shards directly.
+    # path; "cached" keeps hot mapped rows in a bounded pinned bank; "disk" stages
+    # mapped rows; "hmm" gathers from mapped shards directly.
     ple_backend: str = "pinned"
+    ple_cache_gib: float = 8.0
+    ple_cache_warm: str | None = None
+    ple_cache_profile_out: str | None = None
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -94,11 +99,13 @@ class EngineConfig:
     num_token_override: int | None = None
 
     def __post_init__(self) -> None:
-        if self.ple_backend not in ("pinned", "disk", "hmm"):
+        if self.ple_backend not in ("pinned", "cached", "disk", "hmm"):
             raise ValueError(
-                "--ple-backend must be 'pinned', 'disk', or 'hmm', got "
+                "--ple-backend must be 'pinned', 'cached', 'disk', or 'hmm', got "
                 f"{self.ple_backend!r}"
             )
+        if not math.isfinite(float(self.ple_cache_gib)) or self.ple_cache_gib <= 0:
+            raise ValueError("--ple-cache-gib must be a finite positive number")
         if self.moe_disk_prefill not in ("cpu", "copy"):
             raise ValueError(
                 "--moe-disk-prefill must be 'cpu' or 'copy', got "

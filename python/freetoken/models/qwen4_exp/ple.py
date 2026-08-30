@@ -12,17 +12,20 @@ HF reference: ``Qwen4ExpTextNGramEmbedding`` (modeling_qwen4_exp.py:1018) and
     R += D                                       # before the attention hyper-connection mix
 
 The table is the 47.7 GiB FP8 n-gram store. ``PinnedUVATable`` gathers from a fully pinned host
-bank, ``HMMMappedTable`` gathers directly from read-only file mappings, and
-``DiskStagedTable`` copies requested mapped rows through a small pinned bank. ``GpuResidentTable``
-is the small-table oracle the host backends are diffed against.
+bank, ``CachedTable`` keeps a bounded pinned hot-row bank, ``HMMMappedTable`` gathers directly
+from read-only file mappings, and ``DiskStagedTable`` copies requested mapped rows through a
+small pinned bank. ``GpuResidentTable`` is the small-table oracle the host backends are diffed
+against.
 """
 
 from __future__ import annotations
 
 import ctypes
+import json
 import math
 import mmap
 import os
+from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
 
@@ -30,6 +33,7 @@ import torch
 import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, LinearReplicated
+from freetoken.utils import init_logger
 
 from .config import PLE_CONV_STATE, PLE_NGRAM_STATE
 from .hc import GroupedPlusOneRMSNorm
@@ -46,6 +50,9 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
+_PLE_CACHE_SLAB_ROWS = 1 << 16
+
+logger = init_logger(__name__)
 
 
 class _IOVec(ctypes.Structure):
@@ -88,7 +95,7 @@ class PLETableBackend(Protocol):
     """Row store for one PLE layer's 40M-row by 160-wide n-gram embedding table.
 
     Frozen contract. ``GpuResidentTable`` is the small-table oracle;
-    ``PinnedUVATable``, ``HMMMappedTable``, and ``DiskStagedTable`` serve the real
+    ``PinnedUVATable``, ``CachedTable``, ``HMMMappedTable``, and ``DiskStagedTable`` serve the real
     host table. Rows are addressed by the GLOBAL hashed id, i.e. the
     per-head vocab offset is already added by ``NGramEmbedding``.
 
@@ -485,6 +492,174 @@ class HMMMappedTable(PinnedUVATable):
             raise RuntimeError(message) from exc
 
 
+def ple_packed_row_nbytes(table) -> int:
+    """Bytes held in one cache slot, including any per-row scale payload."""
+    row_nbytes = int(table.row_nbytes)
+    scale_banks = getattr(table, "scale_banks", ())
+    if scale_banks:
+        scale = scale_banks[0].tensor
+        row_nbytes += scale.stride(0) * scale.element_size()
+    if row_nbytes < 1:
+        raise ValueError("PLE packed row bytes must be positive")
+    return row_nbytes
+
+
+def ple_cache_capacity_rows(cache_gib: float, table) -> int:
+    """Convert a row-bank GiB budget to packed slots without exceeding the table."""
+    budget = float(cache_gib)
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("--ple-cache-gib must be a finite positive number")
+    return min(int(table.num_rows), int(budget * (1 << 30)) // ple_packed_row_nbytes(table))
+
+
+@dataclass(frozen=True)
+class CacheResolution:
+    slot_ids: torch.Tensor
+    installed_rows: torch.Tensor
+    installed_slots: torch.Tensor
+    hits: int
+    misses: int
+    evictions: int
+
+
+class ClockSlotAllocator:
+    """Dense row-to-slot indirection with CLOCK eviction and batch protection.
+
+    Rows required by the current batch are protected while its misses are installed,
+    so a union no larger than the cache always remains fully addressable.
+    """
+
+    def __init__(self, num_rows: int, capacity: int) -> None:
+        if num_rows < 1 or capacity < 1 or capacity > num_rows:
+            raise ValueError("PLE cache capacity must be in [1, num_rows]")
+        self.num_rows = int(num_rows)
+        self.capacity = int(capacity)
+        self.row_to_slot = torch.full((num_rows,), -1, dtype=torch.int32)
+        self.slot_to_row = torch.full((capacity,), -1, dtype=torch.int64)
+        self.referenced = torch.zeros(capacity, dtype=torch.bool)
+        self._hand = 0
+        self._size = 0
+
+    def _victim(self, protected: torch.Tensor) -> int:
+        if self._size < self.capacity:
+            slot = self._size
+            self._size += 1
+            return slot
+        examined = 0
+        while examined < self.capacity * 2:
+            slot = self._hand
+            self._hand = (self._hand + 1) % self.capacity
+            examined += 1
+            if bool(protected[slot]):
+                continue
+            if bool(self.referenced[slot]):
+                self.referenced[slot] = False
+                continue
+            return slot
+        # Every unprotected row may have received a second chance. A final pass finds
+        # the first one without disturbing a row used by this batch.
+        for _ in range(self.capacity):
+            slot = self._hand
+            self._hand = (self._hand + 1) % self.capacity
+            if not bool(protected[slot]):
+                return slot
+        raise RuntimeError("PLE cache batch protects more rows than its capacity")
+
+    def resolve(self, row_ids: torch.Tensor | Sequence[int]) -> CacheResolution:
+        ids = torch.as_tensor(row_ids, dtype=torch.int64, device="cpu")
+        shape = ids.shape
+        flat = ids.reshape(-1)
+        if not flat.numel():
+            empty = torch.empty(0, dtype=torch.int64)
+            return CacheResolution(ids.to(torch.int32), empty, empty, 0, 0, 0)
+        lo, hi = int(flat.min()), int(flat.max())
+        if lo < 0 or hi >= self.num_rows:
+            raise IndexError(
+                f"PLE row ids must be in [0, {self.num_rows}), got [{lo}, {hi}]"
+            )
+        if torch.unique(flat).numel() > self.capacity:
+            raise ValueError(
+                f"PLE row union exceeds cache capacity {self.capacity}"
+            )
+
+        before = self.row_to_slot.index_select(0, flat)
+        hit_mask = before >= 0
+        hits = int(hit_mask.sum())
+        misses = flat.numel() - hits
+        protected = torch.zeros(self.capacity, dtype=torch.bool)
+        if hits:
+            hit_slots = before[hit_mask].long()
+            protected[hit_slots] = True
+            self.referenced[hit_slots] = True
+
+        missing_rows = torch.unique(flat[~hit_mask], sorted=True)
+        installed_slots = torch.empty(missing_rows.numel(), dtype=torch.int64)
+        evictions = 0
+        for index, row in enumerate(missing_rows.tolist()):
+            slot = self._victim(protected)
+            old = int(self.slot_to_row[slot])
+            if old >= 0:
+                self.row_to_slot[old] = -1
+                evictions += 1
+            self.slot_to_row[slot] = row
+            self.row_to_slot[row] = slot
+            self.referenced[slot] = True
+            protected[slot] = True
+            installed_slots[index] = slot
+
+        slots = self.row_to_slot.index_select(0, flat).view(shape)
+        if bool((slots < 0).any()):
+            raise RuntimeError("PLE cache failed to preserve the current row union")
+        return CacheResolution(
+            slots,
+            missing_rows,
+            installed_slots,
+            hits,
+            misses,
+            evictions,
+        )
+
+
+def load_ple_row_profile(path: str, num_rows: int) -> list[int]:
+    """Read a JSON row-frequency object, warning and returning no warm rows on error."""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("top-level JSON value must be an object")
+        frequencies: list[tuple[int, float]] = []
+        for raw_id, raw_count in raw.items():
+            if not isinstance(raw_id, str) or not raw_id.isdecimal():
+                raise ValueError(f"invalid row id {raw_id!r}")
+            row_id = int(raw_id)
+            if str(row_id) != raw_id or not 0 <= row_id < num_rows:
+                raise ValueError(f"row id {raw_id!r} is outside [0, {num_rows})")
+            if isinstance(raw_count, bool) or not isinstance(raw_count, (int, float)):
+                raise ValueError(f"frequency for row {row_id} must be finite and non-negative")
+            count = float(raw_count)
+            if not math.isfinite(count) or count < 0:
+                raise ValueError(f"frequency for row {row_id} must be finite and non-negative")
+            frequencies.append((row_id, count))
+        frequencies.sort(key=lambda item: (-item[1], item[0]))
+        return [row_id for row_id, _count in frequencies]
+    except (OSError, OverflowError, TypeError, ValueError) as exc:
+        logger.warning_rank0(
+            f"--ple-cache-warm {path!r} is unusable: {exc}; starting with a cold cache"
+        )
+        return []
+
+
+def write_ple_row_profile(path: str, counts: Counter[int]) -> None:
+    """Atomically write the cumulative row-frequency profile used by cache warmup."""
+    expanded = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(os.path.abspath(expanded)) or ".", exist_ok=True)
+    tmp = f"{expanded}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({str(row): count for row, count in sorted(counts.items())}, f)
+        f.write("\n")
+    os.replace(tmp, expanded)
+
+
 class DiskStagedTable:
     """Read PLE rows from file mappings through a fixed pinned staging bank.
 
@@ -668,7 +843,13 @@ class DiskStagedTable:
                 scale_bank = self.table.scale_banks[shard]
                 pages += scale_bank.prefetch_rows(local.tolist())
                 source_scales = scale_bank.tensor.index_select(0, local)
-                staged_scales.index_copy_(0, positions, source_scales)
+                staged_scale_bytes = staged_scales.view(torch.uint8).reshape(
+                    staged_scales.shape[0], -1
+                )
+                source_scale_bytes = source_scales.view(torch.uint8).reshape(
+                    source_scales.shape[0], -1
+                )
+                staged_scale_bytes.index_copy_(0, positions, source_scale_bytes)
         self._prefetch_pages += pages
         return staged, inverse.view(shape)
 
@@ -946,6 +1127,402 @@ class DiskStagedTable:
             return rows
         out.copy_(rows)
         return out
+
+
+class CachedTable:
+    """Pinned hot-row cache backed by read-only PLE shard mappings.
+
+    The cache bank is allocated as fixed row-group slabs. CLOCK metadata and the
+    dense global row-to-slot map stay on the host. Decode writes resolved int32
+    slot ids into one fixed pinned buffer, and a captured graph gathers only from
+    the pinned slabs at stable addresses. Disk reads occur only for cache misses.
+    """
+
+    def __init__(
+        self,
+        table,
+        capacity_rows: int,
+        source_capacity_rows: int,
+        *,
+        device: torch.device | None = None,
+        prefetch: bool = True,
+        max_decode_batch_size: int,
+        rows_per_token: int,
+        slab_rows: int = _PLE_CACHE_SLAB_ROWS,
+        collect_profile: bool = False,
+    ) -> None:
+        from freetoken.moe.host_banks import HostBank
+
+        capacity_rows = int(capacity_rows)
+        if capacity_rows < 1 or capacity_rows > int(table.num_rows):
+            raise ValueError("PLE cache capacity must be in [1, table.num_rows]")
+        if source_capacity_rows < 1 or max_decode_batch_size < 1 or rows_per_token < 1:
+            raise ValueError("PLE cache staging and decode sizes must be positive")
+        if slab_rows < 1:
+            raise ValueError("PLE cache slab size must be positive")
+        if device is None:
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available() else torch.device("cpu")
+            )
+
+        self.table = table
+        self.num_rows = int(table.num_rows)
+        self.head_dim = int(table.head_dim)
+        self.dtype = torch.bfloat16
+        self.scale = float(table.weight_scale)
+        self.format = getattr(table, "format", "fp8")
+        self.capacity = capacity_rows
+        self._device = device
+        self._slab_rows = min(int(slab_rows), capacity_rows)
+        self._allocator = ClockSlotAllocator(self.num_rows, capacity_rows)
+        self._profile_counts: Counter[int] | None = Counter() if collect_profile else None
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._installed_rows = 0
+        self._overflow_fallbacks = 0
+        self._overflow_logged = False
+
+        data = table.banks[0].tensor
+        scale_banks = getattr(table, "scale_banks", ())
+        scale = None if not scale_banks else scale_banks[0].tensor
+        self._data_slabs = []
+        self._scale_slabs = []
+        for start in range(0, capacity_rows, self._slab_rows):
+            rows = min(self._slab_rows, capacity_rows - start)
+            bank = HostBank((rows, *data.shape[1:]), data.dtype)
+            bank.tensor.zero_()
+            self._data_slabs.append(bank)
+            if scale is not None:
+                scale_bank = HostBank((rows, *scale.shape[1:]), scale.dtype)
+                scale_bank.tensor.zero_()
+                self._scale_slabs.append(scale_bank)
+
+        self._local_ids_bank = HostBank(
+            (int(max_decode_batch_size), int(rows_per_token)), torch.int32
+        )
+        self._local_ids_bank.tensor.zero_()
+        self._local_ids_ptr: int | None = None
+        self._slab_bases: torch.Tensor | None = None
+        self._scale_slab_bases: torch.Tensor | None = None
+        if self._device.type == "cuda":
+            from freetoken.kernel.pinned import device_ptr
+
+            for bank in (*self._data_slabs, *self._scale_slabs, self._local_ids_bank):
+                bank.pin()
+            max_slabs = math.ceil(self.num_rows / self._slab_rows)
+            bases = torch.zeros(max_slabs, dtype=torch.int64, device=self._device)
+            bases[: len(self._data_slabs)] = torch.tensor(
+                [device_ptr(bank.tensor) for bank in self._data_slabs],
+                dtype=torch.int64,
+                device=self._device,
+            )
+            self._slab_bases = bases
+            if self._scale_slabs:
+                scale_bases = torch.zeros(max_slabs, dtype=torch.int64, device=self._device)
+                scale_bases[: len(self._scale_slabs)] = torch.tensor(
+                    [device_ptr(bank.tensor) for bank in self._scale_slabs],
+                    dtype=torch.int64,
+                    device=self._device,
+                )
+                self._scale_slab_bases = scale_bases
+            self._local_ids_ptr = device_ptr(self._local_ids_bank.tensor)
+
+        # One staged reader supplies bulk miss installation and the explicit prefill
+        # overflow path. It never participates in captured decode.
+        self._reader = DiskStagedTable(
+            table,
+            int(source_capacity_rows),
+            device=self._device,
+            prefetch=prefetch,
+        )
+        self._decode_shape: torch.Size | None = None
+        self._replay_done: torch.cuda.Event | None = None
+        self._pending: tuple[str, torch.Tensor, torch.Tensor | None, torch.Tensor | None] | None = None
+        self._stream = (
+            torch.cuda.Stream(device=self._device)
+            if prefetch and self._device.type == "cuda" else None
+        )
+        self._staging: torch.Tensor | None = None
+        self._graph_staging: dict[int, torch.Tensor] = {}
+
+    @property
+    def row_to_slot(self) -> torch.Tensor:
+        return self._allocator.row_to_slot
+
+    @property
+    def local_ids(self) -> torch.Tensor:
+        return self._local_ids_bank.tensor
+
+    @property
+    def cache_nbytes(self) -> int:
+        return sum(bank.nbytes for bank in (*self._data_slabs, *self._scale_slabs))
+
+    @property
+    def prefetch_pages(self) -> int:
+        return self._reader.prefetch_pages
+
+    @property
+    def overflow_fallbacks(self) -> int:
+        return self._overflow_fallbacks
+
+    def profile_counts(self) -> Counter[int]:
+        return Counter() if self._profile_counts is None else self._profile_counts.copy()
+
+    def cache_stats(self) -> dict[str, int | float]:
+        accesses = self._hits + self._misses
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "evictions": self._evictions,
+            "installed_rows": self._installed_rows,
+            "hit_rate": self._hits / accesses if accesses else 0.0,
+            "overflow_fallbacks": self._overflow_fallbacks,
+        }
+
+    def reset_stats(self) -> None:
+        self._reader.reset_stats()
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._installed_rows = 0
+        self._overflow_fallbacks = 0
+
+    def _record_profile(self, ids: torch.Tensor) -> None:
+        if self._profile_counts is None or not ids.numel():
+            return
+        unique, counts = torch.unique(ids.reshape(-1), return_counts=True)
+        self._profile_counts.update(
+            {int(row): int(count) for row, count in zip(unique, counts)}
+        )
+
+    def _stage(self, rows: int) -> torch.Tensor:
+        if torch.cuda.is_current_stream_capturing():
+            buf = self._graph_staging.get(rows)
+            if buf is None:
+                buf = torch.empty((rows, self.head_dim), dtype=self.dtype, device=self._device)
+                self._graph_staging[rows] = buf
+            return buf
+        if self._staging is None or self._staging.shape[0] < rows:
+            self._staging = torch.empty(
+                (rows, self.head_dim), dtype=self.dtype, device=self._device
+            )
+        return self._staging[:rows]
+
+    def _gather_device(self, slot_ids: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.triton.ple import ple_gather_rows_sharded
+
+        assert self._slab_bases is not None
+        return ple_gather_rows_sharded(
+            self._slab_bases,
+            self._slab_rows,
+            self.capacity,
+            self.head_dim,
+            slot_ids.reshape(-1),
+            dst,
+            self.scale,
+            self.format == "fp8",
+            table_format=self.format,
+            scale_shard_bases=self._scale_slab_bases,
+        )
+
+    def _gather_device_from_ptr(self, shape, out: torch.Tensor | None) -> torch.Tensor:
+        from freetoken.kernel.triton.ple import ple_gather_rows_sharded_from_ptr
+
+        assert self._slab_bases is not None and self._local_ids_ptr is not None
+        count = math.prod(shape)
+        rows = ple_gather_rows_sharded_from_ptr(
+            self._slab_bases,
+            self._slab_rows,
+            self.capacity,
+            self.head_dim,
+            self._local_ids_ptr,
+            count,
+            self._stage(count),
+            self.scale,
+            self.format == "fp8",
+            table_format=self.format,
+            scale_shard_bases=self._scale_slab_bases,
+        ).view(*shape[:-1], shape[-1] * self.head_dim)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+    def _gather_cpu(self, slot_ids: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
+        flat = slot_ids.reshape(-1).long()
+        data_shape = self._data_slabs[0].tensor.shape[1:]
+        data = torch.empty((flat.numel(), *data_shape), dtype=self._data_slabs[0].tensor.dtype)
+        scales = None
+        if self._scale_slabs:
+            scale_shape = self._scale_slabs[0].tensor.shape[1:]
+            scales = torch.empty(
+                (flat.numel(), *scale_shape), dtype=self._scale_slabs[0].tensor.dtype
+            )
+        slab_ids = torch.div(flat, self._slab_rows, rounding_mode="floor")
+        local_ids = torch.remainder(flat, self._slab_rows)
+        for slab_id in torch.unique(slab_ids).tolist():
+            positions = (slab_ids == slab_id).nonzero().reshape(-1)
+            local = local_ids.index_select(0, positions)
+            selected_data = self._data_slabs[slab_id].tensor.index_select(0, local)
+            data.view(torch.uint8).reshape(flat.numel(), -1).index_copy_(
+                0, positions, selected_data.view(torch.uint8).reshape(local.numel(), -1)
+            )
+            if scales is not None:
+                selected_scales = self._scale_slabs[slab_id].tensor.index_select(0, local)
+                scales.view(torch.uint8).reshape(flat.numel(), -1).index_copy_(
+                    0,
+                    positions,
+                    selected_scales.view(torch.uint8).reshape(local.numel(), -1),
+                )
+        rows = dequantize_ple_rows(data, scales, self.format, self.scale)
+        rows = rows.view(*slot_ids.shape[:-1], slot_ids.shape[-1] * self.head_dim)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+    def _copy_installed(self, rows: torch.Tensor, slots: torch.Tensor) -> None:
+        if not rows.numel():
+            return
+        if self._replay_done is not None:
+            self._replay_done.synchronize()
+        staged, _inverse = self._reader._stage_rows_reference(rows)
+        staged_scales = None
+        if self._reader._stage_scale_bank is not None:
+            staged_scales = self._reader._stage_scale_bank.tensor[: rows.numel()]
+        slab_ids = torch.div(slots, self._slab_rows, rounding_mode="floor")
+        local_ids = torch.remainder(slots, self._slab_rows)
+        for slab_id in torch.unique(slab_ids).tolist():
+            positions = (slab_ids == slab_id).nonzero().reshape(-1)
+            local = local_ids.index_select(0, positions)
+            slab = self._data_slabs[slab_id].tensor
+            selected = staged.index_select(0, positions)
+            slab.view(torch.uint8).reshape(slab.shape[0], -1).index_copy_(
+                0, local, selected.view(torch.uint8).reshape(selected.shape[0], -1)
+            )
+            if staged_scales is not None:
+                scale_slab = self._scale_slabs[slab_id].tensor
+                selected_scales = staged_scales.index_select(0, positions)
+                scale_slab.view(torch.uint8).reshape(scale_slab.shape[0], -1).index_copy_(
+                    0,
+                    local,
+                    selected_scales.view(torch.uint8).reshape(selected_scales.shape[0], -1),
+                )
+
+    def _resolve(self, ids: torch.Tensor, *, record: bool = True) -> torch.Tensor:
+        resolution = self._allocator.resolve(ids)
+        self._copy_installed(resolution.installed_rows, resolution.installed_slots)
+        if record:
+            self._hits += resolution.hits
+            self._misses += resolution.misses
+            self._evictions += resolution.evictions
+            self._installed_rows += resolution.installed_rows.numel()
+        return resolution.slot_ids
+
+    def warm(self, row_ids: Sequence[int]) -> int:
+        """Install the hottest profile rows in bounded batches, then clear runtime stats."""
+        selected = list(row_ids[: self.capacity])
+        chunk = self._reader._capacity
+        for start in range(0, len(selected), chunk):
+            ids = torch.tensor(selected[start : start + chunk], dtype=torch.int64)
+            self._resolve(ids, record=False)
+        self.reset_stats()
+        return len(selected)
+
+    def _prepare_eager(self, row_ids: torch.Tensor) -> tuple[str, torch.Tensor | None]:
+        ids = row_ids.detach().to(device="cpu", dtype=torch.int64)
+        self._record_profile(ids)
+        if torch.unique(ids).numel() > self.capacity:
+            self._overflow_fallbacks += 1
+            if not self._overflow_logged:
+                logger.warning_rank0(
+                    f"PLE prefill row union exceeds cache capacity {self.capacity}; "
+                    "falling back to pure disk staging for this chunk"
+                )
+                self._overflow_logged = True
+            self._reader.prefetch(row_ids)
+            return "disk", None
+        slots = self._resolve(ids)
+        return "cache", slots.to(row_ids.device)
+
+    def prepare_decode(self, row_ids: torch.Tensor) -> None:
+        ids = torch.as_tensor(row_ids, dtype=torch.int64, device="cpu")
+        if (
+            ids.ndim != 2
+            or ids.shape[0] > self.local_ids.shape[0]
+            or ids.shape[1] != self.local_ids.shape[1]
+        ):
+            raise ValueError(
+                f"PLE decode ids shape {tuple(ids.shape)} exceeds fixed buffer "
+                f"{tuple(self.local_ids.shape)}"
+            )
+        if torch.unique(ids).numel() > self.capacity:
+            raise ValueError(
+                f"PLE decode row union exceeds cache capacity {self.capacity}; "
+                "increase --ple-cache-gib"
+            )
+        self._record_profile(ids)
+        slots = self._resolve(ids)
+        self.local_ids[: ids.shape[0]].copy_(slots)
+        self._decode_shape = ids.shape
+
+    def finish_decode(self, *, record_event: bool) -> None:
+        self._decode_shape = None
+        if record_event and self._device.type == "cuda":
+            if self._replay_done is None:
+                self._replay_done = torch.cuda.Event()
+            self._replay_done.record(torch.cuda.current_stream(self._device))
+
+    def prefetch(self, row_ids: torch.Tensor) -> None:
+        if self._decode_shape is not None:
+            return
+        mode, slots = self._prepare_eager(row_ids)
+        prefetched = None
+        if mode == "cache" and self._stream is not None:
+            assert slots is not None
+            dst = self._stage(slots.numel())
+            self._stream.wait_stream(torch.cuda.current_stream(self._device))
+            slots.record_stream(self._stream)
+            with torch.cuda.stream(self._stream):
+                self._gather_device(slots, dst)
+            prefetched = dst
+        self._pending = (mode, row_ids, slots, prefetched)
+
+    def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if self._decode_shape is not None:
+            if row_ids.shape != self._decode_shape:
+                raise RuntimeError(
+                    f"prepared cached PLE shape {tuple(self._decode_shape)} does not match "
+                    f"forward shape {tuple(row_ids.shape)}"
+                )
+            if self._device.type == "cuda":
+                return self._gather_device_from_ptr(self._decode_shape, out)
+            return self._gather_cpu(self.local_ids[: self._decode_shape[0]], out)
+
+        pending, self._pending = self._pending, None
+        if pending is not None and pending[1] is row_ids:
+            mode, _original, slots, prefetched = pending
+        else:
+            mode, slots = self._prepare_eager(row_ids)
+            prefetched = None
+        if mode == "disk":
+            return self._reader.lookup(row_ids, out)
+        assert slots is not None
+        if self._device.type == "cuda":
+            if prefetched is not None:
+                assert self._stream is not None
+                torch.cuda.current_stream(self._device).wait_stream(self._stream)
+                rows = prefetched
+            else:
+                rows = self._gather_device(slots, self._stage(slots.numel()))
+            rows = rows.view(*slots.shape[:-1], slots.shape[-1] * self.head_dim)
+            if out is None:
+                return rows
+            out.copy_(rows)
+            return out
+        return self._gather_cpu(slots, out)
 
 
 def _splitmix64(value: int) -> int:

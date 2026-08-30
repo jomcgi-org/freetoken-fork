@@ -823,6 +823,44 @@ def test_hmm_ple_stats_report_major_fault_delta_without_staging(monkeypatch):
     }
 
 
+def test_cached_ple_stats_report_direct_hit_rate(monkeypatch):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    import freetoken.models.qwen4_exp.ple as ple
+
+    class Backend:
+        prefetch_pages = 3
+
+        def cache_stats(self):
+            return {
+                "hits": 90,
+                "misses": 10,
+                "evictions": 4,
+                "installed_rows": 7,
+                "overflow_fallbacks": 1,
+            }
+
+        def reset_stats(self):
+            pass
+
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model._ple_disk_backends = [Backend()]
+    model._ple_major_fault_base = 10
+    model._ple_staging_ns = 8_000
+    monkeypatch.setattr(ple, "process_major_faults", lambda: 12)
+
+    assert model.ple_disk_stats() == {
+        "ple_prefetch_pages": 3,
+        "ple_major_faults": 2,
+        "ple_staging_us": 8.0,
+        "ple_hits": 90,
+        "ple_misses": 10,
+        "ple_evictions": 4,
+        "ple_installed_rows": 7,
+        "ple_hit_rate": 0.9,
+        "ple_overflow_fallbacks": 1,
+    }
+
+
 def test_disk_ple_prepare_replay_handles_mixed_history_abort_and_padding():
     from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
 
@@ -965,6 +1003,73 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     assert model._ple_decode_contexts.shape == (8, 2)
     assert model._ple_decode_input_ids.shape == (8,)
     assert snapshotted == [8]
+
+
+def test_cached_ple_load_reserves_row_bank_and_applies_warm_profile(monkeypatch):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    import freetoken.models.qwen4_exp.ple as ple
+    import freetoken.models.qwen4_exp.weight as weight
+
+    attached = []
+    snapshotted = []
+    layer = SimpleNamespace(
+        ple_embedding=SimpleNamespace(
+            attach_table=attached.append,
+            snapshot_host_hash_constants=lambda size: snapshotted.append(size),
+        )
+    )
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model.model = SimpleNamespace(ple_layers=[layer])
+    model._config = SimpleNamespace(
+        qwen4_args=SimpleNamespace(num_ngram_heads=4, ngram_size=3)
+    )
+    mapped = SimpleNamespace(num_rows=100, head_dim=4)
+    constructed = []
+
+    class FakeCache:
+        cache_nbytes = 1234
+        prefetch_pages = 0
+
+        def __init__(self, table, capacity, source_capacity, **kwargs):
+            constructed.append((table, capacity, source_capacity, kwargs))
+
+        def warm(self, rows):
+            assert rows == [9, 2]
+            return len(rows)
+
+    monkeypatch.setattr(weight, "load_ple_table", lambda *args, **kwargs: mapped)
+    monkeypatch.setattr(ple, "CachedTable", FakeCache)
+    monkeypatch.setattr(ple, "ple_cache_capacity_rows", lambda budget, table: 64)
+    monkeypatch.setattr(ple, "load_ple_row_profile", lambda path, rows: [9, 2])
+    engine_config = SimpleNamespace(
+        model_path="/tmp/model",
+        ple_backend="cached",
+        ple_cache_gib=1.5,
+        ple_cache_warm="/tmp/hot.json",
+        ple_cache_profile_out="/tmp/out.json",
+        use_dummy_weight=False,
+        max_running_req=2,
+        max_forward_len=5,
+        cuda_graph_bs=[1, 3],
+        cuda_graph_max_bs=2,
+    )
+
+    assert model.load_host_tables(engine_config) == 1234
+    assert attached == model._ple_disk_backends
+    assert snapshotted == [3]
+    assert constructed == [
+        (
+            mapped,
+            64,
+            20,
+            {
+                "max_decode_batch_size": 3,
+                "rows_per_token": 4,
+                "collect_profile": True,
+            },
+        )
+    ]
+    assert model._ple_cache_profile_out == "/tmp/out.json"
 
 
 def test_hmm_ple_load_reserves_zero_expert_pin_budget(monkeypatch):

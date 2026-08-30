@@ -318,13 +318,34 @@ def parse_args(
 
     parser.add_argument(
         "--ple-backend",
-        choices=["pinned", "disk", "hmm"],
+        choices=["pinned", "cached", "disk", "hmm"],
         default=ServerArgs.ple_backend,
         help=(
             "Qwen3.8 Flash-Next PLE table backend: 'pinned' keeps the full table in "
-            "pinned host RAM; 'disk' stages rows from read-only mappings; 'hmm' lets "
-            "the GPU read those mappings directly and requires NVIDIA open kernel modules."
+            "pinned host RAM; 'cached' pins a bounded hot-row bank; 'disk' stages rows "
+            "from read-only mappings; 'hmm' lets the GPU read those mappings directly."
         ),
+    )
+
+    parser.add_argument(
+        "--ple-cache-gib",
+        type=float,
+        default=ServerArgs.ple_cache_gib,
+        help="Pinned PLE hot-row bank budget in GiB for --ple-backend cached.",
+    )
+
+    parser.add_argument(
+        "--ple-cache-warm",
+        type=str,
+        default=ServerArgs.ple_cache_warm,
+        help="Optional JSON row-frequency profile used to warm the PLE cache.",
+    )
+
+    parser.add_argument(
+        "--ple-cache-profile-out",
+        type=str,
+        default=ServerArgs.ple_cache_profile_out,
+        help="Write cumulative cached-PLE row frequencies to this JSON file.",
     )
 
     parser.add_argument(

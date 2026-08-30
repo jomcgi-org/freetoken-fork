@@ -495,13 +495,13 @@ def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
                    chunk: int = 8 << 20) -> PleTable | DiskPleTable:
     """Load the PLE table as one pinned bank or read-only safetensors mappings.
 
-    ``pinned`` preserves the original O_DIRECT concatenate, fill, then pin route. ``disk`` and
-    ``hmm`` map each tensor payload from its safetensors file with ``MAP_SHARED`` and
-    ``MADV_RANDOM``. HMM differs only in how the model gathers from these mappings.
+    ``pinned`` preserves the original O_DIRECT concatenate, fill, then pin route. ``cached``,
+    ``disk``, and ``hmm`` map each tensor payload from its safetensors file with ``MAP_SHARED``
+    and ``MADV_RANDOM``. Their model backends differ in how rows reach the GPU.
     """
-    if backend not in ("pinned", "disk", "hmm"):
+    if backend not in ("pinned", "cached", "disk", "hmm"):
         raise ValueError(
-            f"--ple-backend must be 'pinned', 'disk', or 'hmm', got {backend!r}"
+            f"--ple-backend must be 'pinned', 'cached', 'disk', or 'hmm', got {backend!r}"
         )
     layout = _ple_table_layout(model_path, qwen4_args)
     expected = int(qwen4_args.split_ngram_parts)
@@ -515,7 +515,7 @@ def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
         scale_shard_bytes = math.prod(scale_shape) * torch.empty(
             (), dtype=layout.scale_dtype
         ).element_size()
-    if backend in ("disk", "hmm"):
+    if backend in ("cached", "disk", "hmm"):
         banks = []
         scale_banks = []
         for shard in range(expected):

@@ -71,6 +71,21 @@ layer ids and the available scores.
 
 Qwen3.8-Flash-Next defaults to `--ple-backend pinned`, which keeps its PLE n-gram
 table in pinned host RAM and preserves the original CUDA graph path.
+`--ple-backend cached --ple-cache-gib 8` instead maps the checkpoint read-only and
+uses the GiB budget for a CLOCK-managed pinned hot-row bank. The bank is allocated
+in fixed row-group slabs, so a future runtime resize can add or retire slabs without
+reloading the checkpoint. Decode resolves row ids in the existing pre-replay hook,
+installs only misses, updates fixed pinned slot ids, and keeps the captured gather
+restricted to the cache bank. The `ple_hits`, `ple_misses`, `ple_evictions`,
+`ple_installed_rows`, and `ple_hit_rate` fields are printed in decode status lines.
+
+For traffic-derived warmup, pass a JSON row-frequency object such as
+`{"123": 40, "987": 12}` with `--ple-cache-warm profile.json`. To collect that
+format from live traffic, set `--ple-cache-profile-out profile.json`; the cumulative
+profile is atomically refreshed at each decode status interval. Prefill installs the
+chunk row union in bulk. If one chunk's union exceeds the cache capacity, that chunk
+is logged and served through the pure staged disk path.
+
 `--ple-backend disk` instead maps each PLE safetensors payload read-only, applies
 random-access advice, and page-prefetches the deduplicated union of requested rows
 before copying them through a small pinned staging bank. Disk PLE bytes are not
@@ -88,7 +103,7 @@ fault servicing, but procfs does not directly expose GPU-side page residency.
 The PLE format is detected from the checkpoint tensors. Supported layouts are FP8 e4m3
 with scalar or per-row scales, INT4 group-16 with fp16 scales, and NVFP4-style e2m1
 group-16 with e4m3 scales plus `weight_scale_2`. Packed 4-bit rows use low-nibble-first
-storage. All three formats support `pinned`, `disk`, and `hmm`; the backend flag does not
+storage. All three formats support `pinned`, `cached`, `disk`, and `hmm`; the backend flag does not
 select or override precision.
 
 Disk PLE keeps CUDA graph decode enabled: a pre-replay host hook derives the next
@@ -103,6 +118,7 @@ the full requested-row union for each chunk through the unchanged eager path.
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
-- Qwen3.8-Flash-Next keeps its PLE table pinned by default; use
-  `--ple-backend disk` on memory-constrained hosts.
+- Qwen3.8-Flash-Next keeps its PLE table pinned by default. Use
+  `--ple-backend cached --ple-cache-gib N` for a bounded pinned hot set, or
+  `--ple-backend disk` when no persistent PLE row bank fits.
 - Multimodal checkpoints are served text-only.

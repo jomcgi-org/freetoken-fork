@@ -22,12 +22,14 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import init_logger, nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -190,6 +192,75 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 self._ple_hmm_backends.append(mapped)
                 ple.ple_embedding.attach_table(mapped)
             return 0
+        if backend == "cached":
+            from .ple import (
+                CachedTable,
+                load_ple_row_profile,
+                ple_cache_capacity_rows,
+                process_major_faults,
+            )
+
+            args = self._config.qwen4_args
+            graph_sizes = getattr(engine_config, "cuda_graph_bs", None) or ()
+            max_decode_batch_size = max(
+                int(getattr(engine_config, "max_running_req", 1)),
+                int(getattr(engine_config, "cuda_graph_max_bs", 0) or 0),
+                max(graph_sizes, default=0),
+            )
+            max_tokens = max(
+                max_decode_batch_size,
+                int(engine_config.max_forward_len),
+            )
+            source_capacity = max_tokens * args.num_ngram_heads
+            capacity = ple_cache_capacity_rows(engine_config.ple_cache_gib, table)
+            decode_rows = max_decode_batch_size * args.num_ngram_heads
+            if capacity < decode_rows:
+                raise ValueError(
+                    f"--ple-cache-gib {engine_config.ple_cache_gib} holds {capacity} rows, "
+                    f"but decode graphs can require {decode_rows}; increase the cache budget"
+                )
+            warm_path = getattr(engine_config, "ple_cache_warm", None)
+            warm_rows = (
+                load_ple_row_profile(warm_path, table.num_rows) if warm_path else []
+            )
+            profile_out = getattr(engine_config, "ple_cache_profile_out", None)
+            self._ple_disk_backends = []
+            self._ple_major_fault_base = process_major_faults()
+            self._ple_staging_ns = 0
+            self._ple_cache_profile_out = profile_out
+            pin = torch.cuda.is_available()
+            self._ple_decode_contexts = torch.empty(
+                (max_decode_batch_size, args.ngram_size - 1),
+                dtype=torch.int64,
+                pin_memory=pin,
+            )
+            self._ple_decode_input_ids = torch.empty(
+                max_decode_batch_size, dtype=torch.int64, pin_memory=pin
+            )
+            self._ple_waited_events = [None] * max_decode_batch_size
+            reserved = 0
+            warmed = 0
+            for ple in ple_layers:
+                cached = CachedTable(
+                    table,
+                    capacity,
+                    source_capacity,
+                    max_decode_batch_size=max_decode_batch_size,
+                    rows_per_token=args.num_ngram_heads,
+                    collect_profile=bool(profile_out),
+                )
+                if warm_rows:
+                    warmed = cached.warm(warm_rows)
+                reserved += cached.cache_nbytes
+                self._ple_disk_backends.append(cached)
+                ple.ple_embedding.attach_table(cached)
+                ple.ple_embedding.snapshot_host_hash_constants(max_decode_batch_size)
+            self._ple_disk_decode = tuple(zip(ple_layers, self._ple_disk_backends))
+            logger.info_rank0(
+                f"PLE cache: {capacity} rows, {reserved / 2**30:.2f} GiB pinned, "
+                f"{warmed} warm rows"
+            )
+            return reserved
         if backend == "disk":
             from .ple import DiskStagedTable, process_major_faults
 
@@ -266,6 +337,38 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             "ple_major_faults": None if now is None or base is None else now - base,
             "ple_staging_us": getattr(self, "_ple_staging_ns", 0) / 1_000.0,
         }
+        cached = [table for table in backends if hasattr(table, "cache_stats")]
+        if cached:
+            stats = [table.cache_stats() for table in cached]
+            hits = sum(int(item["hits"]) for item in stats)
+            misses = sum(int(item["misses"]) for item in stats)
+            result.update({
+                "ple_hits": hits,
+                "ple_misses": misses,
+                "ple_evictions": sum(int(item["evictions"]) for item in stats),
+                "ple_installed_rows": sum(
+                    int(item["installed_rows"]) for item in stats
+                ),
+                "ple_hit_rate": hits / (hits + misses) if hits + misses else 0.0,
+                "ple_overflow_fallbacks": sum(
+                    int(item["overflow_fallbacks"]) for item in stats
+                ),
+            })
+            profile_out = getattr(self, "_ple_cache_profile_out", None)
+            if reset and profile_out:
+                from collections import Counter
+
+                from .ple import write_ple_row_profile
+
+                counts: Counter[int] = Counter()
+                for table in cached:
+                    counts.update(table.profile_counts())
+                try:
+                    write_ple_row_profile(profile_out, counts)
+                except OSError as exc:
+                    logger.warning_rank0(
+                        f"could not write --ple-cache-profile-out {profile_out!r}: {exc}"
+                    )
         if reset:
             for table in backends:
                 table.reset_stats()

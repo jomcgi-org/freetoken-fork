@@ -258,6 +258,50 @@ def ple_gather_rows_sharded(
     return out
 
 
+def ple_gather_rows_sharded_from_ptr(
+    shard_bases: torch.Tensor,
+    rows_per_shard: int,
+    num_rows: int,
+    embed_dim: int,
+    row_ids_ptr: int,
+    num_ids: int,
+    out: torch.Tensor,
+    scale: float = 1.0,
+    is_fp8: bool = True,
+    *,
+    table_format: str | None = None,
+    scale_shard_bases: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gather fixed-address int32 slot ids from pinned host slabs."""
+    assert shard_bases.dtype is torch.int64 and shard_bases.is_cuda
+    format_code = _format_code(
+        table_format, is_fp8, 0 if scale_shard_bases is None else 1
+    )
+    if format_code in (_FORMAT_FP8_ROW, _FORMAT_INT4G16, _FORMAT_E2M1G16):
+        assert scale_shard_bases is not None
+        assert scale_shard_bases.dtype is torch.int64 and scale_shard_bases.is_cuda
+    assert out.shape == (num_ids, embed_dim) and out.is_contiguous(), out.shape
+    if num_ids:
+        _ple_gather_kernel[(num_ids,)](
+            0,
+            shard_bases,
+            0,
+            0 if scale_shard_bases is None else scale_shard_bases,
+            row_ids_ptr,
+            out,
+            float(scale),
+            num_rows,
+            rows_per_shard,
+            EMB_DIM=embed_dim,
+            TABLE_FORMAT=format_code,
+            IDS_RAW_INT32=True,
+            SHARDED=True,
+            BLOCK_D=triton.next_power_of_2(embed_dim),
+            num_warps=_NUM_WARPS,
+        )
+    return out
+
+
 def _format_code(table_format: str | None, is_fp8: bool, scale_ptr: int) -> int:
     if table_format is None:
         return _FORMAT_FP8 if is_fp8 else _FORMAT_BF16
@@ -274,4 +318,9 @@ def _format_code(table_format: str | None, is_fp8: bool, scale_ptr: int) -> int:
     raise ValueError(f"unsupported PLE table format {table_format!r}")
 
 
-__all__ = ["ple_gather_rows", "ple_gather_rows_from_ptr", "ple_gather_rows_sharded"]
+__all__ = [
+    "ple_gather_rows",
+    "ple_gather_rows_from_ptr",
+    "ple_gather_rows_sharded",
+    "ple_gather_rows_sharded_from_ptr",
+]

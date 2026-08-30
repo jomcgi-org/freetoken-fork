@@ -161,6 +161,15 @@ class Scheduler(SchedulerIOMixin):
                     f"ple_major_faults: {ple_stats['ple_major_faults']}, "
                     f"ple_staging_us: {ple_stats['ple_staging_us']:.0f}"
                 )
+                if "ple_hits" in ple_stats:
+                    message += (
+                        f", ple_hits: {ple_stats['ple_hits']}, "
+                        f"ple_misses: {ple_stats['ple_misses']}, "
+                        f"ple_evictions: {ple_stats['ple_evictions']}, "
+                        f"ple_installed_rows: {ple_stats['ple_installed_rows']}, "
+                        f"ple_hit_rate: {ple_stats['ple_hit_rate']:.4f}, "
+                        f"ple_overflow_fallbacks: {ple_stats['ple_overflow_fallbacks']}"
+                    )
             logger.info_rank0(message)
 
         self.status_reporter = SchedulerStatusReporter(

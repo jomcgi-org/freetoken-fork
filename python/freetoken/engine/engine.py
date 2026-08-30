@@ -1448,19 +1448,19 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_max_bs", 1)
 
     ple_backend = getattr(config, "ple_backend", "pinned")
-    if ple_backend in ("disk", "hmm"):
+    if ple_backend in ("cached", "disk", "hmm"):
         if not has_ple:
             raise ValueError(
                 f"--ple-backend {ple_backend} is only supported for models with a PLE "
                 "n-gram table"
             )
-    if ple_backend == "disk":
+    if ple_backend in ("cached", "disk"):
         no_graphs = os.getenv("FREETOKEN_PLE_DISK_NO_GRAPHS", "").strip().lower()
         if no_graphs in ("1", "true", "yes", "on"):
             override("cuda_graph_bs", [])
             override("cuda_graph_max_bs", 0)
             logger.info_rank0(
-                "FREETOKEN_PLE_DISK_NO_GRAPHS=1: disabling disk PLE CUDA graph decode"
+                f"FREETOKEN_PLE_DISK_NO_GRAPHS=1: disabling {ple_backend} PLE CUDA graph decode"
             )
 
     if config.cuda_graph_max_bs is None:
