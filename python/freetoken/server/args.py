@@ -328,6 +328,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-mtp",
+        choices=["off", "on"],
+        default=ServerArgs.speculative_mtp,
+        help=(
+            "Qwen3.8 Flash-Next native MTP speculative decoding. The initial "
+            "implementation is greedy-only and batch-size 1; unsupported batches "
+            "fall back to normal decode."
+        ),
+    )
+
+    parser.add_argument(
         "--ple-cache-gib",
         type=float,
         default=ServerArgs.ple_cache_gib,

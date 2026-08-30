@@ -322,7 +322,7 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING:
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.config.speculative_mtp == "on":
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -373,42 +373,53 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
+                tokens = (
+                    next_tokens_cpu
+                    if getattr(batch, "mtp_verify", False)
+                    else next_tokens_cpu[i : i + 1]
                 )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
+                finished = False
+                for next_token_tensor in tokens:
+                    req.append_host(next_token_tensor.unsqueeze(0))
+                    next_token = int(next_token_tensor.item())
+                    # EOS / stop-string -> "stop", output budget exhausted -> "length";
+                    # EOS and stop strings win over length. Host length, rather than
+                    # req.can_decode, is required when one MTP step has already advanced
+                    # device_len by several accepted tokens.
+                    hit_length = req.input_ids.numel() >= req.max_device_len
+                    hit_eos = (
+                        not req.sampling_params.ignore_eos
+                        and next_token in self.eos_token_ids
                     )
-                )
+                    matched_stop = (
+                        self._match_stop_str(req)
+                        if not hit_eos and req.sampling_params.stop_strs
+                        else None
+                    )
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    if (
+                        next_token == self.toolcall_anchor_id
+                        and req.toolcall_anchor_len is None
+                        and not finished
+                    ):
+                        req.toolcall_anchor_len = req.input_ids.numel()
+                    reply.append(
+                        DetokenizeMsg(
+                            uid=req.uid,
+                            next_token=next_token,
+                            finished=finished,
+                            finish_reason=finish_reason,
+                            matched_stop=matched_stop,
+                            stop_strs=req.sampling_params.stop_strs or None,
+                        )
+                    )
+                    if finished:
+                        break
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -839,6 +850,28 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        # Native MTP v1 verifies one greedy request at a time. Shape the decode
+        # as a short eager extend so every existing PLE, QSA, GDN, and DISK-MoE
+        # prefill primitive sees its already-supported multi-token layout.
+        mtp_verify = (
+            self.config.speculative_mtp == "on"
+            and batch.is_decode
+            and len(batch.reqs) == 1
+            and batch.reqs[0].sampling_params.is_greedy
+            and batch.reqs[0].mtp_hidden is not None
+        )
+        if mtp_verify:
+            from freetoken.spec_decode import MTP_DRAFT_STEPS
+
+            req = batch.reqs[0]
+            width = min(MTP_DRAFT_STEPS + 1, req.remain_len)
+            if width > 1:
+                batch.mtp_verify = True
+                batch.mtp_original_device_len = req.device_len
+                batch.mtp_original_cached_len = req.cached_len
+                batch.mtp_allocated_end = req.device_len + width - 1
+                req.device_len = batch.mtp_allocated_end
+                batch.phase = "prefill"
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
         if batch.is_decode:
@@ -948,7 +981,19 @@ class Scheduler(SchedulerIOMixin):
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
         forward_output = self.engine.forward_batch(batch, sample_args)
-        self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+        if getattr(batch, "mtp_verify", False):
+            req = batch.reqs[0]
+            start = int(batch.mtp_original_device_len)
+            count = forward_output.next_tokens_gpu.numel()
+            self.token_pool[req.table_idx, start : start + count] = (
+                forward_output.next_tokens_gpu
+            )
+            committed = int(batch.mtp_original_cached_len) + count
+            self.cache_manager.rollback_paged_tail(
+                req, committed, int(batch.mtp_allocated_end)
+            )
+        else:
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 

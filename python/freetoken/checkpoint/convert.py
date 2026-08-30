@@ -5,6 +5,8 @@ no per-model conversion code is needed.
 
 * dense weights = exactly what ``load_weight(include_moe_experts=...)`` yields (post
   fusion/TP-shard) -> ``kind="weight"``; at load they feed ``model.load_state_dict``.
+* optional Qwen3.8 MTP weights = the separately gated head reader output ->
+  ``kind="mtp"``; default conversions omit it.
 * offload experts = exactly what ``load_expert_banks(parallel=True)`` produces (post
   backend-repack pinned banks + alpha scale vectors) -> ``kind="experts_bank"`` (alphas are
   told apart at load by their reserved names, so they need no separate kind).
@@ -168,6 +170,7 @@ def convert_checkpoint(
     moe_backend: str = "offload",
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
+    include_mtp: bool = False,
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -203,7 +206,7 @@ def convert_checkpoint(
     from freetoken.utils.progress import byte_bar, count_bar
 
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
-    n_weight = n_bank = n_alpha = 0
+    n_weight = n_mtp = n_bank = n_alpha = 0
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
@@ -215,6 +218,19 @@ def convert_checkpoint(
         n_weight += 1
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
+
+    # Preserve Qwen3.8's optional MTP head under its own kind. Runtime loading still
+    # ignores these tensors unless --speculative-mtp on is selected, so existing FTW
+    # memory use and the default-off model state are unchanged.
+    if include_mtp and getattr(mc, "qwen4_args", None) is not None:
+        from freetoken.models.qwen4_exp.weight import iter_mtp_weights
+
+        for name, tensor in count_bar(
+            iter_mtp_weights(model_path, torch.device("cpu")),
+            "Converting MTP weights",
+        ):
+            writer.add_tensor(name, tensor, kind="mtp")
+            n_mtp += 1
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
@@ -295,7 +311,11 @@ def convert_checkpoint(
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.
         "expert_bank_num_layers": num_layers,
-        "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
+        "counts": {
+            "weight": n_weight,
+            "mtp": n_mtp,
+            "experts_bank": n_bank + n_alpha,
+        },
         "copied_metadata": copied,
     })
     return index

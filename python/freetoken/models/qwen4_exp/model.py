@@ -119,6 +119,8 @@ class Qwen4ExpModel(BaseOP):
                 ple.start_prefetch(batch, meta)
         for layer in self.layers.op_list:
             hidden = layer.forward(hidden, batch)
+        if getattr(self, "_capture_mtp_hidden", False):
+            self._last_hc_hidden = hidden
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
@@ -145,6 +147,14 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+
+    def enable_mtp(self) -> None:
+        """Build the optional head while the engine is still on the meta device."""
+        from .mtp import Qwen4ExpMTPHead
+
+        if not hasattr(self, "mtp"):
+            self.mtp = Qwen4ExpMTPHead(self._config)
+            self.model._capture_mtp_hidden = True
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the selected PLE backend and return bytes reserved from the pin budget."""

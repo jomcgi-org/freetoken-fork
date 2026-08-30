@@ -20,6 +20,7 @@ from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _ple_table_layout,
     iter_weights,
+    iter_mtp_weights,
     load_ple_table,
 )
 from freetoken.moe.host_banks import HostBank, read_range_into
@@ -124,11 +125,30 @@ def _raw_checkpoint() -> dict[str, torch.Tensor]:
         f"{attn}.indexer.q_layernorm.weight": _bf16(IHD),
         f"{attn}.indexer.k_layernorm.weight": _bf16(IHD),
     })
+    raw.update(_hc_weights("mtp.hyper_connection_mixer", inject=False))
+    raw.update(_hc_weights("mtp.layers.0.attn_hyper_connection", inject=True))
+    raw.update(_hc_weights("mtp.layers.0.mlp_hyper_connection", inject=True))
     raw.update({
-        "mtp.hyper_connection_mixer.hc_norm.weight": _bf16(HCH),
+        "mtp.fc_embedding.weight": _bf16(H, H),
+        "mtp.fc_hidden.weight": _bf16(H, H),
+        "mtp.pre_fc_norm_embedding.weight": _bf16(H),
+        "mtp.pre_fc_norm_hidden.weight": _bf16(HCH),
         "mtp.layers.0.self_attn.q_proj.weight": _bf16(2 * QH * AHD, H),
+        "mtp.layers.0.self_attn.k_proj.weight": _bf16(KVH * AHD, H),
+        "mtp.layers.0.self_attn.v_proj.weight": _bf16(KVH * AHD, H),
+        "mtp.layers.0.self_attn.o_proj.weight": _bf16(H, QH * AHD),
+        "mtp.layers.0.self_attn.q_norm.weight": _bf16(AHD),
+        "mtp.layers.0.self_attn.k_norm.weight": _bf16(AHD),
+        "mtp.layers.0.self_attn.indexer.index_qk_proj.weight": _bf16(5 * IHD, H),
+        "mtp.layers.0.self_attn.indexer.q_layernorm.weight": _bf16(IHD),
+        "mtp.layers.0.self_attn.indexer.k_layernorm.weight": _bf16(IHD),
+        "mtp.layers.0.mlp.gate.weight": _bf16(E, H),
         "mtp.layers.0.mlp.experts.gate_up_proj": _bf16(E, 2 * I, H),
         "mtp.layers.0.mlp.experts.down_proj": _bf16(E, H, I),
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight": _bf16(I, H),
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight": _bf16(I, H),
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight": _bf16(H, I),
+        "mtp.layers.0.mlp.shared_expert_gate.weight": _bf16(1, H),
         "model.visual.blocks.0.attn.qkv.weight": _bf16(3 * H, H),
         "model.visual.merger.norm.weight": _bf16(H),
     })
@@ -228,6 +248,12 @@ def loaded(checkpoint) -> dict[str, torch.Tensor]:
     }
 
 
+@pytest.fixture(scope="module")
+def loaded_mtp(checkpoint) -> dict[str, torch.Tensor]:
+    folder, _raw = checkpoint
+    return dict(iter_mtp_weights(folder, torch.device("cpu")))
+
+
 def _expected_names() -> set[str]:
     names = {"model.embed_tokens.weight", "lm_head.weight"}
     names |= {f"model.hyper_connection_mixer.{leaf}" for leaf in
@@ -263,6 +289,24 @@ def test_mtp_visual_experts_and_table_never_loaded(loaded):
         assert ".mlp.experts." not in name
         assert "ngram_embedding" not in name
         assert not name.endswith((".weight_scale", ".weight_scale_2", ".input_scale"))
+
+
+def test_mtp_reader_loads_head_only_and_fuses_checkpoint_parts(loaded_mtp, checkpoint):
+    _folder, raw = checkpoint
+    assert loaded_mtp
+    assert all(name.startswith("mtp.") for name in loaded_mtp)
+    assert "mtp.layers.0.mlp.experts.gate_up_proj" in loaded_mtp
+    assert torch.equal(
+        loaded_mtp["mtp.layers.0.mlp.experts.gate_up_proj"],
+        raw["mtp.layers.0.mlp.experts.gate_up_proj"],
+    )
+    qkv = loaded_mtp["mtp.layers.0.self_attn.qkv_proj.weight"]
+    assert qkv.shape == (2 * QH * AHD + 2 * KVH * AHD, H)
+    hc = loaded_mtp[
+        "mtp.layers.0.attn_hyper_connection.input_mix_weight_down_block_inject.weight"
+    ]
+    assert hc.shape == (LR + HC + 12, HCH)
+    assert torch.count_nonzero(hc[-12:]) == 0
 
 
 def test_hc_merge_is_down_then_inject_then_zero_pad(loaded, checkpoint):

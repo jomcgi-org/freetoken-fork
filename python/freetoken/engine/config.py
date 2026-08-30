@@ -71,6 +71,10 @@ class EngineConfig:
     ple_cache_gib: float = 8.0
     ple_cache_warm: str | None = None
     ple_cache_profile_out: str | None = None
+    # Qwen3.8-Flash-Next native multi-token prediction head. Kept as an explicit
+    # on/off choice instead of a boolean so the CLI and serialized daemon config
+    # have one stable spelling.
+    speculative_mtp: str = "off"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -99,6 +103,9 @@ class EngineConfig:
     num_token_override: int | None = None
 
     def __post_init__(self) -> None:
+        from freetoken.spec_decode import validate_speculative_mtp
+
+        validate_speculative_mtp(self.speculative_mtp)
         if self.ple_backend not in ("pinned", "cached", "disk", "hmm"):
             raise ValueError(
                 "--ple-backend must be 'pinned', 'cached', 'disk', or 'hmm', got "

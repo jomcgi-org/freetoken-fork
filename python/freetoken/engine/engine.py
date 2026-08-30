@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import itertools
 import json
 import math
 import os
@@ -317,6 +318,14 @@ class Engine:
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
+            if config.speculative_mtp == "on":
+                if not hasattr(self.model, "enable_mtp"):
+                    raise ValueError(
+                        "--speculative-mtp on is supported only by Qwen3.8-Flash-Next"
+                    )
+                if config.tp_info.size != 1:
+                    raise ValueError("--speculative-mtp on currently requires --tp-size 1")
+                self.model.enable_mtp()
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
@@ -414,7 +423,9 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
+            cuda_graph_bs=(
+                [] if config.speculative_mtp == "on" else config.cuda_graph_bs
+            ),
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
@@ -460,13 +471,37 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
+        weights = load_weight(
+            config.model_path,
+            self.device,
+            include_moe_experts=not is_offload_moe_backend(config.moe_backend),
+        )
+        if config.speculative_mtp == "on":
+            from freetoken.checkpoint.ftw import (
+                FTWReader,
+                is_ftw_checkpoint,
+                iter_ftw_weights,
+            )
+
+            if is_ftw_checkpoint(config.model_path):
+                reader = FTWReader(config.model_path)
+                try:
+                    if not reader.entries("mtp"):
+                        raise ValueError(
+                            "--speculative-mtp on requires MTP tensors in this FTW "
+                            "checkpoint; reconvert it with this FreeToken version"
+                        )
+                finally:
+                    reader.close()
+                mtp_weights = iter_ftw_weights(config.model_path, kinds=("mtp",))
+            else:
+                from freetoken.models.qwen4_exp.weight import iter_mtp_weights
+
+                mtp_weights = iter_mtp_weights(config.model_path, self.device)
+            weights = itertools.chain(weights, mtp_weights)
         return _materialize_loaded_weight_state_dict(
             model_state,
-            load_weight(
-                config.model_path,
-                self.device,
-                include_moe_experts=not is_offload_moe_backend(config.moe_backend),
-            ),
+            weights,
             device=self.device,
         )
 
@@ -977,7 +1012,13 @@ class Engine:
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
-            if self.graph_runner.can_use_cuda_graph(batch):
+            if getattr(batch, "mtp_verify", False):
+                next_tokens_gpu = self._forward_mtp_verify(batch)
+                logits = None
+            elif (
+                self.config.speculative_mtp != "on"
+                and self.graph_runner.can_use_cuda_graph(batch)
+            ):
                 logits = self.graph_runner.replay(batch)
             else:
                 logits = self.model.forward()
@@ -986,20 +1027,116 @@ class Engine:
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
 
-        for req in batch.reqs:
-            req.complete_one()
+        if not getattr(batch, "mtp_verify", False):
+            self._record_mtp_hidden(batch)
+            for req in batch.reqs:
+                req.complete_one()
 
-        batch_logits = logits[: batch.size]
-        next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            assert logits is not None
+            batch_logits = logits[: batch.size]
+            next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            batch.generated_tokens = len(batch.reqs)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         # Decode host hooks can run before overlap scheduling drains append_host(). Keep the
         # sampled token and its readiness fence on each request until a newer sample replaces it.
-        for req, token in zip(batch.reqs, next_tokens_cpu):
-            req.pending_token_cpu = token
+        if getattr(batch, "mtp_verify", False):
+            req = batch.reqs[0]
+            req.pending_token_cpu = next_tokens_cpu[-1]
             req.sample_copy_done = copy_done_event
+        else:
+            for req, token in zip(batch.reqs, next_tokens_cpu):
+                req.pending_token_cpu = token
+                req.sample_copy_done = copy_done_event
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _record_mtp_hidden(self, batch: Batch) -> None:
+        hidden = getattr(getattr(self.model, "model", None), "_last_hc_hidden", None)
+        if hidden is None or self.config.speculative_mtp != "on":
+            return
+        offset = 0
+        for req in batch.reqs:
+            length = req.extend_len
+            if length:
+                req.mtp_hidden = hidden[offset + length - 1].detach().clone()
+            offset += length
+
+    def _snapshot_verify_state(self, req: Req) -> dict[str, Any]:
+        slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
+        snapshot: dict[str, Any] = {"slot": slot}
+        pool = self.linear_state_pool
+        if pool is not None:
+            snapshot["conv"] = pool.conv_states[:, slot].clone()
+            snapshot["recurrent"] = pool.recurrent_states[:, slot].clone()
+            snapshot["slot_states"] = {
+                name: value[:, slot].clone() for name, value in pool.slot_states.items()
+            }
+        pending = getattr(self.kv_cache, "_pending_ring", None)
+        if pending is not None:
+            snapshot["qsa_pending"] = pending[req.table_idx].clone()
+        return snapshot
+
+    def _restore_verify_state(self, req: Req, snapshot: dict[str, Any]) -> None:
+        slot = int(snapshot["slot"])
+        pool = self.linear_state_pool
+        if pool is not None and "conv" in snapshot:
+            pool.conv_states[:, slot].copy_(snapshot["conv"])
+            pool.recurrent_states[:, slot].copy_(snapshot["recurrent"])
+            for name, value in snapshot["slot_states"].items():
+                pool.slot_states[name][:, slot].copy_(value)
+        pending = getattr(self.kv_cache, "_pending_ring", None)
+        if pending is not None and "qsa_pending" in snapshot:
+            pending[req.table_idx].copy_(snapshot["qsa_pending"])
+
+    def _forward_mtp_verify(self, batch: Batch) -> torch.Tensor:
+        """Draft three tokens and greedily verify four positions for one request."""
+        from freetoken.attention.linear import build_fla_metadata
+        from freetoken.spec_decode import greedy_accept_prefix
+
+        req = batch.reqs[0]
+        width = batch.positions.numel()
+        steps = width - 1
+        assert steps > 0 and req.mtp_hidden is not None
+        seed = batch.input_ids[:1]
+        drafts = self.model.mtp.draft(
+            seed,
+            req.mtp_hidden,
+            int(batch.positions[0].item()),
+            embed_tokens=self.model.model.embed_tokens,
+            lm_head=self.model.lm_head,
+            steps=steps,
+        )
+        verify_ids = torch.cat((seed, drafts)).to(torch.int32)
+        batch.input_ids = verify_ids
+        snapshot = self._snapshot_verify_state(req)
+
+        logits = self.model.forward()
+        target = torch.argmax(logits, dim=-1).to(torch.int32)
+        accepted, matched = greedy_accept_prefix(drafts, target)
+        committed_inputs = matched + 1
+        full_hidden = self.model.model._last_hc_hidden
+
+        if committed_inputs < width:
+            self._restore_verify_state(req, snapshot)
+            req.device_len = int(batch.mtp_original_device_len) + committed_inputs - 1
+            batch.input_ids = verify_ids[:committed_inputs]
+            batch.positions = batch.positions[:committed_inputs]
+            if batch.out_loc is not None:
+                batch.out_loc = batch.out_loc[:committed_inputs]
+            batch.fla_metadata = build_fla_metadata(batch, self.device)
+            self.attn_backend.prepare_metadata(batch)
+            self.model.forward()
+            full_hidden = self.model.model._last_hc_hidden
+
+        req.cached_len = int(batch.mtp_original_cached_len) + committed_inputs
+        req.device_len = int(batch.mtp_original_device_len) + accepted.numel()
+        req.mtp_hidden = full_hidden[committed_inputs - 1].detach().clone()
+        batch.mtp_drafted = steps
+        batch.mtp_accepted = matched
+        batch.generated_tokens = accepted.numel()
+        batch.phase = "decode"
+        return accepted
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

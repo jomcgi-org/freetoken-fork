@@ -71,6 +71,10 @@ class Req:
     sample_copy_done: torch.cuda.Event | None = field(
         default=None, init=False, repr=False
     )
+    # Last target-model HC state used to seed Qwen4Exp MTP. It is deliberately
+    # request-owned rather than scheduler-global so the ordinary fallback path can
+    # update it without changing batching behavior.
+    mtp_hidden: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -153,6 +157,11 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # Decode accounting populated by the MTP engine path. Zeroes preserve the
+    # ordinary one-token scheduler path and its log output.
+    mtp_drafted: int = field(default=0, init=False)
+    mtp_accepted: int = field(default=0, init=False)
+    generated_tokens: int = field(default=0, init=False)
 
     @property
     def is_prefill(self) -> bool:

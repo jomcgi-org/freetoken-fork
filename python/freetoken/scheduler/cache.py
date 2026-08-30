@@ -281,6 +281,24 @@ class CacheManager:
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
 
+    def rollback_paged_tail(self, req: Req, committed_len: int, allocated_len: int) -> None:
+        """Return whole pages allocated only for rejected speculative positions.
+
+        A page shared by the committed prefix and rejected tail stays allocated;
+        its rejected rows are invisible by sequence length and will be overwritten.
+        """
+        first_page = div_ceil(committed_len, self.page_size)
+        last_page = div_ceil(allocated_len, self.page_size)
+        if last_page <= first_page:
+            return
+        first = first_page * self.page_size
+        last = last_page * self.page_size
+        indices = self.page_table[req.table_idx, first:last]
+        if self.swa_paged:
+            self._free_swa(indices)
+        self._free(indices)
+        self.page_table[req.table_idx, first:last].zero_()
+
     def cache_req(self, req: Req, *, finished: bool) -> None:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)

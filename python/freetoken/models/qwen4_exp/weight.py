@@ -7,7 +7,8 @@ Three separate paths, because the checkpoint's three weight classes live in diff
   pinned :class:`HostBank` objects or left as read-only shard mappings for disk staging or HMM.
 * :func:`load_nvfp4_expert_sources` -- the routed NVFP4 experts, into the offload cache's source banks.
 
-Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``) and ``model.visual.*`` (served text-only).
+Dropped by the default reader: ``mtp.*`` (loaded separately when native MTP is enabled) and
+``model.visual.*`` (served text-only).
 """
 
 from __future__ import annotations
@@ -184,6 +185,33 @@ def iter_weights(
                 yield name, tensor
 
     assert not fuse_buf, f"Incomplete projection fusions: {sorted(fuse_buf)}"
+
+
+def iter_mtp_weights(
+    model_path: str,
+    device: torch.device,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield only the optional BF16 MTP head under its native ``mtp.*`` keys."""
+    if get_tp_info().size > 1:
+        raise NotImplementedError("qwen4_exp MTP weight loading supports TP=1 only")
+    fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
+    for file in tqdm(
+        iter_weight_files(model_path),
+        desc="Loading MTP weights",
+        disable=not get_tp_info().is_primary(),
+    ):
+        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+            for name in f.keys():
+                if not name.startswith("mtp."):
+                    continue
+                tensor = f.get_tensor(name)
+                fused = _try_fuse(name, tensor, fuse_buf)
+                if fused is not None:
+                    if fused != ():
+                        yield fused
+                    continue
+                yield name, tensor
+    assert not fuse_buf, f"Incomplete MTP projection fusions: {sorted(fuse_buf)}"
 
 
 # ======================================================================================

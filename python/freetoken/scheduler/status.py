@@ -16,6 +16,8 @@ class SchedulerStatusReporter:
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
     _decode_generated_tokens: int = field(default=0, init=False)
+    _decode_drafted_tokens: int = field(default=0, init=False)
+    _decode_accepted_tokens: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -103,7 +105,11 @@ class SchedulerStatusReporter:
         swa_tokens: tuple[int, int] | None = None,
     ) -> None:
         self._decode_forward_count += 1
-        self._decode_generated_tokens += len(batch.reqs)
+        self._decode_generated_tokens += getattr(batch, "generated_tokens", 0) or len(
+            batch.reqs
+        )
+        self._decode_drafted_tokens += getattr(batch, "mtp_drafted", 0)
+        self._decode_accepted_tokens += getattr(batch, "mtp_accepted", 0)
         if self._decode_forward_count % self.decode_log_interval != 0:
             return
 
@@ -111,7 +117,16 @@ class SchedulerStatusReporter:
         gap = now - self._last_decode_time
         self._last_decode_time = now
         gen_throughput = self._decode_generated_tokens / gap if gap > 0 else 0.0
+        tokens_per_step = self._decode_generated_tokens / self.decode_log_interval
+        acceptance_rate = (
+            self._decode_accepted_tokens / self._decode_drafted_tokens
+            if self._decode_drafted_tokens else 0.0
+        )
         self._decode_generated_tokens = 0
+        drafted = self._decode_drafted_tokens
+        accepted = self._decode_accepted_tokens
+        self._decode_drafted_tokens = 0
+        self._decode_accepted_tokens = 0
         self.log(
             f"Decode batch, "
             f"#running-req: {running_reqs}, "
@@ -120,6 +135,9 @@ class SchedulerStatusReporter:
             f"{_swa_msg(swa_tokens)}"
             f"{_mamba_msg(mamba_slots)}"
             f"gen throughput (token/s): {gen_throughput:.2f}, "
+            f"drafted: {drafted}, accepted: {accepted}, "
+            f"acceptance rate: {acceptance_rate:.4f}, "
+            f"tokens/step: {tokens_per_step:.2f}, "
             f"#queue-req: {queue_reqs}"
         )
 

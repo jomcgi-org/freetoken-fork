@@ -29,6 +29,12 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     p.add_argument("--moe-backend", default="offload",
                    help="offload (experts -> banks) or e.g. triton (experts stay dense)")
     p.add_argument("--shard-gib", type=float, default=8.0, help="max shard size in GiB")
+    p.add_argument(
+        "--speculative-mtp",
+        choices=("off", "on"),
+        default="off",
+        help="preserve the optional Qwen3.8 MTP head in the FTW (default: off)",
+    )
     p.add_argument("--gpu", type=single_gpu_arg, default=None,
                    help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
                         "an nvidia-smi index (default: the first visible GPU)")
@@ -47,12 +53,16 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     index = convert_checkpoint(
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
         moe_backend=ns.moe_backend, shard_limit=shard_limit, device=device,
+        include_mtp=ns.speculative_mtp == "on",
     )
     dt = time.perf_counter() - t
     c = index["counts"]
     gib = index["total_bytes"] / (1 << 30)
     print(f"\nwrote FTW checkpoint -> {ns.out}")
-    print(f"  tensors: {c['weight']} weight + {c['experts_bank']} experts_bank")
+    print(
+        f"  tensors: {c['weight']} weight + {c.get('mtp', 0)} mtp + "
+        f"{c['experts_bank']} experts_bank"
+    )
     print(f"  FTW: {gib:.2f} GiB across {len(index['shards'])} shard(s) "
           f"(<= {ns.shard_gib} GiB each)")
     print(f"  quant_format: {index['quant_format']}  fingerprint={index['fingerprint']}")

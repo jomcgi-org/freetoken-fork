@@ -112,6 +112,45 @@ fixed pinned compact-id buffers read by the captured gather. Set
 `FREETOKEN_PLE_DISK_NO_GRAPHS=1` to restore eager decode for debugging. Prefill stages
 the full requested-row union for each chunk through the unchanged eager path.
 
+### Native MTP speculative decoding
+
+Qwen3.8-Flash-Next can load its checkpoint-native multi-token prediction head with
+`--speculative-mtp on`. The default is `off`, which retains the previous model shape,
+weight loading, scheduling, and CUDA graph behavior. The shipped head is one decoder
+layer reused for three draft steps. FreeToken verifies the seed plus those three drafts
+in one target-model forward, then accepts the longest matching greedy prefix and one
+target bonus token.
+
+This first implementation supports TP 1, greedy sampling, and one request in the decode
+batch. Unsupported sampling modes and larger decode batches fall back to ordinary
+one-token decoding. Enabling the feature selects the non-overlapped scheduler loop so
+request-owned recurrent state can be restored safely after a rejected draft.
+
+The target verification forward is eager and uses the existing short-extend layout.
+Consequently PLE row derivation, page preparation, and DISK-layer CPU MoE execution see
+all verification positions together. A fully accepted step needs one target forward.
+After a partial rejection, FreeToken restores the GDN, PLE, and QSA continuation state
+and replays only the committed input prefix. This recovery forward preserves greedy
+equivalence but reduces the benefit of low-acceptance steps. CUDA graph capture remains
+unchanged when the feature is off. It is disabled while MTP is enabled because the next
+draft step consumes target hidden state that is not currently exposed by graph replay.
+
+Pass `--speculative-mtp on` to `ft checkpoint` to store MTP tensors under a separate
+optional tensor kind. An FTW checkpoint created without that conversion flag must be
+reconverted before it can be served with `--speculative-mtp on`. Default-off conversions
+do not store the large head, and default-off FTW loads do not read or allocate it.
+
+The RadixArk checkpoint stores the MTP routed experts as stacked BF16 tensors. Those two
+expert tensors alone occupy about 4.69 GiB, with the rest of the head adding more, so the
+resident cost is materially higher than 2 GiB for that checkpoint. The v1 draft attention
+keeps the current three-token speculative chain but does not yet retain an independent MTP
+prompt KV and QSA cache. Verification remains lossless, while acceptance can be lower than
+an implementation with the complete draft cache.
+
+Decode status lines report `drafted`, `accepted`, `acceptance rate`, and `tokens/step`.
+Here `accepted` counts matching draft tokens; the target bonus token contributes to
+`tokens/step` but not the acceptance numerator.
+
 ## Notes
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into

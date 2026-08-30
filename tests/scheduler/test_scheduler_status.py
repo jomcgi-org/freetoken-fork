@@ -148,6 +148,27 @@ def test_zero_gap_and_zero_total_are_guarded():
     assert "#token: 0" in line  # owned-KV (dsv4) reports 0/0 pages
 
 
+def test_decode_mtp_acceptance_stats():
+    rep, logs, clock = _reporter(interval=1)
+    batch = _decode_batch(1)
+    batch.mtp_drafted = 3
+    batch.mtp_accepted = 2
+    batch.generated_tokens = 3
+    clock["t"] = 2.0
+    rep.report_batch(
+        batch,
+        running_reqs=1,
+        queue_reqs=0,
+        kv_used_pages=1,
+        kv_total_pages=2,
+        page_size=1,
+    )
+    line = logs[-1]
+    assert "drafted: 3, accepted: 2" in line
+    assert "acceptance rate: 0.6667" in line
+    assert "tokens/step: 3.00" in line
+
+
 def test_interval_is_clamped_to_at_least_one():
     rep, _, _ = _reporter(interval=0)
     assert rep.decode_log_interval == 1
