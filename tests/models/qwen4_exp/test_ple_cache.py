@@ -150,6 +150,10 @@ def test_cached_ple_capture_replay_tracks_evolving_row_sets(tmp_path):
     with torch.cuda.graph(graph):
         captured = cache.lookup(placeholder)
     cache.finish_decode(record_event=False)
+    # Capture records the gather without executing it: replay before asserting.
+    cache.prepare_decode(first)
+    graph.replay()
+    cache.finish_decode(record_event=True)
     torch.cuda.synchronize()
     assert torch.equal(
         captured,
