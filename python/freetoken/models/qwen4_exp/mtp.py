@@ -17,7 +17,7 @@ from freetoken.layers import (
     LinearReplicated,
     OPList,
 )
-from freetoken.layers.moe import MoELayer
+from freetoken.layers.moe import MoELayer, make_moe_layer
 from freetoken.layers.rotary import get_rope
 from freetoken.moe.fused import fused_topk
 
@@ -98,9 +98,11 @@ class Qwen4ExpMTPAttention(BaseOP):
 
 
 class Qwen4ExpMTPMoE(Qwen4ExpMoE):
-    """BF16 resident sibling of the target's possibly offloaded MoE block."""
+    """Resident sibling of the target's possibly offloaded MoE block."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, mtp_quant: str = "bf16") -> None:
+        if mtp_quant not in ("bf16", "nvfp4"):
+            raise ValueError(f"unsupported MTP expert quantization {mtp_quant!r}")
         resident = replace(
             config,
             moe_backend="fused",
@@ -108,7 +110,15 @@ class Qwen4ExpMTPMoE(Qwen4ExpMoE):
             dense_quant="none",
         )
         super().__init__(resident, layer_id=None)
+        if mtp_quant == "nvfp4":
+            self.experts = make_moe_layer(
+                resident,
+                layer_id=None,
+                renormalize=config.norm_topk_prob,
+                weight_format="nvfp4",
+            )
         assert isinstance(self.experts, MoELayer)
+        self.mtp_quant = mtp_quant
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -126,9 +136,9 @@ class Qwen4ExpMTPMoE(Qwen4ExpMoE):
 
 
 class Qwen4ExpMTPDecoderLayer(BaseOP):
-    def __init__(self, config) -> None:
+    def __init__(self, config, mtp_quant: str = "bf16") -> None:
         self.self_attn = Qwen4ExpMTPAttention(config, config.num_layers)
-        self.mlp = Qwen4ExpMTPMoE(config)
+        self.mlp = Qwen4ExpMTPMoE(config, mtp_quant)
         self.attn_hyper_connection = GatedResidual(config)
         self.mlp_hyper_connection = GatedResidual(config)
 
@@ -146,7 +156,7 @@ class Qwen4ExpMTPDecoderLayer(BaseOP):
 class Qwen4ExpMTPHead(BaseOP):
     """Checkpoint-native one-layer head, reused for three greedy draft steps."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, mtp_quant: str = "bf16") -> None:
         args = config.qwen4_args
         self.hidden_size = config.hidden_size
         self.hc_count = args.hc_count
@@ -162,8 +172,9 @@ class Qwen4ExpMTPHead(BaseOP):
         self.fc_hidden = LinearReplicated(
             config.hidden_size, config.hidden_size, has_bias=False
         )
-        self.layers = OPList([Qwen4ExpMTPDecoderLayer(config)])
+        self.layers = OPList([Qwen4ExpMTPDecoderLayer(config, mtp_quant)])
         self.hyper_connection_mixer = GatedResidual(config, use_combine=False)
+        self.mtp_quant = mtp_quant
 
     def _fuse(self, embedding: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
         embedding = self.fc_embedding.forward(self.pre_fc_norm_embedding.forward(embedding))

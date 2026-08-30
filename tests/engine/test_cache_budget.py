@@ -112,6 +112,47 @@ def test_resolve_auto_applies_ratio_once_and_marlin_cap():
     assert size == 8 and pages == 40 and overlap is True
 
 
+def test_resident_mtp_head_is_charged_before_expert_cache_and_kv_planning():
+    from freetoken.engine.engine import _startup_kv_budget, _state_dict_nbytes
+
+    dense_bytes = 2_000
+    mtp_state = {
+        "experts.gate_up": torch.empty(300, dtype=torch.bfloat16),
+        "experts.down": torch.empty(200, dtype=torch.bfloat16),
+    }
+    mtp_bytes = _state_dict_nbytes(mtp_state)
+    assert mtp_bytes == 1_000
+
+    baseline_free = 10_000
+    post_weights_free = baseline_free - dense_bytes - mtp_bytes
+    kv_budget = _startup_kv_budget(0.9, baseline_free, post_weights_free)
+    assert kv_budget == int(0.9 * baseline_free) - dense_bytes - mtp_bytes
+
+    # The same measured resident-weight delta feeds --moe-cache-auto before the KV
+    # pool is allocated. Charging the MTP head removes exactly its bytes from the
+    # joint expert-cache/KV budget.
+    kwargs = dict(
+        baseline_free=baseline_free,
+        memory_ratio=0.9,
+        cache_per_page=10,
+        fixed_cache_size=0,
+        per_expert_bytes=100,
+        num_experts=2,
+        total_experts=10,
+        prefill_overlap=False,
+        kv_reserve_tokens=0,
+        page_size=1,
+        quant_format="bf16",
+    )
+    _, pages_without_head, _ = resolve_moe_cache_auto(
+        weights_bytes=dense_bytes, **kwargs
+    )
+    _, pages_with_head, _ = resolve_moe_cache_auto(
+        weights_bytes=dense_bytes + mtp_bytes, **kwargs
+    )
+    assert pages_without_head * 10 - pages_with_head * 10 == mtp_bytes
+
+
 def test_resolve_auto_marlin_caps_slots():
     size, _, _ = resolve_moe_cache_auto(
         baseline_free=10_000_000, weights_bytes=0, memory_ratio=1.0,

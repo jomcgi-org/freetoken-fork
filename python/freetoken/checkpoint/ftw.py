@@ -106,6 +106,22 @@ def is_ftw_checkpoint(path: str) -> bool:
     return os.path.isfile(os.path.join(path, INDEX_NAME))
 
 
+def mtp_quant_from_checkpoint(path: str) -> str:
+    """Resolve an MTP resident layout from FTW metadata, defaulting raw/old files to BF16."""
+    if not is_ftw_checkpoint(path):
+        return "bf16"
+    reader = FTWReader(path)
+    try:
+        value = reader.meta("mtp_quant")
+        if value is None:
+            value = "bf16"
+    finally:
+        reader.close()
+    if value not in ("bf16", "nvfp4"):
+        raise ValueError(f"unsupported FTW MTP quantization {value!r}")
+    return value
+
+
 # ============================== writer ==============================
 class FTWWriter:
     """Stream tensors into the FTW, rolling shard files at ``shard_limit``.
@@ -703,4 +719,5 @@ __all__ = [
     "INDEX_NAME", "FORMAT_TAG", "FORMAT_VERSION", "ALIGN", "DEFAULT_SHARD_LIMIT",
     "is_ftw_checkpoint", "FTWWriter", "FTWReader",
     "iter_ftw_weights", "load_ftw_banks", "layer_bank_entry_name",
+    "mtp_quant_from_checkpoint",
 ]

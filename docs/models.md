@@ -136,16 +136,23 @@ unchanged when the feature is off. It is disabled while MTP is enabled because t
 draft step consumes target hidden state that is not currently exposed by graph replay.
 
 Pass `--speculative-mtp on` to `ft checkpoint` to store MTP tensors under a separate
-optional tensor kind. An FTW checkpoint created without that conversion flag must be
-reconverted before it can be served with `--speculative-mtp on`. Default-off conversions
-do not store the large head, and default-off FTW loads do not read or allocate it.
+optional tensor kind. The head is BF16 by default. Add `--mtp-quant nvfp4` to quantize
+only its routed experts with the same packed E2M1, e4m3 group-16 scale, and fp16 row-global
+layout used by the main NVFP4 experts. Serving reads `mtp_quant` from the FTW metadata, so
+no serve-side precision flag is needed. An FTW checkpoint created without the MTP conversion
+flag must be reconverted before it can be served with `--speculative-mtp on`. Default-off
+conversions do not store the large head, and default-off FTW loads do not read or allocate it.
 
-The RadixArk checkpoint stores the MTP routed experts as stacked BF16 tensors. Those two
-expert tensors alone occupy about 4.69 GiB, with the rest of the head adding more, so the
-resident cost is materially higher than 2 GiB for that checkpoint. The v1 draft attention
-keeps the current three-token speculative chain but does not yet retain an independent MTP
-prompt KV and QSA cache. Verification remains lossless, while acceptance can be lower than
-an implementation with the complete draft cache.
+The MTP head is always GPU-resident, even when the target model uses an offload-family MoE
+backend. It never enters the expert bank, LRU, CPU, or disk tiers. Startup logs its exact
+resident tensor bytes, and the engine charges those bytes with the other dense weights before
+sizing the target expert cache and KV pool. For the RadixArk geometry (`E=512`, `H=2560`,
+`I=640`), the two BF16 expert tensors use `6*E*H*I = 5,033,164,800` bytes (4.6875 GiB).
+The native NVFP4 expert banks use 1,419,509,760 bytes (1.3220 GiB), plus the unchanged BF16
+non-expert portion of the head. The v1 draft attention keeps the current three-token
+speculative chain but does not yet retain an independent MTP prompt KV and QSA cache.
+Verification remains lossless, while acceptance can be lower than an implementation with
+the complete draft cache.
 
 Decode status lines report `drafted`, `accepted`, `acceptance rate`, and `tokens/step`.
 Here `accepted` counts matching draft tokens; the target bonus token contributes to

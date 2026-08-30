@@ -1,7 +1,8 @@
 """CLI: convert an HF safetensors checkpoint to a FreeToken Weight (FTW) checkpoint.
 
     ft checkpoint --model <hf_dir> --out <ftw_dir> \
-        [--dtype bfloat16] [--moe-backend offload] [--shard-gib 8] [--gpu <uuid-or-index>]
+        [--dtype bfloat16] [--moe-backend offload] [--shard-gib 8]
+        [--speculative-mtp on --mtp-quant {bf16,nvfp4}] [--gpu <uuid-or-index>]
 
 The output dir is self-contained: point the server's ``--model`` at it to load via the FTW
 fast path (auto-detected).
@@ -35,10 +36,18 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
         default="off",
         help="preserve the optional Qwen3.8 MTP head in the FTW (default: off)",
     )
+    p.add_argument(
+        "--mtp-quant",
+        choices=("bf16", "nvfp4"),
+        default="bf16",
+        help="resident MTP routed-expert precision (default: bf16)",
+    )
     p.add_argument("--gpu", type=single_gpu_arg, default=None,
                    help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
                         "an nvidia-smi index (default: the first visible GPU)")
     ns = p.parse_args(argv)
+    if ns.speculative_mtp == "off" and ns.mtp_quant != "bf16":
+        p.error("--mtp-quant nvfp4 requires --speculative-mtp on")
 
     # same as ft serve --gpu: resolve, then bind by UUID at CUDA init
     try:
@@ -54,6 +63,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
         ns.model, ns.out, dtype=_DTYPES[ns.dtype],
         moe_backend=ns.moe_backend, shard_limit=shard_limit, device=device,
         include_mtp=ns.speculative_mtp == "on",
+        mtp_quant=ns.mtp_quant,
     )
     dt = time.perf_counter() - t
     c = index["counts"]
@@ -66,6 +76,8 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
     print(f"  FTW: {gib:.2f} GiB across {len(index['shards'])} shard(s) "
           f"(<= {ns.shard_gib} GiB each)")
     print(f"  quant_format: {index['quant_format']}  fingerprint={index['fingerprint']}")
+    if index.get("mtp_quant") is not None:
+        print(f"  mtp_quant: {index['mtp_quant']}")
     print(f"  converted in {dt:.1f}s")
     return 0
 

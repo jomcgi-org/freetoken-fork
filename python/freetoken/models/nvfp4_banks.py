@@ -12,6 +12,33 @@ import torch
 from freetoken.utils import download_hf_weight
 from tqdm import tqdm
 
+
+# Native ModelOpt NVFP4 values. The serving kernels use the same nibble ordering and
+# dequantization rule in kernel/triton/nvfp4_{dequant,fused_moe}.py.
+_E2M1_VALUES = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
+_E4M3_MAX = 448.0
+_E2M1_MAX = 6.0
+
 LayerToBank = Callable[[int, object], int | None]
 DropPageCache = Callable[[str], None]
 
@@ -22,6 +49,97 @@ class Nvfp4ExpertSourceSpec:
     proj_to_role: dict[str, str]
     layer_to_bank: LayerToBank
     desc: str
+
+
+def quantize_nvfp4_group16(
+    weight: torch.Tensor,
+    *,
+    row_chunk: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize dense rows to the native group-16 NVFP4 expert layout.
+
+    The last dimension is the reduction dimension. Two E2M1 values are packed in
+    low-nibble-first order, every 16 values share an e4m3 scale, and every output row
+    carries one fp16 global scale. This is the same six-bank representation used by the
+    main routed experts, so the resident MTP head can use the existing inline-dequant MoE
+    kernels without a BF16 staging copy.
+
+    Conversion is chunked by flattened output row. A full Qwen3.8 MTP expert tensor is
+    several GiB, so even the float32 conversion workspace must stay bounded.
+    """
+    if weight.ndim < 2:
+        raise ValueError(f"NVFP4 weight must have at least 2 dimensions, got {weight.shape}")
+    in_features = int(weight.shape[-1])
+    if in_features % 16:
+        raise ValueError(
+            f"NVFP4 group-16 reduction dimension must be divisible by 16, got {in_features}"
+        )
+    rows = weight.detach().to(device="cpu").reshape(-1, in_features)
+    packed = torch.empty((rows.shape[0], in_features // 2), dtype=torch.uint8)
+    scales = torch.empty(
+        (rows.shape[0], in_features // 16), dtype=torch.float8_e4m3fn
+    )
+    globals_ = torch.empty((rows.shape[0],), dtype=torch.float16)
+    # Midpoints between the eight non-negative E2M1 magnitudes. bucketize maps a
+    # normalized magnitude directly to its nearest code without a 16x codebook-distance
+    # tensor. Exact midpoint ties choose the lower code deterministically.
+    thresholds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+
+    for start in range(0, rows.shape[0], row_chunk):
+        end = min(start + row_chunk, rows.shape[0])
+        groups = rows[start:end].float().reshape(end - start, -1, 16)
+        desired_scale = groups.abs().amax(dim=-1) / _E2M1_MAX
+        # Use the full e4m3 range for the largest group in each row. Zero rows use a
+        # benign global of one and zero block scales/codes.
+        row_global = desired_scale.amax(dim=-1) / _E4M3_MAX
+        row_global = torch.where(row_global == 0, torch.ones_like(row_global), row_global)
+        row_global16 = row_global.to(torch.float16)
+        if torch.any(row_global16 == 0):
+            raise ValueError("NVFP4 row global scale underflowed float16 during conversion")
+        normalized_scale = desired_scale / row_global16.float().unsqueeze(-1)
+        scale8 = normalized_scale.clamp(max=_E4M3_MAX).to(torch.float8_e4m3fn)
+        actual_scale = scale8.float() * row_global16.float().unsqueeze(-1)
+        safe_scale = torch.where(actual_scale == 0, torch.ones_like(actual_scale), actual_scale)
+        normalized = groups / safe_scale.unsqueeze(-1)
+        magnitude_codes = torch.bucketize(normalized.abs().contiguous(), thresholds)
+        codes = (magnitude_codes + (normalized < 0) * 8).to(torch.uint8)
+        codes = torch.where(actual_scale.unsqueeze(-1) == 0, torch.zeros_like(codes), codes)
+        codes = codes.reshape(end - start, in_features)
+        packed[start:end] = codes[:, 0::2] | (codes[:, 1::2] << 4)
+        scales[start:end] = scale8
+        globals_[start:end] = row_global16
+
+    leading = tuple(weight.shape[:-1])
+    return (
+        packed.reshape(*leading, in_features // 2),
+        scales.reshape(*leading, in_features // 16),
+        globals_.reshape(*leading),
+    )
+
+
+def dequantize_nvfp4_group16(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    row_global: torch.Tensor,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """CPU/reference dequantization for :func:`quantize_nvfp4_group16`."""
+    if packed.dtype != torch.uint8 or scale.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"expected uint8/e4m3 NVFP4 tensors, got {packed.dtype}/{scale.dtype}")
+    in_features = int(packed.shape[-1]) * 2
+    if scale.shape != (*packed.shape[:-1], in_features // 16):
+        raise ValueError(f"NVFP4 scale shape {scale.shape} does not match packed {packed.shape}")
+    if row_global.shape != packed.shape[:-1]:
+        raise ValueError(
+            f"NVFP4 global shape {row_global.shape} does not match packed {packed.shape}"
+        )
+    codes = torch.empty((*packed.shape[:-1], in_features), dtype=torch.long)
+    codes[..., 0::2] = packed & 0xF
+    codes[..., 1::2] = packed >> 4
+    values = _E2M1_VALUES[codes]
+    block_scale = scale.float().repeat_interleave(16, dim=-1)
+    return (values * block_scale * row_global.float().unsqueeze(-1)).to(dtype)
 
 
 def _num_moe_layers(config) -> int:
@@ -322,6 +440,8 @@ def load_nvfp4_expert_source_banks_parallel(
 
 __all__ = [
     "Nvfp4ExpertSourceSpec",
+    "dequantize_nvfp4_group16",
     "load_nvfp4_expert_source_banks",
     "load_nvfp4_expert_source_banks_parallel",
+    "quantize_nvfp4_group16",
 ]

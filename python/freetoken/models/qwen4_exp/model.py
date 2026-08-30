@@ -148,12 +148,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
-    def enable_mtp(self) -> None:
+    def enable_mtp(self, mtp_quant: str = "bf16") -> None:
         """Build the optional head while the engine is still on the meta device."""
         from .mtp import Qwen4ExpMTPHead
 
         if not hasattr(self, "mtp"):
-            self.mtp = Qwen4ExpMTPHead(self._config)
+            self.mtp = Qwen4ExpMTPHead(self._config, mtp_quant)
             self.model._capture_mtp_hidden = True
 
     def load_host_tables(self, engine_config) -> int:

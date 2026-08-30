@@ -72,6 +72,11 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
+def _state_dict_nbytes(state_dict: Dict[str, torch.Tensor]) -> int:
+    """Logical resident tensor bytes, independent of CUDA allocator slab rounding."""
+    return sum(t.numel() * t.element_size() for t in state_dict.values())
+
+
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
     """Column count for the page table. ``_write_page_table`` writes WHOLE trailing pages, so the
     highest column touched is ``align_ceil(max_seq_len, page_size) - 1`` -- which the 32-alignment
@@ -301,6 +306,13 @@ class Engine:
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
         self.config = config  # retained for runtime cache rebuild (rebuild_runtime_cache)
+        from freetoken.checkpoint.ftw import mtp_quant_from_checkpoint
+
+        self.mtp_quant = (
+            mtp_quant_from_checkpoint(config.model_path)
+            if config.speculative_mtp == "on"
+            else None
+        )
         # KV pool family fixed at construction from the model config: its classmethods own the
         # page-token geometry and cost arithmetic the engine needs BEFORE the pool exists
         # (num_pages sizing, --moe-cache-auto); the instance owns rebuild/validation after.
@@ -325,8 +337,15 @@ class Engine:
                     )
                 if config.tp_info.size != 1:
                     raise ValueError("--speculative-mtp on currently requires --tp-size 1")
-                self.model.enable_mtp()
+                self.model.enable_mtp(self.mtp_quant)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        self._mtp_head_bytes = 0
+        if config.speculative_mtp == "on":
+            self._mtp_head_bytes = _state_dict_nbytes(self.model.mtp.state_dict())
+            logger.info_rank0(
+                f"MTP head resident on GPU: {self._mtp_head_bytes} bytes "
+                f"({mem_GB(self._mtp_head_bytes)}), quant={self.mtp_quant}"
+            )
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are

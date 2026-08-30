@@ -39,11 +39,18 @@ def _progress(phase: str, done: int = 0, total: int = 0) -> None:
         print(f"FTCONVERT {phase} {done} {total}", flush=True)
 
 
-def _source_fingerprint(model_path: str, model_config, *, device) -> str:
+def _source_fingerprint(
+    model_path: str,
+    model_config,
+    *,
+    device,
+    mtp_quant: str | None = None,
+) -> str:
     """Identity of (checkpoint + quant + GPU capability), stored in the FTW index so
     it's clear what an FTW was built from. Cheap (stat only)."""
     h = hashlib.sha256()
     h.update(f"quant={getattr(model_config, 'expert_quant', None)}|".encode())
+    h.update(f"mtp_quant={mtp_quant}|".encode())
     h.update(f"arch={getattr(model_config, 'architectures', None)}|".encode())
     try:  # nvfp4 marlin/b12x layout depends on compute capability
         h.update(f"cc={torch.cuda.get_device_capability(device)}|".encode())
@@ -162,6 +169,55 @@ class _ConvertSink:
         return len(self._seen)
 
 
+def iter_converted_mtp_weights(weights, mtp_quant: str):
+    """Yield MTP tensors in the runtime state-dict layout for one FTW precision.
+
+    BF16 is a pass-through. NVFP4 replaces only the two routed-expert tensors with
+    the six native group-16 banks used by the main experts. Attention, router, shared
+    expert, hyper-connections, and all norms remain BF16.
+    """
+    if mtp_quant not in ("bf16", "nvfp4"):
+        raise ValueError(f"--mtp-quant must be 'bf16' or 'nvfp4', got {mtp_quant!r}")
+    if mtp_quant == "bf16":
+        yield from weights
+        return
+
+    from freetoken.models.nvfp4_banks import quantize_nvfp4_group16
+
+    converted = set()
+    suffixes = {
+        ".mlp.experts.gate_up_proj": "gate_up",
+        ".mlp.experts.down_proj": "down",
+    }
+    for name, tensor in weights:
+        role = next((r for suffix, r in suffixes.items() if name.endswith(suffix)), None)
+        if role is None:
+            yield name, tensor
+            continue
+        if role in converted:
+            raise ValueError(f"MTP checkpoint contains more than one {role} expert tensor")
+        converted.add(role)
+        packed, scale, row_global = quantize_nvfp4_group16(tensor)
+        prefix = name.rsplit(".", 1)[0]
+        yield f"{prefix}.{role}_packed", packed
+        yield f"{prefix}.{role}_scale", scale
+        yield f"{prefix}.{role}_global", row_global
+    if converted != {"gate_up", "down"}:
+        raise ValueError(
+            "NVFP4 MTP conversion requires gate_up_proj and down_proj routed experts; "
+            f"found {sorted(converted)}"
+        )
+
+
+def mtp_ftw_metadata(mtp_quant: str | None, n_mtp: int, mtp_expert_bytes: int) -> dict:
+    """Metadata shared by production conversion and CPU-only synthetic FTW tests."""
+    if n_mtp == 0:
+        return {"mtp_quant": None, "mtp_expert_bytes": 0}
+    if mtp_quant not in ("bf16", "nvfp4"):
+        raise ValueError(f"invalid MTP FTW quantization {mtp_quant!r}")
+    return {"mtp_quant": mtp_quant, "mtp_expert_bytes": int(mtp_expert_bytes)}
+
+
 def convert_checkpoint(
     model_path: str,
     out_dir: str,
@@ -171,6 +227,7 @@ def convert_checkpoint(
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
     include_mtp: bool = False,
+    mtp_quant: str = "bf16",
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -184,6 +241,10 @@ def convert_checkpoint(
 
     if is_ftw_checkpoint(model_path):
         raise SystemExit(f"{model_path} is already an FTW checkpoint")
+    if mtp_quant not in ("bf16", "nvfp4"):
+        raise ValueError(f"--mtp-quant must be 'bf16' or 'nvfp4', got {mtp_quant!r}")
+    if not include_mtp and mtp_quant != "bf16":
+        raise ValueError("--mtp-quant nvfp4 requires --speculative-mtp on")
     tp = try_get_tp_info()
     if tp is None:
         set_tp_info(rank=0, size=1)
@@ -207,6 +268,7 @@ def convert_checkpoint(
 
     writer = FTWWriter(out_dir, shard_limit=shard_limit)
     n_weight = n_mtp = n_bank = n_alpha = 0
+    mtp_expert_bytes = 0
 
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
@@ -226,11 +288,15 @@ def convert_checkpoint(
         from freetoken.models.qwen4_exp.weight import iter_mtp_weights
 
         for name, tensor in count_bar(
-            iter_mtp_weights(model_path, torch.device("cpu")),
+            iter_converted_mtp_weights(
+                iter_mtp_weights(model_path, torch.device("cpu")), mtp_quant
+            ),
             "Converting MTP weights",
         ):
             writer.add_tensor(name, tensor, kind="mtp")
             n_mtp += 1
+            if ".mlp.experts." in name:
+                mtp_expert_bytes += tensor.numel() * tensor.element_size()
 
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
@@ -294,7 +360,9 @@ def convert_checkpoint(
     copied = _copy_metadata(model_path, out_dir)
 
     try:
-        fingerprint = _source_fingerprint(model_path, mc, device=dev)
+        fingerprint = _source_fingerprint(
+            model_path, mc, device=dev, mtp_quant=mtp_quant if include_mtp else None
+        )
     except Exception:
         fingerprint = None
 
@@ -311,6 +379,7 @@ def convert_checkpoint(
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.
         "expert_bank_num_layers": num_layers,
+        **mtp_ftw_metadata(mtp_quant if include_mtp else None, n_mtp, mtp_expert_bytes),
         "counts": {
             "weight": n_weight,
             "mtp": n_mtp,
@@ -321,4 +390,8 @@ def convert_checkpoint(
     return index
 
 
-__all__ = ["convert_checkpoint"]
+__all__ = [
+    "convert_checkpoint",
+    "iter_converted_mtp_weights",
+    "mtp_ftw_metadata",
+]

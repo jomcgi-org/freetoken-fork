@@ -77,6 +77,21 @@ class MoELayer(BaseOP):
             self.down_proj = torch.empty(n, h, i, dtype=FP8)
             self.down_scale_inv = torch.empty(n, h // blk, i // blk, dtype=torch.bfloat16)
             return
+        if self.weight_format == "nvfp4":
+            # Native group-16 ModelOpt rows. These are ordinary resident tensors, not
+            # OffloadMoeCache slots, and are read directly by the existing inline-dequant
+            # NVFP4 kernels.
+            n, i, h = self.num_experts, self.intermediate_size, self.hidden_size
+            if h % 16 or i % 16:
+                raise ValueError(f"resident NVFP4 MoE requires H/I divisible by 16, got {h}/{i}")
+            fp8 = torch.float8_e4m3fn
+            self.gate_up_packed = torch.empty(n, 2 * i, h // 2, dtype=torch.uint8)
+            self.gate_up_scale = torch.empty(n, 2 * i, h // 16, dtype=fp8)
+            self.gate_up_global = torch.empty(n, 2 * i, dtype=torch.float16)
+            self.down_packed = torch.empty(n, h, i // 2, dtype=torch.uint8)
+            self.down_scale = torch.empty(n, h, i // 16, dtype=fp8)
+            self.down_global = torch.empty(n, h, dtype=torch.float16)
+            return
         assert self.weight_format == "bf16", (
             f"no resident expert allocation for weight_format {self.weight_format!r}"
         )
@@ -129,7 +144,10 @@ class MoELayer(BaseOP):
                 fused_experts_fp8_block,
             )
 
-            if get_global_ctx().batch.is_prefill:
+            # The MTP head drafts one row while the surrounding target verification
+            # batch is marked prefill. Resident rows need no cache movement semantics,
+            # so select the lower-overhead decode GEMV for that one-row case.
+            if get_global_ctx().batch.is_prefill and hidden_states.shape[0] > 1:
                 return fused_experts_fp8_block(
                     hidden_states, self.gate_up_proj, self.gate_up_scale_inv,
                     self.down_proj, self.down_scale_inv,
@@ -138,6 +156,37 @@ class MoELayer(BaseOP):
             return fused_experts_decode_fp8_block(
                 hidden_states, self.gate_up_proj, self.gate_up_scale_inv,
                 self.down_proj, self.down_scale_inv, topk_weights, topk_ids,
+            )
+        if self.weight_format == "nvfp4":
+            views = (
+                self.gate_up_packed,
+                self.gate_up_scale,
+                self.gate_up_global,
+                self.down_packed,
+                self.down_scale,
+                self.down_global,
+            )
+            if get_global_ctx().batch.is_prefill:
+                from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+
+                return fused_experts_nvfp4(
+                    hidden_states,
+                    *views,
+                    topk_weights,
+                    topk_ids,
+                    self.num_experts,
+                    self.activation,
+                    self.apply_router_weight_on_input,
+                )
+            from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+            return fused_experts_decode_nvfp4_marlin(
+                hidden_states,
+                *views,
+                topk_weights,
+                topk_ids,
+                self.activation,
+                self.apply_router_weight_on_input,
             )
         assert self.weight_format == "bf16", (
             f"no resident expert kernel for weight_format {self.weight_format!r}"
