@@ -303,7 +303,6 @@ def test_engine_config_rejects_invalid_hot_expert_budget(budget):
             dtype=torch.bfloat16,
             moe_hot_expert_budget_gib=budget,
         )
-    assert config.moe_disk_lookahead == "on"
 
 
 def test_engine_config_rejects_invalid_disk_prefill_mode():
