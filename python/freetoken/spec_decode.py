@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Callable
-
 import torch
 
 
-MTP_DRAFT_STEPS = 3
+MTP_DRAFT_STEPS = 1
 
 
 def reserve_mtp_window(batch, width: int) -> None:
@@ -36,6 +34,34 @@ def configure_mtp_decode_step(
     if out_loc is not None:
         batch.out_loc = out_loc[step : step + 1]
     batch.phase = "decode"
+    batch.mtp_fused = False
+
+
+def configure_mtp_fused_step(
+    batch,
+    verify_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out_loc: torch.Tensor | None,
+) -> None:
+    """Expose ``[seed, draft]`` as one decode-routed target forward.
+
+    The request still has one logical sequence with an extend length of two. Model
+    components with recurrent state use ``mtp_fused`` to execute the two rows in
+    order, while MoE dispatch continues to see a decode batch.
+    """
+    if verify_ids.numel() != 2 or positions.numel() != 2:
+        raise ValueError("K=1 fused MTP verification requires exactly two positions")
+    if out_loc is not None and out_loc.numel() != 2:
+        raise ValueError("K=1 fused MTP verification requires exactly two cache locations")
+    req = batch.reqs[0]
+    req.cached_len = int(batch.mtp_original_cached_len)
+    req.device_len = int(batch.mtp_original_device_len) + 1
+    batch.input_ids = verify_ids
+    batch.positions = positions
+    if out_loc is not None:
+        batch.out_loc = out_loc
+    batch.phase = "decode"
+    batch.mtp_fused = True
 
 
 def snapshot_verify_state(pool, kv_cache, req) -> dict:
@@ -75,6 +101,15 @@ def validate_speculative_mtp(value: str) -> str:
     return value
 
 
+def validate_mtp_draft_tokens(value: int) -> int:
+    if value != MTP_DRAFT_STEPS:
+        raise ValueError(
+            "--mtp-draft-tokens is fixed at 1 for fused MTP verification, got "
+            f"{value!r}"
+        )
+    return value
+
+
 def greedy_accept_prefix(
     draft_tokens: torch.Tensor,
     target_tokens: torch.Tensor,
@@ -95,33 +130,14 @@ def greedy_accept_prefix(
     return accepted, matches
 
 
-def greedy_accept_decode(
-    draft_tokens: torch.Tensor,
-    target_step: Callable[[int], tuple[torch.Tensor, object]],
-) -> tuple[torch.Tensor, int, object]:
-    """Verify ordered decode steps, stopping before any rejected input is run.
-
-    ``target_step(i)`` processes chain input ``i`` and returns its one-token target
-    prediction plus an opaque state payload. The final payload therefore belongs to
-    exactly the committed input prefix.
-    """
-    drafts = draft_tokens.reshape(-1)
-    for step in range(drafts.numel() + 1):
-        target, state = target_step(step)
-        target = target.reshape(-1)[:1]
-        if step < drafts.numel() and bool((target[0] == drafts[step]).item()):
-            continue
-        return torch.cat((drafts[:step], target)), step, state
-    raise AssertionError("decode verifier did not produce a bonus token")
-
-
 __all__ = [
     "MTP_DRAFT_STEPS",
     "configure_mtp_decode_step",
-    "greedy_accept_decode",
+    "configure_mtp_fused_step",
     "greedy_accept_prefix",
     "reserve_mtp_window",
     "restore_verify_state",
     "snapshot_verify_state",
+    "validate_mtp_draft_tokens",
     "validate_speculative_mtp",
 ]

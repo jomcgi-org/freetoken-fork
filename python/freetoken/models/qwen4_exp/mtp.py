@@ -33,7 +33,7 @@ class Qwen4ExpMTPAttention(BaseOP):
     """The MTP head's one full-attention block over its short draft chain.
 
     The target QSA layer uses a large paged cache. The draft head has an
-    independent cache in SGLang; v1 keeps only the three-token chain locally
+    independent cache in SGLang; v1 keeps only the one-token draft locally
     and evaluates it densely. This is lossless for speculative decoding even
     when draft quality is lower, because the target verifies every proposal.
     """
@@ -61,7 +61,7 @@ class Qwen4ExpMTPAttention(BaseOP):
             rope_scaling=tuple(rotary.scaling.items()) if rotary.scaling else None,
         )
         # Loaded for checkpoint completeness. Target-aligned QSA selection is a
-        # future optimization; a chain of at most three tokens is exactly dense.
+        # future optimization; the single-token draft is exactly dense.
         self.indexer = Qwen4ExpIndexer(config, layer_id)
         self._keys: list[torch.Tensor] = []
         self._values: list[torch.Tensor] = []
@@ -154,7 +154,7 @@ class Qwen4ExpMTPDecoderLayer(BaseOP):
 
 
 class Qwen4ExpMTPHead(BaseOP):
-    """Checkpoint-native one-layer head, reused for three greedy draft steps."""
+    """Checkpoint-native one-layer head used for one greedy draft step."""
 
     def __init__(self, config, mtp_quant: str = "bf16") -> None:
         args = config.qwen4_args

@@ -144,9 +144,8 @@ class MoELayer(BaseOP):
                 fused_experts_fp8_block,
             )
 
-            # The MTP head drafts one row while the surrounding target verification
-            # batch is marked prefill. Resident rows need no cache movement semantics,
-            # so select the lower-overhead decode GEMV for that one-row case.
+            # Resident rows need no cache movement semantics, so select the
+            # lower-overhead decode GEMV for any one-row call.
             if get_global_ctx().batch.is_prefill and hidden_states.shape[0] > 1:
                 return fused_experts_fp8_block(
                     hidden_states, self.gate_up_proj, self.gate_up_scale_inv,

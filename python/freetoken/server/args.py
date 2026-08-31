@@ -339,6 +339,13 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mtp-draft-tokens",
+        type=int,
+        default=ServerArgs.mtp_draft_tokens,
+        help="Number of MTP drafts per step. This fused implementation requires 1.",
+    )
+
+    parser.add_argument(
         "--ple-cache-gib",
         type=float,
         default=ServerArgs.ple_cache_gib,
