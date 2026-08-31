@@ -490,3 +490,18 @@ layer profile, MRR=8: **19.5 x1 / 116 prefill / 33 x8**.
 1. Online hot-set adaptation (evidence: the 72->62% drift above).
 2. CPU/GPU layer pipelining (structural x1 lever, unattempted).
 3. UFFD stays the bigger-than-RAM capacity lane.
+
+## Adaptation round: the hierarchy tunes itself
+
+**Online hot-set adaptation** (--moe-hot-adapt-interval-steps): decayed
+per-expert counters, bounded three-phase background swaps (retire, copy,
+flip - no torn mappings). Under drifted traffic hot_pair_rate recovered
+**62.6% -> 73.3%** across four adaptation windows while static stayed at
+62%; quality 5/5. Profile-free startup works (all-cold, warms itself), so
+deployment no longer needs a capture step. One correction round
+(inference-mode guard on the background copy thread). Known cosmetic bug:
+hot_swaps/interval stat prints 0.00 despite live swaps.
+
+Ops: node-4 CPU governor pinned to performance (was powersave/EPP-perf);
+DDR confirmed at 6000 MT/s EXPO; GPU never throttles (138W of 450W) - the
+step is host-bound, watts are not the constraint.
