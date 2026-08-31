@@ -289,6 +289,7 @@ def test_disk_prefetch_deduplicates_route_union_across_batch():
     down = Bank(7)
     executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
     executor.num_layers = 2
+    executor.num_experts = 4
     executor._disk_banks = {1: [gate_up, down]}
     executor._disk_prefetch_calls = [0, 0]
     executor._disk_prefetch_pages = [0, 0]
