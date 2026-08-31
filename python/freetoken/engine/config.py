@@ -67,7 +67,7 @@ class EngineConfig:
     moe_disk_pager: str = "madvise"
     # Predict madvise WILLNEED rows from the preceding decode step. UFFD ignores this
     # setting because its userspace pager already prefetches logical expert rows.
-    moe_disk_lookahead: str = "on"
+    moe_disk_lookahead: str = "off"
     moe_pager_budget_gib: float = 40.0
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
