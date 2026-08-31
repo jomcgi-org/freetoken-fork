@@ -151,9 +151,9 @@ def test_zero_gap_and_zero_total_are_guarded():
 def test_decode_mtp_acceptance_stats():
     rep, logs, clock = _reporter(interval=1)
     batch = _decode_batch(1)
-    batch.mtp_drafted = 3
-    batch.mtp_accepted = 2
-    batch.generated_tokens = 3
+    batch.mtp_drafted = 1
+    batch.mtp_accepted = 1
+    batch.generated_tokens = 2
     clock["t"] = 2.0
     rep.report_batch(
         batch,
@@ -164,19 +164,19 @@ def test_decode_mtp_acceptance_stats():
         page_size=1,
     )
     line = logs[-1]
-    assert "drafted: 3, accepted: 2" in line
-    assert "acceptance rate: 0.6667" in line
-    assert "tokens/step: 3.00" in line
+    assert "drafted: 1, accepted: 1" in line
+    assert "acceptance rate: 1.0000" in line
+    assert "tokens/step: 2.00" in line
 
 
 def test_decode_mtp_timing_is_logged_per_window():
     rep, logs, clock = _reporter(interval=40)
     batch = _decode_batch(1)
-    batch.mtp_drafted = 3
-    batch.mtp_accepted = 1
-    batch.generated_tokens = 2
+    batch.mtp_drafted = 1
+    batch.mtp_accepted = 0
+    batch.generated_tokens = 1
     batch.mtp_verify_us = 2300
-    batch.mtp_snapshot_us = 0
+    batch.mtp_snapshot_us = 180
     batch.mtp_draft_us = 700
     clock["t"] = 1.0
 
@@ -190,8 +190,8 @@ def test_decode_mtp_timing_is_logged_per_window():
     )
 
     assert logs == [
-        "MTP verify window, route: decode, width: 4, accepted: 1, "
-        "verify_us: 2300, snapshot_us: 0, draft_us: 700"
+        "MTP verify window, route: decode, width: 2, accepted: 0, "
+        "verify_us: 2300, snapshot_us: 180, draft_us: 700"
     ]
 
 

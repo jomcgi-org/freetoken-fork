@@ -426,7 +426,7 @@ class Engine:
                 "MTP mutable state per request: "
                 f"{mutable_bytes} bytes ({mem_GB(mutable_bytes)}), "
                 f"linear={linear_bytes}, qsa_pending={pending_bytes}; "
-                "decode-stepped verification does not snapshot it"
+                "snapshotted once per fused K=1 verify window"
             )
 
         # ======================= Page table initialization ========================
@@ -872,9 +872,10 @@ class Engine:
                 "CPU MoE backend is not yet supported for this model architecture "
                 f"(MoE layer {type(sample).__name__} is missing {required})."
             )
-        # Decode batches never exceed max_running_req, but CUDA-graph padding can
-        # round a batch up to the largest captured size; cover both.
-        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, 1)
+        # Fused K=1 MTP presents two target rows for one request. CUDA-graph padding
+        # can also round a batch up to the largest captured size; cover both.
+        mtp_rows = 2 if config.speculative_mtp == "on" else 1
+        max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, mtp_rows)
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
             cache,
@@ -1166,12 +1167,7 @@ class Engine:
             offset += length
 
     def _snapshot_verify_state(self, req: Req) -> dict[str, Any]:
-        """Copy all request-local mutable state.
-
-        This remains a tested recovery primitive for callers that must run past a
-        decision point. The decode-stepped MTP verifier stops at the first rejection,
-        so it does not call this path.
-        """
+        """Copy all request-local mutable state before the fused verify window."""
         from freetoken.spec_decode import snapshot_verify_state
 
         return snapshot_verify_state(self.linear_state_pool, self.kv_cache, req)
@@ -1188,27 +1184,28 @@ class Engine:
             return
         batch.mtp_draft_us = _mtp_elapsed_us(*marks["draft"])
         batch.mtp_verify_us = _mtp_elapsed_us(*marks["verify"])
-        # The verifier never advances beyond the accepted prefix, so no save or
-        # restore traffic occurs.
-        batch.mtp_snapshot_us = 0.0
+        batch.mtp_snapshot_us = _mtp_elapsed_us(*marks["snapshot"])
         del batch._mtp_timing_marks
 
     def _forward_mtp_verify(self, batch: Batch) -> torch.Tensor:
-        """Draft three tokens and greedily verify with width-1 decode operations.
+        """Draft one token and verify ``[seed, draft]`` in one target-model call.
 
-        A multi-position target forward was previously labeled prefill. That routed
-        every offloaded MoE layer through whole-layer prefill staging, including DISK
-        layers. A decode operation cannot advance GDN and PLE state for several positions
-        in parallel, so verify one position at a time and stop at the first mismatch. The
-        state then ends exactly at the accepted prefix and no rollback snapshot is needed.
+        The batch remains decode-routed for MoE. Stateful layers execute their existing
+        width-1 decode operations in order inside that call. A rejection restores the
+        pre-window checkpoint and recomputes the seed, leaving every recurrent state at
+        the exact committed position.
         """
         from freetoken.attention.linear import build_fla_metadata
-        from freetoken.spec_decode import configure_mtp_decode_step, greedy_accept_decode
+        from freetoken.spec_decode import (
+            configure_mtp_decode_step,
+            configure_mtp_fused_step,
+            greedy_accept_prefix,
+        )
 
         req = batch.reqs[0]
         width = batch.positions.numel()
         steps = width - 1
-        assert steps > 0 and req.mtp_hidden is not None
+        assert steps == 1 and req.mtp_hidden is not None
         seed = batch.input_ids[:1]
         draft_start = _mtp_timing_mark(self.device)
         drafts = self.model.mtp.draft(
@@ -1227,23 +1224,34 @@ class Engine:
         original_device_len = int(batch.mtp_original_device_len)
         assert original_device_len == original_cached_len + 1
 
+        snapshot_start = _mtp_timing_mark(self.device)
+        snapshot = self._snapshot_verify_state(req)
+        snapshot_end = _mtp_timing_mark(self.device)
         verify_start = _mtp_timing_mark(self.device)
 
-        def target_step(step: int):
-            # Present exactly one continuing token as one decode request. This keeps PLE,
-            # GDN, QSA and MoE on their decode implementations and advances recurrent state
-            # in order.
+        configure_mtp_fused_step(
+            batch, verify_ids, verify_positions, verify_out_loc
+        )
+        batch.fla_metadata = build_fla_metadata(batch, self.device)
+        self.attn_backend.prepare_metadata(batch)
+        logits = self.model.forward(select_last=False)
+        full_hidden = self.model.model._last_hc_hidden
+        targets = torch.argmax(logits, dim=-1).to(torch.int32)
+        accepted, matched = greedy_accept_prefix(drafts, targets)
+
+        if matched == 0:
+            # The fused call advanced through the rejected draft. Restore the state
+            # before the window, then replay only the committed seed with the same
+            # width-1 path used by ordinary decode.
+            self._restore_verify_state(req, snapshot)
             configure_mtp_decode_step(
-                batch, verify_ids, verify_positions, verify_out_loc, step
+                batch, verify_ids, verify_positions, verify_out_loc, 0
             )
             batch.fla_metadata = build_fla_metadata(batch, self.device)
             self.attn_backend.prepare_metadata(batch)
-            logits = self.model.forward(select_last=False)
+            replay_logits = self.model.forward(select_last=False)
             full_hidden = self.model.model._last_hc_hidden
-            target = torch.argmax(logits, dim=-1).to(torch.int32)
-            return target, full_hidden
-
-        accepted, matched, full_hidden = greedy_accept_decode(drafts, target_step)
+            accepted = torch.argmax(replay_logits, dim=-1).to(torch.int32)[:1]
         verify_end = _mtp_timing_mark(self.device)
 
         committed_inputs = matched + 1
@@ -1254,8 +1262,10 @@ class Engine:
         batch.mtp_accepted = matched
         batch.generated_tokens = accepted.numel()
         batch.phase = "decode"
+        batch.mtp_fused = False
         batch._mtp_timing_marks = {
             "draft": (draft_start, draft_end),
+            "snapshot": (snapshot_start, snapshot_end),
             "verify": (verify_start, verify_end),
         }
         return accepted

@@ -32,7 +32,8 @@ static buffers (``prepare_for_replay``) so the whole path is CUDA-graph capturab
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, List
 
 import torch
@@ -191,6 +192,24 @@ class QSASparseAttnBackend(BaseAttnBackend):
             kv_len_cpu=kv_len,
         )
         batch.attn_metadata = md
+        if getattr(batch, "mtp_fused", False):
+            original_device_len = int(batch.mtp_original_device_len)
+            mtp_metadata = []
+            for step in range(2):
+                one = QSASparseMetadata(
+                    is_decode=True,
+                    last_indices=torch.zeros(
+                        1, dtype=torch.int32, device=self.device
+                    ),
+                    qo_indptr_cpu=torch.tensor([0, 1], **_CPU_PINNED),
+                    kv_len_cpu=torch.tensor(
+                        [original_device_len + step], **_CPU_PINNED
+                    ),
+                )
+                self._snapshot_decode(one, batch)
+                mtp_metadata.append(one)
+            batch.mtp_qsa_metadata = tuple(mtp_metadata)
+            return
         if not is_decode:
             table_idx = torch.tensor([r.table_idx for r in reqs], **_CPU_PINNED)
             token_to_req = torch.repeat_interleave(
@@ -266,6 +285,19 @@ class QSASparseAttnBackend(BaseAttnBackend):
         layer_id: int,
         batch: Batch,
     ) -> torch.Tensor:
+        if getattr(batch, "mtp_fused", False):
+            return self._qsa_forward_mtp_k1(q, k, v, index, layer_id, batch)
+        return self._qsa_forward_one(q, k, v, index, layer_id, batch)
+
+    def _qsa_forward_one(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index,
+        layer_id: int,
+        batch: Batch,
+    ) -> torch.Tensor:
         from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
 
         md = batch.attn_metadata
@@ -291,6 +323,49 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.token_to_req,
             torch.empty_like(q),
         )
+
+    def _qsa_forward_mtp_k1(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index,
+        layer_id: int,
+        batch: Batch,
+    ) -> torch.Tensor:
+        """Run both QSA rows through the established width-1 decode path.
+
+        This stays inside one target-model call, but preserves the exact pending-ring,
+        compression, selection, and attention order of ordinary greedy decode.
+        """
+        assert q.shape[0] == k.shape[0] == v.shape[0] == index.k.shape[0] == 2
+        assert len(batch.reqs) == 1
+        outputs = []
+        for step in range(2):
+            md = batch.mtp_qsa_metadata[step]
+            one = SimpleNamespace(
+                padded_reqs=batch.padded_reqs,
+                reqs=batch.reqs,
+                positions=batch.positions[step : step + 1],
+                out_loc=batch.out_loc[step : step + 1],
+                attn_metadata=md,
+            )
+            one_index = replace(
+                index,
+                q=index.q[step : step + 1],
+                k=index.k[step : step + 1],
+            )
+            outputs.append(
+                self._qsa_forward_one(
+                    q[step : step + 1],
+                    k[step : step + 1],
+                    v[step : step + 1],
+                    one_index,
+                    layer_id,
+                    one,
+                )
+            )
+        return torch.cat(outputs, dim=0)
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it

@@ -83,6 +83,9 @@ class EngineConfig:
     # on/off choice instead of a boolean so the CLI and serialized daemon config
     # have one stable spelling.
     speculative_mtp: str = "off"
+    # Patch 11-lite intentionally supports one draft only. Keep the explicit
+    # knob so attempts to reuse older K>1 launch commands fail loudly.
+    mtp_draft_tokens: int = 1
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -111,9 +114,13 @@ class EngineConfig:
     num_token_override: int | None = None
 
     def __post_init__(self) -> None:
-        from freetoken.spec_decode import validate_speculative_mtp
+        from freetoken.spec_decode import (
+            validate_mtp_draft_tokens,
+            validate_speculative_mtp,
+        )
 
         validate_speculative_mtp(self.speculative_mtp)
+        validate_mtp_draft_tokens(self.mtp_draft_tokens)
         if self.ple_backend not in ("pinned", "cached", "disk", "hmm"):
             raise ValueError(
                 "--ple-backend must be 'pinned', 'cached', 'disk', or 'hmm', got "

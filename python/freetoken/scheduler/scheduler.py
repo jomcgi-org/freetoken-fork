@@ -867,10 +867,9 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        # Native MTP verifies one greedy request at a time. Reserve the whole candidate
-        # window in the paged cache, but keep the batch classified as decode. The engine
-        # presents the reserved positions as ordered width-1 decode operations so recurrent
-        # state is correct and offloaded MoE never enters whole-layer prefill staging.
+        # Native MTP verifies one greedy request at a time. Reserve seed plus one draft
+        # in the paged cache, but keep the batch classified as decode so the target MoE
+        # remains on its decode-routed expert path.
         mtp_verify = (
             self.config.speculative_mtp == "on"
             and batch.is_decode

@@ -164,6 +164,7 @@ class Batch:
     # ordinary one-token scheduler path and its log output.
     mtp_drafted: int = field(default=0, init=False)
     mtp_accepted: int = field(default=0, init=False)
+    mtp_fused: bool = field(default=False, init=False)
     generated_tokens: int = field(default=0, init=False)
     # Per-window MTP timings. CUDA events are resolved by the scheduler after the
     # sampled-token fence completes, so recording does not synchronize the model stream.
@@ -196,11 +197,9 @@ def select_lm_head_rows(
 ) -> torch.Tensor:
     """Apply the ordinary prefill last-token projection policy when requested.
 
-    MTP target verification deliberately uses the prefill model path for a short
-    multi-position chain, but needs logits for every chain position. Its one-row
-    draft calls also run while that wider prefill batch is active. Keeping the
-    policy explicit prevents the surrounding batch's ``width - 1`` last-row index
-    from being applied to a one-row draft tensor.
+    MTP target verification needs logits for both rows of its short chain. Keeping
+    the policy explicit also prevents request-level last-row metadata from being
+    applied to the MTP head's one-row draft tensor.
     """
     if select_last and batch.is_prefill:
         indices = batch.attn_metadata.get_last_indices(batch.size)

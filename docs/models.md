@@ -132,23 +132,26 @@ the full requested-row union for each chunk through the unchanged eager path.
 Qwen3.8-Flash-Next can load its checkpoint-native multi-token prediction head with
 `--speculative-mtp on`. The default is `off`, which retains the previous model shape,
 weight loading, scheduling, and CUDA graph behavior. The shipped head is one decoder
-layer reused for three draft steps. FreeToken verifies the seed plus those three drafts
-in one target-model forward, then accepts the longest matching greedy prefix and one
-target bonus token.
+layer used for one draft step. FreeToken verifies `[seed, draft]` in one target-model
+forward. A matching draft emits the draft and one target bonus token; a rejection emits
+only the target token for the seed. `--mtp-draft-tokens` is fixed at `1` in this patch,
+and any other value is rejected at startup.
 
 This first implementation supports TP 1, greedy sampling, and one request in the decode
 batch. Unsupported sampling modes and larger decode batches fall back to ordinary
 one-token decoding. Enabling the feature selects the non-overlapped scheduler loop so
 request-owned recurrent state can be restored safely after a rejected draft.
 
-The target verification forward is eager and uses the existing short-extend layout.
-Consequently PLE row derivation, page preparation, and DISK-layer CPU MoE execution see
-all verification positions together. A fully accepted step needs one target forward.
-After a partial rejection, FreeToken restores the GDN, PLE, and QSA continuation state
-and replays only the committed input prefix. This recovery forward preserves greedy
-equivalence but reduces the benefit of low-acceptance steps. CUDA graph capture remains
-unchanged when the feature is off. It is disabled while MTP is enabled because the next
-draft step consumes target hidden state that is not currently exposed by graph replay.
+The target verification forward is eager and remains classified as decode, so target MoE
+experts use the existing decode-routed path for both rows. GDN, PLE convolution, and QSA
+run their established width-one decode operations in order inside that model call. Before
+the call, FreeToken snapshots the request's GDN, PLE, and QSA continuation tensors. A
+rejection restores that snapshot and recomputes only the seed row. This recovery preserves
+bit-identical greedy state without a multi-position recurrent rollback, but reduces the
+benefit of rejected steps. Decode logs report the snapshot copy time as `snapshot_us`.
+CUDA graph capture remains unchanged when the feature is off. It is disabled while MTP is
+enabled because the next draft step consumes target hidden state that is not currently
+exposed by graph replay.
 
 Pass `--speculative-mtp on` to `ft checkpoint` to store MTP tensors under a separate
 optional tensor kind. The head is BF16 by default. Add `--mtp-quant nvfp4` to quantize
@@ -164,7 +167,7 @@ resident tensor bytes, and the engine charges those bytes with the other dense w
 sizing the target expert cache and KV pool. For the RadixArk geometry (`E=512`, `H=2560`,
 `I=640`), the two BF16 expert tensors use `6*E*H*I = 5,033,164,800` bytes (4.6875 GiB).
 The native NVFP4 expert banks use 1,419,509,760 bytes (1.3220 GiB), plus the unchanged BF16
-non-expert portion of the head. The v1 draft attention keeps the current three-token
+non-expert portion of the head. The v1 draft attention keeps the current one-token
 speculative chain but does not yet retain an independent MTP prompt KV and QSA cache.
 Verification remains lossless, while acceptance can be lower than an implementation with
 the complete draft cache.

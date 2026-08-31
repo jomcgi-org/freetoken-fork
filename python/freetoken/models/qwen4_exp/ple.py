@@ -1955,6 +1955,7 @@ class PLEMetadata:
     state_slots: torch.Tensor
     fresh_slots: torch.Tensor | None
     is_decode: bool
+    mtp_fused: bool = False
 
 
 def _state_slot(req) -> int:
@@ -1999,6 +2000,18 @@ def build_ple_metadata(
     if batch.is_decode and slots_dev is not None:
         slots = slots_dev.long()
         bs = slots.numel()
+        if getattr(batch, "mtp_fused", False):
+            assert bs == 1 and batch.input_ids.numel() == 2
+            return PLEMetadata(
+                input_ids=batch.input_ids,
+                cu_seqlens=torch.tensor([0, 2], dtype=torch.int32, device=device),
+                seq_lens=(2,),
+                ngram_context=context_pool.index_select(0, slots).long(),
+                state_slots=slots,
+                fresh_slots=None,
+                is_decode=False,
+                mtp_fused=True,
+            )
         return PLEMetadata(
             input_ids=batch.input_ids,
             cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
@@ -2361,6 +2374,23 @@ class PLELayer(BaseOP):
         self, x: torch.Tensor, meta: PLEMetadata, states: torch.Tensor
     ) -> torch.Tensor:
         """silu of the dilated depthwise conv over [state | x], and roll the per-request state."""
+        if meta.mtp_fused:
+            # Preserve the decode kernel's operation order and rounding for both
+            # positions while the outer model call remains fused.
+            assert x.shape[0] == 2 and meta.state_slots.numel() == 1
+            outputs = []
+            for step in range(2):
+                one = PLEMetadata(
+                    input_ids=meta.input_ids[step : step + 1],
+                    cu_seqlens=meta.cu_seqlens.new_tensor([0, 1]),
+                    seq_lens=(1,),
+                    ngram_context=meta.ngram_context,
+                    state_slots=meta.state_slots,
+                    fresh_slots=None,
+                    is_decode=True,
+                )
+                outputs.append(self._decode_conv(x[step : step + 1], one, states))
+            return torch.cat(outputs, dim=0)
         if meta.is_decode:
             return self._decode_conv(x, meta, states)
         return self._prefill_conv(x, meta, states)
