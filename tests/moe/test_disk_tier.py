@@ -365,6 +365,7 @@ def test_uffd_prefetch_groups_all_layer_banks_into_one_budget_request():
     down = SimpleNamespace(_pager=pager)
     executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
     executor.num_layers = 1
+    executor.num_experts = 8
     executor._disk_banks = {0: [gate_up, down]}
     executor._disk_prefetch_calls = [0]
     executor._disk_prefetch_pages = [0]
@@ -441,6 +442,8 @@ def test_uffd_stats_are_merged_into_disk_telemetry(monkeypatch):
     executor._disk_prefetch_calls = [2]
     executor._disk_prefetch_pages = [7]
     executor._disk_decode_steps = 1
+    executor._disk_route_pairs = 0
+    executor._disk_distinct_experts = 0
     executor._disk_major_fault_base = 10
     monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 10)
 
