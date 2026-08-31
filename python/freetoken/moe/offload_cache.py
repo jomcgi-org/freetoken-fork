@@ -1141,6 +1141,10 @@ class OffloadMoeCache:
                     self.src_indices[: self._gpufetch_capacity], non_blocking=True,
                 )
                 self.cpu_executor.gpufetch(layer_id)
+                # dst/src index buffers must be the same length for the copy
+                # kernels; decode misses are bounded by the ring capacity, so the
+                # capacity-long prefix of evict_slots covers every live entry.
+                evict_prefix = self.evict_slots[: self._gpufetch_capacity]
                 if self._gpufetch_fused_ok:
                     from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
@@ -1148,7 +1152,7 @@ class OffloadMoeCache:
                         self._gpufetch_dst_ptrs,
                         self._gpufetch_src_ptrs,
                         self._gpufetch_feat_bytes,
-                        self.evict_slots,
+                        evict_prefix,
                         self._gpufetch_stage_indices,
                         self.num_indices,
                     )
@@ -1158,7 +1162,7 @@ class OffloadMoeCache:
                     for stage, (_, cache) in zip(self._gpufetch_staging, self.banks):
                         fast_index_copy_jit(
                             cache,
-                            self.evict_slots,
+                            evict_prefix,
                             stage,
                             self._gpufetch_stage_indices,
                             self.num_indices,
