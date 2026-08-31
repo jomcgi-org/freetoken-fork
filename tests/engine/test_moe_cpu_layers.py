@@ -174,6 +174,22 @@ def test_engine_config_accepts_disk_prefill_modes(mode):
     assert config.moe_disk_prefill == mode
 
 
+@pytest.mark.parametrize("mode", ["cpu", "gpufetch"])
+def test_engine_config_accepts_disk_decode_modes(mode):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        moe_disk_decode=mode,
+    )
+    assert config.moe_disk_decode == mode
+
+
 def test_engine_config_defaults_disk_prefill_to_cpu():
     import torch
 
@@ -186,6 +202,7 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
         dtype=torch.bfloat16,
     )
     assert config.moe_disk_prefill == "cpu"
+    assert config.moe_disk_decode == "cpu"
 
 
 def test_engine_config_rejects_invalid_disk_prefill_mode():
@@ -200,6 +217,21 @@ def test_engine_config_rejects_invalid_disk_prefill_mode():
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_disk_prefill="gpu",
+        )
+
+
+def test_engine_config_rejects_invalid_disk_decode_mode():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-disk-decode.*cpu.*gpufetch"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_disk_decode="eager",
         )
 
 

@@ -153,7 +153,10 @@ class Scheduler(SchedulerIOMixin):
                     f"disk pages requested: {disk['pages_requested']}, "
                     f"disk major faults: {disk['major_faults']}, "
                     f"disk major faults/decode step: "
-                    f"{disk['major_faults_per_decode_step']:.2f}"
+                    f"{disk['major_faults_per_decode_step']:.2f}, "
+                    f"disk gpufetch fills/step: "
+                    f"{disk['gpufetch_fills_per_step']:.2f}, "
+                    f"disk gpufetch fill_us: {disk['gpufetch_fill_us']:.0f}"
                 )
             if ple_stats:
                 message += (

@@ -116,6 +116,7 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     executor._disk_prefetch_pages = [0, 17, 19]
     executor._disk_decode_steps = 6
     executor._disk_major_fault_base = 10
+    executor._gpufetch_tasks = {}
     monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 16)
 
     stats = executor.disk_prefetch_stats(reset=True)
@@ -123,12 +124,123 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["pages_requested"] == 36
     assert stats["major_faults"] == 6
     assert stats["major_faults_per_decode_step"] == 2.0
+    assert stats["gpufetch_fills_per_step"] == 0.0
+    assert stats["gpufetch_fill_us"] == 0.0
     assert stats["per_layer"] == [
         {"layer": 1, "prefetch_calls": 3, "pages_requested": 17},
         {"layer": 2, "prefetch_calls": 3, "pages_requested": 19},
     ]
     assert executor._disk_prefetch_calls == [0, 0, 0]
     assert executor._disk_major_fault_base == 16
+
+
+def test_gpufetch_staging_capacity_tracks_max_distinct_decode_routes():
+    from freetoken.moe.offload_cache import disk_gpufetch_capacity
+
+    assert disk_gpufetch_capacity(
+        max_tokens=4, top_k=8, num_experts=128, cache_size=256,
+    ) == 32
+    assert disk_gpufetch_capacity(
+        max_tokens=64, top_k=8, num_experts=128, cache_size=96,
+    ) == 96
+    with pytest.raises(ValueError, match="positive"):
+        disk_gpufetch_capacity(
+            max_tokens=0, top_k=8, num_experts=128, cache_size=256,
+        )
+
+
+def test_disk_gpufetch_residency_does_not_require_cpu_decode_membership():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=4,
+        device=torch.device("cpu"),
+        moe_disk_decode="gpufetch",
+    )
+    cache.set_bank_sources(
+        {
+            "gate_up": [torch.randn(4, 16, 8)],
+            "down": [torch.randn(4, 8, 8)],
+        },
+        layer_residency=[HostResidency.DISK.value],
+    )
+
+    assert cache.cpu_layer_ids == frozenset()
+    assert cache.is_gpufetch_layer(0)
+    assert not cache.is_cpu_layer(0)
+
+
+def test_gpufetch_stats_are_reported_per_decode_step(monkeypatch):
+    import freetoken.moe.cpu_executor as cpu_executor
+
+    class Extension:
+        def gpufetch_stats(self, reset):
+            assert reset
+            return (12, 6, 900_000)
+
+    executor = cpu_executor.CpuMoeExecutor.__new__(cpu_executor.CpuMoeExecutor)
+    executor.num_layers = 3
+    executor._disk_banks = {1: [object()], 2: [object()]}
+    executor._disk_prefetch_calls = [0, 0, 0]
+    executor._disk_prefetch_pages = [0, 0, 0]
+    executor._disk_decode_steps = 0
+    executor._disk_major_fault_base = 5
+    executor._gpufetch_tasks = {1: (10, 1), 2: (11, 2)}
+    executor._ext = Extension()
+    monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 11)
+
+    stats = executor.disk_prefetch_stats(reset=True)
+
+    assert stats["gpufetch_fills_per_step"] == 4.0
+    assert stats["gpufetch_fill_us"] == 300.0
+    assert stats["major_faults_per_decode_step"] == 2.0
+
+
+def test_gpufetch_decode_uses_lru_gpu_path_even_for_hybrid_cache():
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    calls = []
+    output = torch.randn(1, 8)
+
+    class Cache:
+        decode_target = "hybrid"
+
+        def is_gpufetch_layer(self, layer_id):
+            return True
+
+        def is_cpu_layer(self, layer_id):
+            return False
+
+        def ensure_experts(self, layer_id, ids):
+            calls.append(("ensure", layer_id, ids))
+
+        def copy_missing(self):
+            calls.append(("copy",))
+
+        def bank_views(self):
+            return ()
+
+        def alphas_for_slots(self, layer_id):
+            return None
+
+    layer = OffloadMoELayer(
+        layer_id=0, num_experts=4, top_k=2,
+        hidden_size=8, intermediate_size=8,
+    )
+    layer.offload_cache = Cache()
+    layer._expert_gemm = lambda *args, **kwargs: calls.append(("gemm",)) or output
+    hidden = torch.randn(1, 8)
+    weights = torch.tensor([[0.6, 0.4]])
+    ids = torch.tensor([[1, 3]], dtype=torch.int32)
+
+    assert layer._decode_routed(hidden, weights, ids) is output
+    assert [call[0] for call in calls] == ["ensure", "copy", "gemm"]
 
 
 def test_cpu_prefill_io_reuses_one_grow_to_largest_buffer():
@@ -379,3 +491,95 @@ def test_cpu_executor_disk_mapping_matches_anonymous_bank(tmp_path):
     assert disk_out.dtype == x.dtype
     assert torch.equal(disk_out, ram_out)
     assert disk_executor.disk_prefetch_stats()["prefetch_calls"] == 1
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_disk_gpufetch_decode_matches_cpu_executor(tmp_path):
+    from freetoken.checkpoint.ftw import load_ftw_banks
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kernel import _cpu_moe
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    required = (
+        "create_gpufetch_task",
+        "register_flag_gpufetch_task",
+        "gpufetch_with_cuda_stream",
+    )
+    if not all(hasattr(_cpu_moe.CpuMoeExecutor, name) for name in required):
+        pytest.skip("CPU MoE extension needs rebuilding for DISK gpufetch")
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+
+    torch.manual_seed(31)
+    experts, hidden, inter, top_k, batch = 4, 128, 128, 2, 2
+    gate_up = torch.randn(
+        experts, 2 * inter, hidden, dtype=torch.bfloat16,
+    ) * 0.1
+    down = torch.randn(experts, hidden, inter, dtype=torch.bfloat16) * 0.1
+    _write_bf16_ftw(tmp_path, [(gate_up, down)])
+    banks = load_ftw_banks(
+        str(tmp_path),
+        num_layers=1,
+        layer_residency=[HostResidency.DISK.value],
+    )
+    assert banks is not None
+
+    device = torch.device("cuda")
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=experts,
+        cache_size=experts,
+        device=device,
+        prefill_overlap=False,
+        moe_disk_decode="gpufetch",
+        decode_target="gpu",
+    )
+    cache.set_bank_sources(
+        banks.sources,
+        layer_residency=[HostResidency.DISK.value],
+    )
+    executor = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=1,
+        max_tokens=batch,
+        device=device,
+    )
+    cache.set_cpu_executor(executor)
+    cache.init_disk_gpufetch(executor, max_tokens=batch, top_k=top_k)
+    layer = OffloadMoELayer(
+        layer_id=0,
+        num_experts=experts,
+        top_k=top_k,
+        hidden_size=hidden,
+        intermediate_size=inter,
+    )
+    layer.offload_cache = cache
+
+    x = torch.randn(batch, hidden, device=device, dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 2], [3, 1]], device=device, dtype=torch.int32)
+    weights = torch.tensor(
+        [[0.6, 0.4], [0.25, 0.75]], device=device, dtype=torch.float32,
+    )
+    cpu_out = executor.decode(0, x, weights, ids).float()
+    torch.cuda.synchronize()
+
+    executor.reset_disk_stats()
+    gpu_out = layer._decode_routed(x, weights, ids.clone()).float()
+    torch.cuda.synchronize()
+    first = executor.disk_prefetch_stats(reset=True)
+    hot_out = layer._decode_routed(x, weights, ids.clone()).float()
+    torch.cuda.synchronize()
+    hot = executor.disk_prefetch_stats(reset=True)
+
+    rel = (cpu_out - gpu_out).abs().max() / (cpu_out.abs().max() + 1e-6)
+    assert rel < 2e-2, f"relative error {rel.item()}"
+    torch.testing.assert_close(hot_out, gpu_out, rtol=0, atol=0)
+    assert first["gpufetch_fills_per_step"] == experts
+    assert hot["gpufetch_fills_per_step"] == 0

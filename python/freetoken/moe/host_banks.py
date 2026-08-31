@@ -40,9 +40,9 @@ _BLK = 4096  # O_DIRECT alignment (page size)
 class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
-    Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths. LOCKED,
-    PAGEABLE, and file-backed DISK layers have no device address and decode on the CPU
-    executor.
+    Only PINNED (cudaHostRegister'd) memory can directly feed GPU movement. LOCKED and
+    PAGEABLE layers decode on the CPU executor. File-backed DISK layers either do the
+    same or copy routed misses through the bounded pinned GPU-fetch ring.
     """
 
     PINNED = "pinned"
