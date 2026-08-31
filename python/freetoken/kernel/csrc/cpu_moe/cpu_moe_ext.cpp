@@ -1072,6 +1072,7 @@ struct MoeTask {
   CpuMoeExecutor* exec;
   int layer_id;
   int num_tokens;
+  bool group_routes;      // persistent decode tasks group routes by expert; prefill does not
   const bf16_t* x;     // [num_tokens, H]
   const int32_t* ids;  // [num_tokens, top_k]  (raw expert ids; <0 = skip)
   const float* w;      // [num_tokens, top_k]
@@ -1098,16 +1099,15 @@ struct GpuFetchTask {
 // Output-row tiling. Small enough to give every worker independent work even at
 // batch size 1; large enough to amortize the atomic work-grab.
 //
-// Bandwidth notes (Sapphire Rapids 8480+, 13 cores): the two passes already read
-// every expert weight byte exactly once per token (each output row block is owned
-// by one worker), and x stays hot in L1 across a (token,expert)'s rows -- so the
-// kernel is single-read bandwidth-optimal at bs=1 (~205 GB/s vs ~55 GB/s PCIe).
+// Bandwidth notes (Sapphire Rapids 8480+, 13 cores): at bs=1 the two passes read
+// every expert weight byte exactly once (each output row block is owned by one
+// worker), and x stays hot in L1 across a route's rows. Decode batches group routes
+// by expert below, keeping each expert tile hot while it is applied to every routed
+// token. Synchronous prefill retains the original route-major tiling.
 // One worker per *physical* core, pinned, is the sweet spot; SMT oversubscription
 // thrashes the spin-barrier. Deferred (not worth it here / for this workload):
 //   - AMX-bf16: a GEMM tile engine; decode is M=1 GEMV so tiles sit idle. It would
 //     only pay off in a grouped/batched (dedup) path.
-//   - expert dedup for bs>1: read each distinct expert once and GEMM its tokens.
-//     Helps locality+bytes when bs is large; decode batches here are tiny (<=4).
 //   - NUMA: a single node is assumed. Multi-socket machines would split each
 //     expert's K dimension per node (banks are already per-row contiguous).
 constexpr int IBLK = 32;
@@ -1250,7 +1250,7 @@ struct CpuMoeExecutor {
   // Per-layer pointer tables (one base address per layer, see tbl_at). gate_up_tbl
   // doubles as the bf16 gate_up table and the nvfp4/mxfp4/q4_0/ds_fp4 packed-gate_up
   // table (down_tbl likewise for down); which reinterpretation applies is picked by
-  // fmt at each resolve site (see gemm1_dot/gemm2_dot/do_pass1_mxfp4/do_pass1_dsfp4).
+  // fmt at each resolve site (see gemm1_dot/gemm2_dot and the format-specific passes).
   const uint64_t* gate_up_tbl;   // bf16: [E,2I,H] rows; else: packed e2m1/mxfp4-blocks
   const uint64_t* down_tbl;      // bf16: [E,H,I] rows; else: packed e2m1/mxfp4-blocks
   const uint64_t* gu_scale_tbl;  // nvfp4/mxfp4/ds_fp4: [E,2I,*] block scales
@@ -1284,6 +1284,13 @@ struct CpuMoeExecutor {
   const char* isa;
 
   std::vector<bf16_t> g_scratch;   // [max_tokens * top_k * I] intermediate
+  // Decode-only expert grouping. grouped_routes is stable within each expert, so
+  // the final route reduction can retain the original top-k accumulation order.
+  std::vector<int> expert_offsets;    // [num_experts + 1]
+  std::vector<int> expert_cursor;     // submit-time fill cursor, allocation-stable
+  std::vector<int> grouped_routes;    // flattened route ids (token * top_k + k)
+  std::vector<int> distinct_experts;  // experts with at least one valid route
+  std::vector<float> route_y_scratch; // [num_tokens * top_k, H] unweighted down outputs
   std::vector<bf16_t> xq_scratch;  // [max_tokens * H] ds_fp4 fp8-roundtripped input
   // ds_fp4 activations pre-deinterleaved to fp32 (even/odd K) for the row-major dot.
   std::vector<float> xe_scratch, xo_scratch;  // [max_tokens * H/2]   (input)
@@ -1307,8 +1314,9 @@ struct CpuMoeExecutor {
 
   std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
+  std::atomic<int64_t> p3_next{0};  // grouped decode's stable per-token reduction
   std::atomic<int64_t> prt_next{0};  // ds_fp4 intermediate fp8 round-trip phase
-  int64_t p1_total = 0, p2_total = 0, prt_total = 0;
+  int64_t p1_total = 0, p2_total = 0, p3_total = 0, prt_total = 0;
   int n_iblk = 0, n_hblk = 0;
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
@@ -1424,6 +1432,11 @@ struct CpuMoeExecutor {
     // e8m0 (mxfp4 block scale) = 2^(s-127); the GPU GEMV clamps s to [0,254].
     for (int i = 0; i < 256; ++i) e8m0_lut[i] = std::ldexp(1.0f, std::min(i, 254) - 127);
     g_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
+    expert_offsets.assign(static_cast<size_t>(num_experts) + 1, 0);
+    expert_cursor.assign(static_cast<size_t>(num_experts), 0);
+    grouped_routes.reserve(static_cast<size_t>(max_tokens) * top_k);
+    distinct_experts.reserve(std::min(num_experts, max_tokens * top_k));
+    route_y_scratch.assign(static_cast<size_t>(max_tokens) * top_k * H, 0.0f);
     // Row-major fp4 (nvfp4/ds_fp4) pre-deinterleaves activations to fp32 even/odd.
     needs_di = (fmt == WF_NVFP4 || fmt == WF_DSFP4);
     if (needs_di) {
@@ -1574,6 +1587,7 @@ struct CpuMoeExecutor {
     MoeTask* t = new MoeTask{this,
                              layer_id,
                              num_tokens,
+                             true,
                              reinterpret_cast<const bf16_t*>(x_ptr),
                              reinterpret_cast<const int32_t*>(ids_ptr),
                              reinterpret_cast<const float*>(w_ptr),
@@ -1643,20 +1657,18 @@ struct CpuMoeExecutor {
     }
   }
 
-  void do_pass1(const MoeTask* t, int64_t p) {
+  void do_pass1_route(const MoeTask* t, int route, int ib) {
     if (fmt == WF_MXFP4) {
-      do_pass1_mxfp4(t, p);
+      do_pass1_mxfp4_route(t, route, ib);
       return;
     }
     if (fmt == WF_DSFP4) {
-      do_pass1_dsfp4(t, p);
+      do_pass1_dsfp4_route(t, route, ib);
       return;
     }
-    const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
+    const int k = route % top_k;
+    const int tok = route / top_k;
+    const int e = t->ids[route];
     if (e < 0 || e >= num_experts) return;
     const float w_in = apply_on_input ? t->w[static_cast<size_t>(tok) * top_k + k] : 1.0f;
     // Resolve this task's layer base once; row indexing below is layer-local (e).
@@ -1696,6 +1708,12 @@ struct CpuMoeExecutor {
         g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
       }
     }
+  }
+
+  void do_pass1(const MoeTask* t, int64_t p) {
+    const int ib = static_cast<int>(p % n_iblk);
+    const int route = static_cast<int>(p / n_iblk);
+    do_pass1_route(t, route, ib);
   }
 
   void do_pass2(const MoeTask* t, int64_t p) {
@@ -1748,12 +1766,10 @@ struct CpuMoeExecutor {
   // Dequant: w = E2M1[code] * 2^(e8m0_scale - 127); two codes per byte (low nibble
   // first), one e8m0 scale per 32 contiguous K. Matches kernel/triton/mxfp4_moe.py.
 
-  void do_pass1_mxfp4(const MoeTask* t, int64_t p) {
-    const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
+  void do_pass1_mxfp4_route(const MoeTask* t, int route, int ib) {
+    const int k = route % top_k;
+    const int tok = route / top_k;
+    const int e = t->ids[route];
     if (e < 0 || e >= num_experts) return;
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
@@ -1819,12 +1835,10 @@ struct CpuMoeExecutor {
   // activations (x once in submit -> xq_scratch; the intermediate g in a dedicated
   // round-trip phase between the two passes). Router weight applies on the down output.
 
-  void do_pass1_dsfp4(const MoeTask* t, int64_t p) {
-    const int64_t ib = p % n_iblk;
-    const int64_t tk = p / n_iblk;
-    const int k = static_cast<int>(tk % top_k);
-    const int tok = static_cast<int>(tk / top_k);
-    const int e = t->ids[static_cast<size_t>(tok) * top_k + k];
+  void do_pass1_dsfp4_route(const MoeTask* t, int route, int ib) {
+    const int k = route % top_k;
+    const int tok = route / top_k;
+    const int e = t->ids[route];
     if (e < 0 || e >= num_experts) return;
     // Resolve this task's layer base once; row indexing below is layer-local (e).
     const uint8_t* gu_packed_l = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
@@ -1902,12 +1916,123 @@ struct CpuMoeExecutor {
     }
   }
 
+  // ----------------------- grouped decode (expert-major) -----------------------
+  // One work item owns an (expert, output-row tile) and applies that hot tile to
+  // every route selecting the expert. The per-route math is unchanged. Pass 2
+  // writes independent fp32 route outputs, then pass 3 weights and sums them in the
+  // token's original top-k order, preserving the old deterministic reduction.
+
+  void do_pass1_grouped(const MoeTask* t, int64_t p) {
+    const int ib = static_cast<int>(p % n_iblk);
+    const int di = static_cast<int>(p / n_iblk);
+    const int e = distinct_experts[di];
+    for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; ++pos)
+      do_pass1_route(t, grouped_routes[pos], ib);
+  }
+
+  void do_pass2_grouped_route(const MoeTask* t, int route, int e, int hb) {
+    const int h0 = hb * HBLK;
+    const int h1 = std::min(H, h0 + HBLK);
+    float* route_y = route_y_scratch.data() + static_cast<size_t>(route) * H;
+
+    if (fmt == WF_MXFP4) {
+      const int Ih = I / 2;
+      const int nh = h1 - h0;
+      const uint8_t* dn_packed_l =
+          reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+      const uint8_t* dn_scale_l =
+          reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+      const bf16_t* dn_bias_l =
+          reinterpret_cast<const bf16_t*>(tbl_at(dn_bias_tbl, t->layer_id));
+      const bf16_t* g_row = g_scratch.data() + static_cast<size_t>(route) * I;
+      const uint8_t* blk_e = dn_packed_l + static_cast<size_t>(e) * Ih * H;
+      const uint8_t* scl_e = dn_scale_l + static_cast<size_t>(e) * (I / 32) * H;
+      float part[HBLK];
+      mxgemv(part, blk_e + h0, scl_e + h0, g_row, Ih, H, nh, e2m1_lut, e8m0_lut);
+      const bf16_t* bias_e = dn_bias_l + static_cast<size_t>(e) * H + h0;
+      for (int c = 0; c < nh; ++c)
+        route_y[h0 + c] = part[c] + bf16_to_f32(bias_e[c]);
+      return;
+    }
+
+    if (fmt == WF_DSFP4) {
+      const int Ih = I / 2, Is = I / 32;
+      const uint8_t* dn_packed_l =
+          reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+      const uint8_t* dn_scale_l =
+          reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+      const float* ge = ge_scratch.data() + static_cast<size_t>(route) * (I / 2);
+      const float* go = go_scratch.data() + static_cast<size_t>(route) * (I / 2);
+      for (int h = h0; h < h1; ++h) {
+        const uint8_t* dp =
+            dn_packed_l + static_cast<size_t>(e) * H * Ih + static_cast<size_t>(h) * Ih;
+        const uint8_t* ds =
+            dn_scale_l + static_cast<size_t>(e) * H * Is + static_cast<size_t>(h) * Is;
+        route_y[h] = dsdot(dp, ds, ge, go, I, e2m1_lut, e8m0_lut);
+      }
+      return;
+    }
+
+    const bf16_t* down_l = reinterpret_cast<const bf16_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* dn_packed_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* dn_scale_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+    const uint16_t* dn_global_l =
+        reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
+    const bf16_t* g_row = g_scratch.data() + static_cast<size_t>(route) * I;
+    const float* ge = needs_di ? ge_scratch.data() + static_cast<size_t>(route) * (I / 2) : nullptr;
+    const float* go = needs_di ? go_scratch.data() + static_cast<size_t>(route) * (I / 2) : nullptr;
+    const int8_t* gi8 =
+        (use_vnni || use_q4a8) ? gi8_scratch.data() + static_cast<size_t>(route) * I : nullptr;
+    const float* gas = use_vnni ? gas_scratch.data() + static_cast<size_t>(route) * (I / 16)
+                       : use_q4a8 ? gas_scratch.data() + static_cast<size_t>(route) * (I / 32)
+                                    : nullptr;
+    for (int h = h0; h < h1; ++h)
+      route_y[h] = gemm2_dot(down_l, dn_packed_l, dn_scale_l, dn_global_l, e, h, g_row,
+                             ge, go, gi8, gas);
+  }
+
+  void do_pass2_grouped(const MoeTask* t, int64_t p) {
+    const int hb = static_cast<int>(p % n_hblk);
+    const int di = static_cast<int>(p / n_hblk);
+    const int e = distinct_experts[di];
+    for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; ++pos)
+      do_pass2_grouped_route(t, grouped_routes[pos], e, hb);
+  }
+
+  void do_pass3_grouped(const MoeTask* t, int64_t p) {
+    const int hb = static_cast<int>(p % n_hblk);
+    const int tok = static_cast<int>(p / n_hblk);
+    const int h0 = hb * HBLK;
+    const int h1 = std::min(H, h0 + HBLK);
+    bf16_t* y_row = t->y + static_cast<size_t>(tok) * H;
+    for (int h = h0; h < h1; ++h) {
+      float acc = 0.0f;
+      for (int k = 0; k < top_k; ++k) {
+        const int route = tok * top_k + k;
+        const int e = t->ids[route];
+        if (e < 0 || e >= num_experts) continue;
+        const float down = route_y_scratch[static_cast<size_t>(route) * H + h];
+        if (fmt == WF_DSFP4) {
+          // Preserve ds_fp4's per-route weighted bf16 rounding before the sum.
+          acc += bf16_to_f32(f32_to_bf16(down * t->w[route]));
+        } else {
+          const float w_out = (fmt == WF_MXFP4 || !apply_on_input) ? t->w[route] : 1.0f;
+          acc += down * w_out;
+        }
+      }
+      y_row[h] = f32_to_bf16(acc);
+    }
+  }
+
   void run_task_body(const MoeTask* t) {
     int local_sense = 0;
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p1_total) break;
-      do_pass1(t, p);
+      if (t->group_routes) do_pass1_grouped(t, p);
+      else do_pass1(t, p);
     }
     barrier(local_sense);
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
@@ -1924,7 +2049,16 @@ struct CpuMoeExecutor {
     for (;;) {
       int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p2_total) break;
-      do_pass2(t, p);
+      if (t->group_routes) do_pass2_grouped(t, p);
+      else do_pass2(t, p);
+    }
+    if (t->group_routes) {
+      barrier(local_sense);
+      for (;;) {
+        int64_t p = p3_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= p3_total) break;
+        do_pass3_grouped(t, p);
+      }
     }
   }
 
@@ -1951,12 +2085,42 @@ struct CpuMoeExecutor {
     }
   }
 
+  void build_decode_groups(const MoeTask* t) {
+    std::fill(expert_offsets.begin(), expert_offsets.end(), 0);
+    const int routes = t->num_tokens * top_k;
+    for (int route = 0; route < routes; ++route) {
+      const int e = t->ids[route];
+      if (e >= 0 && e < num_experts) ++expert_offsets[e + 1];
+    }
+    distinct_experts.clear();
+    for (int e = 0; e < num_experts; ++e) {
+      expert_offsets[e + 1] += expert_offsets[e];
+      if (expert_offsets[e + 1] != expert_offsets[e]) distinct_experts.push_back(e);
+      expert_cursor[e] = expert_offsets[e];
+    }
+    grouped_routes.resize(static_cast<size_t>(expert_offsets[num_experts]));
+    // Route ids are visited in token-major/top-k order. Insertion is therefore
+    // stable within each expert group, which also makes grouping deterministic.
+    for (int route = 0; route < routes; ++route) {
+      const int e = t->ids[route];
+      if (e >= 0 && e < num_experts) grouped_routes[expert_cursor[e]++] = route;
+    }
+  }
+
   void submit(MoeTask* t, bool run_pre_callback = true) {
+    if (t->group_routes) build_decode_groups(t);
     if (run_pre_callback && pre_run_callback) {
-      std::vector<int32_t> ids(
-          t->ids, t->ids + static_cast<size_t>(t->num_tokens) * top_k);
       pybind11::gil_scoped_acquire gil;
-      pre_run_callback(t->layer_id, std::move(ids));
+      if (t->group_routes) {
+        // The same route D2H used by compute is enough to build the expert union.
+        // Hand WILLNEED the compact list plus the original valid-pair count, with
+        // no second transfer and no repeated page-advice requests.
+        pre_run_callback(t->layer_id, distinct_experts, grouped_routes.size());
+      } else {
+        std::vector<int32_t> ids(
+            t->ids, t->ids + static_cast<size_t>(t->num_tokens) * top_k);
+        pre_run_callback(t->layer_id, std::move(ids));
+      }
     }
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
@@ -1965,11 +2129,20 @@ struct CpuMoeExecutor {
     // synchronous prefill can grow this further as larger chunks arrive.
     const size_t need = static_cast<size_t>(t->num_tokens) * top_k * I;
     if (need > g_scratch.size()) g_scratch.resize(need);
-    p1_total = static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
-    p2_total = static_cast<int64_t>(t->num_tokens) * n_hblk;
+    const size_t route_y_need = static_cast<size_t>(t->num_tokens) * top_k * H;
+    if (t->group_routes && route_y_need > route_y_scratch.size())
+      route_y_scratch.resize(route_y_need);
+    p1_total = t->group_routes
+        ? static_cast<int64_t>(distinct_experts.size()) * n_iblk
+        : static_cast<int64_t>(t->num_tokens) * top_k * n_iblk;
+    p2_total = t->group_routes
+        ? static_cast<int64_t>(distinct_experts.size()) * n_hblk
+        : static_cast<int64_t>(t->num_tokens) * n_hblk;
+    p3_total = t->group_routes ? static_cast<int64_t>(t->num_tokens) * n_hblk : 0;
     prt_total = (needs_di || use_q4a8) ? static_cast<int64_t>(t->num_tokens) * top_k : 0;
     p1_next.store(0, std::memory_order_relaxed);
     p2_next.store(0, std::memory_order_relaxed);
+    p3_next.store(0, std::memory_order_relaxed);
     prt_next.store(0, std::memory_order_relaxed);
     done_count.store(0, std::memory_order_relaxed);
     bar_count.store(0, std::memory_order_relaxed);
@@ -2190,6 +2363,7 @@ struct CpuMoeExecutor {
     MoeTask task{this,
                  layer_id,
                  num_tokens,
+                 false,
                  reinterpret_cast<const bf16_t*>(x_ptr),
                  reinterpret_cast<const int32_t*>(ids_ptr),
                  reinterpret_cast<const float*>(w_ptr),

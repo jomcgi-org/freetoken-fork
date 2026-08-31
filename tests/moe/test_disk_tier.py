@@ -115,6 +115,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     executor._disk_prefetch_calls = [0, 3, 3]
     executor._disk_prefetch_pages = [0, 17, 19]
     executor._disk_decode_steps = 6
+    executor._disk_route_pairs = 48
+    executor._disk_distinct_experts = 30
     executor._disk_major_fault_base = 10
     executor._gpufetch_tasks = {}
     monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 16)
@@ -124,6 +126,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["pages_requested"] == 36
     assert stats["major_faults"] == 6
     assert stats["major_faults_per_decode_step"] == 2.0
+    assert stats["distinct_experts_per_step"] == 5.0
+    assert stats["dedup_ratio"] == 1.6
     assert stats["gpufetch_fills_per_step"] == 0.0
     assert stats["gpufetch_fill_us"] == 0.0
     assert stats["per_layer"] == [
@@ -131,6 +135,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
         {"layer": 2, "prefetch_calls": 3, "pages_requested": 19},
     ]
     assert executor._disk_prefetch_calls == [0, 0, 0]
+    assert executor._disk_route_pairs == 0
+    assert executor._disk_distinct_experts == 0
     assert executor._disk_major_fault_base == 16
 
 
@@ -187,6 +193,8 @@ def test_gpufetch_stats_are_reported_per_decode_step(monkeypatch):
     executor._disk_prefetch_calls = [0, 0, 0]
     executor._disk_prefetch_pages = [0, 0, 0]
     executor._disk_decode_steps = 0
+    executor._disk_route_pairs = 0
+    executor._disk_distinct_experts = 0
     executor._disk_major_fault_base = 5
     executor._gpufetch_tasks = {1: (10, 1), 2: (11, 2)}
     executor._ext = Extension()
@@ -285,6 +293,8 @@ def test_disk_prefetch_deduplicates_route_union_across_batch():
     executor._disk_prefetch_calls = [0, 0]
     executor._disk_prefetch_pages = [0, 0]
     executor._disk_decode_steps = 0
+    executor._disk_route_pairs = 0
+    executor._disk_distinct_experts = 0
 
     routes = torch.tensor(
         [[3, 1], [3, -1], [2, 1], [2, 3]], dtype=torch.int32
@@ -295,6 +305,40 @@ def test_disk_prefetch_deduplicates_route_union_across_batch():
     assert executor._disk_prefetch_calls == [0, 1]
     assert executor._disk_prefetch_pages == [0, 12]
     assert executor._disk_decode_steps == 0
+
+
+def test_disk_decode_route_dedup_stats_track_heavy_recurrence():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor, _dedupe_decode_routes
+
+    class Bank:
+        def prefetch_experts(self, expert_ids):
+            assert expert_ids == [1, 2, 7]
+            return 3
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_layers = 1
+    executor.num_experts = 8
+    executor._disk_banks = {0: [Bank()]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._disk_decode_steps = 0
+    executor._disk_route_pairs = 0
+    executor._disk_distinct_experts = 0
+    executor._disk_major_fault_base = None
+    executor._gpufetch_tasks = {}
+
+    routes = torch.tensor(
+        [[1, 1, 2, 7], [1, 2, 2, 7], [1, 1, 1, -1]], dtype=torch.int32
+    )
+    selected, route_pairs = _dedupe_decode_routes(routes, executor.num_experts)
+    assert selected == [1, 2, 7]
+    # Native decode supplies this compact list from the existing routing D2H,
+    # along with the pre-dedup pair count used by the ratio counter.
+    assert executor.prefetch_experts(0, selected, route_pairs=route_pairs) == 3
+
+    stats = executor.disk_prefetch_stats()
+    assert stats["distinct_experts_per_step"] == 3.0
+    assert stats["dedup_ratio"] == pytest.approx(11 / 3)
 
 
 def test_disk_decode_tasks_are_cached_per_layer_and_batch_size():

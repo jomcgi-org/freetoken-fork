@@ -96,6 +96,20 @@ def _major_faults() -> int | None:
         return None
 
 
+def _dedupe_decode_routes(expert_ids, num_experts: int) -> tuple[list[int], int]:
+    """Return the sorted valid expert union and valid route-pair count.
+
+    Decode routing has already arrived in the pinned D2H buffer when the native
+    pre-run callback invokes this helper. Keeping the full route list in that
+    existing buffer avoids another transfer; this CPU-side pass supplies the
+    deduped list consumed by every bank's WILLNEED sweep.
+    """
+    if isinstance(expert_ids, torch.Tensor):
+        expert_ids = expert_ids.detach().cpu().reshape(-1).tolist()
+    valid = [int(i) for i in expert_ids if 0 <= int(i) < num_experts]
+    return sorted(set(valid)), len(valid)
+
+
 def compiled_extension_supports(activation: str) -> bool:
     """Whether the compiled ``_cpu_moe`` extension can serve ``activation``
     through its generic epilogue. A stale prebuilt .so accepts newer act ids
@@ -221,6 +235,8 @@ class CpuMoeExecutor:
         self._disk_prefetch_calls = [0] * self.num_layers
         self._disk_prefetch_pages = [0] * self.num_layers
         self._disk_decode_steps = 0
+        self._disk_route_pairs = 0
+        self._disk_distinct_experts = 0
         self._disk_major_fault_base = _major_faults()
         self._disk_prefetch_error: BaseException | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
@@ -640,7 +656,13 @@ class CpuMoeExecutor:
         assert self._prefill_io is not None
         return {name: tensor[:bs] for name, tensor in self._prefill_io.items()}
 
-    def prefetch_experts(self, layer_id: int, expert_ids, is_prefill: bool = False) -> int:
+    def prefetch_experts(
+        self,
+        layer_id: int,
+        expert_ids,
+        is_prefill: bool = False,
+        route_pairs: int | None = None,
+    ) -> int:
         """Prefetch the union of selected rows for one DISK layer.
 
         Decode invokes this after routing has reached the pinned host buffer and before
@@ -650,11 +672,11 @@ class CpuMoeExecutor:
         banks = self._disk_banks.get(int(layer_id))
         if not banks:
             return 0
+        selected, counted_pairs = _dedupe_decode_routes(expert_ids, self.num_experts)
         if not is_prefill:
             self._disk_decode_steps += 1
-        if isinstance(expert_ids, torch.Tensor):
-            expert_ids = expert_ids.detach().cpu().reshape(-1).tolist()
-        selected = sorted({int(i) for i in expert_ids if int(i) >= 0})
+            self._disk_route_pairs += counted_pairs if route_pairs is None else int(route_pairs)
+            self._disk_distinct_experts += len(selected)
         if not selected:
             return 0
         pages = sum(bank.prefetch_experts(selected) for bank in banks)
@@ -666,6 +688,8 @@ class CpuMoeExecutor:
         self._disk_prefetch_calls = [0] * self.num_layers
         self._disk_prefetch_pages = [0] * self.num_layers
         self._disk_decode_steps = 0
+        self._disk_route_pairs = 0
+        self._disk_distinct_experts = 0
         self._disk_major_fault_base = _major_faults()
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
             self._ext.gpufetch_stats(True)
@@ -703,6 +727,14 @@ class CpuMoeExecutor:
                 major_faults / decode_steps
                 if major_faults is not None and decode_steps else 0.0
             ),
+            "distinct_experts_per_step": (
+                self._disk_distinct_experts / self._disk_decode_steps
+                if self._disk_decode_steps else 0.0
+            ),
+            "dedup_ratio": (
+                self._disk_route_pairs / self._disk_distinct_experts
+                if self._disk_distinct_experts else 0.0
+            ),
             "gpufetch_fills_per_step": (
                 gpufetch_fills / gpufetch_decode_steps
                 if gpufetch_decode_steps else 0.0
@@ -717,6 +749,8 @@ class CpuMoeExecutor:
             self._disk_prefetch_calls = [0] * self.num_layers
             self._disk_prefetch_pages = [0] * self.num_layers
             self._disk_decode_steps = 0
+            self._disk_route_pairs = 0
+            self._disk_distinct_experts = 0
             self._disk_major_fault_base = now
         return result
 
@@ -906,13 +940,15 @@ class CpuMoeExecutor:
             )
 
 
-def _disk_prefetch_callback(executor_ref, layer_id: int, expert_ids) -> None:
+def _disk_prefetch_callback(
+    executor_ref, layer_id: int, expert_ids, route_pairs: int | None = None,
+) -> None:
     """No-throw native pre-run callback without a strong executor reference."""
     executor = executor_ref()
     if executor is None:
         return
     try:
-        executor.prefetch_experts(layer_id, expert_ids)
+        executor.prefetch_experts(layer_id, expert_ids, route_pairs=route_pairs)
     except BaseException as exc:
         if executor._disk_prefetch_error is None:
             executor._disk_prefetch_error = exc
