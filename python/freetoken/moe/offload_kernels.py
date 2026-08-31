@@ -61,7 +61,7 @@ def ensure_experts_hybrid(
 
 
 def ensure_experts_hot(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
-    """Static HOT/COLD split for a file-backed DISK layer.
+    """Current HOT/COLD split for a file-backed DISK layer.
 
     HOT experts use normal LRU slots and compact pinned source rows. COLD routes are
     rewritten to -1 for the CPU partial. The single fixed-shape launch is graph-safe.
@@ -142,6 +142,7 @@ def _ensure_experts_hot_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -> N
     _ensure_experts_hot_kernel[(1,)](
         expert_ids,
         cache.hot_row_for_expert,
+        cache.decayed_decode_freq,
         cache.slot_for_id,
         cache.id_of_slot,
         cache.usage,
@@ -157,6 +158,8 @@ def _ensure_experts_hot_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -> N
         expert_ids.numel(),
         cache.num_experts,
         cache.cache_size,
+        cache._hot_decay_factor,
+        HOT_ADAPT=cache.hot_adapt_enabled,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         num_warps=8 if block_c >= 2048 else 4,
@@ -227,7 +230,7 @@ def _ensure_experts_hybrid_cpu(
 
 
 def _ensure_experts_hot_cpu(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
-    """CPU reference for the static HOT/COLD split kernel."""
+    """CPU reference for the current HOT/COLD split kernel."""
     raw = [int(expert) for expert in expert_ids.view(-1).tolist()]
     hot_row = cache.hot_row_for_expert[layer_id].tolist()
     seen_hot = []
@@ -271,6 +274,11 @@ def _ensure_experts_hot_cpu(cache, layer_id: int, expert_ids: torch.Tensor) -> N
         cache.src_indices[idx] = hot_row[expert]
 
     hot_pairs = sum(hot_row[expert] >= 0 for expert in raw)
+    if cache.hot_adapt_enabled:
+        counts = torch.bincount(
+            torch.tensor(raw, dtype=torch.long), minlength=cache.num_experts
+        ).to(torch.float32)
+        cache.decayed_decode_freq[layer_id].mul_(cache._hot_decay_factor).add_(counts)
     cache.stat_hot_pairs += hot_pairs
     cache.stat_hot_total_pairs += len(raw)
     flat = expert_ids.view(-1)
@@ -507,6 +515,7 @@ def _ensure_experts_hybrid_kernel(
 def _ensure_experts_hot_kernel(
     expert_ids_ptr,
     hot_row_ptr,
+    decayed_freq_ptr,
     slot_for_id_ptr,
     id_of_slot_ptr,
     usage_ptr,
@@ -522,10 +531,12 @@ def _ensure_experts_hot_kernel(
     num_active,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
+    decay_factor,
+    HOT_ADAPT: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    """Timestamp-LRU restricted to a static HOT set.
+    """Timestamp-LRU restricted to the currently published HOT set.
 
     ``hot_row_ptr`` maps original expert ids to compact pinned source rows, or -1
     for COLD experts. Every HOT miss is installed. COLD pairs are rewritten to -1
@@ -538,12 +549,19 @@ def _ensure_experts_hot_kernel(
     e_mask = off_e < num_experts
     compact_row = tl.load(hot_row_ptr + base + off_e, mask=e_mask, other=-1)
     eligible = compact_row >= 0
-    pair_count = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    route_count = tl.zeros((BLOCK_E,), dtype=tl.int32)
     for i in tl.range(num_active):
         expert = tl.load(expert_ids_ptr + i)
-        pair_count += ((off_e == expert) & eligible).to(tl.int32)
-    is_active = pair_count > 0
-    hot_pairs = tl.sum(pair_count)
+        route_count += (off_e == expert).to(tl.int32)
+    is_active = (route_count > 0) & eligible
+    hot_pairs = tl.sum(tl.where(eligible, route_count, 0))
+    if HOT_ADAPT:
+        decayed = tl.load(decayed_freq_ptr + base + off_e, mask=e_mask, other=0.0)
+        tl.store(
+            decayed_freq_ptr + base + off_e,
+            decayed * decay_factor + route_count.to(tl.float32),
+            mask=e_mask,
+        )
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & eligible & (slot < 0) & e_mask

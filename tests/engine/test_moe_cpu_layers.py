@@ -208,6 +208,42 @@ def test_hot_budget_counts_whole_layers_against_global_pin_cap(tmp_path, monkeyp
     assert resolve_hot(config, frozenset({0}), 2) == {0: (0, 1)}
 
 
+def test_hot_budget_without_profile_starts_all_cold_when_adaptation_is_on(
+    tmp_path, monkeypatch,
+):
+    index = {
+        "format": "freetoken_weight",
+        "tensors": [
+            {"kind": "experts_bank", "name": "gate_up#L00000", "nbytes": 400},
+        ],
+    }
+    (tmp_path / "freetoken_weight.json").write_text(json.dumps(index))
+    monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(num_experts=4),
+        moe_hot_expert_budget_gib=200 / 2**30,
+        moe_hot_adapt_interval_steps=1000,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=None,
+    )
+    assert resolve_hot(config, frozenset({0}), 1) == {0: ()}
+
+
+def test_hot_budget_without_profile_rejects_static_mode(tmp_path):
+    _write_ftw_index(tmp_path, 1)
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(num_experts=1),
+        moe_hot_expert_budget_gib=1.0,
+        moe_hot_adapt_interval_steps=0,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=None,
+    )
+    with pytest.raises(ValueError, match="static.*requires.*profile"):
+        resolve_hot(config, frozenset({0}), 1)
+
+
 @pytest.mark.parametrize(
     "contents",
     ["{not-json", json.dumps({"0": 1, "1": 2, "2": 3})],
@@ -287,6 +323,9 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_disk_prefill == "cpu"
     assert config.moe_disk_decode == "cpu"
     assert config.moe_hot_expert_budget_gib == 0
+    assert config.moe_hot_adapt_halflife_steps == 2000
+    assert config.moe_hot_adapt_interval_steps == 1000
+    assert config.moe_hot_adapt_max_swap_gib == 0.5
 
 
 @pytest.mark.parametrize("budget", [-1, float("inf"), float("nan")])
@@ -302,6 +341,54 @@ def test_engine_config_rejects_invalid_hot_expert_budget(budget):
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_hot_expert_budget_gib=budget,
+        )
+
+
+@pytest.mark.parametrize("half_life", [0, -1, 1.5, True])
+def test_engine_config_rejects_invalid_hot_adapt_half_life(half_life):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-halflife-steps"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_halflife_steps=half_life,
+        )
+
+
+@pytest.mark.parametrize("interval", [-1, 1.5, True])
+def test_engine_config_rejects_invalid_hot_adapt_interval(interval):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-interval-steps"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_interval_steps=interval,
+        )
+
+
+@pytest.mark.parametrize("max_swap", [0, -1, float("inf"), float("nan")])
+def test_engine_config_rejects_invalid_hot_adapt_swap_bound(max_swap):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-max-swap-gib"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_max_swap_gib=max_swap,
         )
 
 

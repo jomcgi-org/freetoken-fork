@@ -641,10 +641,32 @@ def parse_args(
         type=float,
         default=ServerArgs.moe_hot_expert_budget_gib,
         help=(
-            "Pinned-host byte budget for profile-selected HOT experts inside DISK "
-            "layers. Requires the versioned per-expert layer profile and DISK CPU "
-            "decode. 0 disables expert-granular residency."
+            "Pinned-host byte budget for HOT experts inside DISK layers. A versioned "
+            "per-expert profile seeds the partition when provided; otherwise online "
+            "adaptation starts all-cold. Requires DISK CPU decode. 0 disables "
+            "expert-granular residency."
         ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-halflife-steps",
+        type=int,
+        default=ServerArgs.moe_hot_adapt_halflife_steps,
+        help="Decode-step half-life for online per-expert route counts (default: 2000).",
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-interval-steps",
+        type=int,
+        default=ServerArgs.moe_hot_adapt_interval_steps,
+        help="Decode steps between HOT partition recomputes; 0 disables adaptation.",
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-max-swap-gib",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_max_swap_gib,
+        help="Maximum HOT row bytes copied by one adaptation interval (default: 0.5 GiB).",
     )
 
     parser.add_argument(

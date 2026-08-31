@@ -643,7 +643,7 @@ class Engine:
                 f"MoE DISK layers selected explicitly: {sorted(disk_layer_ids)}; "
                 "layer profile scores not consulted"
             )
-        hot_expert_ids = _resolve_hot_expert_sets(
+        hot_expert_ids, hot_expert_capacity, hot_expert_bytes = _resolve_hot_expert_setup(
             config,
             disk_layer_ids,
             num_moe_layers,
@@ -723,6 +723,7 @@ class Engine:
                 layer_residency=requested_residency,
                 disk_pager=disk_pager,
                 hot_expert_ids=hot_expert_ids,
+                hot_expert_capacity=hot_expert_capacity,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -765,6 +766,13 @@ class Engine:
                 layer_residency=banks.layer_residency,
                 hot_sources=banks.hot_sources,
                 hot_expert_ids=banks.hot_expert_ids,
+                hot_expert_capacity=banks.hot_expert_capacity,
+            )
+            cache.configure_hot_adaptation(
+                half_life_steps=config.moe_hot_adapt_halflife_steps,
+                interval_steps=config.moe_hot_adapt_interval_steps,
+                max_swap_bytes=int(config.moe_hot_adapt_max_swap_gib * 2**30),
+                expert_bytes=hot_expert_bytes,
             )
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
@@ -1157,6 +1165,11 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        if batch.is_decode and self.moe_offload_cache is not None:
+            # The current model work is already ordered on self.stream. Adaptation
+            # retires or publishes rows here so the next decode observes one complete
+            # mapping, while file-to-pinned copies continue on a worker thread.
+            self.moe_offload_cache.hot_adapt_step_boundary()
 
         if not getattr(batch, "mtp_verify", False):
             self._record_mtp_hidden(batch)
@@ -1355,6 +1368,8 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.shutdown_hot_adaptation()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
@@ -1656,30 +1671,15 @@ def _plan_hot_experts(
     smaller than one expert in every DISK layer is deliberately left unused so the
     partition keeps the documented per-layer top-N shape.
     """
-    if budget_bytes < 0 or expert_bytes <= 0 or num_experts <= 0:
-        raise ValueError("HOT planner geometry must be non-negative with positive rows")
-    if not disk_layer_ids or budget_bytes == 0:
-        return {}
-    missing = set(disk_layer_ids) - set(expert_hits)
-    if missing:
-        raise ValueError(f"profile has no expert counts for DISK layers {sorted(missing)}")
-    top_n = min(
-        num_experts,
-        budget_bytes // (expert_bytes * len(disk_layer_ids)),
+    from freetoken.moe.hot_adapt import recompute_hot_partition
+
+    return recompute_hot_partition(
+        expert_hits,
+        disk_layer_ids,
+        budget_bytes=budget_bytes,
+        expert_bytes=expert_bytes,
+        num_experts=num_experts,
     )
-    if top_n <= 0:
-        return {}
-    plan = {}
-    for layer_id in sorted(disk_layer_ids):
-        counts = expert_hits[layer_id]
-        if len(counts) != num_experts:
-            raise ValueError(
-                f"profile layer {layer_id} has {len(counts)} experts, expected {num_experts}"
-            )
-        ranked = sorted(range(num_experts), key=lambda expert_id: (-counts[expert_id], expert_id))
-        # Compact source row order is expert-id order, independent of rank order.
-        plan[layer_id] = tuple(sorted(ranked[:top_n]))
-    return plan
 
 
 def _profiled_hot_pair_rate(
@@ -1694,36 +1694,40 @@ def _profiled_hot_pair_rate(
     return hot / total if total else 0.0
 
 
-def _resolve_hot_expert_sets(
+def _resolve_hot_expert_setup(
     config: EngineConfig,
     disk_layer_ids: frozenset[int],
     num_moe_layers: int,
     *,
     reserved: int = 0,
-) -> dict[int, tuple[int, ...]]:
-    """Resolve profile, logical row bytes, and the shared CUDA pin ceiling."""
+) -> tuple[dict[int, tuple[int, ...]], dict[int, int], int]:
+    """Resolve initial rows, fixed capacity, and logical bytes per HOT row."""
     requested = int(config.moe_hot_expert_budget_gib * 2**30)
     if requested <= 0:
-        return {}
+        return {}, {}, 0
     if not disk_layer_ids:
         raise ValueError("--moe-hot-expert-budget-gib requires at least one DISK layer")
     if config.moe_disk_decode != "cpu":
         raise ValueError(
             "--moe-hot-expert-budget-gib requires --moe-disk-decode cpu"
         )
-    if not config.moe_disk_layer_profile:
+    adapt_enabled = getattr(config, "moe_hot_adapt_interval_steps", 1000) > 0
+    if not config.moe_disk_layer_profile and not adapt_enabled:
         raise ValueError(
-            "--moe-hot-expert-budget-gib requires --moe-disk-layer-profile"
+            "static --moe-hot-expert-budget-gib requires --moe-disk-layer-profile; "
+            "set --moe-hot-adapt-interval-steps above 0 to warm up from all-cold"
         )
     num_experts = config.model_config.num_experts
-    try:
-        hits = _load_hot_expert_profile(
-            config.moe_disk_layer_profile, num_moe_layers, num_experts
-        )
-    except (OSError, OverflowError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"--moe-disk-layer-profile is unusable for HOT experts: {exc}"
-        ) from exc
+    hits = None
+    if config.moe_disk_layer_profile:
+        try:
+            hits = _load_hot_expert_profile(
+                config.moe_disk_layer_profile, num_moe_layers, num_experts
+            )
+        except (OSError, OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"--moe-disk-layer-profile is unusable for HOT experts: {exc}"
+            ) from exc
 
     from freetoken.moe.expert_banks import (
         bank_bytes_per_expert,
@@ -1760,27 +1764,52 @@ def _resolve_hot_expert_sets(
                 f"{effective / 2**30:.2f} GiB by FREETOKEN_PIN_BUDGET_GB after "
                 "whole-layer and fixed-bank pin accounting"
             )
-    plan = _plan_hot_experts(
-        hits,
-        disk_layer_ids,
-        budget_bytes=effective,
-        expert_bytes=expert_bytes,
-        num_experts=num_experts,
+    top_n = min(
+        num_experts,
+        effective // (expert_bytes * len(disk_layer_ids)),
     )
-    if not plan:
+    if top_n <= 0:
         logger.warning_rank0(
             "HOT expert budget cannot fit one expert in every DISK layer; "
             "expert-granular residency is disabled"
         )
-        return {}
-    top_n = len(next(iter(plan.values())))
-    actual = top_n * len(plan) * expert_bytes
-    logger.info_rank0(
-        f"MoE HOT expert plan: top {top_n}/{num_experts} experts in each of "
-        f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB pinned, profiled "
-        f"hot_pair_rate={_profiled_hot_pair_rate(hits, plan):.1%}"
-    )
-    return plan
+        return {}, {}, expert_bytes
+    capacity = {layer_id: top_n for layer_id in sorted(disk_layer_ids)}
+    actual = top_n * len(capacity) * expert_bytes
+    if hits is None:
+        plan = {layer_id: () for layer_id in sorted(disk_layer_ids)}
+        logger.info_rank0(
+            f"MoE HOT expert plan: all-cold startup with {top_n}/{num_experts} row "
+            f"capacity in each of {len(plan)} DISK layers, {actual / 2**30:.2f} GiB "
+            "pinned; online adaptation will warm the partition"
+        )
+    else:
+        plan = _plan_hot_experts(
+            hits,
+            disk_layer_ids,
+            budget_bytes=effective,
+            expert_bytes=expert_bytes,
+            num_experts=num_experts,
+        )
+        logger.info_rank0(
+            f"MoE HOT expert plan: top {top_n}/{num_experts} experts in each of "
+            f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB pinned, profiled "
+            f"hot_pair_rate={_profiled_hot_pair_rate(hits, plan):.1%}"
+        )
+    return plan, capacity, expert_bytes
+
+
+def _resolve_hot_expert_sets(
+    config: EngineConfig,
+    disk_layer_ids: frozenset[int],
+    num_moe_layers: int,
+    *,
+    reserved: int = 0,
+) -> dict[int, tuple[int, ...]]:
+    """Compatibility wrapper returning the initial HOT expert ids only."""
+    return _resolve_hot_expert_setup(
+        config, disk_layer_ids, num_moe_layers, reserved=reserved
+    )[0]
 
 
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
@@ -1851,6 +1880,9 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_layers": None,
     "moe_disk_layer_profile": None,
     "moe_hot_expert_budget_gib": 0.0,
+    "moe_hot_adapt_halflife_steps": 2000,
+    "moe_hot_adapt_interval_steps": 1000,
+    "moe_hot_adapt_max_swap_gib": 0.5,
     "moe_disk_prefill": "cpu",
     "moe_disk_decode": "cpu",
     "moe_disk_pager": "madvise",
@@ -2195,9 +2227,13 @@ def _adjust_config(config: EngineConfig):
             raise ValueError(
                 "--moe-hot-expert-budget-gib requires --moe-disk-decode cpu"
             )
-        if not config.moe_disk_layer_profile:
+        if (
+            not config.moe_disk_layer_profile
+            and config.moe_hot_adapt_interval_steps == 0
+        ):
             raise ValueError(
-                "--moe-hot-expert-budget-gib requires --moe-disk-layer-profile"
+                "static --moe-hot-expert-budget-gib requires "
+                "--moe-disk-layer-profile"
             )
         from freetoken.checkpoint.ftw import is_ftw_checkpoint
 

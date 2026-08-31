@@ -422,7 +422,7 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Static profile split for a DISK layer, using the hybrid merge contract."""
+        """Current HOT/COLD split for a DISK layer, using the hybrid merge contract."""
         raw = topk_ids.clone()
         cache.ensure_experts_hot(self.layer_id, topk_ids)
         return self._decode_split_partials(

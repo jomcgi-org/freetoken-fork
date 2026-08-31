@@ -79,6 +79,28 @@ def test_ftw_load_builds_compact_hot_rows_and_keeps_cold_rows_file_backed(
     assert banks.hot_sources["gate_up"][0]._freetoken_host_bank.residency is not HostResidency.DISK
 
 
+def test_ftw_load_allocates_all_cold_hot_capacity(tmp_path, monkeypatch):
+    from freetoken.checkpoint.ftw import load_ftw_banks
+    from freetoken.moe.host_banks import HostResidency
+
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")
+    gate_up = torch.arange(5 * 4 * 3, dtype=torch.int32).view(5, 4, 3)
+    down = torch.arange(5 * 3 * 2, dtype=torch.int32).view(5, 3, 2)
+    _write_bf16_ftw(tmp_path, [(gate_up, down)])
+
+    banks = load_ftw_banks(
+        str(tmp_path),
+        num_layers=1,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: ()},
+        hot_expert_capacity={0: 2},
+    )
+    assert banks is not None
+    assert banks.hot_expert_ids == {0: ()}
+    assert banks.hot_expert_capacity == {0: 2}
+    assert banks.hot_sources["gate_up"][0].shape == (2, 4, 3)
+
+
 def test_disk_residency_rejects_non_ftw_checkpoint(tmp_path):
     from freetoken.moe.expert_banks import load_expert_banks
     from freetoken.moe.host_banks import HostResidency
@@ -141,11 +163,18 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     cache.cpu_executor = Executor()
     cache.stat_hot_pairs.fill_(7)
     cache.stat_hot_total_pairs.fill_(10)
+    cache.hot_adapt_enabled = True
+    cache._hot_slot_owners = {0: [1]}
+    cache.decayed_decode_freq[0] = torch.tensor([1.0, 3.0, 2.0, 4.0])
+    cache.hot_adapt_ticks = 2
+    cache.hot_adapt_swaps = 3
 
     stats = cache.disk_prefetch_stats(reset=True)
     assert stats["hot_pair_rate"] == pytest.approx(0.7)
     assert stats["hot_pairs"] == 7
     assert stats["routed_pairs"] == 10
+    assert stats["hot_swaps_per_interval"] == pytest.approx(1.5)
+    assert stats["decayed_hot_pair_rate"] == pytest.approx(0.3)
     assert cache.stat_hot_pairs.item() == 0
     assert cache.stat_hot_total_pairs.item() == 0
 
@@ -1012,3 +1041,87 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
     torch.testing.assert_close(split_out, cpu_out, rtol=2e-2, atol=2e-2)
     stats = cache.disk_prefetch_stats(reset=True)
     assert stats["hot_pair_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_disk_hot_adaptation_forced_tick_preserves_decode_parity(tmp_path):
+    from freetoken.checkpoint.ftw import load_ftw_banks
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    torch.manual_seed(47)
+    experts, hidden, inter, top_k, batch = 4, 128, 128, 2, 2
+    gate_up = torch.randn(experts, 2 * inter, hidden, dtype=torch.bfloat16) * 0.1
+    down = torch.randn(experts, hidden, inter, dtype=torch.bfloat16) * 0.1
+    _write_bf16_ftw(tmp_path, [(gate_up, down)])
+    banks = load_ftw_banks(
+        str(tmp_path),
+        num_layers=1,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (0, 2)},
+        hot_expert_capacity={0: 2},
+    )
+    assert banks is not None
+
+    device = torch.device("cuda")
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=experts, cache_size=experts, device=device,
+        prefill_overlap=False, decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        banks.sources,
+        layer_residency=banks.layer_residency,
+        hot_sources=banks.hot_sources,
+        hot_expert_ids=banks.hot_expert_ids,
+        hot_expert_capacity=banks.hot_expert_capacity,
+    )
+    row_bytes = sum(
+        source[0][0].numel() * source[0].element_size()
+        for source in banks.sources.values()
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2, interval_steps=1,
+        max_swap_bytes=2 * row_bytes, expert_bytes=row_bytes,
+    )
+    executor = CpuMoeExecutor(
+        cache, top_k=top_k, activation="silu",
+        apply_router_weight_on_input=False, num_threads=1,
+        max_tokens=batch, device=device,
+    )
+    cache.set_cpu_executor(executor)
+    layer = OffloadMoELayer(
+        layer_id=0, num_experts=experts, top_k=top_k,
+        hidden_size=hidden, intermediate_size=inter,
+    )
+    layer.offload_cache = cache
+
+    x = torch.randn(batch, hidden, device=device, dtype=torch.bfloat16)
+    ids = torch.tensor([[1, 3], [3, 1]], device=device, dtype=torch.int32)
+    weights = torch.tensor(
+        [[0.6, 0.4], [0.25, 0.75]], device=device, dtype=torch.float32,
+    )
+    expected = executor.decode(0, x, weights, ids).float()
+    torch.cuda.synchronize()
+    before_ptr = cache.hot_row_for_expert.data_ptr()
+    cache.decayed_decode_freq.zero_()
+    cache.decayed_decode_freq[0, 1] = 10
+    cache.decayed_decode_freq[0, 3] = 9
+
+    cache.hot_adapt_step_boundary()
+    cache._hot_adapt_future.result(timeout=10)
+    cache.hot_adapt_step_boundary()
+    cache._hot_adapt_future.result(timeout=10)
+    cache.hot_adapt_step_boundary()
+    assert cache.hot_row_for_expert.data_ptr() == before_ptr
+    assert cache.hot_row_for_expert[0].tolist() == [-1, 1, -1, 0]
+
+    actual = layer._decode_routed(x, weights, ids.clone()).float()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)

@@ -55,9 +55,14 @@ class EngineConfig:
     # Optional per-MoE-layer traffic scores used only by automatic FTW DISK spill
     # selection. Explicit moe_disk_layers remains authoritative.
     moe_disk_layer_profile: str | None = None
-    # Compact pinned HOT rows selected from the per-expert section of the DISK
-    # profile. Zero preserves pure layer residency.
+    # Compact pinned HOT row capacity for DISK layers. A profile seeds the rows;
+    # without one, online adaptation starts the fixed bank all-cold.
     moe_hot_expert_budget_gib: float = 0.0
+    # Online HOT-set adaptation. Interval 0 disables it. The accumulator decays
+    # once per decode step and the copy bound limits convergence work per tick.
+    moe_hot_adapt_halflife_steps: int = 2000
+    moe_hot_adapt_interval_steps: int = 1000
+    moe_hot_adapt_max_swap_gib: float = 0.5
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"
@@ -151,6 +156,23 @@ class EngineConfig:
             raise ValueError(
                 "--moe-hot-expert-budget-gib must be a finite non-negative number"
             )
+        if (
+            isinstance(self.moe_hot_adapt_halflife_steps, bool)
+            or not isinstance(self.moe_hot_adapt_halflife_steps, int)
+            or self.moe_hot_adapt_halflife_steps <= 0
+        ):
+            raise ValueError("--moe-hot-adapt-halflife-steps must be a positive integer")
+        if (
+            isinstance(self.moe_hot_adapt_interval_steps, bool)
+            or not isinstance(self.moe_hot_adapt_interval_steps, int)
+            or self.moe_hot_adapt_interval_steps < 0
+        ):
+            raise ValueError("--moe-hot-adapt-interval-steps must be a non-negative integer")
+        if (
+            not math.isfinite(float(self.moe_hot_adapt_max_swap_gib))
+            or self.moe_hot_adapt_max_swap_gib <= 0
+        ):
+            raise ValueError("--moe-hot-adapt-max-swap-gib must be a finite positive number")
         if self.moe_disk_pager not in ("madvise", "uffd"):
             raise ValueError(
                 "--moe-disk-pager must be 'madvise' or 'uffd', got "
