@@ -369,6 +369,8 @@ def test_uffd_prefetch_groups_all_layer_banks_into_one_budget_request():
     executor._disk_prefetch_calls = [0]
     executor._disk_prefetch_pages = [0]
     executor._disk_decode_steps = 0
+    executor._disk_route_pairs = 0
+    executor._disk_distinct_experts = 0
 
     assert executor.prefetch_experts(0, [3, 1, 3, -1]) == 9
     assert pager.calls == [([gate_up, down], [1, 3])]
