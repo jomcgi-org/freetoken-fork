@@ -46,7 +46,22 @@ copying the whole bank to the GPU cache. `--moe-disk-prefill copy` restores the 
 whole-layer pageable copy path for benchmarking. LOCKED and PAGEABLE layers keep their
 existing GPU prefill copy behavior.
 
-The DISK tier requires FreeToken's aligned, per-layer FTW layout. Convert a raw
+`--moe-disk-pager madvise` is the default and preserves that file-mapping behavior.
+On Linux, `--moe-disk-pager uffd --moe-pager-budget-gib 40` instead registers anonymous
+bank regions with userfaultfd. The route hook accepts logical expert rows, deduplicates
+the physical pages covering them, and installs missing pages with positional I/O before
+compute. A process-wide userspace LRU evicts pages with `MADV_DONTNEED` at the configured
+resident-byte ceiling. Decode status reports proactive and fault-driven logical fills,
+installed pages, evictions, resident bytes, and a fill-latency histogram.
+
+UFFD mode requires `/proc/sys/vm/unprivileged_userfaultfd=1` or `CAP_SYS_PTRACE`.
+Startup probes the kernel API and reports the current sysctl value on failure. It also
+requires page-aligned anonymous mapping boundaries. Expert row sizes and FTW file
+offsets may be arbitrary.
+The `madvise` backend remains available on every supported platform and is the bench
+baseline when comparing warm-decode fault counts.
+
+The DISK tier requires FreeToken's per-layer FTW layout. Convert a raw
 safetensors checkpoint first with `ft checkpoint`; raw safetensors and GGUF banks are
 not supported. When expert banks exceed `FREETOKEN_PIN_BUDGET_GB`, an FTW checkpoint
 automatically spills enough head and tail layers to DISK, following the assumption that

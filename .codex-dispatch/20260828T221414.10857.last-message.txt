@@ -1,0 +1,22 @@
+Implemented the DISK residency tier. Changes remain uncommitted because the repository guardrail reserves commits for the orchestrator. Nothing was pushed.
+
+Key files changed:
+
+- FTW mapping/alignment: `checkpoint/ftw.py`, `moe/host_banks.py`, `moe/expert_banks.py`
+- Routing, selection, CLI: `engine/config.py`, `engine/engine.py`, `server/args.py`, `layers/moe.py`, `moe/offload_cache.py`
+- Prefetch and stats: `moe/cpu_executor.py`, existing CPU executor callback bridge, `scheduler/scheduler.py`
+- Tests: `tests/moe/test_disk_tier.py`, `tests/engine/test_moe_cpu_layers.py`
+- Documentation: `docs/models.md`
+
+Test summary, verbatim:
+
+`21 passed, 2 skipped in 3.00s`
+
+Skipped locally:
+
+- `test_copy_plan_skips_disk_layer`: needs CUDA
+- `test_cpu_executor_disk_mapping_matches_anonymous_bank`: `_cpu_moe` extension is not built on this macOS host
+
+The project’s pinned CUDA Torch has no macOS ARM wheel, so tests ran in an isolated Torch 2.10 environment with a temporary flashlib import stub. The stub was removed afterward. Python compilation and `git diff --check` pass.
+
+No FTW version bump was needed because the existing format already aligns tensor starts. The writer now also keeps each small tensor’s alignment padding in the same shard, while incompatible legacy flat or cross-shard bank regions fail with a clear `ft checkpoint` reconversion message. No new C extension was added; the existing CPU executor binding only gained a pre-run callback so Python `mmap.madvise` runs after routing D2H and before GEMVs. The pre-existing `.codex-dispatch/` directory was left untouched.

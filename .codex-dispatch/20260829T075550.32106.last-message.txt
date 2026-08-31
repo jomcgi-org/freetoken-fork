@@ -1,0 +1,34 @@
+Implemented the DISK CPU-prefill path. Changes remain uncommitted because repo guardrails reserve commits for the orchestrator. Nothing was pushed.
+
+Key changes:
+
+- DISK prefill now prefetches routed experts, then runs synchronously on the CPU executor.
+- `--moe-disk-prefill {cpu,copy}` added, default `cpu`.
+- Added reusable grow-to-largest prefill IO and a stack-scoped native task.
+- Added build-time chunk-limit and stale-extension validation.
+- LOCKED/PAGEABLE and DISK `copy` behavior remain unchanged.
+- Updated docs and routing, parity, config, and buffer-growth tests.
+
+Files changed:
+
+- [config.py](/Users/jomcgi/repos/FreeToken/python/freetoken/engine/config.py)
+- [engine.py](/Users/jomcgi/repos/FreeToken/python/freetoken/engine/engine.py)
+- [cpu_moe_ext.cpp](/Users/jomcgi/repos/FreeToken/python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp)
+- [moe.py](/Users/jomcgi/repos/FreeToken/python/freetoken/layers/moe.py)
+- [cpu_executor.py](/Users/jomcgi/repos/FreeToken/python/freetoken/moe/cpu_executor.py)
+- [offload_cache.py](/Users/jomcgi/repos/FreeToken/python/freetoken/moe/offload_cache.py)
+- [args.py](/Users/jomcgi/repos/FreeToken/python/freetoken/server/args.py)
+- [test_disk_tier.py](/Users/jomcgi/repos/FreeToken/tests/moe/test_disk_tier.py)
+- [test_moe_cpu_layers.py](/Users/jomcgi/repos/FreeToken/tests/engine/test_moe_cpu_layers.py)
+- [models.md](/Users/jomcgi/repos/FreeToken/docs/models.md)
+
+Test summary:
+
+`32 passed, 2 skipped in 4.19s`
+
+Skipped:
+
+- `test_copy_plan_skips_disk_layer`: needs CUDA
+- `test_cpu_executor_disk_mapping_matches_anonymous_bank`: CPU MoE extension is not built
+
+Python compilation and `git diff --check` pass. The broader `tests/moe tests/engine` run was not executed because the repo guardrail permits only targeted edited test files; the orchestrator’s Linux CI remains the full gate. Open questions: none.

@@ -232,6 +232,7 @@ class CpuMoeExecutor:
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
         self._disk_banks: dict[int, list] = {}
+        self._disk_pagers: set = set()
         self._disk_prefetch_calls = [0] * self.num_layers
         self._disk_prefetch_pages = [0] * self.num_layers
         self._disk_decode_steps = 0
@@ -240,6 +241,15 @@ class CpuMoeExecutor:
         self._disk_major_fault_base = _major_faults()
         self._disk_prefetch_error: BaseException | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
+        for layer_id, banks in self._disk_banks.items():
+            pagers = {getattr(bank, "_pager", None) for bank in banks}
+            for pager in pagers - {None}:
+                pager_banks = [bank for bank in banks if bank._pager is pager]
+                pager.validate_working_set(
+                    pager_banks,
+                    min(self.num_experts, self.max_tokens * self.top_k),
+                    context=f"layer {layer_id} decode",
+                )
 
         # Decide the flag handshake up front (env + device + a functional stream-memop
         # probe): its coordinator needs a core of its own, which the auto thread sizing
@@ -388,6 +398,8 @@ class CpuMoeExecutor:
                 layer_banks = self._disk_banks.setdefault(layer_id, [])
                 if bank not in layer_banks:
                     layer_banks.append(bank)
+                if getattr(bank, "_pager", None) is not None:
+                    self._disk_pagers.add(bank._pager)
         table = torch.tensor([t.data_ptr() for t in layers], dtype=torch.int64)
         self._banks.append(table)
         self._banks.extend(layers)
@@ -679,7 +691,20 @@ class CpuMoeExecutor:
             self._disk_distinct_experts += len(selected)
         if not selected:
             return 0
-        pages = sum(bank.prefetch_experts(selected) for bank in banks)
+        pages = 0
+        paged_banks: set[int] = set()
+        by_pager: dict[object, list] = {}
+        for bank in banks:
+            pager = getattr(bank, "_pager", None)
+            if pager is not None:
+                by_pager.setdefault(pager, []).append(bank)
+                paged_banks.add(id(bank))
+        for pager, pager_banks in by_pager.items():
+            pages += pager.prefetch(pager_banks, selected)
+        pages += sum(
+            bank.prefetch_experts(selected) for bank in banks
+            if id(bank) not in paged_banks
+        )
         self._disk_prefetch_calls[layer_id] += 1
         self._disk_prefetch_pages[layer_id] += pages
         return pages
@@ -693,6 +718,8 @@ class CpuMoeExecutor:
         self._disk_major_fault_base = _major_faults()
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
             self._ext.gpufetch_stats(True)
+        for pager in getattr(self, "_disk_pagers", ()):
+            pager.stats(reset=True)
 
     def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
         """Aggregate DISK counters, reading procfs only when stats are flushed."""
@@ -745,6 +772,41 @@ class CpuMoeExecutor:
             ),
             "per_layer": per_layer,
         }
+        pagers = list(getattr(self, "_disk_pagers", ()))
+        if pagers:
+            native_stats = [pager.stats(reset=reset) for pager in pagers]
+            buckets = native_stats[0]["fill_latency_histogram"]["buckets_us"]
+            counts = [0] * len(native_stats[0]["fill_latency_histogram"]["counts"])
+            for item in native_stats:
+                if item["fill_latency_histogram"]["buckets_us"] != buckets:
+                    raise RuntimeError("UFFD pager latency histogram buckets disagree")
+                counts = [
+                    left + right for left, right in zip(
+                        counts, item["fill_latency_histogram"]["counts"]
+                    )
+                ]
+            result.update({
+                "pager_backend": "uffd",
+                "fills": sum(item["fills"] for item in native_stats),
+                "fills_from_prefetch": sum(
+                    item["fills_from_prefetch"] for item in native_stats
+                ),
+                "fault_driven": sum(item["fault_driven"] for item in native_stats),
+                "evictions": sum(item["evictions"] for item in native_stats),
+                "resident_bytes": sum(item["resident_bytes"] for item in native_stats),
+                "pages_installed": sum(
+                    item.get("pages_installed", 0) for item in native_stats
+                ),
+                "rows_spanning_pages": sum(
+                    item.get("rows_spanning_pages", 0) for item in native_stats
+                ),
+                "fill_latency_histogram": {
+                    "buckets_us": buckets,
+                    "counts": counts,
+                },
+            })
+        else:
+            result["pager_backend"] = "madvise"
         if reset:
             self._disk_prefetch_calls = [0] * self.num_layers
             self._disk_prefetch_pages = [0] * self.num_layers
@@ -930,6 +992,8 @@ class CpuMoeExecutor:
             and (code := self._ext.gpufetch_error_code())
         ):
             raise RuntimeError(f"DISK GPU-fetch staging failed with error code {code}")
+        for pager in getattr(self, "_disk_pagers", ()):
+            pager.raise_if_error()
         if self._err is not None and bool((self._err != 0).any()):
             raise RuntimeError(
                 "CPU MoE flag-handshake watchdog fired: a decode step's doorbell was "

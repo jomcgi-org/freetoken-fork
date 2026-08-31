@@ -75,10 +75,19 @@ def test_ftw_writer_keeps_mmap_padding_in_one_shard(tmp_path):
     index = writer.finalize({})
     entry = next(t for t in index["tensors"] if t["name"] == "bank#L00000")
     reader = FTWReader(str(tmp_path))
-    path, file_offset, mapped_length = reader.file_region(entry)
+    path, file_offset, source_length = reader.file_region(entry)
     assert path.endswith("freetoken-00001.ftw")
     assert file_offset == 0
-    assert mapped_length == 8192
+    assert source_length == 5000
+
+    path, file_offset, source_length = reader.file_region({
+        "name": "misaligned",
+        "global_off": 1234,
+        "nbytes": 2700,
+    })
+    assert path.endswith("freetoken-00000.ftw")
+    assert file_offset == 1234
+    assert source_length == 2700
 
 
 @pytest.mark.parametrize(
@@ -340,6 +349,112 @@ def test_disk_decode_route_dedup_stats_track_heavy_recurrence():
     stats = executor.disk_prefetch_stats()
     assert stats["distinct_experts_per_step"] == 3.0
     assert stats["dedup_ratio"] == pytest.approx(11 / 3)
+def test_uffd_prefetch_groups_all_layer_banks_into_one_budget_request():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    class Pager:
+        def __init__(self):
+            self.calls = []
+
+        def prefetch(self, banks, expert_ids):
+            self.calls.append((banks, expert_ids))
+            return 9
+
+    pager = Pager()
+    gate_up = SimpleNamespace(_pager=pager)
+    down = SimpleNamespace(_pager=pager)
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_layers = 1
+    executor._disk_banks = {0: [gate_up, down]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._disk_decode_steps = 0
+
+    assert executor.prefetch_experts(0, [3, 1, 3, -1]) == 9
+    assert pager.calls == [([gate_up, down], [1, 3])]
+    assert executor._disk_prefetch_pages == [9]
+
+
+def test_uffd_host_bank_uses_anonymous_region_and_residency_bitmap_hook(tmp_path):
+    from freetoken.moe.host_banks import HostBank, HostResidency
+
+    class Pager:
+        def __init__(self):
+            self.registration = None
+            self.prefetch_call = None
+
+        def register_bank(self, bank, **kwargs):
+            self.registration = (bank, kwargs)
+            return 7
+
+        def prefetch(self, banks, expert_ids):
+            self.prefetch_call = (banks, expert_ids)
+            return 2
+
+    source = tmp_path / "bank.ftw"
+    source.write_bytes(b"x" * 8192)
+    pager = Pager()
+    bank = HostBank(
+        (2, 4096), torch.uint8, backing="uffd",
+        file_path=str(source), file_offset=0, disk_pager=pager,
+    )
+
+    assert bank.residency is HostResidency.DISK
+    assert bank._pager is pager
+    assert bank._pager_region == 7
+    assert pager.registration[1] == {
+        "file_path": str(source),
+        "file_offset": 0,
+        "row_bytes": 4096,
+        "num_rows": 2,
+    }
+    assert bank.prefetch_experts([1]) == 2
+    assert pager.prefetch_call == ([bank], [1])
+
+
+def test_uffd_stats_are_merged_into_disk_telemetry(monkeypatch):
+    import freetoken.moe.cpu_executor as cpu_executor
+
+    class Pager:
+        def stats(self, *, reset=False):
+            assert reset
+            return {
+                "fills": 5,
+                "fills_from_prefetch": 4,
+                "fault_driven": 1,
+                "evictions": 2,
+                "resident_bytes": 12288,
+                "pages_installed": 3,
+                "rows_spanning_pages": 2,
+                "fill_latency_histogram": {
+                    "buckets_us": [50, 100],
+                    "counts": [1, 3, 1],
+                },
+            }
+
+    executor = cpu_executor.CpuMoeExecutor.__new__(cpu_executor.CpuMoeExecutor)
+    executor.num_layers = 1
+    executor._disk_banks = {0: [object()]}
+    executor._disk_pagers = {Pager()}
+    executor._disk_prefetch_calls = [2]
+    executor._disk_prefetch_pages = [7]
+    executor._disk_decode_steps = 1
+    executor._disk_major_fault_base = 10
+    monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 10)
+
+    stats = executor.disk_prefetch_stats(reset=True)
+    assert stats["pager_backend"] == "uffd"
+    assert stats["fills"] == 5
+    assert stats["fills_from_prefetch"] == 4
+    assert stats["fault_driven"] == 1
+    assert stats["evictions"] == 2
+    assert stats["resident_bytes"] == 12288
+    assert stats["pages_installed"] == 3
+    assert stats["rows_spanning_pages"] == 2
+    assert stats["fill_latency_histogram"] == {
+        "buckets_us": [50, 100],
+        "counts": [1, 3, 1],
+    }
 
 
 def test_disk_decode_tasks_are_cached_per_layer_and_batch_size():

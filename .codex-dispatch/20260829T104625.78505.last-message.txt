@@ -1,0 +1,28 @@
+Implemented the graph-compatible staged disk PLE gather as an uncommitted diff.
+
+Key changes:
+
+- Fixed pinned compact-ID buffers and fixed-address UVA gather.
+- Host-side decode hash derivation with signed-int64 overflow parity.
+- Pre-replay staging hook with overlap-safe sampled-token handoff and buffer reuse fencing.
+- Disk PLE no longer disables CUDA graphs by default.
+- Added `FREETOKEN_PLE_DISK_NO_GRAPHS=1`.
+- Prefill behavior remains unchanged.
+- Updated docs and CPU/config/CUDA-gated tests.
+
+Files changed: 10 across `ple.py`, Qwen model integration, graph/engine/core plumbing, Triton gather, docs, and tests.
+
+Validation:
+
+- Config tests: `24 passed in 2.31s`
+- Standalone hash parity: `100 random host hash parity cases passed`
+- Modified production files: Ruff passed.
+- Compilation and `git diff --check`: passed.
+- Host/device-reference ID parity was achievable exactly.
+
+Deviations and open questions:
+
+- Full model pytest could not collect on this macOS host because FreeToken imports Linux-only Triton modules. The initial branch baseline also could not collect because the default Python lacked Torch.
+- CUDA capture/replay test was added but requires Linux with CUDA.
+- No commit was created, per the repository guardrail. Suggested commit: `feat(qwen4_exp): make disk PLE gather graph replayable`
+- The existing untracked `.codex-dispatch/` directory was not touched.

@@ -1325,8 +1325,8 @@ struct CpuMoeExecutor {
   std::vector<MoeTask*> owned_tasks;  // persistent task descriptors (graph-stable)
   std::vector<GpuFetchTask*> owned_gpufetch_tasks;
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
-  // Optional Python pre-run hook. DISK banks use it to issue mmap.madvise after the
-  // routing D2H has completed and before worker threads first read expert weights.
+  // Optional Python pre-run hook. DISK banks use it to issue mmap advice or wait for
+  // UFFD row fills after routing D2H and before workers first read expert weights.
   pybind11::function pre_run_callback;
 
   // ---- Flag-based GPU<->CPU handshake (replaces the per-layer cudaLaunchHostFunc pair) ----

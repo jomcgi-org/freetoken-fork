@@ -1,0 +1,36 @@
+Implemented the working greedy bs=1 MTP subset. The branch remains at `906574a`; no commit was created because the repository guardrail assigns commits to the orchestrator.
+
+### Changed
+
+- MTP head and acceptance logic: [mtp.py](/Users/jomcgi/repos/FreeToken/python/freetoken/models/qwen4_exp/mtp.py), [spec_decode.py](/Users/jomcgi/repos/FreeToken/python/freetoken/spec_decode.py)
+- Optional raw and FTW weight loading: [weight.py](/Users/jomcgi/repos/FreeToken/python/freetoken/models/qwen4_exp/weight.py), [convert.py](/Users/jomcgi/repos/FreeToken/python/freetoken/checkpoint/convert.py), [__main__.py](/Users/jomcgi/repos/FreeToken/python/freetoken/checkpoint/__main__.py)
+- Eager three-draft, four-position verification with state restoration and rejected-page rollback: [engine.py](/Users/jomcgi/repos/FreeToken/python/freetoken/engine/engine.py), [scheduler.py](/Users/jomcgi/repos/FreeToken/python/freetoken/scheduler/scheduler.py), [cache.py](/Users/jomcgi/repos/FreeToken/python/freetoken/scheduler/cache.py)
+- Default-off configuration and CLI gating: [config.py](/Users/jomcgi/repos/FreeToken/python/freetoken/engine/config.py), [args.py](/Users/jomcgi/repos/FreeToken/python/freetoken/server/args.py)
+- Multi-token output handling and decode statistics: [core.py](/Users/jomcgi/repos/FreeToken/python/freetoken/core.py), [status.py](/Users/jomcgi/repos/FreeToken/python/freetoken/scheduler/status.py)
+- Documentation and tests: [models.md](/Users/jomcgi/repos/FreeToken/docs/models.md), [test_mtp.py](/Users/jomcgi/repos/FreeToken/tests/models/qwen4_exp/test_mtp.py), [test_weight.py](/Users/jomcgi/repos/FreeToken/tests/models/qwen4_exp/test_weight.py), [test_scheduler_status.py](/Users/jomcgi/repos/FreeToken/tests/scheduler/test_scheduler_status.py)
+
+The architecture was checked against the pinned [SGLang Qwen4Exp MTP implementation](https://raw.githubusercontent.com/sgl-project/sglang/99c9362e6685db579c469f6e0e566b08827b3477/python/sglang/srt/models/qwen4_exp_mtp.py) and current [HF Qwen4Exp modeling code](https://raw.githubusercontent.com/huggingface/transformers/main/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py).
+
+### Tests
+
+Passing edited GPU-free subset:
+
+```bash
+PYTHONPATH=python .venv/bin/python -c 'import sys, types, pytest; specs=(("freetoken.models","python/freetoken/models"),("freetoken.models.qwen4_exp","python/freetoken/models/qwen4_exp"),("freetoken.scheduler","python/freetoken/scheduler")); [(setattr((p:=types.ModuleType(n)),"__path__",[d]),sys.modules.__setitem__(n,p)) for n,d in specs]; raise SystemExit(pytest.main(["-q", "tests/models/qwen4_exp/test_mtp.py", "tests/models/qwen4_exp/test_weight.py::test_mtp_reader_loads_head_only_and_fuses_checkpoint_parts", "tests/scheduler/test_scheduler_status.py", "-x"]))'
+```
+
+Result: `17 passed, 1 skipped in 2.88s`. The skip is CUDA equivalence coverage.
+
+All edited Python files pass `py_compile`; `git diff --check` passes. A broader weight-module run reaches an existing macOS incompatibility because `os.posix_fadvise` and Triton are unavailable on this host.
+
+### Deferred and deviations
+
+- Persistent MTP prompt KV and QSA cache. The draft layer currently attends over the current three-token speculative chain only. Verification is lossless, but acceptance may be lower.
+- CUDA graphs while MTP is enabled. Graph capture is disabled because graph replay does not expose the target HC hidden state needed by the next draft step.
+- Batch size greater than one, non-greedy speculation, and TP greater than one. Larger/non-greedy batches use ordinary decoding; TP greater than one is rejected at startup.
+- Full Engine/Scheduler CUDA end-to-end execution. The added CUDA-gated test uses a tiny synthetic target and imperfect draft loop, but no CUDA host was available.
+- No runtime acceptance rate was observed for the same reason.
+
+The checkpoint’s stacked BF16 MTP expert tensors alone occupy about 4.69 GiB, materially above the estimated 2 GiB. FTW conversion therefore stores them only when `ft checkpoint --speculative-mtp on` is explicitly selected.
+
+The pre-existing untracked `.codex-dispatch/` directory was not modified.

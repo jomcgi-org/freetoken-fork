@@ -1,0 +1,27 @@
+Implemented miss-aware DISK spill selection and left the diff uncommitted per guardrails.
+
+Changes:
+
+- Added `--moe-disk-layer-profile`, complete profile validation, stable lowest-score selection, and head plus tail fallback in [engine.py](/Users/jomcgi/repos/FreeToken/python/freetoken/engine/engine.py).
+- Added `--moe-collect-stats` and configuration fields.
+- Added `GET /v1/moe-layer-profile`, returning `{layer_id: missing_per_step}`.
+- Added scheduler, tokenizer, and message plumbing for on-demand snapshots.
+- Added selection, fallback warning, serializer, logging, and message round-trip tests.
+- Updated [docs/models.md](/Users/jomcgi/repos/FreeToken/docs/models.md).
+
+Verification:
+
+- `py_compile`: passed.
+- `git diff --check`: passed.
+- Ruff undefined-name checks: `All checks passed!`
+- Pytest command attempted:
+  `uv run pytest tests/engine/test_moe_cpu_layers.py tests/moe/test_offload.py tests/server/test_message_wire.py`
+- No pytest summary line was produced. Dependency resolution stopped before collection because the pinned CUDA Torch 2.11 wheel does not support macOS arm64.
+
+Deviations:
+
+- No commit created, as explicitly required by the repo guardrails.
+- Checkout HEAD was already `b48297d`, not the specified `04f6d88`; no git state was changed.
+- Linux CI still needs to run the targeted GPU-free subset.
+
+Open questions: none.

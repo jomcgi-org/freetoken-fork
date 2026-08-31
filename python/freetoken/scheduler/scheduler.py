@@ -161,6 +161,15 @@ class Scheduler(SchedulerIOMixin):
                     f"{disk['gpufetch_fills_per_step']:.2f}, "
                     f"disk gpufetch fill_us: {disk['gpufetch_fill_us']:.0f}"
                 )
+                if disk.get("pager_backend") == "uffd":
+                    message += (
+                        f", uffd fills: {disk['fills']} "
+                        f"(prefetch: {disk['fills_from_prefetch']}, "
+                        f"fault: {disk['fault_driven']}), "
+                        f"uffd pages installed: {disk.get('pages_installed', 0)}, "
+                        f"uffd evictions: {disk['evictions']}, "
+                        f"uffd resident GiB: {disk['resident_bytes'] / 2**30:.2f}"
+                    )
             if ple_stats:
                 message += (
                     f", ple_prefetch_pages: {ple_stats['ple_prefetch_pages']}, "

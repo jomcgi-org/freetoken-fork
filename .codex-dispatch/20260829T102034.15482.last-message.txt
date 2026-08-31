@@ -1,0 +1,41 @@
+Implemented the disk-backed PLE table using the graphs-disabled staged-gather fallback. Changes remain uncommitted per repo guardrails. Nothing was pushed.
+
+Key behavior:
+
+- Maps each safetensors PLE shard read-only with unaligned-offset support and `MADV_RANDOM`.
+- Deduplicates requested rows and pages, issues `MADV_WILLNEED`, then copies unique rows into a fixed pinned staging bank.
+- Reuses the existing UVA gather kernel with compact local indices.
+- Handles prefill as one requested-row union per chunk.
+- Automatically disables CUDA graphs for `--ple-backend disk`.
+- Returns zero reserved PLE bytes, allowing the expert-bank pin budget to retain more layers.
+- Adds `ple_prefetch_pages` and `ple_major_faults` to decode status output.
+- Keeps `--ple-backend pinned` as the default without constructing file mappings.
+
+Files changed:
+
+- [config.py](/Users/jomcgi/repos/FreeToken/python/freetoken/engine/config.py)
+- [engine.py](/Users/jomcgi/repos/FreeToken/python/freetoken/engine/engine.py)
+- [model.py](/Users/jomcgi/repos/FreeToken/python/freetoken/models/qwen4_exp/model.py)
+- [ple.py](/Users/jomcgi/repos/FreeToken/python/freetoken/models/qwen4_exp/ple.py)
+- [weight.py](/Users/jomcgi/repos/FreeToken/python/freetoken/models/qwen4_exp/weight.py)
+- [host_banks.py](/Users/jomcgi/repos/FreeToken/python/freetoken/moe/host_banks.py)
+- [scheduler.py](/Users/jomcgi/repos/FreeToken/python/freetoken/scheduler/scheduler.py)
+- [args.py](/Users/jomcgi/repos/FreeToken/python/freetoken/server/args.py)
+- [test_weight.py](/Users/jomcgi/repos/FreeToken/tests/models/qwen4_exp/test_weight.py)
+- [test_disk_tier.py](/Users/jomcgi/repos/FreeToken/tests/moe/test_disk_tier.py)
+- [test_moe_cpu_layers.py](/Users/jomcgi/repos/FreeToken/tests/engine/test_moe_cpu_layers.py)
+- [models.md](/Users/jomcgi/repos/FreeToken/docs/models.md)
+
+Exact targeted pytest summary:
+
+`65 passed, 3 skipped, 2 warnings in 0.34s`
+
+Skipped tests:
+
+- `test_fusion_pad_rides_the_tensor_device`: needs CUDA
+- `test_copy_plan_skips_disk_layer`: needs CUDA
+- `test_cpu_executor_disk_mapping_matches_anonymous_bank`: CPU MoE extension is not built
+
+The macOS run used temporary import-only Triton/flashlib and O_DIRECT compatibility shims outside the repository. Python compilation, `git diff --check`, and Ruff undefined-name checks pass.
+
+Open questions: none.
