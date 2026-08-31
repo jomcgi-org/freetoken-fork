@@ -320,11 +320,12 @@ class FTWReader:
             raise ValueError("tensor range exceeds FTW shards")
 
     def file_region(self, entry: dict) -> tuple[str, int, int]:
-        """Return one mmap-ready ``(path, file_offset, mapped_length)`` for an entry.
+        """Return one ``(path, file_offset, length)`` source range for an entry.
 
-        File-backed banks require a single shard and page-aligned file offset. Current
-        per-layer FTW entries satisfy both writer invariants. Legacy flat banks and an
-        unusually large entry that spans shards are rejected by the DISK loader.
+        File-backed banks require a single shard. mmap-backed banks align the mapping
+        down internally, while UFFD-backed banks use positional reads, so the source
+        offset itself may be arbitrary. Legacy flat banks and an unusually large entry
+        that spans shards are rejected by the DISK loader.
         """
         pieces = list(self._pieces(entry["global_off"], entry["nbytes"]))
         if len(pieces) != 1:
@@ -333,19 +334,16 @@ class FTWReader:
                 "be file-mapped; reconvert it with `ft checkpoint`"
             )
         file, file_off, dest_off, length = pieces[0]
-        if dest_off or file_off % ALIGN:
+        if dest_off:
             raise RuntimeError(
-                f"FTW bank {entry.get('name')!r} is not {ALIGN}-byte aligned and cannot "
-                "be file-mapped; reconvert it with `ft checkpoint`"
+                f"FTW bank {entry.get('name')!r} does not begin in its source shard"
             )
         path = os.path.join(self.dir, file)
-        mapped_length = _align_up(length)
-        if file_off + mapped_length > os.path.getsize(path):
+        if file_off + length > os.path.getsize(path):
             raise RuntimeError(
-                f"FTW bank {entry.get('name')!r} has alignment padding in another "
-                "shard and cannot be file-mapped; reconvert it with `ft checkpoint`"
+                f"FTW bank {entry.get('name')!r} exceeds its source shard"
             )
-        return path, file_off, mapped_length
+        return path, file_off, length
 
     def read_into(self, dest: memoryview, entry: dict, *, workers: int = 8,
                   chunk: int = _DEFAULT_CHUNK) -> None:
@@ -550,7 +548,7 @@ def load_ftw_banks(
     disk_layers = {i for i, r in enumerate(residency) if r == HostResidency.DISK.value}
     if disk_layers and flat_entries:
         raise RuntimeError(
-            "DISK residency requires per-layer, page-aligned FTW expert banks; this "
+            "DISK residency requires per-layer FTW expert banks; this "
             "checkpoint has legacy flat bank entries. Reconvert it with `ft checkpoint`."
         )
 
@@ -592,12 +590,11 @@ def load_ftw_banks(
         row_view_args[base] = []
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
-            assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
             kw = {}
             if layer_id in disk_layers:
-                path_, file_off, mapped = reader.file_region(e)
-                if mapped < _align_up(e["nbytes"]):
-                    raise RuntimeError(f"FTW bank {e['name']!r} has a truncated mapped region")
+                path_, file_off, source_length = reader.file_region(e)
+                if source_length != e["nbytes"]:
+                    raise RuntimeError(f"FTW bank {e['name']!r} has a truncated source range")
                 kw = {
                     "file_path": path_, "file_offset": file_off,
                     "disk_pager": disk_pager,

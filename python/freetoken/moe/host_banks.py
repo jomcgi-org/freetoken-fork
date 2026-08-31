@@ -79,12 +79,13 @@ class HostBank:
 
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
-    * ``"file"`` -- a read-only shared mapping of one aligned FTW bank entry. It stays
+    * ``"file"`` -- a read-only shared mapping of one FTW bank entry. It stays
       DISK resident and applies ``MADV_RANDOM`` at creation.
     * ``"uffd"`` -- a writable anonymous mapping registered with the process-wide
-      UFFD pager. Its FTW rows are installed on demand and governed by userspace LRU.
+      UFFD pager. Its FTW pages are installed on demand and governed by userspace LRU.
 
-    The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
+    The buffer is rounded up to its backing alignment; ``tensor`` views exactly
+    ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
     __slots__ = (
         "tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_disk",
@@ -102,7 +103,10 @@ class HostBank:
         assert backing in ("mmap", "cuda", "file", "uffd"), backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
-        asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
+        allocation_alignment = mmap.PAGESIZE if backing == "uffd" else _BLK
+        asize = (
+            (self.nbytes + allocation_alignment - 1) // allocation_alignment
+        ) * allocation_alignment
         self._disk = backing in ("file", "uffd")
         self._uffd = backing == "uffd"
         self._pager = disk_pager

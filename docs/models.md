@@ -48,19 +48,20 @@ existing GPU prefill copy behavior.
 
 `--moe-disk-pager madvise` is the default and preserves that file-mapping behavior.
 On Linux, `--moe-disk-pager uffd --moe-pager-budget-gib 40` instead registers anonymous
-bank regions with userfaultfd. The route hook fills complete missing expert rows with
-io_uring before compute, and a process-wide userspace LRU evicts rows with
-`MADV_DONTNEED` at the configured byte ceiling. Decode status reports proactive and
-fault-driven fills, evictions, resident bytes, and the fill-latency histogram is
-available in the DISK pager stats.
+bank regions with userfaultfd. The route hook accepts logical expert rows, deduplicates
+the physical pages covering them, and installs missing pages with positional I/O before
+compute. A process-wide userspace LRU evicts pages with `MADV_DONTNEED` at the configured
+resident-byte ceiling. Decode status reports proactive and fault-driven logical fills,
+installed pages, evictions, resident bytes, and a fill-latency histogram.
 
 UFFD mode requires `/proc/sys/vm/unprivileged_userfaultfd=1` or `CAP_SYS_PTRACE`.
 Startup probes the kernel API and reports the current sysctl value on failure. It also
-requires every FTW expert row, file offset, and anonymous region to be page-aligned.
+requires page-aligned anonymous mapping boundaries. Expert row sizes and FTW file
+offsets may be arbitrary.
 The `madvise` backend remains available on every supported platform and is the bench
 baseline when comparing warm-decode fault counts.
 
-The DISK tier requires FreeToken's aligned, per-layer FTW layout. Convert a raw
+The DISK tier requires FreeToken's per-layer FTW layout. Convert a raw
 safetensors checkpoint first with `ft checkpoint`; raw safetensors and GGUF banks are
 not supported. When expert banks exceed `FREETOKEN_PIN_BUDGET_GB`, an FTW checkpoint
 automatically spills enough head and tail layers to DISK, following the assumption that

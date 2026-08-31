@@ -160,6 +160,7 @@ class Scheduler(SchedulerIOMixin):
                         f", uffd fills: {disk['fills']} "
                         f"(prefetch: {disk['fills_from_prefetch']}, "
                         f"fault: {disk['fault_driven']}), "
+                        f"uffd pages installed: {disk.get('pages_installed', 0)}, "
                         f"uffd evictions: {disk['evictions']}, "
                         f"uffd resident GiB: {disk['resident_bytes'] / 2**30:.2f}"
                     )

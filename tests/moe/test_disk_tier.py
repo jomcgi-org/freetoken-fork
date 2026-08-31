@@ -75,10 +75,19 @@ def test_ftw_writer_keeps_mmap_padding_in_one_shard(tmp_path):
     index = writer.finalize({})
     entry = next(t for t in index["tensors"] if t["name"] == "bank#L00000")
     reader = FTWReader(str(tmp_path))
-    path, file_offset, mapped_length = reader.file_region(entry)
+    path, file_offset, source_length = reader.file_region(entry)
     assert path.endswith("freetoken-00001.ftw")
     assert file_offset == 0
-    assert mapped_length == 8192
+    assert source_length == 5000
+
+    path, file_offset, source_length = reader.file_region({
+        "name": "misaligned",
+        "global_off": 1234,
+        "nbytes": 2700,
+    })
+    assert path.endswith("freetoken-00000.ftw")
+    assert file_offset == 1234
+    assert source_length == 2700
 
 
 @pytest.mark.parametrize(
@@ -260,6 +269,8 @@ def test_uffd_stats_are_merged_into_disk_telemetry(monkeypatch):
                 "fault_driven": 1,
                 "evictions": 2,
                 "resident_bytes": 12288,
+                "pages_installed": 3,
+                "rows_spanning_pages": 2,
                 "fill_latency_histogram": {
                     "buckets_us": [50, 100],
                     "counts": [1, 3, 1],
@@ -283,6 +294,8 @@ def test_uffd_stats_are_merged_into_disk_telemetry(monkeypatch):
     assert stats["fault_driven"] == 1
     assert stats["evictions"] == 2
     assert stats["resident_bytes"] == 12288
+    assert stats["pages_installed"] == 3
+    assert stats["rows_spanning_pages"] == 2
     assert stats["fill_latency_histogram"] == {
         "buckets_us": [50, 100],
         "counts": [1, 3, 1],

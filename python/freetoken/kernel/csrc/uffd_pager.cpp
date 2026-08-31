@@ -15,6 +15,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -30,8 +31,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -71,6 +74,25 @@ size_t system_page_size() {
   const long value = sysconf(_SC_PAGESIZE);
   if (value <= 0) throw std::runtime_error("could not determine system page size");
   return static_cast<size_t>(value);
+}
+
+void pread_exact(int source_fd, void* dst, size_t length, uint64_t offset) {
+  size_t completed = 0;
+  while (completed < length) {
+    ssize_t got;
+    do {
+      got = pread(
+          source_fd, static_cast<char*>(dst) + completed, length - completed,
+          static_cast<off_t>(offset + completed));
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) throw_errno("pread FTW page");
+    if (got == 0) {
+      throw std::runtime_error(
+          "unexpected EOF during pread FTW page: got " +
+          std::to_string(completed) + ", expected " + std::to_string(length));
+    }
+    completed += static_cast<size_t>(got);
+  }
 }
 
 class IoUring {
@@ -138,53 +160,58 @@ class IoUring {
 
   void read_exact(int source_fd, void* dst, size_t length, uint64_t offset) {
     if (length > std::numeric_limits<unsigned>::max()) {
-      throw std::runtime_error("UFFD row is too large for one io_uring read");
+      throw std::runtime_error("UFFD page is too large for one io_uring read");
     }
-    const unsigned head = __atomic_load_n(sq_head_, __ATOMIC_ACQUIRE);
-    const unsigned tail = __atomic_load_n(sq_tail_, __ATOMIC_RELAXED);
-    if (tail - head >= *sq_entries_) {
-      throw std::runtime_error("io_uring submission queue is full");
-    }
-    const unsigned index = tail & *sq_mask_;
-    struct io_uring_sqe* sqe = &sqes_[index];
-    std::memset(sqe, 0, sizeof(*sqe));
-    sqe->opcode = IORING_OP_READ;
-    sqe->fd = source_fd;
-    sqe->off = offset;
-    sqe->addr = reinterpret_cast<uint64_t>(dst);
-    sqe->len = static_cast<unsigned>(length);
-    sqe->user_data = 1;
-    sq_array_[index] = index;
-    __atomic_store_n(sq_tail_, tail + 1, __ATOMIC_RELEASE);
+    size_t completed = 0;
+    while (completed < length) {
+      const unsigned head = __atomic_load_n(sq_head_, __ATOMIC_ACQUIRE);
+      const unsigned tail = __atomic_load_n(sq_tail_, __ATOMIC_RELAXED);
+      if (tail - head >= *sq_entries_) {
+        throw std::runtime_error("io_uring submission queue is full");
+      }
+      const unsigned index = tail & *sq_mask_;
+      struct io_uring_sqe* sqe = &sqes_[index];
+      std::memset(sqe, 0, sizeof(*sqe));
+      sqe->opcode = IORING_OP_READ;
+      sqe->fd = source_fd;
+      sqe->off = offset + completed;
+      sqe->addr = reinterpret_cast<uint64_t>(
+          static_cast<char*>(dst) + completed);
+      sqe->len = static_cast<unsigned>(length - completed);
+      sqe->user_data = 1;
+      sq_array_[index] = index;
+      __atomic_store_n(sq_tail_, tail + 1, __ATOMIC_RELEASE);
 
-    int entered;
-    do {
-      entered = static_cast<int>(
-          syscall(SYS_io_uring_enter, fd_, 1, 1, IORING_ENTER_GETEVENTS,
-                  nullptr, 0));
-    } while (entered < 0 && errno == EINTR);
-    if (entered < 0) throw_errno("io_uring_enter");
-
-    unsigned cq_head = __atomic_load_n(cq_head_, __ATOMIC_RELAXED);
-    while (cq_head == __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE)) {
-      int waited;
+      int entered;
       do {
-        waited = static_cast<int>(
-            syscall(SYS_io_uring_enter, fd_, 0, 1, IORING_ENTER_GETEVENTS,
+        entered = static_cast<int>(
+            syscall(SYS_io_uring_enter, fd_, 1, 1, IORING_ENTER_GETEVENTS,
                     nullptr, 0));
-      } while (waited < 0 && errno == EINTR);
-      if (waited < 0) throw_errno("io_uring completion wait");
-    }
-    const struct io_uring_cqe cqe = cqes_[cq_head & *cq_mask_];
-    __atomic_store_n(cq_head_, cq_head + 1, __ATOMIC_RELEASE);
-    if (cqe.res < 0) {
-      errno = -cqe.res;
-      throw_errno("io_uring O_DIRECT row read");
-    }
-    if (static_cast<size_t>(cqe.res) != length) {
-      throw std::runtime_error(
-          "short io_uring O_DIRECT row read: got " +
-          std::to_string(cqe.res) + ", expected " + std::to_string(length));
+      } while (entered < 0 && errno == EINTR);
+      if (entered < 0) throw_errno("io_uring_enter");
+
+      unsigned cq_head = __atomic_load_n(cq_head_, __ATOMIC_RELAXED);
+      while (cq_head == __atomic_load_n(cq_tail_, __ATOMIC_ACQUIRE)) {
+        int waited;
+        do {
+          waited = static_cast<int>(
+              syscall(SYS_io_uring_enter, fd_, 0, 1, IORING_ENTER_GETEVENTS,
+                      nullptr, 0));
+        } while (waited < 0 && errno == EINTR);
+        if (waited < 0) throw_errno("io_uring completion wait");
+      }
+      const struct io_uring_cqe cqe = cqes_[cq_head & *cq_mask_];
+      __atomic_store_n(cq_head_, cq_head + 1, __ATOMIC_RELEASE);
+      if (cqe.res < 0) {
+        errno = -cqe.res;
+        throw_errno("io_uring FTW page read");
+      }
+      if (cqe.res == 0) {
+        throw std::runtime_error(
+            "unexpected EOF during io_uring FTW page read: got " +
+            std::to_string(completed) + ", expected " + std::to_string(length));
+      }
+      completed += static_cast<size_t>(cqe.res);
     }
   }
 
@@ -232,8 +259,7 @@ struct Region {
   int num_rows = 0;
   int source_fd = -1;
   uint64_t file_offset = 0;
-  std::vector<uint8_t> resident;
-  std::vector<uint64_t> last_use;
+  std::vector<uint64_t> page_last_use;
 
   ~Region() {
     if (source_fd >= 0) close(source_fd);
@@ -293,24 +319,37 @@ class UffdPager {
   int add_region(uintptr_t address, size_t length, size_t nbytes,
                  const std::string& path, uint64_t file_offset,
                  size_t row_bytes, int num_rows) {
-    if (address % page_size_ || length % page_size_ || file_offset % page_size_ ||
-        row_bytes % page_size_) {
+    if (address % page_size_ || length == 0 || length % page_size_) {
       throw std::invalid_argument(
-          "UFFD bank address, mapping length, FTW offset, and expert row size "
-          "must all be page-aligned");
+          "UFFD bank address and mapping length must be page-aligned");
     }
     if (num_rows <= 0 || row_bytes == 0 ||
         row_bytes > std::numeric_limits<size_t>::max() / static_cast<size_t>(num_rows) ||
-        row_bytes * static_cast<size_t>(num_rows) != nbytes || nbytes != length) {
+        row_bytes * static_cast<size_t>(num_rows) != nbytes || nbytes > length ||
+        length - nbytes >= page_size_) {
       throw std::invalid_argument(
-          "UFFD bank mapping must consist exactly of equal, page-aligned expert rows");
+          "UFFD bank mapping must contain equal expert rows plus at most one "
+          "partial page of mapping padding");
     }
-    if (row_bytes > budget_bytes_) {
+    if (page_size_ > budget_bytes_) {
       throw std::invalid_argument(
-          "UFFD pager budget is smaller than one expert-bank row");
+          "UFFD pager budget is smaller than one system page");
     }
-    const int source_fd = open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-    if (source_fd < 0) throw_errno("open O_DIRECT FTW bank source " + path);
+    const int source_fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (source_fd < 0) throw_errno("open FTW bank source " + path);
+    struct stat source_stat {};
+    if (fstat(source_fd, &source_stat) < 0) {
+      const int saved = errno;
+      close(source_fd);
+      errno = saved;
+      throw_errno("fstat FTW bank source " + path);
+    }
+    if (source_stat.st_size < 0 ||
+        file_offset > std::numeric_limits<uint64_t>::max() - nbytes ||
+        file_offset + nbytes > static_cast<uint64_t>(source_stat.st_size)) {
+      close(source_fd);
+      throw std::runtime_error("UFFD FTW bank source range exceeds file " + path);
+    }
 
     struct uffdio_register registration {};
     registration.range.start = address;
@@ -337,8 +376,15 @@ class UffdPager {
     region->num_rows = num_rows;
     region->source_fd = source_fd;
     region->file_offset = file_offset;
-    region->resident.assign(num_rows, 0);
-    region->last_use.assign(num_rows, 0);
+    const size_t num_pages = length / page_size_;
+    region->page_last_use.assign(num_pages, 0);
+    uint64_t spanning_rows = 0;
+    for (int row = 0; row < num_rows; ++row) {
+      const size_t first = static_cast<size_t>(row) * row_bytes / page_size_;
+      const size_t end = (static_cast<size_t>(row + 1) * row_bytes +
+                          page_size_ - 1) / page_size_;
+      if (end - first > 1) ++spanning_rows;
+    }
     std::lock_guard<std::mutex> guard(regions_mutex_);
     const int id = static_cast<int>(regions_.size());
     try {
@@ -347,6 +393,10 @@ class UffdPager {
       struct uffdio_range range {address, length};
       ioctl(uffd_, UFFDIO_UNREGISTER, &range);
       throw;
+    }
+    {
+      std::lock_guard<std::mutex> state_guard(state_mutex_);
+      rows_spanning_pages_ += spanning_rows;
     }
     return id;
   }
@@ -371,7 +421,12 @@ class UffdPager {
     std::lock_guard<std::mutex> regions_guard(regions_mutex_);
     Region& region = checked_region(region_id, row);
     std::lock_guard<std::mutex> state_guard(state_mutex_);
-    return region.resident[row] != 0;
+    const size_t first = row_first_page(region, row);
+    const size_t end = row_page_end(region, row);
+    return std::all_of(
+        region.page_last_use.begin() + first,
+        region.page_last_use.begin() + end,
+        [](uint64_t last_use) { return last_use != 0; });
   }
 
   py::dict stats(bool reset) {
@@ -385,12 +440,15 @@ class UffdPager {
     out["fault_driven"] = fault_driven_;
     out["evictions"] = evictions_;
     out["resident_bytes"] = resident_bytes_;
+    out["pages_installed"] = pages_installed_;
+    out["rows_spanning_pages"] = rows_spanning_pages_;
     out["fill_latency_histogram"] = histogram;
     if (reset) {
       fills_ = 0;
       fills_from_prefetch_ = 0;
       fault_driven_ = 0;
       evictions_ = 0;
+      pages_installed_ = 0;
       std::fill(latency_counts_.begin(), latency_counts_.end(), 0);
     }
     return out;
@@ -404,9 +462,17 @@ class UffdPager {
   }
 
  private:
-  static uint64_t row_key(int region, int row) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(region)) << 32) |
-           static_cast<uint32_t>(row);
+  uint64_t page_key(const Region& region, size_t page) const {
+    return static_cast<uint64_t>(region.start) + page * page_size_;
+  }
+
+  size_t row_first_page(const Region& region, int row) const {
+    return static_cast<size_t>(row) * region.row_bytes / page_size_;
+  }
+
+  size_t row_page_end(const Region& region, int row) const {
+    return (static_cast<size_t>(row + 1) * region.row_bytes + page_size_ - 1) /
+           page_size_;
   }
 
   Region& checked_region(int region_id, int row) {
@@ -437,7 +503,7 @@ class UffdPager {
     void* replacement = nullptr;
     const int err = posix_memalign(&replacement, page_size_, bytes);
     if (err != 0) {
-      throw std::runtime_error("posix_memalign UFFD row buffer: " +
+      throw std::runtime_error("posix_memalign UFFD page buffer: " +
                                std::string(std::strerror(err)));
     }
     if (bounce_) free(bounce_);
@@ -445,69 +511,95 @@ class UffdPager {
     bounce_size_ = bytes;
   }
 
-  bool evict_one(const std::unordered_set<uint64_t>& protected_rows) {
-    int victim_region = -1;
-    int victim_row = -1;
-    uint64_t oldest = std::numeric_limits<uint64_t>::max();
-    for (int region_id = 0; region_id < static_cast<int>(regions_.size()); ++region_id) {
-      Region& region = *regions_[region_id];
-      for (int row = 0; row < region.num_rows; ++row) {
-        if (!region.resident[row] || protected_rows.count(row_key(region_id, row))) continue;
-        if (region.last_use[row] < oldest) {
-          oldest = region.last_use[row];
-          victim_region = region_id;
-          victim_row = row;
-        }
-      }
+  bool evict_one(const std::unordered_set<uint64_t>& protected_pages) {
+    auto victim = page_lru_.begin();
+    while (victim != page_lru_.end()) {
+      const auto& [last_use, region_id, page] = *victim;
+      (void)last_use;
+      if (!protected_pages.count(page_key(*regions_[region_id], page))) break;
+      ++victim;
     }
-    if (victim_region < 0) return false;
-    Region& victim = *regions_[victim_region];
+    if (victim == page_lru_.end()) return false;
+    const auto [last_use, victim_region, victim_page] = *victim;
+    (void)last_use;
+    Region& region = *regions_[victim_region];
     void* address = reinterpret_cast<void*>(
-        victim.start + static_cast<uintptr_t>(victim_row) * victim.row_bytes);
-    if (madvise(address, victim.row_bytes, MADV_DONTNEED) < 0) {
-      throw_errno("MADV_DONTNEED UFFD expert row");
+        region.start + static_cast<uintptr_t>(victim_page) * page_size_);
+    if (madvise(address, page_size_, MADV_DONTNEED) < 0) {
+      throw_errno("MADV_DONTNEED UFFD bank page");
     }
-    victim.resident[victim_row] = 0;
-    victim.last_use[victim_row] = 0;
-    resident_bytes_ -= victim.row_bytes;
+    region.page_last_use[victim_page] = 0;
+    page_lru_.erase(victim);
+    resident_bytes_ -= page_size_;
     ++evictions_;
     return true;
   }
 
-  size_t fill_row(int region_id, int row, bool from_prefetch,
-                  const std::unordered_set<uint64_t>& protected_rows) {
+  void touch_page(Region& region, int region_id, size_t page) {
+    const uint64_t previous = region.page_last_use[page];
+    if (previous) {
+      page_lru_.erase(std::make_tuple(previous, region_id, page));
+    }
+    const uint64_t current = ++clock_;
+    region.page_last_use[page] = current;
+    page_lru_.emplace(current, region_id, page);
+  }
+
+  size_t fill_page(int region_id, size_t page,
+                   const std::unordered_set<uint64_t>& protected_pages) {
     std::lock_guard<std::mutex> regions_guard(regions_mutex_);
     std::lock_guard<std::mutex> state_guard(state_mutex_);
-    Region& region = checked_region(region_id, row);
-    if (region.resident[row]) {
-      region.last_use[row] = ++clock_;
+    if (region_id < 0 || region_id >= static_cast<int>(regions_.size())) {
+      throw std::out_of_range("UFFD region id is out of range");
+    }
+    Region& region = *regions_[region_id];
+    if (page >= region.page_last_use.size()) {
+      throw std::out_of_range("UFFD page id is out of range for bank");
+    }
+    if (region.page_last_use[page]) {
+      touch_page(region, region_id, page);
       return 0;
     }
-    while (resident_bytes_ + region.row_bytes > budget_bytes_) {
-      if (!evict_one(protected_rows)) {
+    while (resident_bytes_ + page_size_ > budget_bytes_) {
+      if (!evict_one(protected_pages)) {
         throw std::runtime_error(
-            "UFFD pager budget cannot hold the routed expert-row working set; "
+            "UFFD pager budget cannot hold the routed expert-page working set; "
             "increase --moe-pager-budget-gib");
       }
     }
 
-    ensure_bounce(region.row_bytes);
-    const auto begin = std::chrono::steady_clock::now();
-    ring_->read_exact(
-        region.source_fd, bounce_, region.row_bytes,
-        region.file_offset + static_cast<uint64_t>(row) * region.row_bytes);
+    ensure_bounce(page_size_);
+    std::memset(bounce_, 0, page_size_);
+    const size_t bank_offset = page * page_size_;
+    const size_t valid_bytes = bank_offset < region.nbytes
+        ? std::min(page_size_, region.nbytes - bank_offset)
+        : 0;
+    if (valid_bytes) {
+      const uint64_t source_offset =
+          region.file_offset + static_cast<uint64_t>(bank_offset);
+      if (source_offset % page_size_ == 0 && valid_bytes == page_size_) {
+        ring_->read_exact(region.source_fd, bounce_, valid_bytes, source_offset);
+      } else {
+        pread_exact(region.source_fd, bounce_, valid_bytes, source_offset);
+      }
+    }
     struct uffdio_copy copy {};
     copy.src = reinterpret_cast<uintptr_t>(bounce_);
-    copy.dst = region.start + static_cast<uintptr_t>(row) * region.row_bytes;
-    copy.len = region.row_bytes;
+    copy.dst = region.start + static_cast<uintptr_t>(page) * page_size_;
+    copy.len = page_size_;
     copy.mode = 0;
-    if (ioctl(uffd_, UFFDIO_COPY, &copy) < 0) throw_errno("UFFDIO_COPY expert row");
-    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - begin).count();
+    if (ioctl(uffd_, UFFDIO_COPY, &copy) < 0) throw_errno("UFFDIO_COPY bank page");
+    touch_page(region, region_id, page);
+    resident_bytes_ += page_size_;
+    ++pages_installed_;
+    return 1;
+  }
 
-    region.resident[row] = 1;
-    region.last_use[row] = ++clock_;
-    resident_bytes_ += region.row_bytes;
+  void record_fill(bool from_prefetch,
+                   std::chrono::steady_clock::duration duration) {
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        duration).count();
+    std::lock_guard<std::mutex> state_guard(state_mutex_);
     ++fills_;
     if (from_prefetch) ++fills_from_prefetch_;
     else ++fault_driven_;
@@ -515,7 +607,6 @@ class UffdPager {
         latency_buckets_us_.begin(), latency_buckets_us_.end(),
         static_cast<uint64_t>(std::max<int64_t>(elapsed, 0)));
     ++latency_counts_[static_cast<size_t>(bucket - latency_buckets_us_.begin())];
-    return region.row_bytes / page_size_;
   }
 
   void finish_request(const std::shared_ptr<Request>& request,
@@ -541,26 +632,42 @@ class UffdPager {
       size_t pages = 0;
       try {
         raise_if_error();
-        std::unordered_set<uint64_t> protected_rows;
+        std::unordered_set<uint64_t> protected_pages;
         size_t working_set = 0;
         {
           std::lock_guard<std::mutex> regions_guard(regions_mutex_);
           for (const int region_id : request->regions) {
             for (const int row : request->rows) {
               Region& region = checked_region(region_id, row);
-              if (protected_rows.insert(row_key(region_id, row)).second) {
-                if (working_set > budget_bytes_ - region.row_bytes) {
+              for (size_t page = row_first_page(region, row);
+                   page < row_page_end(region, row); ++page) {
+                if (!protected_pages.insert(page_key(region, page)).second) continue;
+                if (working_set > budget_bytes_ - page_size_) {
                   throw std::runtime_error(
-                      "routed UFFD expert rows exceed --moe-pager-budget-gib");
+                      "routed UFFD expert pages exceed --moe-pager-budget-gib");
                 }
-                working_set += region.row_bytes;
+                working_set += page_size_;
               }
             }
           }
         }
         for (const int region_id : request->regions) {
           for (const int row : request->rows) {
-            pages += fill_row(region_id, row, true, protected_rows);
+            Region* region;
+            {
+              std::lock_guard<std::mutex> regions_guard(regions_mutex_);
+              region = &checked_region(region_id, row);
+            }
+            const auto begin = std::chrono::steady_clock::now();
+            size_t row_pages = 0;
+            for (size_t page = row_first_page(*region, row);
+                 page < row_page_end(*region, row); ++page) {
+              row_pages += fill_page(region_id, page, protected_pages);
+            }
+            pages += row_pages;
+            if (row_pages) {
+              record_fill(true, std::chrono::steady_clock::now() - begin);
+            }
           }
         }
         finish_request(request, pages, "");
@@ -592,22 +699,29 @@ class UffdPager {
       const uintptr_t address = message.arg.pagefault.address;
       try {
         int region_id = -1;
-        int row = -1;
+        size_t page = 0;
         {
           std::lock_guard<std::mutex> regions_guard(regions_mutex_);
           for (int i = 0; i < static_cast<int>(regions_.size()); ++i) {
             const Region& region = *regions_[i];
-            if (address >= region.start && address < region.start + region.nbytes) {
+            if (address >= region.start && address < region.start + region.length) {
               region_id = i;
-              row = static_cast<int>((address - region.start) / region.row_bytes);
+              page = (address - region.start) / page_size_;
               break;
             }
           }
         }
-        if (region_id < 0) throw std::runtime_error("fault outside registered bank rows");
-        const std::unordered_set<uint64_t> protected_rows{
-            row_key(region_id, row)};
-        fill_row(region_id, row, false, protected_rows);
+        if (region_id < 0) throw std::runtime_error("fault outside registered bank mapping");
+        uint64_t key;
+        {
+          std::lock_guard<std::mutex> regions_guard(regions_mutex_);
+          key = page_key(*regions_[region_id], page);
+        }
+        const std::unordered_set<uint64_t> protected_pages{key};
+        const auto begin = std::chrono::steady_clock::now();
+        if (fill_page(region_id, page, protected_pages)) {
+          record_fill(false, std::chrono::steady_clock::now() - begin);
+        }
       } catch (const std::exception& exc) {
         set_fatal(exc.what());
         resolve_failed_fault(address);
@@ -652,11 +766,14 @@ class UffdPager {
   std::deque<std::shared_ptr<Request>> requests_;
   std::mutex state_mutex_;
   uint64_t clock_ = 0;
+  std::set<std::tuple<uint64_t, int, size_t>> page_lru_;
   uint64_t fills_ = 0;
   uint64_t fills_from_prefetch_ = 0;
   uint64_t fault_driven_ = 0;
   uint64_t evictions_ = 0;
   uint64_t resident_bytes_ = 0;
+  uint64_t pages_installed_ = 0;
+  uint64_t rows_spanning_pages_ = 0;
   const std::vector<uint64_t> latency_buckets_us_{
       50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000};
   std::vector<uint64_t> latency_counts_ =

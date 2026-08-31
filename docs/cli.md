@@ -85,8 +85,8 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-disk-layers` | none | FTW MoE layers kept in the DISK tier and computed on CPU |
-| `--moe-disk-pager` | madvise | DISK residency manager: portable file mmap advice or Linux-only `uffd` row paging |
-| `--moe-pager-budget-gib` | 40 | Resident expert-row ceiling for the UFFD pager |
+| `--moe-disk-pager` | madvise | DISK residency manager: portable file mmap advice or Linux-only `uffd` page paging with logical row prefetch |
+| `--moe-pager-budget-gib` | 40 | Resident-byte ceiling for the UFFD page LRU |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |

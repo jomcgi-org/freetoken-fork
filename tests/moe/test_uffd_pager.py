@@ -31,6 +31,8 @@ class _FakeNativePager:
             "fault_driven": 1,
             "evictions": 2,
             "resident_bytes": 8192,
+            "pages_installed": 4,
+            "rows_spanning_pages": 1,
             "fill_latency_histogram": {
                 "buckets_us": [50, 100],
                 "counts": [1, 2, 1],
@@ -100,10 +102,45 @@ def test_python_wrapper_deduplicates_rows_and_exposes_stats(monkeypatch):
     assert native.instances[0].prefetches == [([0, 1], [1, 3])]
     assert pager.is_resident(bank0, 3)
     assert pager.stats()["fills_from_prefetch"] == 3
+    assert pager.stats()["pages_installed"] == 4
 
-    row_bank = SimpleNamespace(nbytes=16384, tensor=SimpleNamespace(shape=(4, 4096)))
+    row_bank = SimpleNamespace(nbytes=32768, tensor=SimpleNamespace(shape=(8, 4096)))
     with pytest.raises(ValueError, match="working set"):
         pager.validate_working_set([row_bank], 5, context="decode")
+
+
+def test_register_bank_preserves_misaligned_row_and_file_offset(monkeypatch):
+    import freetoken.moe.uffd_pager as module
+
+    native = _FakeNativeModule()
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    pager = module.UFFDPager(8192, _native_module=native)
+    bank = SimpleNamespace(addr=0x1000, _buf=bytearray(8192), nbytes=8100)
+
+    assert pager.register_bank(
+        bank,
+        file_path="/tmp/misaligned.ftw",
+        file_offset=1234,
+        row_bytes=2700,
+        num_rows=3,
+    ) == 0
+    assert native.instances[0].regions == [(
+        0x1000,
+        8192,
+        8100,
+        "/tmp/misaligned.ftw",
+        1234,
+        2700,
+        3,
+    )]
+    logical_bank = SimpleNamespace(
+        nbytes=8100,
+        tensor=SimpleNamespace(shape=(3, 2700)),
+    )
+    pager.validate_working_set([logical_bank], 1, context="decode")
+    pager.budget_bytes = 4096
+    with pytest.raises(ValueError, match="expert-page working set"):
+        pager.validate_working_set([logical_bank], 1, context="decode")
 
 
 @pytest.mark.parametrize("budget", [0, -1, float("inf"), float("nan")])

@@ -682,6 +682,12 @@ class CpuMoeExecutor:
                 "fault_driven": sum(item["fault_driven"] for item in native_stats),
                 "evictions": sum(item["evictions"] for item in native_stats),
                 "resident_bytes": sum(item["resident_bytes"] for item in native_stats),
+                "pages_installed": sum(
+                    item.get("pages_installed", 0) for item in native_stats
+                ),
+                "rows_spanning_pages": sum(
+                    item.get("rows_spanning_pages", 0) for item in native_stats
+                ),
                 "fill_latency_histogram": {
                     "buckets_us": buckets,
                     "counts": counts,

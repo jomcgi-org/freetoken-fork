@@ -1,8 +1,10 @@
-"""Linux userfaultfd pager for file-backed expert-bank rows.
+"""Linux userfaultfd pager for file-backed expert banks.
 
 The native extension owns userfaultfd, io_uring, the handler thread, and the
-global row LRU.  This module intentionally imports that extension only after a
-Linux check so ordinary imports and checkpoint tooling remain portable.
+global page LRU. Logical operations remain row-based while physical reads,
+installs, and evictions operate on system pages. This module intentionally
+imports that extension only after a Linux check so ordinary imports and
+checkpoint tooling remain portable.
 """
 
 from __future__ import annotations
@@ -75,7 +77,7 @@ class UFFDPager:
         row_bytes: int,
         num_rows: int,
     ) -> int:
-        """Register an anonymous bank mapping and its aligned FTW source rows."""
+        """Register an anonymous bank mapping and its FTW source rows."""
         region = self._native.add_region(
             bank.addr,
             len(bank._buf),
@@ -101,17 +103,37 @@ class UFFDPager:
         return int(self._native.prefetch(regions, rows))
 
     def is_resident(self, bank, expert_id: int) -> bool:
-        """Read the native residency bitmap for one bank row."""
+        """Return whether every physical page covering a bank row is resident."""
         return bool(self._native.is_resident(bank._pager_region, int(expert_id)))
 
     def validate_working_set(self, banks, num_rows: int, *, context: str) -> None:
         """Reject a route union that cannot remain resident through compute."""
-        row_bytes = sum(bank.nbytes // bank.tensor.shape[0] for bank in banks)
-        required = row_bytes * int(num_rows)
+        import mmap
+
+        required = 0
+        for bank in banks:
+            bank_rows = int(bank.tensor.shape[0])
+            row_bytes = bank.nbytes // bank_rows
+            # A row can begin at any byte position within a page. Account for
+            # the maximum pages touched by each selected row, capped by the
+            # physical pages in the whole bank mapping.
+            pages_per_row = max(
+                (
+                    ((row + 1) * row_bytes + mmap.PAGESIZE - 1)
+                    // mmap.PAGESIZE
+                    - (row * row_bytes) // mmap.PAGESIZE
+                )
+                for row in range(bank_rows)
+            )
+            bank_pages = (bank.nbytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE
+            required += min(
+                bank_pages,
+                int(num_rows) * pages_per_row,
+            ) * mmap.PAGESIZE
         if required > self.budget_bytes:
             raise ValueError(
                 f"UFFD pager budget {self.budget_bytes / 2**30:.2f} GiB cannot hold "
-                f"the {required / 2**30:.2f} GiB {context} expert-row working set; "
+                f"the {required / 2**30:.2f} GiB {context} expert-page working set; "
                 "increase --moe-pager-budget-gib"
             )
 
