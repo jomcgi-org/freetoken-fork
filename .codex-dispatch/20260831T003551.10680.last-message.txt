@@ -1,0 +1,25 @@
+Implemented split-residency prefill overlap.
+
+Files changed:
+
+- [offload_cache.py](/tmp/claude-worktrees/ft-prefill-overlap/python/freetoken/moe/offload_cache.py): per-layer overlap eligibility, safe buffer scheduling, hard errors for unpinned overlap routing, path counts.
+- [moe.py](/tmp/claude-worktrees/ft-prefill-overlap/python/freetoken/layers/moe.py): pinned layers overlap; DISK CPU and pageable synchronous paths remain intact.
+- [engine.py](/tmp/claude-worktrees/ft-prefill-overlap/python/freetoken/engine/engine.py): removed global split-residency disable and added boot counts.
+- [test_offload.py](/tmp/claude-worktrees/ft-prefill-overlap/tests/moe/test_offload.py): GPU-free split-residency output parity and routing coverage.
+- [test_gpt_oss.py](/tmp/claude-worktrees/ft-prefill-overlap/tests/moe/test_gpt_oss.py): CUDA-gated bit-identical split-residency parity.
+
+Validation:
+
+- Python compilation passed.
+- `git diff --check` passed.
+- Pytest was not run because this Mac cannot install the Linux accelerator dependencies.
+
+Exact Linux GPU-free pytest line:
+
+```bash
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=python pytest -q tests/moe/test_offload.py tests/moe/test_disk_tier.py tests/moe/test_gpt_oss.py tests/engine/test_moe_cpu_layers.py
+```
+
+Expected gain: full-layer H2D copies for pinned layers are again staged behind preceding pinned GEMMs or DISK CPU execution. On the 30 pinned plus 18 DISK configuration, this should remove synchronous-copy stalls from nearly all pinned layers while leaving DISK CPU costs unchanged. The first eligible copy remains unavoidable.
+
+Deviation: no commit was created because the repository guardrail explicitly requires leaving the diff for the orchestrator to review and commit. The unrelated `.codex-dispatch/` directory remains untouched.

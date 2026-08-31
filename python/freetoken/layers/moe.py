@@ -430,6 +430,8 @@ class OffloadMoELayer(MoELayer):
         and DISK under the copy escape hatch, stream whole layers to the GPU cache."""
         cache = self.offload_cache
         assert cache is not None
+        if self.layer_id == 0 and cache.prefill_overlap:
+            cache.begin_prefill()
         residency = getattr(cache, "layer_residency", ())
         if self.layer_id < len(residency) and residency[self.layer_id] == "disk":
             # Keep the union-of-routed-experts WILLNEED sweep ahead of either compute
@@ -439,10 +441,11 @@ class OffloadMoELayer(MoELayer):
             if cache.moe_disk_prefill == "cpu":
                 executor = cache.cpu_executor
                 assert executor is not None, "DISK layer requires the CPU MoE executor"
+                self._prefetch_next_overlap_layer(cache)
                 return executor.prefill(
                     self.layer_id, hidden_states, topk_weights, topk_ids
                 )
-        if cache.prefill_overlap:
+        if cache.prefill_overlap and cache.prefill_overlap_for_layer(self.layer_id):
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
                 cache,
@@ -458,6 +461,7 @@ class OffloadMoELayer(MoELayer):
             return out
         cache.materialize_layer(self.layer_id)
         cache.copy_missing()
+        self._prefetch_next_overlap_layer(cache)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -475,11 +479,17 @@ class OffloadMoELayer(MoELayer):
         bank registration order; buffer position == expert id, so routing ids pass
         through unmapped). The caller runs ``release_prefill_layer`` after its GEMMs.
         """
-        if self.layer_id == 0:
-            cache.begin_prefill()
         cache.prefetch_prefill_layer(self.layer_id)
-        cache.prefetch_prefill_layer(self.layer_id + 1)
+        self._prefetch_next_overlap_layer(cache)
         return cache.wait_prefill_layer(self.layer_id)
+
+    def _prefetch_next_overlap_layer(self, cache: OffloadMoeCache) -> None:
+        """Start the next physical layer's copy when it has pinned banks."""
+        if not cache.prefill_overlap:
+            return
+        next_layer_id = self.layer_id + 1
+        if cache.prefill_overlap_for_layer(next_layer_id):
+            cache.prefetch_prefill_layer(next_layer_id)
 
     # ------------------------------------------------------------------
     # Kernel dispatch -- pure routing on the cache's quant format. ``views``

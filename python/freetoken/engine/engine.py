@@ -660,13 +660,6 @@ class Engine:
                     f"pin budget; OS-locking all layers instead of pinning"
                 )
         split_residency = bool(locked_layer_ids or disk_layer_ids)
-        if split_residency and config.moe_prefill_overlap:
-            # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
-            logger.info_rank0(
-                "split MoE bank residency: disabling prefill overlap "
-                "(non-pinned layers use synchronous pageable copies)"
-            )
-            object.__setattr__(config, "moe_prefill_overlap", False)
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -761,6 +754,17 @@ class Engine:
             elif hasattr(cache, "moe_disk_prefill"):
                 cache.moe_disk_prefill = config.moe_disk_prefill
             cache.cpu_layer_ids = cpu_layer_ids
+        # A custom cache may have attached its banks before the engine applies the
+        # requested DISK prefill mode. Refresh the per-layer buffer assignment so
+        # DISK copy mode reserves buffer 0 exactly like LOCKED/PAGEABLE layers.
+        cache._configure_prefill_overlap_layers()
+        overlap_layers, sync_layers, cpu_layers = cache.prefill_path_counts()
+        logger.info_rank0(
+            "MoE prefill paths: "
+            f"overlap={overlap_layers} pinned layers, "
+            f"non-overlap={sync_layers + cpu_layers} layers "
+            f"(sync={sync_layers}, CPU={cpu_layers} DISK)"
+        )
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
