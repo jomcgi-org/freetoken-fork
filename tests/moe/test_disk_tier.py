@@ -349,6 +349,108 @@ def test_disk_decode_route_dedup_stats_track_heavy_recurrence():
     stats = executor.disk_prefetch_stats()
     assert stats["distinct_experts_per_step"] == 3.0
     assert stats["dedup_ratio"] == pytest.approx(11 / 3)
+
+
+def _make_lookahead_executor(*, enabled=True):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    class Bank:
+        def __init__(self):
+            self.calls = []
+
+        def prefetch_experts(self, expert_ids):
+            selected = list(expert_ids)
+            self.calls.append(selected)
+            return len(selected)
+
+    banks = [Bank(), Bank()]
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_layers = 2
+    executor.num_experts = 8
+    executor._disk_banks = {0: [banks[0]], 1: [banks[1]]}
+    executor._disk_pagers = set()
+    executor._disk_prefetch_calls = [0, 0]
+    executor._disk_prefetch_pages = [0, 0]
+    executor._disk_decode_steps = 0
+    executor._disk_route_pairs = 0
+    executor._disk_distinct_experts = 0
+    executor._disk_lookahead_hits = 0
+    executor._disk_lookahead_routes = 0
+    executor._disk_delta_pages = 0
+    executor._disk_major_fault_base = None
+    executor._gpufetch_tasks = {}
+    executor._disk_lookahead_enabled = enabled
+    executor._disk_previous_experts = {}
+    executor._disk_predicted_experts = {}
+    return executor, banks
+
+
+def test_disk_lookahead_tracks_each_layer_and_prefetches_only_route_delta():
+    executor, banks = _make_lookahead_executor()
+
+    # No history on the first step means the existing full reactive sweep remains.
+    assert executor.begin_decode_step() == 0
+    assert executor.prefetch_experts(0, [3, 1, 3]) == 2
+    assert executor.prefetch_experts(1, [4, 2]) == 2
+    assert executor._disk_previous_experts == {0: (1, 3), 1: (2, 4)}
+
+    # The next step starts with both per-layer predictions. Layer 0 then requests
+    # only expert 4, while layer 1's perfect prediction has no reactive call.
+    assert executor.begin_decode_step() == 4
+    assert executor.prefetch_experts(0, [4, 3]) == 1
+    assert executor.prefetch_experts(1, [2, 4]) == 0
+    assert banks[0].calls == [[1, 3], [1, 3], [4]]
+    assert banks[1].calls == [[2, 4], [2, 4]]
+    assert executor._disk_previous_experts == {0: (3, 4), 1: (2, 4)}
+
+    stats = executor.disk_prefetch_stats(reset=True)
+    assert stats["lookahead_hit_rate"] == pytest.approx(3 / 4)
+    assert stats["delta_pages_per_step"] == 2.5
+    assert executor._disk_lookahead_hits == 0
+    assert executor._disk_lookahead_routes == 0
+    assert executor._disk_delta_pages == 0
+    # Telemetry flushes must not turn the next live step into a cold prediction.
+    assert executor._disk_previous_experts == {0: (3, 4), 1: (2, 4)}
+
+
+def test_disk_lookahead_defaults_to_madvise_only():
+    from freetoken.moe.cpu_executor import _disk_lookahead_allowed
+
+    assert _disk_lookahead_allowed(True, set())
+
+
+@pytest.mark.parametrize(
+    ("requested", "pagers"),
+    [(False, set()), (True, {"uffd"})],
+    ids=["flag-off", "uffd-backend"],
+)
+def test_disk_lookahead_disabled_keeps_reactive_prefetch(requested, pagers):
+    from freetoken.moe.cpu_executor import _disk_lookahead_allowed
+
+    assert not _disk_lookahead_allowed(requested, pagers)
+    executor, banks = _make_lookahead_executor(enabled=False)
+    executor._disk_previous_experts = {0: (1, 2), 1: (3,)}
+
+    assert executor.begin_decode_step() == 0
+    assert executor.prefetch_experts(0, [1, 2, 4]) == 3
+    assert banks[0].calls == [[1, 2, 4]]
+    assert executor._disk_previous_experts == {0: (1, 2), 1: (3,)}
+
+
+def test_disk_lookahead_prefill_boundary_restores_first_step_fallback():
+    executor, banks = _make_lookahead_executor()
+    executor.prefetch_experts(0, [1, 2])
+
+    # Explicit prefill advice neither consumes nor replaces decode prediction state.
+    executor.prefetch_experts(0, [7], is_prefill=True)
+    assert executor._disk_previous_experts == {0: (1, 2)}
+
+    executor.reset_disk_lookahead()
+    assert executor.begin_decode_step() == 0
+    assert executor.prefetch_experts(0, [2, 5]) == 2
+    assert banks[0].calls == [[1, 2], [7], [2, 5]]
+
+
 def test_uffd_prefetch_groups_all_layer_banks_into_one_budget_request():
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 

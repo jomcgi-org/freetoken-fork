@@ -110,6 +110,11 @@ def _dedupe_decode_routes(expert_ids, num_experts: int) -> tuple[list[int], int]
     return sorted(set(valid)), len(valid)
 
 
+def _disk_lookahead_allowed(requested: bool, pagers: set) -> bool:
+    """Return whether previous-step WILLNEED prediction applies to these banks."""
+    return bool(requested and not pagers)
+
+
 def compiled_extension_supports(activation: str) -> bool:
     """Whether the compiled ``_cpu_moe`` extension can serve ``activation``
     through its generic epilogue. A stale prebuilt .so accepts newer act ids
@@ -195,6 +200,7 @@ class CpuMoeExecutor:
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
+        disk_lookahead: bool = True,
     ) -> None:
         from freetoken.kernel import _cpu_moe
 
@@ -238,9 +244,19 @@ class CpuMoeExecutor:
         self._disk_decode_steps = 0
         self._disk_route_pairs = 0
         self._disk_distinct_experts = 0
+        self._disk_lookahead_hits = 0
+        self._disk_lookahead_routes = 0
+        self._disk_delta_pages = 0
         self._disk_major_fault_base = _major_faults()
         self._disk_prefetch_error: BaseException | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
+        # UFFD already prefetches complete logical rows through its userspace pager.
+        # Keep one-step prediction on the madvise path only.
+        self._disk_lookahead_enabled = _disk_lookahead_allowed(
+            disk_lookahead, self._disk_pagers
+        )
+        self._disk_previous_experts: dict[int, tuple[int, ...]] = {}
+        self._disk_predicted_experts: dict[int, tuple[int, ...]] = {}
         for layer_id, banks in self._disk_banks.items():
             pagers = {getattr(bank, "_pager", None) for bank in banks}
             for pager in pagers - {None}:
@@ -668,6 +684,52 @@ class CpuMoeExecutor:
         assert self._prefill_io is not None
         return {name: tensor[:bs] for name, tensor in self._prefill_io.items()}
 
+    def _prefetch_selected(self, layer_id: int, selected: list[int] | tuple[int, ...]) -> int:
+        """Issue and account one coalesced prefetch for an already deduped set."""
+        banks = self._disk_banks.get(int(layer_id))
+        if not banks or not selected:
+            return 0
+        pages = 0
+        paged_banks: set[int] = set()
+        by_pager: dict[object, list] = {}
+        for bank in banks:
+            pager = getattr(bank, "_pager", None)
+            if pager is not None:
+                by_pager.setdefault(pager, []).append(bank)
+                paged_banks.add(id(bank))
+        for pager, pager_banks in by_pager.items():
+            pages += pager.prefetch(pager_banks, selected)
+        pages += sum(
+            bank.prefetch_experts(selected) for bank in banks
+            if id(bank) not in paged_banks
+        )
+        self._disk_prefetch_calls[layer_id] += 1
+        self._disk_prefetch_pages[layer_id] += pages
+        return pages
+
+    def begin_decode_step(self) -> int:
+        """Prefetch every DISK layer from its previous decode routing set.
+
+        Called before graph replay or eager model execution. The native per-layer
+        callback later compares real routing with this snapshot and advises only the
+        delta. A layer without history is deliberately absent from the snapshot, so
+        its first decode step keeps the existing reactive behavior.
+        """
+        if not getattr(self, "_disk_lookahead_enabled", False):
+            return 0
+        previous = getattr(self, "_disk_previous_experts", {})
+        self._disk_predicted_experts = dict(previous)
+        return sum(
+            self._prefetch_selected(layer_id, self._disk_predicted_experts[layer_id])
+            for layer_id in sorted(self._disk_banks)
+            if layer_id in self._disk_predicted_experts
+        )
+
+    def reset_disk_lookahead(self) -> None:
+        """Make the next decode step cold after a prefill or cache reset boundary."""
+        self._disk_previous_experts = {}
+        self._disk_predicted_experts = {}
+
     def prefetch_experts(
         self,
         layer_id: int,
@@ -689,24 +751,26 @@ class CpuMoeExecutor:
             self._disk_decode_steps += 1
             self._disk_route_pairs += counted_pairs if route_pairs is None else int(route_pairs)
             self._disk_distinct_experts += len(selected)
-        if not selected:
-            return 0
-        pages = 0
-        paged_banks: set[int] = set()
-        by_pager: dict[object, list] = {}
-        for bank in banks:
-            pager = getattr(bank, "_pager", None)
-            if pager is not None:
-                by_pager.setdefault(pager, []).append(bank)
-                paged_banks.add(id(bank))
-        for pager, pager_banks in by_pager.items():
-            pages += pager.prefetch(pager_banks, selected)
-        pages += sum(
-            bank.prefetch_experts(selected) for bank in banks
-            if id(bank) not in paged_banks
-        )
-        self._disk_prefetch_calls[layer_id] += 1
-        self._disk_prefetch_pages[layer_id] += pages
+        if is_prefill:
+            return self._prefetch_selected(layer_id, selected)
+
+        predicted_by_layer = getattr(self, "_disk_predicted_experts", {})
+        predicted = predicted_by_layer.pop(int(layer_id), None)
+        if getattr(self, "_disk_lookahead_enabled", False):
+            self._disk_previous_experts[int(layer_id)] = tuple(selected)
+        if predicted is None:
+            delta = selected
+        else:
+            predicted_set = set(predicted)
+            self._disk_lookahead_routes = getattr(
+                self, "_disk_lookahead_routes", 0
+            ) + len(selected)
+            self._disk_lookahead_hits = getattr(self, "_disk_lookahead_hits", 0) + sum(
+                i in predicted_set for i in selected
+            )
+            delta = [i for i in selected if i not in predicted_set]
+        pages = self._prefetch_selected(layer_id, delta)
+        self._disk_delta_pages = getattr(self, "_disk_delta_pages", 0) + pages
         return pages
 
     def reset_disk_stats(self) -> None:
@@ -715,6 +779,9 @@ class CpuMoeExecutor:
         self._disk_decode_steps = 0
         self._disk_route_pairs = 0
         self._disk_distinct_experts = 0
+        self._disk_lookahead_hits = 0
+        self._disk_lookahead_routes = 0
+        self._disk_delta_pages = 0
         self._disk_major_fault_base = _major_faults()
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
             self._ext.gpufetch_stats(True)
@@ -761,6 +828,15 @@ class CpuMoeExecutor:
             "dedup_ratio": (
                 self._disk_route_pairs / self._disk_distinct_experts
                 if self._disk_distinct_experts else 0.0
+            ),
+            "lookahead_hit_rate": (
+                getattr(self, "_disk_lookahead_hits", 0)
+                / getattr(self, "_disk_lookahead_routes", 0)
+                if getattr(self, "_disk_lookahead_routes", 0) else 0.0
+            ),
+            "delta_pages_per_step": (
+                getattr(self, "_disk_delta_pages", 0) / decode_steps
+                if decode_steps else 0.0
             ),
             "gpufetch_fills_per_step": (
                 gpufetch_fills / gpufetch_decode_steps
@@ -813,6 +889,9 @@ class CpuMoeExecutor:
             self._disk_decode_steps = 0
             self._disk_route_pairs = 0
             self._disk_distinct_experts = 0
+            self._disk_lookahead_hits = 0
+            self._disk_lookahead_routes = 0
+            self._disk_delta_pages = 0
             self._disk_major_fault_base = now
         return result
 

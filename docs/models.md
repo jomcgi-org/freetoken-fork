@@ -47,6 +47,11 @@ whole-layer pageable copy path for benchmarking. LOCKED and PAGEABLE layers keep
 existing GPU prefill copy behavior.
 
 `--moe-disk-pager madvise` is the default and preserves that file-mapping behavior.
+During decode, `--moe-disk-lookahead on` (the default) issues each DISK layer's
+previous route set before the next step starts, then advises only newly routed experts
+when that layer's current routing arrives. `--moe-disk-lookahead off` restores fully
+reactive advice. The option is a no-op with `uffd` because its logical-row prefetch path
+already manages residency differently.
 On Linux, `--moe-disk-pager uffd --moe-pager-budget-gib 40` instead registers anonymous
 bank regions with userfaultfd. The route hook accepts logical expert rows, deduplicates
 the physical pages covering them, and installs missing pages with positional I/O before

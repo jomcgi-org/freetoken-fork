@@ -632,6 +632,9 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        if self.cpu_executor is not None:
+            # A rebuilt cache is a cold boundary for route prediction as well as LRU.
+            self.cpu_executor.reset_disk_lookahead()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -1042,6 +1045,10 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        if self.cpu_executor is not None:
+            # Graph capture calls reset before live serving. Do not let synthetic
+            # warmup routes seed the first real decode prediction.
+            self.cpu_executor.reset_disk_lookahead()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0

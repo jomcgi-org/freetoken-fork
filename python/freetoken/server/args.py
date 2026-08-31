@@ -678,6 +678,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-lookahead",
+        choices=["on", "off"],
+        default=ServerArgs.moe_disk_lookahead,
+        help=(
+            "Prefetch each madvise DISK layer's preceding decode routes before the "
+            "next decode step (default: on). No-op with the UFFD pager."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-pager-budget-gib",
         type=float,
         default=ServerArgs.moe_pager_budget_gib,
