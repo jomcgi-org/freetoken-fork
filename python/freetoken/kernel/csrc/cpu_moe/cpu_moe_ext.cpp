@@ -1078,6 +1078,23 @@ struct MoeTask {
   bf16_t* y;           // [num_tokens, H]
 };
 
+// One graph-stable DISK -> pinned staging task. The GPU copies num_rows and the
+// LRU's layer-local source row ids into mapped-pinned control buffers before it
+// rings the normal coordinator doorbell. The coordinator then faults/copies only
+// those rows from the read-only FTW mappings into the pinned bank ring. A later
+// captured H2D gather installs ring row i into the LRU-selected destination slot.
+struct GpuFetchTask {
+  CpuMoeExecutor* exec;
+  int layer_id;
+  int num_experts;
+  int capacity;
+  const int64_t* num_rows;
+  const int32_t* row_ids;
+  std::vector<uintptr_t> source_ptrs;
+  std::vector<uintptr_t> staging_ptrs;
+  std::vector<int64_t> row_bytes;
+};
+
 // Output-row tiling. Small enough to give every worker independent work even at
 // batch size 1; large enough to amortize the atomic work-grab.
 //
@@ -1298,6 +1315,7 @@ struct CpuMoeExecutor {
   std::atomic<int> bar_sense{0};
 
   std::vector<MoeTask*> owned_tasks;  // persistent task descriptors (graph-stable)
+  std::vector<GpuFetchTask*> owned_gpufetch_tasks;
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
   // Optional Python pre-run hook. DISK banks use it to issue mmap.madvise after the
   // routing D2H has completed and before worker threads first read expert weights.
@@ -1317,8 +1335,13 @@ struct CpuMoeExecutor {
   volatile int64_t* done_flags = nullptr;   // this thread sets, GPU spin-waits
   int coord_num_slots = 0;
   std::vector<MoeTask*> flag_task;           // slot -> task (registered lazily)
+  std::vector<GpuFetchTask*> flag_gpufetch_task;  // slot -> DISK staging task
   std::vector<int64_t> flag_served;          // slot -> completed dispatch count (tests/debug)
   std::mutex flag_task_mtx;
+  std::atomic<int64_t> gpufetch_fills{0};
+  std::atomic<int64_t> gpufetch_steps{0};
+  std::atomic<int64_t> gpufetch_fill_ns{0};
+  std::atomic<int64_t> gpufetch_error{0};
 
   // Portable ordering for the flag handshake: "ready observed => the DMA'd inputs that
   // preceded the bump are visible" and "y stores are visible before done". Plain
@@ -1543,6 +1566,7 @@ struct CpuMoeExecutor {
     for (auto& th : workers)
       if (th.joinable()) th.join();
     for (MoeTask* t : owned_tasks) delete t;
+    for (GpuFetchTask* t : owned_gpufetch_tasks) delete t;
   }
 
   uintptr_t create_task(int layer_id, int num_tokens, uintptr_t x_ptr,
@@ -1556,6 +1580,51 @@ struct CpuMoeExecutor {
                              reinterpret_cast<bf16_t*>(y_ptr)};
     owned_tasks.push_back(t);
     return reinterpret_cast<uintptr_t>(t);
+  }
+
+  uintptr_t create_gpufetch_task(
+      int layer_id, int capacity, uintptr_t num_rows_ptr, uintptr_t row_ids_ptr,
+      std::vector<uintptr_t> source_ptrs, std::vector<uintptr_t> staging_ptrs,
+      std::vector<int64_t> row_bytes) {
+    if (capacity <= 0 || source_ptrs.empty() || source_ptrs.size() != staging_ptrs.size() ||
+        source_ptrs.size() != row_bytes.size())
+      throw std::invalid_argument("invalid GPU-fetch staging task geometry");
+    GpuFetchTask* t = new GpuFetchTask{
+        this, layer_id, num_experts, capacity,
+        reinterpret_cast<const int64_t*>(num_rows_ptr),
+        reinterpret_cast<const int32_t*>(row_ids_ptr),
+        std::move(source_ptrs), std::move(staging_ptrs), std::move(row_bytes)};
+    owned_gpufetch_tasks.push_back(t);
+    return reinterpret_cast<uintptr_t>(t);
+  }
+
+  void run_gpufetch(GpuFetchTask* t) {
+    const auto begin = std::chrono::steady_clock::now();
+    const int64_t count = *t->num_rows;
+    if (count < 0 || count > t->capacity) {
+      gpufetch_error.store(1, std::memory_order_release);
+      return;
+    }
+    for (int64_t i = 0; i < count; ++i) {
+      const int row = t->row_ids[i];
+      if (row < 0 || row >= t->num_experts) {
+        gpufetch_error.store(2, std::memory_order_release);
+        return;
+      }
+      for (size_t b = 0; b < t->row_bytes.size(); ++b) {
+        const size_t bytes = static_cast<size_t>(t->row_bytes[b]);
+        std::memcpy(
+            reinterpret_cast<void*>(t->staging_ptrs[b] + static_cast<size_t>(i) * bytes),
+            reinterpret_cast<const void*>(
+                t->source_ptrs[b] + static_cast<size_t>(row) * bytes),
+            bytes);
+      }
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - begin).count();
+    gpufetch_fills.fetch_add(count, std::memory_order_relaxed);
+    gpufetch_steps.fetch_add(1, std::memory_order_relaxed);
+    gpufetch_fill_ns.fetch_add(elapsed, std::memory_order_relaxed);
   }
 
   const char* isa_name() const { return isa; }
@@ -1984,6 +2053,13 @@ struct CpuMoeExecutor {
     flag_task[slot] = reinterpret_cast<MoeTask*>(task);
   }
 
+  void register_flag_gpufetch_task(int slot, uintptr_t task) {
+    std::lock_guard<std::mutex> lk(flag_task_mtx);
+    if (static_cast<int>(flag_gpufetch_task.size()) <= slot)
+      flag_gpufetch_task.resize(slot + 1, nullptr);
+    flag_gpufetch_task[slot] = reinterpret_cast<GpuFetchTask*>(task);
+  }
+
   int64_t flag_served_count(int slot) const {
     return (slot >= 0 && slot < static_cast<int>(flag_served.size())) ? flag_served[slot] : 0;
   }
@@ -1999,6 +2075,8 @@ struct CpuMoeExecutor {
     {
       std::lock_guard<std::mutex> lk(flag_task_mtx);
       if (static_cast<int>(flag_task.size()) < num_slots) flag_task.resize(num_slots, nullptr);
+      if (static_cast<int>(flag_gpufetch_task.size()) < num_slots)
+        flag_gpufetch_task.resize(num_slots, nullptr);
     }
     flag_served.assign(num_slots, 0);
     coord_stop.store(false);
@@ -2043,11 +2121,16 @@ struct CpuMoeExecutor {
         if (flag_load_acquire(&ready_flags[L]) != 0) {
           flag_store_release(&ready_flags[L], 0);  // consume this step's doorbell
           MoeTask* t;
+          GpuFetchTask* fetch;
           {
             std::lock_guard<std::mutex> lk(flag_task_mtx);
             t = (L < static_cast<int>(flag_task.size())) ? flag_task[L] : nullptr;
+            fetch = (L < static_cast<int>(flag_gpufetch_task.size()))
+                        ? flag_gpufetch_task[L] : nullptr;
           }
-          if (t != nullptr) {
+          if (fetch != nullptr) {
+            run_gpufetch(fetch);
+          } else if (t != nullptr) {
             submit(t);
             sync();
           }
@@ -2119,6 +2202,23 @@ struct CpuMoeExecutor {
     pre_run_callback = std::move(callback);
   }
 
+  void gpufetch_with_cuda_stream(uintptr_t stream, uintptr_t task) {
+    cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream),
+                       &CpuMoeExecutor::gpufetch_cb,
+                       reinterpret_cast<void*>(task));
+  }
+
+  std::vector<int64_t> gpufetch_stats(bool reset) {
+    const int64_t fills = reset ? gpufetch_fills.exchange(0) : gpufetch_fills.load();
+    const int64_t steps = reset ? gpufetch_steps.exchange(0) : gpufetch_steps.load();
+    const int64_t ns = reset ? gpufetch_fill_ns.exchange(0) : gpufetch_fill_ns.load();
+    return {fills, steps, ns};
+  }
+
+  int64_t gpufetch_error_code() const {
+    return gpufetch_error.load(std::memory_order_acquire);
+  }
+
   static void CUDART_CB submit_cb(void* ud) {
     MoeTask* t = reinterpret_cast<MoeTask*>(ud);
     t->exec->submit(t);
@@ -2126,6 +2226,10 @@ struct CpuMoeExecutor {
   static void CUDART_CB sync_cb(void* ud) {
     MoeTask* t = reinterpret_cast<MoeTask*>(ud);
     t->exec->sync();
+  }
+  static void CUDART_CB gpufetch_cb(void* ud) {
+    GpuFetchTask* t = reinterpret_cast<GpuFetchTask*>(ud);
+    t->exec->run_gpufetch(t);
   }
 };
 
@@ -2149,9 +2253,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))
+      .def("create_gpufetch_task", &CpuMoeExecutor::create_gpufetch_task,
+           py::arg("layer_id"), py::arg("capacity"), py::arg("num_rows_ptr"),
+           py::arg("row_ids_ptr"), py::arg("source_ptrs"),
+           py::arg("staging_ptrs"), py::arg("row_bytes"))
       .def("submit_with_cuda_stream", &CpuMoeExecutor::submit_with_cuda_stream,
            py::arg("stream"), py::arg("task"), py::call_guard<py::gil_scoped_release>())
       .def("sync_with_cuda_stream", &CpuMoeExecutor::sync_with_cuda_stream,
+           py::arg("stream"), py::arg("task"), py::call_guard<py::gil_scoped_release>())
+      .def("gpufetch_with_cuda_stream", &CpuMoeExecutor::gpufetch_with_cuda_stream,
            py::arg("stream"), py::arg("task"), py::call_guard<py::gil_scoped_release>())
       .def("run_task", &CpuMoeExecutor::run_task, py::arg("task"),
            py::call_guard<py::gil_scoped_release>())
@@ -2163,7 +2273,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("callback"))
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,
            py::arg("slot"), py::arg("task"))
+      .def("register_flag_gpufetch_task", &CpuMoeExecutor::register_flag_gpufetch_task,
+           py::arg("slot"), py::arg("task"))
       .def("flag_served_count", &CpuMoeExecutor::flag_served_count, py::arg("slot"))
+      .def("gpufetch_stats", &CpuMoeExecutor::gpufetch_stats, py::arg("reset"))
+      .def("gpufetch_error_code", &CpuMoeExecutor::gpufetch_error_code)
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,
            py::arg("ready_ptr"), py::arg("done_ptr"), py::arg("num_slots"),
            py::arg("pin_core"))

@@ -49,8 +49,8 @@ class EngineConfig:
     # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
-    # File-backed FTW bank layers. Uses the same grammar as moe_cpu_layers and always
-    # routes the selected layers through the CPU executor.
+    # File-backed FTW bank layers. Uses the same grammar as moe_cpu_layers. Decode
+    # uses the CPU executor by default or the GPU slot cache under moe_disk_decode.
     moe_disk_layers: str | None = None
     # Optional per-MoE-layer traffic scores used only by automatic FTW DISK spill
     # selection. Explicit moe_disk_layers remains authoritative.
@@ -58,6 +58,10 @@ class EngineConfig:
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"
+    # DISK-layer decode: "cpu" preserves the native CPU executor path; "gpufetch"
+    # faults only LRU-missing routed expert rows into a pinned staging ring, copies
+    # them into the existing GPU slot cache, and runs the normal GPU expert GEMM.
+    moe_disk_decode: str = "cpu"
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
@@ -117,6 +121,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-disk-prefill must be 'cpu' or 'copy', got "
                 f"{self.moe_disk_prefill!r}"
+            )
+        if self.moe_disk_decode not in ("cpu", "gpufetch"):
+            raise ValueError(
+                "--moe-disk-decode must be 'cpu' or 'gpufetch', got "
+                f"{self.moe_disk_decode!r}"
             )
 
     @cached_property

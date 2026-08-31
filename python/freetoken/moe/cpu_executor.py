@@ -287,6 +287,7 @@ class CpuMoeExecutor:
 
         self._io: dict[int, dict[str, torch.Tensor]] = {}
         self._tasks: dict[tuple[int, int], int] = {}
+        self._gpufetch_tasks: dict[int, tuple[int, int | None]] = {}
         self._prefill_io: dict[str, torch.Tensor] | None = None
         self._prefill_capacity = 0
 
@@ -302,8 +303,10 @@ class CpuMoeExecutor:
         # self so the coordinator's pinned pointers stay valid for the executor's
         # lifetime (flag_sync itself was decided above, before thread sizing).
         self._ready = self._done = self._err = None
-        self._flag_slots: dict[tuple[int, int], int] = {}  # (layer_id, bs) -> slot
-        self._flag_capacity = self.num_layers * _FLAG_SLOTS_PER_LAYER
+        self._flag_slots: dict[tuple, int] = {}
+        # CPU tasks use up to _FLAG_SLOTS_PER_LAYER batch-size variants. Reserve one
+        # additional stable slot per layer for DISK GPU-fetch staging.
+        self._flag_capacity = self.num_layers * (_FLAG_SLOTS_PER_LAYER + 1)
         if self._flag_sync:
             self._ready = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
             self._done = alloc_pinned_tensor(self._flag_capacity, dtype=torch.int64)
@@ -564,6 +567,64 @@ class CpuMoeExecutor:
                     self._ext.register_flag_task(slot, task)
         return task
 
+    def register_gpufetch_layer(
+        self,
+        layer_id: int,
+        *,
+        capacity: int,
+        num_rows_ptr: int,
+        row_ids_ptr: int,
+        source_ptrs: list[int],
+        staging_ptrs: list[int],
+        row_bytes: list[int],
+    ) -> None:
+        """Register one fixed DISK-to-pinned row-fill task with the CPU coordinator."""
+        required = (
+            "create_gpufetch_task",
+            "gpufetch_with_cuda_stream",
+            "register_flag_gpufetch_task",
+            "gpufetch_stats",
+            "gpufetch_error_code",
+        )
+        if not all(hasattr(self._ext, name) for name in required):
+            raise RuntimeError(
+                "the CPU MoE extension needs rebuilding for --moe-disk-decode "
+                "gpufetch; run `python setup.py build_ext --inplace` or reinstall "
+                "the wheel"
+            )
+        task = self._ext.create_gpufetch_task(
+            layer_id,
+            capacity,
+            num_rows_ptr,
+            row_ids_ptr,
+            source_ptrs,
+            staging_ptrs,
+            row_bytes,
+        )
+        slot = None
+        key = ("gpufetch", layer_id)
+        if self._flag_sync:
+            candidate = len(self._flag_slots)
+            if candidate < self._flag_capacity:
+                slot = candidate
+                self._flag_slots[key] = slot
+                self._ext.register_flag_gpufetch_task(slot, task)
+        self._gpufetch_tasks[layer_id] = (task, slot)
+
+    def gpufetch(self, layer_id: int) -> None:
+        """Run a registered staging fill after its captured D2H control copies."""
+        task, slot = self._gpufetch_tasks[layer_id]
+        stream = torch.cuda.current_stream().cuda_stream
+        if slot is not None:
+            self._cpu_moe.memop_submit(
+                stream, self._done.data_ptr(), self._ready.data_ptr(), slot,
+            )
+            self._cpu_moe.memop_sync(stream, self._done.data_ptr(), slot)
+        else:
+            # Existing portable house fallback: a captured cudaLaunchHostFunc node
+            # fills the ring and returns before the following H2D gather can run.
+            self._ext.gpufetch_with_cuda_stream(stream, task)
+
     def _prefill_io_for(self, bs: int) -> dict[str, torch.Tensor]:
         """One reusable prefill buffer, grown only when a larger chunk arrives."""
         validate_cpu_moe_task_tokens(bs, source="CPU MoE prefill batch size")
@@ -606,6 +667,8 @@ class CpuMoeExecutor:
         self._disk_prefetch_pages = [0] * self.num_layers
         self._disk_decode_steps = 0
         self._disk_major_fault_base = _major_faults()
+        if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
+            self._ext.gpufetch_stats(True)
 
     def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
         """Aggregate DISK counters, reading procfs only when stats are flushed."""
@@ -621,8 +684,17 @@ class CpuMoeExecutor:
         major_faults = None if now is None or self._disk_major_fault_base is None else (
             now - self._disk_major_fault_base
         )
+        gpufetch_fills = gpufetch_steps = gpufetch_ns = 0
+        if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
+            gpufetch_fills, gpufetch_steps, gpufetch_ns = self._ext.gpufetch_stats(reset)
         disk_layers = len(self._disk_banks)
         decode_steps = self._disk_decode_steps / disk_layers if disk_layers else 0
+        gpufetch_layers = len(getattr(self, "_gpufetch_tasks", ()))
+        gpufetch_decode_steps = (
+            gpufetch_steps / gpufetch_layers if gpufetch_layers else 0
+        )
+        if gpufetch_decode_steps:
+            decode_steps = gpufetch_decode_steps
         result = {
             "prefetch_calls": sum(self._disk_prefetch_calls),
             "pages_requested": sum(self._disk_prefetch_pages),
@@ -630,6 +702,14 @@ class CpuMoeExecutor:
             "major_faults_per_decode_step": (
                 major_faults / decode_steps
                 if major_faults is not None and decode_steps else 0.0
+            ),
+            "gpufetch_fills_per_step": (
+                gpufetch_fills / gpufetch_decode_steps
+                if gpufetch_decode_steps else 0.0
+            ),
+            "gpufetch_fill_us": (
+                gpufetch_ns / 1_000 / gpufetch_decode_steps
+                if gpufetch_decode_steps else 0.0
             ),
             "per_layer": per_layer,
         }
@@ -810,6 +890,12 @@ class CpuMoeExecutor:
         instead of silently shipping stale expert outputs."""
         if self._disk_prefetch_error is not None:
             raise RuntimeError("DISK expert prefetch failed") from self._disk_prefetch_error
+        if (
+            getattr(self, "_gpufetch_tasks", None)
+            and hasattr(self._ext, "gpufetch_error_code")
+            and (code := self._ext.gpufetch_error_code())
+        ):
+            raise RuntimeError(f"DISK GPU-fetch staging failed with error code {code}")
         if self._err is not None and bool((self._err != 0).any()):
             raise RuntimeError(
                 "CPU MoE flag-handshake watchdog fired: a decode step's doorbell was "

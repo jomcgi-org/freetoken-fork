@@ -611,7 +611,7 @@ def parse_args(
         default=ServerArgs.moe_disk_layers,
         help=(
             "Which MoE layers keep expert banks as read-only file-backed FTW mappings "
-            "and decode on the CPU executor. Explicit id list ('3,7,11'), a count "
+            "and use the selected DISK decode mode. Explicit id list ('3,7,11'), a count "
             "('8' = 8 layers evenly strided), or a fraction ('0.5'). Requires a "
             "checkpoint converted by `ft checkpoint`."
         ),
@@ -645,6 +645,17 @@ def parse_args(
             "How DISK layers run prefill: 'cpu' computes routed experts through the "
             "CPU executor (default); 'copy' restores the whole-layer pageable copy "
             "to the GPU cache for benchmarking."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-disk-decode",
+        choices=["cpu", "gpufetch"],
+        default=ServerArgs.moe_disk_decode,
+        help=(
+            "How DISK layers run decode: 'cpu' uses the CPU executor (default); "
+            "'gpufetch' stages LRU-missing routed experts from the file mapping into "
+            "the existing GPU slot cache, then runs the normal GPU GEMM."
         ),
     )
 

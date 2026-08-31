@@ -612,7 +612,13 @@ class Engine:
                 "--moe-disk-layers requires an FTW checkpoint; convert this model with "
                 "`ft checkpoint` first"
             )
-        cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers) | disk_layer_ids
+        cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers)
+        if config.moe_disk_decode == "cpu":
+            cpu_layer_ids |= disk_layer_ids
+        else:
+            # DISK gpufetch is authoritative for overlapping explicit CPU-layer
+            # selections: those layers must reach the normal slot-cache path.
+            cpu_layer_ids -= disk_layer_ids
         if (
             not cpu_layer_ids
             and config.moe_cpu_layers is None
@@ -625,6 +631,8 @@ class Engine:
             )
             if ftw_checkpoint:
                 disk_layer_ids = cpu_layer_ids
+                if config.moe_disk_decode == "gpufetch":
+                    cpu_layer_ids = frozenset()
         if disk_layer_ids and config.moe_disk_layers is not None:
             logger.info_rank0(
                 f"MoE DISK layers selected explicitly: {sorted(disk_layer_ids)}; "
@@ -685,7 +693,13 @@ class Engine:
                 dtype=self.dtype,
                 dummy=config.use_dummy_weight,
                 parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                # DISK CPU prefill needs a native CPU-readable layout even when its
+                # decode path is pure gpufetch GPU execution. The normal slot-cache
+                # kernels consume that same layout (as the hybrid backend already does).
+                decode_target=(
+                    "cpu" if decode_target in ("cpu", "hybrid") or disk_layer_ids
+                    else "gpu"
+                ),
                 layer_residency=requested_residency,
             )
             if config.moe_cache_auto:
@@ -717,6 +731,7 @@ class Engine:
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 moe_disk_prefill=config.moe_disk_prefill,
+                moe_disk_decode=config.moe_disk_decode,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -751,8 +766,17 @@ class Engine:
                         "a custom MoE cache serving --moe-disk-layers must expose "
                         "an assignable moe_disk_prefill attribute"
                     ) from exc
+                try:
+                    cache.moe_disk_decode = config.moe_disk_decode
+                except AttributeError as exc:
+                    raise TypeError(
+                        "a custom MoE cache serving --moe-disk-layers must expose "
+                        "an assignable moe_disk_decode attribute"
+                    ) from exc
             elif hasattr(cache, "moe_disk_prefill"):
                 cache.moe_disk_prefill = config.moe_disk_prefill
+                if hasattr(cache, "moe_disk_decode"):
+                    cache.moe_disk_decode = config.moe_disk_decode
             cache.cpu_layer_ids = cpu_layer_ids
         # A custom cache may have attached its banks before the engine applies the
         # requested DISK prefill mode. Refresh the per-layer buffer assignment so
@@ -774,7 +798,10 @@ class Engine:
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
         assert len(layers) == config.model_config.num_moe_layers
-        if cache.decode_target in ("cpu", "hybrid"):
+        if (
+            cache.decode_target in ("cpu", "hybrid")
+            or "disk" in getattr(cache, "layer_residency", ())
+        ):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
@@ -855,6 +882,11 @@ class Engine:
                 "`python setup.py build_ext --inplace` or reinstall the wheel"
             )
         cache.set_cpu_executor(executor)
+        cache.init_disk_gpufetch(
+            executor,
+            max_tokens=max_tokens,
+            top_k=sample.top_k,
+        )
         self.cpu_moe_executor = executor
 
     def _sync_get_memory(self) -> Tuple[int, int]:
@@ -1581,6 +1613,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_layers": None,
     "moe_disk_layer_profile": None,
     "moe_disk_prefill": "cpu",
+    "moe_disk_decode": "cpu",
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,

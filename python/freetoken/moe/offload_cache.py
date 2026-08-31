@@ -30,6 +30,16 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 
+def disk_gpufetch_capacity(
+    *, max_tokens: int, top_k: int, num_experts: int, cache_size: int,
+) -> int:
+    """Maximum distinct decode misses that can need staging in one layer call."""
+    values = (max_tokens, top_k, num_experts, cache_size)
+    if any(int(value) <= 0 for value in values):
+        raise ValueError("GPU-fetch staging geometry must be positive")
+    return min(int(max_tokens) * int(top_k), int(num_experts), int(cache_size))
+
+
 def serialize_moe_layer_profile(stats: dict) -> dict[str, float]:
     """Serialize per-layer decode stats as layer id to realized misses per step."""
     profile: dict[str, float] = {}
@@ -128,6 +138,9 @@ class OffloadMoeCache:
     # DISK-only prefill policy. LOCKED/PAGEABLE layers always keep the whole-layer
     # pageable copy path.
     moe_disk_prefill: str = "cpu"
+    # DISK-only decode policy. gpufetch keeps the mmap as the authoritative host
+    # bank but fills LRU misses through a bounded pinned staging ring.
+    moe_disk_decode: str = "cpu"
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
@@ -162,6 +175,7 @@ class OffloadMoeCache:
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         assert self.moe_disk_prefill in ("cpu", "copy"), self.moe_disk_prefill
+        assert self.moe_disk_decode in ("cpu", "gpufetch"), self.moe_disk_decode
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
@@ -217,7 +231,8 @@ class OffloadMoeCache:
         self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
-        # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
+        # per-layer host residency: direct GPU movement requires "pinned";
+        # LOCKED/PAGEABLE decode on CPU, while DISK may use CPU or the staging ring
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
@@ -278,6 +293,18 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        # DISK gpufetch is initialized after the CPU executor exists, because its
+        # existing coordinator owns the graph-safe doorbell. The staging tensors are
+        # host-pinned; only tiny pointer/index descriptors live on the GPU.
+        self._gpufetch_capacity = 0
+        self._gpufetch_num_host: torch.Tensor | None = None
+        self._gpufetch_ids_host: torch.Tensor | None = None
+        self._gpufetch_stage_indices: torch.Tensor | None = None
+        self._gpufetch_staging: list[torch.Tensor] = []
+        self._gpufetch_dst_ptrs: torch.Tensor | None = None
+        self._gpufetch_src_ptrs: torch.Tensor | None = None
+        self._gpufetch_feat_bytes: torch.Tensor | None = None
+        self._gpufetch_fused_ok = False
         # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
@@ -317,10 +344,12 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value
-        (default: all pinned). Non-pinned (LOCKED/PAGEABLE/DISK) layers have no
-        device address: they must already be routed to the CPU executor
-        (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows,
-        and prefill overlap remains enabled only for the pinned layers.
+        (default: all pinned). Non-pinned layers have no direct device address.
+        LOCKED/PAGEABLE layers must route to the CPU executor (``cpu_layer_ids``,
+        set BEFORE this call); DISK layers may instead use
+        ``moe_disk_decode=gpufetch`` and pass through a pinned staging ring. The
+        direct copy plan skips all of them, and prefill overlap remains enabled
+        only for the pinned layers (per-layer schedule).
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -336,11 +365,18 @@ class OffloadMoeCache:
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
         if unpinned:
-            if not unpinned <= self.cpu_layer_ids:
+            gpufetch_disk = frozenset(
+                i for i, r in enumerate(residency)
+                if r == HostResidency.DISK.value and self.moe_disk_decode == "gpufetch"
+            )
+            unsupported = unpinned - self.cpu_layer_ids - gpufetch_disk
+            if unsupported:
                 raise ValueError(
-                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
-                    f"cpu_layer_ids: a layer without a device address can only decode on "
-                    f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
+                    f"non-pinned layers {sorted(unsupported)} are neither in "
+                    "cpu_layer_ids nor DISK gpufetch layers: a layer without a "
+                    "device address can only decode on the CPU executor or, for "
+                    "DISK residency, via --moe-disk-decode gpufetch (set "
+                    "cache.cpu_layer_ids before set_bank_sources)"
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
@@ -400,6 +436,73 @@ class OffloadMoeCache:
             for residency in self.layer_residency
         )
         return overlap, self.num_layers - overlap - cpu, cpu
+
+    def init_disk_gpufetch(self, executor, *, max_tokens: int, top_k: int) -> None:
+        """Allocate/register the bounded pinned row ring used by DISK decode misses."""
+        disk_layers = [
+            i for i, residency in enumerate(self.layer_residency)
+            if residency == "disk"
+        ]
+        if self.moe_disk_decode != "gpufetch" or not disk_layers:
+            return
+        if self.device.type != "cuda":
+            raise RuntimeError("--moe-disk-decode gpufetch requires CUDA")
+        from freetoken.kernel.pinned import alloc_pinned_tensor
+
+        capacity = disk_gpufetch_capacity(
+            max_tokens=max_tokens,
+            top_k=top_k,
+            num_experts=self.num_experts,
+            cache_size=self.cache_size,
+        )
+        self._gpufetch_capacity = capacity
+        self._gpufetch_num_host = alloc_pinned_tensor(1, dtype=torch.int64)
+        self._gpufetch_ids_host = alloc_pinned_tensor(capacity, dtype=torch.int32)
+        self._gpufetch_stage_indices = torch.arange(
+            capacity, dtype=torch.int32, device=self.device,
+        )
+        self._gpufetch_staging = [
+            alloc_pinned_tensor(capacity, *per_layer[0].shape[1:], dtype=per_layer[0].dtype)
+            for per_layer, _ in self.banks
+        ]
+        self._build_gpufetch_copy_plan()
+        row_bytes = [
+            math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
+            for per_layer, _ in self.banks
+        ]
+        staging_ptrs = [stage.data_ptr() for stage in self._gpufetch_staging]
+        for layer_id in disk_layers:
+            executor.register_gpufetch_layer(
+                layer_id,
+                capacity=capacity,
+                num_rows_ptr=self._gpufetch_num_host.data_ptr(),
+                row_ids_ptr=self._gpufetch_ids_host.data_ptr(),
+                source_ptrs=[per_layer[layer_id].data_ptr() for per_layer, _ in self.banks],
+                staging_ptrs=staging_ptrs,
+                row_bytes=row_bytes,
+            )
+
+    def _build_gpufetch_copy_plan(self) -> None:
+        """Refresh H2D descriptors; destination addresses change after cache rebuild."""
+        self._gpufetch_fused_ok = False
+        if not self._gpufetch_staging or self.device.type != "cuda":
+            return
+        from freetoken.kernel.pinned import device_ptr
+
+        dst = [cache.data_ptr() for _, cache in self.banks]
+        src = [device_ptr(stage) for stage in self._gpufetch_staging]
+        feats = [
+            math.prod(cache.shape[1:]) * cache.element_size() for _, cache in self.banks
+        ]
+        if _FUSED_COPY and all(
+            value % 16 == 0 for value in (*dst, *src, *feats)
+        ):
+            self._gpufetch_dst_ptrs = torch.tensor(dst, dtype=torch.int64, device=self.device)
+            self._gpufetch_src_ptrs = torch.tensor(src, dtype=torch.int64, device=self.device)
+            self._gpufetch_feat_bytes = torch.tensor(
+                feats, dtype=torch.int64, device=self.device,
+            )
+            self._gpufetch_fused_ok = True
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -516,6 +619,7 @@ class OffloadMoeCache:
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
+        self._build_gpufetch_copy_plan()
         # 4. Reallocate cache_size-shaped bookkeeping; reset the slot map (cold start).
         self.slot_for_id.fill_(-1)
         self.id_of_slot = torch.full((cache_size,), -1, dtype=torch.int32, device=self.device)
@@ -579,14 +683,22 @@ class OffloadMoeCache:
         IO buffers, and the ``cudaLaunchHostFunc`` submit/sync plumbing. It reads
         experts straight from this cache's host ``bank_sources`` (no extra copy).
         """
-        assert self.decode_target in ("cpu", "hybrid"), (
-            "set_cpu_executor requires decode_target in {'cpu','hybrid'}"
+        assert self.decode_target in ("cpu", "hybrid") or self.moe_disk_decode == "gpufetch", (
+            "set_cpu_executor requires CPU/hybrid decode or DISK gpufetch"
         )
         self.cpu_executor = executor
 
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
         return layer_id in self.cpu_layer_ids
+
+    def is_gpufetch_layer(self, layer_id: int) -> bool:
+        """Whether this file-backed layer decodes through the GPU slot cache."""
+        return (
+            self.moe_disk_decode == "gpufetch"
+            and layer_id < len(self.layer_residency)
+            and self.layer_residency[layer_id] == "disk"
+        )
 
     def is_unpinned_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE/DISK): the GPU slot-gather paths cannot serve it.
@@ -1065,6 +1177,46 @@ class OffloadMoeCache:
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
+            if self.is_gpufetch_layer(layer_id) and not self._pending_whole_layer:
+                assert self.cpu_executor is not None
+                assert self._gpufetch_num_host is not None
+                assert self._gpufetch_ids_host is not None
+                assert self._gpufetch_stage_indices is not None
+                # Fixed-size captured D2H control copies. num_indices tells the native
+                # coordinator how many ids are valid; the ring capacity covers the
+                # maximum distinct routes for every configured decode batch.
+                self._gpufetch_num_host.copy_(self.num_indices, non_blocking=True)
+                self._gpufetch_ids_host.copy_(
+                    self.src_indices[: self._gpufetch_capacity], non_blocking=True,
+                )
+                self.cpu_executor.gpufetch(layer_id)
+                # dst/src index buffers must be the same length for the copy
+                # kernels; decode misses are bounded by the ring capacity, so the
+                # capacity-long prefix of evict_slots covers every live entry.
+                evict_prefix = self.evict_slots[: self._gpufetch_capacity]
+                if self._gpufetch_fused_ok:
+                    from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+                    fast_index_copy_multi_jit(
+                        self._gpufetch_dst_ptrs,
+                        self._gpufetch_src_ptrs,
+                        self._gpufetch_feat_bytes,
+                        evict_prefix,
+                        self._gpufetch_stage_indices,
+                        self.num_indices,
+                    )
+                else:
+                    from freetoken.kernel import fast_index_copy_jit
+
+                    for stage, (_, cache) in zip(self._gpufetch_staging, self.banks):
+                        fast_index_copy_jit(
+                            cache,
+                            evict_prefix,
+                            stage,
+                            self._gpufetch_stage_indices,
+                            self.num_indices,
+                        )
+                return
             if not self._pending_whole_layer:
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "

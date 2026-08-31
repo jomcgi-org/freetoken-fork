@@ -120,6 +120,7 @@ where = ["python"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [
+    "cuda: requires CUDA hardware and is excluded from GPU-free validation",
     "slow: takes tens of seconds (big kernel sweeps, real-checkpoint reads); deselect with -m 'not slow'",
     "needs_weights: needs a real local checkpoint, gated behind an env var (see tests/README.md)",
 ]
