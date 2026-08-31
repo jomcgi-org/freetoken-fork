@@ -62,6 +62,15 @@ setup(
             libraries=["cudart"],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
         ),
+        # Linux userfaultfd expert pager. The translation unit is compile-gated and
+        # leaves only a clear unsupported-platform probe on non-Linux builds.
+        CppExtension(
+            name="freetoken.kernel._uffd_pager",
+            sources=[
+                "python/freetoken/kernel/csrc/uffd_pager.cpp",
+            ],
+            extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+        ),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )

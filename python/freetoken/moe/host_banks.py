@@ -41,7 +41,7 @@ class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
     Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths. LOCKED,
-    PAGEABLE, and file-backed DISK layers have no device address and decode on the CPU
+    PAGEABLE, and DISK layers have no device address and decode on the CPU
     executor.
     """
 
@@ -81,29 +81,34 @@ class HostBank:
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
     * ``"file"`` -- a read-only shared mapping of one aligned FTW bank entry. It stays
       DISK resident and applies ``MADV_RANDOM`` at creation.
+    * ``"uffd"`` -- a writable anonymous mapping registered with the process-wide
+      UFFD pager. Its FTW rows are installed on demand and governed by userspace LRU.
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
     __slots__ = (
         "tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_disk",
-        "_view_offset",
+        "_view_offset", "_uffd", "_pager", "_pager_region",
     )
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None, file_path: str | None = None,
-                 file_offset: int = 0):
+                 file_offset: int = 0, disk_pager=None):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
             born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
-        assert backing in ("mmap", "cuda", "file"), backing
+        assert backing in ("mmap", "cuda", "file", "uffd"), backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        self._disk = backing == "file"
+        self._disk = backing in ("file", "uffd")
+        self._uffd = backing == "uffd"
+        self._pager = disk_pager
+        self._pager_region = None
         self._view_offset = 0
-        if self._disk:
+        if backing == "file":
             if file_path is None:
                 raise ValueError("file-backed HostBank requires file_path")
             map_off = file_offset // mmap.ALLOCATIONGRANULARITY * mmap.ALLOCATIONGRANULARITY
@@ -139,12 +144,33 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            if self._uffd:
+                self._buf = mmap.mmap(
+                    -1, asize, flags=mmap.MAP_PRIVATE,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
+            else:
+                self._buf = mmap.mmap(-1, asize)
+            # Both are lazy anonymous address space; pages materialize only on fill.
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
+            if self._uffd:
+                if file_path is None or disk_pager is None:
+                    raise ValueError(
+                        "UFFD-backed HostBank requires file_path and disk_pager"
+                    )
+                if not shape or shape[0] <= 0 or self.nbytes % shape[0]:
+                    raise ValueError("UFFD expert bank must have a non-empty row axis")
+                self._pager_region = disk_pager.register_bank(
+                    self,
+                    file_path=file_path,
+                    file_offset=file_offset,
+                    row_bytes=self.nbytes // shape[0],
+                    num_rows=shape[0],
+                )
         with warnings.catch_warnings():
-            if self._disk:
+            if backing == "file":
                 warnings.filterwarnings(
                     "ignore", message="The given buffer is not writable",
                     category=UserWarning,
@@ -197,7 +223,7 @@ class HostBank:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
 
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
-        if self._pinned:
+        if self._pinned or self._uffd:
             return
         self._buf.madvise(mmap.MADV_DONTNEED)
 
@@ -228,6 +254,8 @@ class HostBank:
         """
         if not self._disk:
             return 0
+        if self._uffd:
+            return self._pager.prefetch([self], row_ids)
         stride = self.tensor.stride(0) * self.tensor.element_size()
         ranges = coalesced_page_ranges(
             row_ids, stride, limit=self.nbytes, page_offset=self._view_offset,
@@ -383,7 +411,7 @@ def _settle(bank: HostBank, residency: str) -> None:
     elif residency == HostResidency.LOCKED.value:
         bank.lock()
     elif residency == HostResidency.DISK.value and bank.residency is not HostResidency.DISK:
-        raise RuntimeError("DISK residency requires an FTW file-backed HostBank")
+        raise RuntimeError("DISK residency requires an FTW pager-backed HostBank")
 
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:

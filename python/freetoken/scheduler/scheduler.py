@@ -155,6 +155,14 @@ class Scheduler(SchedulerIOMixin):
                     f"disk major faults/decode step: "
                     f"{disk['major_faults_per_decode_step']:.2f}"
                 )
+                if disk.get("pager_backend") == "uffd":
+                    message += (
+                        f", uffd fills: {disk['fills']} "
+                        f"(prefetch: {disk['fills_from_prefetch']}, "
+                        f"fault: {disk['fault_driven']}), "
+                        f"uffd evictions: {disk['evictions']}, "
+                        f"uffd resident GiB: {disk['resident_bytes'] / 2**30:.2f}"
+                    )
             if ple_stats:
                 message += (
                     f", ple_prefetch_pages: {ple_stats['ple_prefetch_pages']}, "

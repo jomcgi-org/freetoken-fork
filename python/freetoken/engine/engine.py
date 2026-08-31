@@ -685,6 +685,15 @@ class Engine:
                     )
                     for i in range(num_moe_layers)
                 ]
+            disk_pager = None
+            if disk_layer_ids and config.moe_disk_pager == "uffd":
+                from freetoken.moe.uffd_pager import make_uffd_pager
+
+                disk_pager = make_uffd_pager(config.moe_pager_budget_gib)
+                logger.info_rank0(
+                    f"MoE DISK pager: uffd, userspace LRU budget "
+                    f"{disk_pager.budget_bytes / 2**30:.2f} GiB"
+                )
             banks = load_expert_banks(
                 config.model_path,
                 config.model_config,
@@ -694,6 +703,7 @@ class Engine:
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
+                disk_pager=disk_pager,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -733,6 +743,11 @@ class Engine:
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
+            if disk_layer_ids and config.moe_disk_pager == "uffd":
+                raise NotImplementedError(
+                    "--moe-disk-pager uffd requires the standard FTW expert-bank loader; "
+                    "this model provides a custom MoE cache"
+                )
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
             cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
@@ -1577,6 +1592,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_layers": None,
     "moe_disk_layer_profile": None,
     "moe_disk_prefill": "cpu",
+    "moe_disk_pager": "madvise",
+    "moe_pager_budget_gib": 40.0,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,

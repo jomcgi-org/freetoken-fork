@@ -203,6 +203,56 @@ def test_engine_config_rejects_invalid_disk_prefill_mode():
         )
 
 
+@pytest.mark.parametrize("pager", ["madvise", "uffd"])
+def test_engine_config_accepts_disk_pagers(pager):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        moe_disk_pager=pager,
+        moe_pager_budget_gib=7.5,
+    )
+    assert config.moe_disk_pager == pager
+    assert config.moe_pager_budget_gib == 7.5
+
+
+def test_engine_config_defaults_to_madvise_disk_pager():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+    )
+    assert config.moe_disk_pager == "madvise"
+    assert config.moe_pager_budget_gib == 40.0
+
+
+def test_engine_config_rejects_invalid_uffd_settings():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    base = dict(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(ValueError, match="--moe-disk-pager"):
+        EngineConfig(**base, moe_disk_pager="kernel")
+    with pytest.raises(ValueError, match="--moe-pager-budget-gib"):
+        EngineConfig(**base, moe_pager_budget_gib=0)
+
+
 @pytest.mark.parametrize("backend", ["pinned", "cached", "disk", "hmm"])
 def test_engine_config_accepts_ple_backends(backend):
     import torch

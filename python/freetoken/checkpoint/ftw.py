@@ -460,13 +460,13 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
 
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
-    layer_residency: list[str] | None = None,
+    layer_residency: list[str] | None = None, disk_pager=None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
     HostBank per layer per bank; see ``moe.offload_cache.set_bank_sources``).
 
-    ``layer_residency`` (default: all pinned) settles each layer's banks per its ``HostResidency`` label as reads complete: PINNED -> cudaHostRegister, LOCKED -> mlock (CPU-executor resident, no pin quota spent).
+    ``layer_residency`` (default: all pinned) settles each layer's banks per its ``HostResidency`` label as reads complete: PINNED -> cudaHostRegister, LOCKED -> mlock (CPU-executor resident, no pin quota spent). DISK uses the existing read-only file mapping unless ``disk_pager`` supplies the anonymous UFFD backend.
     The applied labels are echoed back on ``ExpertBanks.layer_residency``.
 
     Two on-disk row layouts, distinguished per bank name (a file never mixes them for
@@ -508,7 +508,7 @@ def load_ftw_banks(
 
     def _backing(layer_id: int) -> str:
         if residency[layer_id] == HostResidency.DISK.value:
-            return "file"
+            return "uffd" if disk_pager is not None else "file"
         if born and residency[layer_id] == HostResidency.PINNED.value:
             return "cuda"
         return "mmap"
@@ -598,7 +598,10 @@ def load_ftw_banks(
                 path_, file_off, mapped = reader.file_region(e)
                 if mapped < _align_up(e["nbytes"]):
                     raise RuntimeError(f"FTW bank {e['name']!r} has a truncated mapped region")
-                kw = {"file_path": path_, "file_offset": file_off}
+                kw = {
+                    "file_path": path_, "file_offset": file_off,
+                    "disk_pager": disk_pager,
+                }
             bank = HostBank(
                 tuple(e["shape"]), _dtype_of(e["dtype"]),
                 backing=_backing(layer_id), **kw,
@@ -686,8 +689,9 @@ def load_ftw_banks(
         disk_part = ""
         if disk:
             disk_b = sum(by_layer[i] for i in disk)
+            disk_kind = "UFFD-managed anonymous" if disk_pager is not None else "file-backed"
             disk_part = (
-                f" + {disk_b / 2**30:.2f} GiB file-backed "
+                f" + {disk_b / 2**30:.2f} GiB {disk_kind} "
                 f"({len(disk)} DISK layers: {disk})"
             )
         pageable_part = ""

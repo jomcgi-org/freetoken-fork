@@ -418,6 +418,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    disk_pager=None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -438,6 +439,9 @@ def load_expert_banks(
 
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
+
+    ``disk_pager`` selects anonymous UFFD regions for FTW DISK layers. ``None`` keeps
+    the portable file-mapping backend.
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
     from freetoken.moe.host_banks import HostResidency
@@ -455,7 +459,7 @@ def load_expert_banks(
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-            layer_residency=layer_residency,
+            layer_residency=layer_residency, disk_pager=disk_pager,
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")

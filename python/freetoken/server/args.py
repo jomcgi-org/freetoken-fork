@@ -649,6 +649,24 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-pager",
+        choices=["madvise", "uffd"],
+        default=ServerArgs.moe_disk_pager,
+        help=(
+            "DISK expert residency backend: 'madvise' keeps the existing file-mmap "
+            "path (default); Linux-only 'uffd' fills complete expert rows into an "
+            "anonymous userfaultfd region."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-pager-budget-gib",
+        type=float,
+        default=ServerArgs.moe_pager_budget_gib,
+        help="Maximum resident UFFD expert-row bytes in GiB (default: 40).",
+    )
+
+    parser.add_argument(
         "--moe-hybrid-max-fetch",
         type=int,
         default=ServerArgs.moe_hybrid_max_fetch,

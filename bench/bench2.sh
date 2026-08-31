@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Round-2 bench: prefill vs decode, short vs long prompts, per config.
-# Usage: CAP=64G LAYERS=auto BUDGET=52 PREFILL=cpu TAG=n4-cpuprefill MODEL=/mnt/nvme/flash.ftw OUT=/mnt/data/results2 bash bench2.sh
+# Usage: CAP=64G LAYERS=auto BUDGET=52 PREFILL=cpu PAGER=uffd PAGER_BUDGET=40 TAG=n4-uffd MODEL=/mnt/nvme/flash.ftw OUT=/mnt/data/results2 bash bench2.sh
 set -uo pipefail
 CAP="${CAP:-}"; LAYERS="${LAYERS:-auto}"; BUDGET="${BUDGET:-52}"
 PREFILL="${PREFILL:-cpu}"; TAG="${TAG:-bench2}"
+PAGER="${PAGER:-madvise}"; PAGER_BUDGET="${PAGER_BUDGET:-40}"
 MODEL="${MODEL:-/mnt/nvme/flash.ftw}"
 OUT="${OUT:-/mnt/data/results2}"; PORT="${PORT:-8100}"; mkdir -p "$OUT"
 
@@ -23,7 +24,8 @@ log() { echo "$@" | tee -a "$OUT/summary.txt"; }
 
 # ---- serve ----
 args=(--model "$MODEL" --moe-backend offload --moe-cache-auto \
-      --max-running-requests 1 --port "$PORT" --moe-disk-prefill "$PREFILL")
+      --max-running-requests 1 --port "$PORT" --moe-disk-prefill "$PREFILL" \
+      --moe-disk-pager "$PAGER" --moe-pager-budget-gib "$PAGER_BUDGET")
 [ "${PLE:-pinned}" != "pinned" ] && args+=(--ple-backend "${PLE}")
 [ -n "${PROFILE:-}" ] && args+=(--moe-disk-layer-profile "${PROFILE}")
 [ -n "${PLECACHE:-}" ] && args+=(--ple-cache-gib "${PLECACHE}")
@@ -54,7 +56,7 @@ until curl -sf --max-time 5 "localhost:$PORT/v1/models" >/dev/null; do
 done
 MODEL_ID=$(curl -s --max-time 5 "localhost:$PORT/v1/models" | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])")
 SPID=$(pgrep -f "ft serve --model $MODEL" | head -1)
-log "=== $TAG (layers=$LAYERS budget=$BUDGET cap=${CAP:-none} prefill=$PREFILL) ==="
+log "=== $TAG (layers=$LAYERS budget=$BUDGET cap=${CAP:-none} prefill=$PREFILL pager=$PAGER pager_budget=$PAGER_BUDGET) ==="
 # The API binds long before the engine is ready: retry the tiny completion until
 # it succeeds, but bail if the server process dies (never stack orphans).
 t0=$(date +%s)

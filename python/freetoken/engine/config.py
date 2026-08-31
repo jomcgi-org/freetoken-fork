@@ -58,6 +58,10 @@ class EngineConfig:
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"
+    # DISK bank residency backend. "madvise" preserves the file-mmap path; "uffd"
+    # installs FTW expert rows into anonymous mappings under a userspace LRU.
+    moe_disk_pager: str = "madvise"
+    moe_pager_budget_gib: float = 40.0
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
@@ -118,6 +122,16 @@ class EngineConfig:
                 "--moe-disk-prefill must be 'cpu' or 'copy', got "
                 f"{self.moe_disk_prefill!r}"
             )
+        if self.moe_disk_pager not in ("madvise", "uffd"):
+            raise ValueError(
+                "--moe-disk-pager must be 'madvise' or 'uffd', got "
+                f"{self.moe_disk_pager!r}"
+            )
+        if (
+            not math.isfinite(float(self.moe_pager_budget_gib))
+            or self.moe_pager_budget_gib <= 0
+        ):
+            raise ValueError("--moe-pager-budget-gib must be a finite positive number")
 
     @cached_property
     def hf_config(self):
