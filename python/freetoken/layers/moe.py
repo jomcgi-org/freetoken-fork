@@ -351,7 +351,10 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
-        if cache.is_hot_split_layer(self.layer_id):
+        # Optional-feature probe: custom caches (and the DSV4 fixtures) predate
+        # expert-granular residency and expose no hot-split surface.
+        is_hot_split = getattr(cache, "is_hot_split_layer", None)
+        if is_hot_split is not None and is_hot_split(self.layer_id):
             return self._decode_hot_split(cache, hidden_states, topk_weights, topk_ids)
         if cache.is_gpufetch_layer(self.layer_id):
             cache.ensure_experts(self.layer_id, topk_ids)
