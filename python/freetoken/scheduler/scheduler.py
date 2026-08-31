@@ -157,6 +157,7 @@ class Scheduler(SchedulerIOMixin):
                     f"disk distinct_experts/step: "
                     f"{disk['distinct_experts_per_step']:.2f}, "
                     f"disk dedup_ratio: {disk['dedup_ratio']:.2f}, "
+                    f"disk hot_pair_rate: {disk.get('hot_pair_rate', 0.0):.2%}, "
                     f"disk gpufetch fills/step: "
                     f"{disk['gpufetch_fills_per_step']:.2f}, "
                     f"disk gpufetch fill_us: {disk['gpufetch_fill_us']:.0f}"
@@ -720,7 +721,7 @@ class Scheduler(SchedulerIOMixin):
         request_id: str,
         status: str,
         *,
-        profile: dict[str, float] | None = None,
+        profile: dict | None = None,
         error: str | None = None,
     ) -> None:
         self.send_result(

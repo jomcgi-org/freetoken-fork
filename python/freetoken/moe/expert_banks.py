@@ -45,6 +45,11 @@ class ExpertBanks:
     down_alpha: torch.Tensor | None = field(default=None)
     # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
     layer_residency: list[str] | None = field(default=None)
+    # Compact pinned copies of profile-selected rows from DISK layers. Each schema
+    # entry is a num_layers-long list; entries outside the HOT partition are None.
+    # hot_expert_ids[layer] gives the original expert id for each compact row.
+    hot_sources: dict[str, list[torch.Tensor | None]] = field(default_factory=dict)
+    hot_expert_ids: dict[int, tuple[int, ...]] = field(default_factory=dict)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
@@ -386,6 +391,32 @@ def ftw_bank_bytes(model_path: str) -> int | None:
     return sum(t["nbytes"] for t in tensors if t.get("kind") == "experts_bank")
 
 
+def ftw_bank_byte_breakdown(model_path: str) -> tuple[int, int] | None:
+    """Return ``(row_bytes, fixed_bytes)`` for an FTW's expert-bank entries.
+
+    Row bytes are the per-expert tensors whose residency can be split. Fixed bytes
+    are the small alpha vectors that remain pinned regardless of layer residency.
+    ``None`` means the checkpoint is not FTW.
+    """
+    import json
+
+    meta = os.path.join(model_path, "freetoken_weight.json")
+    if not os.path.isfile(meta):
+        return None
+    with open(meta, encoding="utf-8") as f:
+        tensors = json.load(f).get("tensors", [])
+    row_bytes = fixed_bytes = 0
+    for tensor in tensors:
+        if tensor.get("kind") != "experts_bank":
+            continue
+        base = str(tensor.get("name", "")).split("#L", 1)[0]
+        if base in ("gate_up_alpha", "down_alpha"):
+            fixed_bytes += int(tensor["nbytes"])
+        else:
+            row_bytes += int(tensor["nbytes"])
+    return row_bytes, fixed_bytes
+
+
 def bank_bytes_estimate(model_config) -> int | None:
     """Estimated total expert-bank bytes of a raw checkpoint, from the model config alone.
 
@@ -405,6 +436,16 @@ def bank_bytes_estimate(model_config) -> int | None:
     return layers * experts * per_expert(hidden, inter)
 
 
+def bank_bytes_per_expert(model_config) -> int | None:
+    """Logical row-bank bytes for one expert in one layer."""
+    total = bank_bytes_estimate(model_config)
+    layers = getattr(model_config, "num_moe_layers", None)
+    experts = getattr(model_config, "num_experts", None)
+    if total is None or not layers or not experts:
+        return None
+    return total // (layers * experts)
+
+
 def load_expert_banks(
     model_path: str,
     model_config,
@@ -419,6 +460,7 @@ def load_expert_banks(
     layer_sink=None,
     layer_residency: list[str] | None = None,
     disk_pager=None,
+    hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -450,9 +492,11 @@ def load_expert_banks(
         layer_residency
         and HostResidency.DISK.value in layer_residency
     )
-    if wants_disk and (not model_path or not is_ftw_checkpoint(model_path)):
+    if (wants_disk or hot_expert_ids) and (
+        not model_path or not is_ftw_checkpoint(model_path)
+    ):
         raise ValueError(
-            "DISK expert-bank residency requires an FTW checkpoint; convert the model "
+            "DISK and HOT expert-bank residency require an FTW checkpoint; convert the model "
             "with `ft checkpoint` first"
         )
 
@@ -460,6 +504,7 @@ def load_expert_banks(
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency, disk_pager=disk_pager,
+            hot_expert_ids=hot_expert_ids,
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")

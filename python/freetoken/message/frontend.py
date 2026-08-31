@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -74,5 +74,5 @@ class CacheRebuildReply(BaseFrontendMsg):
 class MoeLayerProfileReply(BaseFrontendMsg):
     request_id: str
     status: str
-    profile: Dict[str, float] | None = None
+    profile: Dict[str, Any] | None = None
     error: str | None = None

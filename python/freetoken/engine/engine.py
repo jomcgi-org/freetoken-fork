@@ -594,6 +594,11 @@ class Engine:
                 "--moe-cache-auto is not supported for models with a custom "
                 "make_offload_moe_cache; pass --moe-cache-size explicitly."
             )
+        if cache_factory is not None and config.moe_hot_expert_budget_gib > 0:
+            raise NotImplementedError(
+                "--moe-hot-expert-budget-gib requires the standard FTW expert-bank "
+                "loader; this model provides a custom MoE cache"
+            )
         # decode_target picks the bank layout + the per-decode mechanism:
         #   "hybrid" -> GPU-cache + CPU-overflow co-compute, every layer (--moe-backend hybrid);
         #   "cpu"    -> CPU executor for the cpu_layer_ids set (all layers under --moe-backend
@@ -638,6 +643,12 @@ class Engine:
                 f"MoE DISK layers selected explicitly: {sorted(disk_layer_ids)}; "
                 "layer profile scores not consulted"
             )
+        hot_expert_ids = _resolve_hot_expert_sets(
+            config,
+            disk_layer_ids,
+            num_moe_layers,
+            reserved=self._host_tables_bytes,
+        )
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -711,6 +722,7 @@ class Engine:
                 ),
                 layer_residency=requested_residency,
                 disk_pager=disk_pager,
+                hot_expert_ids=hot_expert_ids,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -748,7 +760,12 @@ class Engine:
             )
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            cache.set_bank_sources(
+                banks.sources,
+                layer_residency=banks.layer_residency,
+                hot_sources=banks.hot_sources,
+                hot_expert_ids=banks.hot_expert_ids,
+            )
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             if disk_layer_ids and config.moe_disk_pager == "uffd":
@@ -1535,12 +1552,18 @@ def _head_tail_layers(num_moe_layers: int, count: int) -> frozenset[int]:
 def _load_disk_layer_profile(
     path: str, num_moe_layers: int,
 ) -> dict[int, float] | None:
-    """Load a complete layer-to-traffic mapping, warning on any unusable input."""
+    """Load complete layer scores from legacy v1 or versioned v2 profiles."""
     try:
         with open(os.path.expanduser(path), encoding="utf-8") as f:
             raw = json.load(f)
         if not isinstance(raw, dict):
             raise ValueError("top-level JSON value must be an object")
+        if "version" in raw:
+            if raw.get("version") != 2:
+                raise ValueError(f"unsupported profile version {raw.get('version')!r}")
+            raw = raw.get("layers")
+            if not isinstance(raw, dict):
+                raise ValueError("version 2 profile requires an object 'layers' section")
         scores: dict[int, float] = {}
         for raw_id, raw_score in raw.items():
             if not isinstance(raw_id, str) or not raw_id.isdecimal():
@@ -1573,6 +1596,183 @@ def _load_disk_layer_profile(
         return None
 
 
+def _load_hot_expert_profile(
+    path: str, num_moe_layers: int, num_experts: int,
+) -> dict[int, tuple[int, ...]]:
+    """Load and validate the v2 per-expert route-count section."""
+    with open(os.path.expanduser(path), encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict) or raw.get("version") != 2:
+        raise ValueError("HOT expert residency requires a version 2 layer profile")
+    section = raw.get("expert_hits")
+    if not isinstance(section, dict):
+        raise ValueError("version 2 profile requires an object 'expert_hits' section")
+    expected_layers = {str(layer_id) for layer_id in range(num_moe_layers)}
+    if set(section) != expected_layers:
+        missing = sorted(expected_layers - set(section), key=int)
+        extra = sorted(set(section) - expected_layers)
+        raise ValueError(
+            f"expert_hits must cover every MoE layer; missing={missing}, extra={extra}"
+        )
+    result: dict[int, tuple[int, ...]] = {}
+    for layer_id in range(num_moe_layers):
+        counts = section[str(layer_id)]
+        if not isinstance(counts, list) or len(counts) != num_experts:
+            raise ValueError(
+                f"expert_hits layer {layer_id} must contain exactly {num_experts} counts"
+            )
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 0
+            for count in counts
+        ):
+            raise ValueError(
+                f"expert_hits layer {layer_id} must contain non-negative integers"
+            )
+        result[layer_id] = tuple(counts)
+    return result
+
+
+def _plan_hot_experts(
+    expert_hits: dict[int, tuple[int, ...]],
+    disk_layer_ids: frozenset[int],
+    *,
+    budget_bytes: int,
+    expert_bytes: int,
+    num_experts: int,
+) -> dict[int, tuple[int, ...]]:
+    """Select the same top-N experts in each DISK layer under a byte budget.
+
+    Counts rank descending with expert id as the stable tie-break. Any remainder
+    smaller than one expert in every DISK layer is deliberately left unused so the
+    partition keeps the documented per-layer top-N shape.
+    """
+    if budget_bytes < 0 or expert_bytes <= 0 or num_experts <= 0:
+        raise ValueError("HOT planner geometry must be non-negative with positive rows")
+    if not disk_layer_ids or budget_bytes == 0:
+        return {}
+    missing = set(disk_layer_ids) - set(expert_hits)
+    if missing:
+        raise ValueError(f"profile has no expert counts for DISK layers {sorted(missing)}")
+    top_n = min(
+        num_experts,
+        budget_bytes // (expert_bytes * len(disk_layer_ids)),
+    )
+    if top_n <= 0:
+        return {}
+    plan = {}
+    for layer_id in sorted(disk_layer_ids):
+        counts = expert_hits[layer_id]
+        if len(counts) != num_experts:
+            raise ValueError(
+                f"profile layer {layer_id} has {len(counts)} experts, expected {num_experts}"
+            )
+        ranked = sorted(range(num_experts), key=lambda expert_id: (-counts[expert_id], expert_id))
+        # Compact source row order is expert-id order, independent of rank order.
+        plan[layer_id] = tuple(sorted(ranked[:top_n]))
+    return plan
+
+
+def _profiled_hot_pair_rate(
+    expert_hits: dict[int, tuple[int, ...]],
+    hot_expert_ids: dict[int, tuple[int, ...]],
+) -> float:
+    total = sum(sum(expert_hits[layer_id]) for layer_id in hot_expert_ids)
+    hot = sum(
+        sum(expert_hits[layer_id][expert_id] for expert_id in experts)
+        for layer_id, experts in hot_expert_ids.items()
+    )
+    return hot / total if total else 0.0
+
+
+def _resolve_hot_expert_sets(
+    config: EngineConfig,
+    disk_layer_ids: frozenset[int],
+    num_moe_layers: int,
+    *,
+    reserved: int = 0,
+) -> dict[int, tuple[int, ...]]:
+    """Resolve profile, logical row bytes, and the shared CUDA pin ceiling."""
+    requested = int(config.moe_hot_expert_budget_gib * 2**30)
+    if requested <= 0:
+        return {}
+    if not disk_layer_ids:
+        raise ValueError("--moe-hot-expert-budget-gib requires at least one DISK layer")
+    if config.moe_disk_decode != "cpu":
+        raise ValueError(
+            "--moe-hot-expert-budget-gib requires --moe-disk-decode cpu"
+        )
+    if not config.moe_disk_layer_profile:
+        raise ValueError(
+            "--moe-hot-expert-budget-gib requires --moe-disk-layer-profile"
+        )
+    num_experts = config.model_config.num_experts
+    try:
+        hits = _load_hot_expert_profile(
+            config.moe_disk_layer_profile, num_moe_layers, num_experts
+        )
+    except (OSError, OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"--moe-disk-layer-profile is unusable for HOT experts: {exc}"
+        ) from exc
+
+    from freetoken.moe.expert_banks import (
+        bank_bytes_per_expert,
+        ftw_bank_byte_breakdown,
+    )
+
+    breakdown = ftw_bank_byte_breakdown(config.model_path)
+    if breakdown is not None:
+        row_total, fixed_bytes = breakdown
+        divisor = num_moe_layers * num_experts
+        if row_total % divisor:
+            raise ValueError(
+                f"FTW expert row bytes {row_total} are not divisible by {divisor}"
+            )
+        expert_bytes = row_total // divisor
+    else:
+        expert_bytes = bank_bytes_per_expert(config.model_config)
+        fixed_bytes = 0
+    if not expert_bytes:
+        raise ValueError("could not determine bytes per expert for HOT residency")
+
+    pinned_whole = (
+        fixed_bytes
+        + (num_moe_layers - len(disk_layer_ids)) * num_experts * expert_bytes
+    )
+    budget = _pin_budget_bytes(reserved)
+    effective = requested
+    if budget is not None:
+        available = max(0, budget - pinned_whole)
+        effective = min(effective, available)
+        if effective < requested:
+            logger.warning_rank0(
+                f"HOT expert budget clipped from {requested / 2**30:.2f} to "
+                f"{effective / 2**30:.2f} GiB by FREETOKEN_PIN_BUDGET_GB after "
+                "whole-layer and fixed-bank pin accounting"
+            )
+    plan = _plan_hot_experts(
+        hits,
+        disk_layer_ids,
+        budget_bytes=effective,
+        expert_bytes=expert_bytes,
+        num_experts=num_experts,
+    )
+    if not plan:
+        logger.warning_rank0(
+            "HOT expert budget cannot fit one expert in every DISK layer; "
+            "expert-granular residency is disabled"
+        )
+        return {}
+    top_n = len(next(iter(plan.values())))
+    actual = top_n * len(plan) * expert_bytes
+    logger.info_rank0(
+        f"MoE HOT expert plan: top {top_n}/{num_experts} experts in each of "
+        f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB pinned, profiled "
+        f"hot_pair_rate={_profiled_hot_pair_rate(hits, plan):.1%}"
+    )
+    return plan
+
+
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
     """Pick CPU MoE layers automatically when banks exceed the pin budget.
 
@@ -1586,7 +1786,10 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
     bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
     if not bank_bytes:
         return frozenset()
-    budget = _pin_budget_bytes(reserved)
+    hot_reserve = int(
+        max(0.0, float(getattr(config, "moe_hot_expert_budget_gib", 0.0))) * 2**30
+    )
+    budget = _pin_budget_bytes(reserved + hot_reserve)
     if budget is None or bank_bytes <= budget:
         return frozenset()
     if not _cpu_moe_executor_viable(config.model_config):
@@ -1637,6 +1840,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_layers": None,
     "moe_disk_layers": None,
     "moe_disk_layer_profile": None,
+    "moe_hot_expert_budget_gib": 0.0,
     "moe_disk_prefill": "cpu",
     "moe_disk_decode": "cpu",
     "moe_disk_pager": "madvise",
@@ -1968,6 +2172,27 @@ def _adjust_config(config: EngineConfig):
             raise ValueError(
                 "--moe-disk-layers requires an FTW checkpoint; convert this model with "
                 "`ft checkpoint` first"
+            )
+
+    if is_moe and config.moe_hot_expert_budget_gib > 0:
+        if config.moe_backend not in ("offload", "hybrid", "cpu"):
+            raise ValueError(
+                "--moe-hot-expert-budget-gib requires --moe-backend offload, hybrid, "
+                f"or cpu (got {config.moe_backend!r})"
+            )
+        if config.moe_disk_decode != "cpu":
+            raise ValueError(
+                "--moe-hot-expert-budget-gib requires --moe-disk-decode cpu"
+            )
+        if not config.moe_disk_layer_profile:
+            raise ValueError(
+                "--moe-hot-expert-budget-gib requires --moe-disk-layer-profile"
+            )
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+        if not config.model_path or not is_ftw_checkpoint(config.model_path):
+            raise ValueError(
+                "--moe-hot-expert-budget-gib requires an FTW checkpoint"
             )
 
     if is_moe:

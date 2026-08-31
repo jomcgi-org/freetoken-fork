@@ -60,6 +60,17 @@ def ensure_experts_hybrid(
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
 
 
+def ensure_experts_hot(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """Static HOT/COLD split for a file-backed DISK layer.
+
+    HOT experts use normal LRU slots and compact pinned source rows. COLD routes are
+    rewritten to -1 for the CPU partial. The single fixed-shape launch is graph-safe.
+    """
+    if not expert_ids.is_cuda:
+        return _ensure_experts_hot_cpu(cache, layer_id, expert_ids)
+    _ensure_experts_hot_gpu(cache, layer_id, expert_ids)
+
+
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     """Compact this layer's cache-resident experts into gather indices, device-side.
 
@@ -125,6 +136,33 @@ def _ensure_experts_hybrid_gpu(
     )
 
 
+def _ensure_experts_hot_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    block_e = triton.next_power_of_2(cache.num_experts)
+    block_c = triton.next_power_of_2(cache.cache_size)
+    _ensure_experts_hot_kernel[(1,)](
+        expert_ids,
+        cache.hot_row_for_expert,
+        cache.slot_for_id,
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        cache.active_mask,
+        cache.evict_slots,
+        cache.src_indices,
+        cache.num_indices,
+        cache.num_missing_full,
+        cache.stat_hot_pairs,
+        cache.stat_hot_total_pairs,
+        layer_id,
+        expert_ids.numel(),
+        cache.num_experts,
+        cache.cache_size,
+        BLOCK_E=block_e,
+        BLOCK_C=block_c,
+        num_warps=8 if block_c >= 2048 else 4,
+    )
+
+
 def _ensure_experts_hybrid_cpu(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
 ) -> None:
@@ -186,6 +224,61 @@ def _ensure_experts_hybrid_cpu(
     flat = expert_ids.view(-1)
     for i in range(flat.numel()):
         flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
+
+
+def _ensure_experts_hot_cpu(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """CPU reference for the static HOT/COLD split kernel."""
+    raw = [int(expert) for expert in expert_ids.view(-1).tolist()]
+    hot_row = cache.hot_row_for_expert[layer_id].tolist()
+    seen_hot = []
+    for expert in raw:
+        if hot_row[expert] >= 0 and expert not in seen_hot:
+            seen_hot.append(expert)
+
+    cache.active_mask.zero_()
+    step = int(cache.step.item()) + 1
+    cache.step.fill_(step)
+    for expert in seen_hot:
+        cache.active_mask[expert] = 1
+        slot = int(cache.slot_for_id[layer_id, expert].item())
+        if slot >= 0:
+            cache.usage[slot] = step
+
+    missing = sorted(
+        expert for expert in seen_hot
+        if int(cache.slot_for_id[layer_id, expert].item()) < 0
+    )
+    cache.num_missing_full.fill_(len(missing))
+    cache.num_indices.fill_(len(missing))
+    usage = cache.usage.tolist()
+    active_ids = {
+        layer_id * cache.num_experts + expert for expert in seen_hot
+    }
+    for idx, expert in enumerate(missing):
+        candidates = [
+            slot for slot in range(cache.cache_size)
+            if int(cache.id_of_slot[slot].item()) not in active_ids
+        ]
+        victim = min(candidates, key=lambda slot: (usage[slot], slot))
+        old_id = int(cache.id_of_slot[victim].item())
+        if old_id >= 0:
+            cache.slot_for_id.view(-1)[old_id] = -1
+        cache.id_of_slot[victim] = layer_id * cache.num_experts + expert
+        cache.slot_for_id[layer_id, expert] = victim
+        cache.usage[victim] = step
+        usage[victim] = step
+        cache.evict_slots[idx] = victim
+        cache.src_indices[idx] = hot_row[expert]
+
+    hot_pairs = sum(hot_row[expert] >= 0 for expert in raw)
+    cache.stat_hot_pairs += hot_pairs
+    cache.stat_hot_total_pairs += len(raw)
+    flat = expert_ids.view(-1)
+    for idx, expert in enumerate(raw):
+        flat[idx] = (
+            int(cache.slot_for_id[layer_id, expert].item())
+            if hot_row[expert] >= 0 else -1
+        )
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:
@@ -408,6 +501,103 @@ def _ensure_experts_hybrid_kernel(
     if BY_RECENCY:
         step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
+
+
+@triton.jit(do_not_specialize=["layer_id", "num_active"])
+def _ensure_experts_hot_kernel(
+    expert_ids_ptr,
+    hot_row_ptr,
+    slot_for_id_ptr,
+    id_of_slot_ptr,
+    usage_ptr,
+    step_ptr,
+    active_mask_ptr,
+    evict_slots_ptr,
+    src_indices_ptr,
+    num_indices_ptr,
+    num_missing_full_ptr,
+    stat_hot_pairs_ptr,
+    stat_total_pairs_ptr,
+    layer_id,
+    num_active,
+    num_experts: tl.constexpr,
+    cache_size: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Timestamp-LRU restricted to a static HOT set.
+
+    ``hot_row_ptr`` maps original expert ids to compact pinned source rows, or -1
+    for COLD experts. Every HOT miss is installed. COLD pairs are rewritten to -1
+    and therefore run only in the CPU doorbell task.
+    """
+    step = tl.load(step_ptr) + 1
+    tl.store(step_ptr, step)
+    base = layer_id * num_experts
+    off_e = tl.arange(0, BLOCK_E)
+    e_mask = off_e < num_experts
+    compact_row = tl.load(hot_row_ptr + base + off_e, mask=e_mask, other=-1)
+    eligible = compact_row >= 0
+    pair_count = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    for i in tl.range(num_active):
+        expert = tl.load(expert_ids_ptr + i)
+        pair_count += ((off_e == expert) & eligible).to(tl.int32)
+    is_active = pair_count > 0
+    hot_pairs = tl.sum(pair_count)
+    tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
+    slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
+    is_missing = is_active & eligible & (slot < 0) & e_mask
+    missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
+    num_missing = tl.sum(is_missing.to(tl.int32))
+    tl.store(num_indices_ptr, num_missing.to(tl.int64))
+    tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
+    tl.store(stat_hot_pairs_ptr, tl.load(stat_hot_pairs_ptr) + hot_pairs.to(tl.int64))
+    tl.store(
+        stat_total_pairs_ptr,
+        tl.load(stat_total_pairs_ptr) + num_active.to(tl.int64),
+    )
+    tl.store(usage_ptr + slot, step, mask=is_active & (slot >= 0))
+
+    if num_missing > 0:
+        off_c = tl.arange(0, BLOCK_C)
+        c_mask = off_c < cache_size
+        owner = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
+        usage = tl.load(
+            usage_ptr + off_c,
+            mask=c_mask,
+            other=9223372036854775807,
+        ).to(tl.int64)
+        owner_active = c_mask & False
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            is_hot = tl.load(hot_row_ptr + base + expert) >= 0
+            owner_active = owner_active | ((owner == base + expert) & is_hot)
+        usage = tl.where(
+            owner_active | (~c_mask), 9223372036854775807, usage
+        )
+        for i in tl.range(num_missing):
+            victim = tl.argmin(usage, axis=0).to(tl.int32)
+            old_id = tl.sum(tl.where(off_c == victim, owner, 0))
+            if old_id >= 0:
+                tl.store(slot_for_id_ptr + old_id, -1)
+            expert = tl.sum(tl.where((missing_rank == i) & is_missing, off_e, 0))
+            source_row = tl.sum(
+                tl.where(off_e == expert, compact_row, 0)
+            ).to(tl.int32)
+            tl.store(id_of_slot_ptr + victim, base + expert)
+            tl.store(slot_for_id_ptr + base + expert, victim)
+            tl.store(usage_ptr + victim, step)
+            tl.store(evict_slots_ptr + i, victim)
+            tl.store(src_indices_ptr + i, source_row)
+            usage = tl.where(
+                off_c == victim, 9223372036854775807, usage
+            )
+
+    for i in tl.range(num_active):
+        expert = tl.load(expert_ids_ptr + i)
+        is_hot = tl.load(hot_row_ptr + base + expert) >= 0
+        result = tl.load(slot_for_id_ptr + base + expert)
+        tl.store(expert_ids_ptr + i, tl.where(is_hot, result, -1))
 
 
 @triton.jit(do_not_specialize=["buffer_base"])

@@ -629,9 +629,21 @@ def parse_args(
         type=str,
         default=ServerArgs.moe_disk_layer_profile,
         help=(
-            "JSON object mapping every MoE layer id to a traffic score. When the pin "
-            "budget automatically spills FTW layers to DISK, the lowest-score layers "
-            "are selected. Explicit --moe-disk-layers takes precedence."
+            "Versioned JSON profile with per-layer traffic scores and per-expert route "
+            "counts. Automatic FTW spill selects the lowest-score layers; HOT expert "
+            "residency uses the expert_hits section. Legacy flat layer-score objects "
+            "remain accepted. Explicit --moe-disk-layers takes precedence."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-expert-budget-gib",
+        type=float,
+        default=ServerArgs.moe_hot_expert_budget_gib,
+        help=(
+            "Pinned-host byte budget for profile-selected HOT experts inside DISK "
+            "layers. Requires the versioned per-expert layer profile and DISK CPU "
+            "decode. 0 disables expert-granular residency."
         ),
     )
 

@@ -113,7 +113,7 @@ class MoeLayerProfileResultMsg(BaseTokenizerMsg):
     """Scheduler -> tokenizer worker profile snapshot passthrough."""
     request_id: str
     status: str
-    profile: Dict[str, float] | None = None
+    profile: Dict[str, Any] | None = None
     error: str | None = None
 
 

@@ -417,7 +417,13 @@ def test_moe_layer_profile_serializer_uses_realized_misses_per_step():
         ]
     }
 
-    assert serialize_moe_layer_profile(stats) == {"0": 1.25, "1": 0.0, "2": 3.5}
+    assert serialize_moe_layer_profile(
+        stats, [[4, 1], [0, 0], [2, 7]],
+    ) == {
+        "version": 2,
+        "layers": {"0": 1.25, "1": 0.0, "2": 3.5},
+        "expert_hits": {"0": [4, 1], "1": [0, 0], "2": [2, 7]},
+    }
 
 
 def test_adjust_config_converts_moe_cache_rate_to_cache_size():

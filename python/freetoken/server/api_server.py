@@ -606,7 +606,7 @@ def _resolve_num_swa_pages(state: FrontendManager, req: CacheRebuildRequest) -> 
 
 @app.get("/v1/moe-layer-profile")
 async def moe_layer_profile(timeout: float = 10.0):
-    """Return a JSON layer-to-misses-per-step mapping suitable for boot selection."""
+    """Return versioned layer traffic and per-expert route counts."""
     state = get_global_state()
     if state.maintenance_state != "serving":
         return JSONResponse(
