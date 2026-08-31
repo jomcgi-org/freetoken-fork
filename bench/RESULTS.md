@@ -439,3 +439,54 @@ efficiency headline.
 - CUDA graph-bs tuning (low value at MRR=8 optimum).
 - MTP speculative decode (parked, Sol-failed-twice; would multiply x1).
 - +64GB RAM: still the biggest single lever (~36 x1 all-pinned upstream).
+
+### Single-stream hunt (stage 15, same day)
+
+- **budget46 + merged tier: x1 19.5 tok/s (new interactive champion), x8 33.2.**
+  Prefill-overlap compounds with the bigger pin budget.
+- budget50 + uffd(6GiB): x1 10.0 - the pager budget was far below the ~24G
+  spill working set, so every install evicted (1.6M evictions). Law: UFFD
+  pays only when its budget covers the working set; it is the
+  bigger-than-RAM lane, not a throughput lane.
+- hybrid backend (PCIe-fetch split): x1 13.8 / x8 29.9 - loses to plain
+  offload, consistent with the gpufetch result: on this box CPU compute
+  beats PCIe expert fetch.
+
+Interactive serving config of record: FREETOKEN_PIN_BUDGET_GB=46, HMM PLE,
+layer profile, MRR=8: **19.5 x1 / 116 prefill / 33 x8**.
+
+## Predictive round (2026-08-31 evening): expert-granular residency breaks both ceilings
+
+- **Expert-granular residency** (--moe-hot-expert-budget-gib, v2 per-expert
+  profiles): profile-hot expert rows of DISK layers pin under a byte budget
+  and route through the GPU slot cache; the cold tail keeps CPU decode.
+  **x1 19.5 -> 23.1, x8 34.0 -> 42.2** (profile-matched workload, hot rate
+  72.5%, distinct CPU experts/step 58 -> 18). Broke the computed DDR wall
+  by moving the Zipf head off the CPU tier. 2D sweep: pin40 + hot6 is the
+  true optimum (44/4 and 36/8 both lose - the same three-tier balance law).
+- Sustained real-world (diverse-traffic profile, hot rate 62%): x1 ~21,
+  **x8 35.6-37.4 tok/s at 138W avg / 197W peak**, quality 5/5.
+- Profile-workload fit matters: hot rate 72% -> 62% when traffic diverges
+  from the capture. Direct motivation for online hot-set adaptation
+  (top open item).
+- **Lookahead prefetch**: negative (48% next-step prediction accuracy
+  nearly doubles advised pages). Merged default-off with stats.
+- **MTP K=1 re-test on the hot config**: still negative (12.6 vs 18.0).
+  Final verdict: speculation does not pay while any meaningful share of
+  marginal-token cost lands on the CPU tier. Closed.
+
+### Numbers of record (4090 24GB + 64GB RAM, 125B-A6B, quality 5/5)
+
+| metric | value |
+|---|---|
+| warm prefill (441 tok) | 116 tok/s |
+| x1 peak / sustained-diverse | 23.1 / ~21 tok/s |
+| x8 peak / sustained-diverse | 42.2 / ~37 tok/s |
+| GPU power under x8 | 138W avg |
+| day-1 baseline for contrast | 3.8 x1 / 9.6 x8 |
+
+### Open items after this round
+
+1. Online hot-set adaptation (evidence: the 72->62% drift above).
+2. CPU/GPU layer pipelining (structural x1 lever, unattempted).
+3. UFFD stays the bigger-than-RAM capacity lane.
