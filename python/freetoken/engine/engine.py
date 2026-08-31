@@ -2174,7 +2174,7 @@ def _adjust_config(config: EngineConfig):
                 "`ft checkpoint` first"
             )
 
-    if is_moe and config.moe_hot_expert_budget_gib > 0:
+    if is_moe and getattr(config, "moe_hot_expert_budget_gib", 0.0) > 0:
         if config.moe_backend not in ("offload", "hybrid", "cpu"):
             raise ValueError(
                 "--moe-hot-expert-budget-gib requires --moe-backend offload, hybrid, "
