@@ -61,7 +61,15 @@ def tp1(monkeypatch):
     return tp_info
 
 
-def _make_offload_cache(config, device, *, cache_size=None, prefill_overlap=False):
+def _make_offload_cache(
+    config,
+    device,
+    *,
+    cache_size=None,
+    prefill_overlap=False,
+    layer_residency=None,
+    cpu_layer_ids=(),
+):
     from freetoken.moe.expert_banks import load_expert_banks
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -81,7 +89,13 @@ def _make_offload_cache(config, device, *, cache_size=None, prefill_overlap=Fals
         prefill_overlap=prefill_overlap,
         quant_format=banks.quant_format,
     )
-    cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+    cache.cpu_layer_ids = frozenset(cpu_layer_ids)
+    cache.set_bank_sources(
+        banks.sources,
+        layer_residency=(
+            banks.layer_residency if layer_residency is None else layer_residency
+        ),
+    )
     cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
     return cache
 
@@ -251,8 +265,7 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
     E, H, tk = c.num_experts, c.hidden_size, c.num_experts_per_tok
 
     cache = _make_offload_cache(c, dev, prefill_overlap=True)
-    # layer_id=0 is mandatory: _wait_prefill_overlap gates begin_prefill() on layer_id==0,
-    # so only layer 0 exercises the previously-crashing code path.
+    # Layer 0 starts the overlap epoch and exercises the original crash path.
     layer = GptOssMxfp4OffloadMoELayer(c, layer_id=0)
     layer.offload_cache = cache
 
@@ -272,3 +285,58 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
     )
     max_diff = (out_overlap - out_ref).abs().max().item()
     assert torch.equal(out_overlap, out_ref), f"overlap prefill differs; max_diff={max_diff}"
+
+
+@CUDA
+def test_split_residency_prefill_is_bit_identical(tp1):
+    """A LOCKED layer stays synchronous while the following pinned layer overlaps."""
+    from freetoken.models.gpt_oss.moe import GptOssMxfp4OffloadMoELayer
+    from freetoken.moe.fused_mxfp4 import (
+        run_mxfp4_prefill_experts_t as _run_mxfp4_prefill_experts_t,
+    )
+
+    dev = torch.device("cuda")
+    c = _tiny_config()
+    E, H, tk = c.num_experts, c.hidden_size, c.num_experts_per_tok
+    cache = _make_offload_cache(
+        c,
+        dev,
+        prefill_overlap=True,
+        layer_residency=["locked", "pinned"],
+        cpu_layer_ids={0},
+    )
+    layers = [GptOssMxfp4OffloadMoELayer(c, layer_id=i) for i in range(2)]
+    for layer in layers:
+        layer.offload_cache = cache
+
+    torch.manual_seed(7)
+    hidden = 0.1 * torch.randn(16, H, device=dev, dtype=torch.bfloat16)
+
+    def direct(layer_id, x, weights, ids):
+        bank = lambda name: cache.bank_sources[name][layer_id].to(dev)
+        return _run_mxfp4_prefill_experts_t(
+            x,
+            weights,
+            ids,
+            bank("gate_up_blocks"),
+            bank("gate_up_scales"),
+            bank("gate_up_bias"),
+            bank("down_blocks"),
+            bank("down_scales"),
+            bank("down_bias"),
+            top_k=tk,
+            hidden_act_alpha=c.hidden_act_alpha,
+            swiglu_limit=c.swiglu_limit,
+        )
+
+    out = hidden
+    expected = hidden
+    for layer_id, layer in enumerate(layers):
+        logits = torch.randn(16, E, device=dev, dtype=torch.bfloat16)
+        weights, ids = layer._topk(logits.contiguous())
+        out = layer._prefill_routed(out, weights, ids.clone())
+        expected = direct(layer_id, expected, weights, ids)
+        assert torch.equal(out, expected), f"split prefill differs at layer {layer_id}"
+
+    assert cache._prefill_overlap_buffer_ids == [-1, 1]
+    assert cache.prefill_path_counts() == (1, 1, 0)

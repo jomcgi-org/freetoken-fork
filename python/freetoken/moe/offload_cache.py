@@ -221,6 +221,10 @@ class OffloadMoeCache:
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
+        # Effective per-layer overlap plan. Non-pinned layers never appear here.
+        # Buffer ids alternate across pinned layers, except that a synchronous
+        # pageable layer reserves buffer 0 for its whole-layer materialization.
+        self._prefill_overlap_buffer_ids: list[int] = [-1] * self.num_layers
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -312,8 +316,11 @@ class OffloadMoeCache:
         repackers (see ``_BANK_SCHEMAS`` and :mod:`freetoken.moe.nvfp4_backends`)
         -- the cache machinery is layout-agnostic and just moves rows.
 
-        ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE/DISK) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch, which is why prefill overlap is incompatible with them.
+        ``layer_residency`` labels each layer with a ``HostResidency`` value
+        (default: all pinned). Non-pinned (LOCKED/PAGEABLE/DISK) layers have no
+        device address: they must already be routed to the CPU executor
+        (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows,
+        and prefill overlap remains enabled only for the pinned layers.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -335,13 +342,9 @@ class OffloadMoeCache:
                     f"cpu_layer_ids: a layer without a device address can only decode on "
                     f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
                 )
-            if self.prefill_overlap:
-                raise ValueError(
-                    "prefill overlap DMAs from registered banks; it must be disabled "
-                    "when any layer is LOCKED/PAGEABLE (the engine does this)"
-                )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        self._configure_prefill_overlap_layers()
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
@@ -360,8 +363,43 @@ class OffloadMoeCache:
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
-        if self.prefill_overlap:
+        if any(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids):
             self._init_prefill_overlap_buffers()
+
+    def _configure_prefill_overlap_layers(self) -> None:
+        """Build the pinned-layer double-buffer schedule.
+
+        A synchronous pageable prefill materializes into slots ``[0, E)``, which
+        alias overlap buffer 0. The next pinned layer therefore uses buffer 1 so
+        its asynchronous copy can overlap that pageable layer's GEMM safely.
+        DISK layers using CPU prefill do not touch either buffer.
+        """
+        self._prefill_overlap_buffer_ids = [-1] * self.num_layers
+        if not self.prefill_overlap:
+            return
+        next_buffer = 0
+        for layer_id, residency in enumerate(self.layer_residency):
+            if layer_id not in self._unpinned_layers:
+                self._prefill_overlap_buffer_ids[layer_id] = next_buffer
+                next_buffer ^= 1
+            elif residency != "disk" or self.moe_disk_prefill != "cpu":
+                next_buffer = 1
+
+    def prefill_overlap_for_layer(self, layer_id: int) -> bool:
+        """Whether this pinned layer uses the prefill double-buffer path."""
+        return (
+            0 <= layer_id < self.num_layers
+            and self._prefill_overlap_buffer_ids[layer_id] >= 0
+        )
+
+    def prefill_path_counts(self) -> tuple[int, int, int]:
+        """Return boot-time counts for overlap, synchronous, and CPU prefill."""
+        overlap = sum(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids)
+        cpu = sum(
+            residency == "disk" and self.moe_disk_prefill == "cpu"
+            for residency in self.layer_residency
+        )
+        return overlap, self.num_layers - overlap - cpu, cpu
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -511,7 +549,8 @@ class OffloadMoeCache:
                 f"< 2*num_experts {2 * self.num_experts}."
             )
             self.prefill_overlap = False
-        if self.prefill_overlap:
+        self._configure_prefill_overlap_layers()
+        if any(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids):
             self._init_prefill_overlap_buffers()
 
     def set_alphas(
@@ -636,7 +675,7 @@ class OffloadMoeCache:
         self.usage[slot_start:slot_end].zero_()
 
     def begin_prefill(self) -> None:
-        if not self.prefill_overlap:
+        if not any(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids):
             return
         self._prefill_buffer_layer = [None, None]
         self._prefill_buffer_released = [True, True]
@@ -663,10 +702,14 @@ class OffloadMoeCache:
             return
         if layer_id < 0:
             raise ValueError(f"Invalid prefill layer id: {layer_id}")
+        if not self.prefill_overlap_for_layer(layer_id):
+            raise RuntimeError(
+                f"layer {layer_id} is unpinned and cannot use prefill overlap"
+            )
 
         assert self.banks and self.prefill_bank_buffers
 
-        buffer_id = layer_id % 2
+        buffer_id = self._prefill_overlap_buffer_ids[layer_id]
         if self._prefill_buffer_layer[buffer_id] == layer_id:
             return
         if self._prefill_buffer_layer[buffer_id] is not None:
@@ -813,10 +856,13 @@ class OffloadMoeCache:
         registered bank in registration order: bf16 ``(gate_up, down)``; nvfp4
         marlin/b12x ``(gate_up_packed, gate_up_scale, down_packed, down_scale)``;
         nvfp4 native adds the two global banks after each scale bank."""
-        assert self.prefill_overlap
+        if not self.prefill_overlap_for_layer(layer_id):
+            raise RuntimeError(
+                f"layer {layer_id} is unpinned and cannot use prefill overlap"
+            )
         assert self.prefill_bank_buffers
         self.prefetch_prefill_layer(layer_id)
-        buffer_id = layer_id % 2
+        buffer_id = self._prefill_overlap_buffer_ids[layer_id]
         assert self._prefill_buffer_layer[buffer_id] == layer_id
         if self.prefill_ready_events:
             torch.cuda.current_stream(self.device).wait_event(self.prefill_ready_events[buffer_id])
@@ -825,7 +871,11 @@ class OffloadMoeCache:
     def release_prefill_layer(self, layer_id: int) -> None:
         if not self.prefill_overlap:
             return
-        buffer_id = layer_id % 2
+        if not self.prefill_overlap_for_layer(layer_id):
+            raise RuntimeError(
+                f"layer {layer_id} is unpinned and cannot use prefill overlap"
+            )
+        buffer_id = self._prefill_overlap_buffer_ids[layer_id]
         if self._prefill_buffer_layer[buffer_id] != layer_id:
             return
         if self.prefill_release_events:

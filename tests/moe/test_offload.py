@@ -206,6 +206,8 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
     prefill_gate_up_buffer, prefill_down_buffer = cache.prefill_bank_buffers
     assert prefill_gate_up_buffer.data_ptr() == cache.bank_caches["gate_up"].data_ptr()
     assert prefill_down_buffer.data_ptr() == cache.bank_caches["down"].data_ptr()
+    assert cache._prefill_overlap_buffer_ids == [0, 1, 0]
+    assert cache.prefill_path_counts() == (num_layers, 0, 0)
 
 
 def test_offload_moe_cache_prefill_overlap_requires_two_layer_slots():
@@ -743,8 +745,7 @@ def test_set_bank_sources_locked_layer_requires_cpu_layer_ids():
         )
 
 
-def test_set_bank_sources_locked_layer_rejects_prefill_overlap():
-    # prefill overlap DMAs from registered banks; a LOCKED layer cannot feed it
+def test_set_bank_sources_limits_prefill_overlap_to_pinned_layers():
     from freetoken.moe.host_banks import HostResidency
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -758,11 +759,132 @@ def test_set_bank_sources_locked_layer_rejects_prefill_overlap():
         "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
         "down": [torch.randn(4, 8, 16) for _ in range(2)],
     }
-    with pytest.raises(ValueError, match="[Pp]refill overlap"):
-        cache.set_bank_sources(
-            sources,
-            layer_residency=[HostResidency.PINNED.value, HostResidency.LOCKED.value],
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.PINNED.value, HostResidency.LOCKED.value],
+    )
+
+    assert cache.prefill_overlap_for_layer(0)
+    assert not cache.prefill_overlap_for_layer(1)
+    assert cache.prefill_path_counts() == (1, 1, 0)
+    assert len(cache.prefill_bank_buffers) == 2
+    with pytest.raises(RuntimeError, match="unpinned.*cannot use prefill overlap"):
+        cache.prefetch_prefill_layer(1)
+
+
+def test_split_residency_prefill_overlap_matches_synchronous_output(monkeypatch):
+    """Pinned layers overlap while DISK and LOCKED layers retain their old paths."""
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    num_layers = 4
+    num_experts = 4
+    residency = [
+        HostResidency.PINNED.value,
+        HostResidency.DISK.value,
+        HostResidency.PINNED.value,
+        HostResidency.LOCKED.value,
+    ]
+    sources = {
+        "gate_up": [
+            torch.full((num_experts, 32, 8), layer_id + 1.0)
+            for layer_id in range(num_layers)
+        ],
+        "down": [
+            torch.full((num_experts, 8, 16), 10.0 * (layer_id + 1))
+            for layer_id in range(num_layers)
+        ],
+    }
+
+    class FakeCpuExecutor:
+        def __init__(self):
+            self.prefetched = []
+
+        def prefetch_experts(self, layer_id, expert_ids, *, is_prefill):
+            self.prefetched.append((layer_id, is_prefill))
+            return 0
+
+        def prefill(self, layer_id, hidden_states, topk_weights, topk_ids):
+            return hidden_states + 1000.0 * (layer_id + 1)
+
+    def make(overlap):
+        cache = OffloadMoeCache(
+            num_layers=num_layers,
+            num_experts=num_experts,
+            cache_size=2 * num_experts,
+            device=torch.device("cpu"),
+            prefill_overlap=overlap,
+            moe_disk_prefill="cpu",
         )
+        cache.cpu_layer_ids = frozenset({1, 3})
+        cache.set_bank_sources(sources, layer_residency=residency)
+        cache.cpu_executor = FakeCpuExecutor()
+        layers = [
+            OffloadMoELayer(
+                layer_id=layer_id,
+                num_experts=num_experts,
+                top_k=2,
+                hidden_size=8,
+                intermediate_size=16,
+            )
+            for layer_id in range(num_layers)
+        ]
+        for layer in layers:
+            layer.offload_cache = cache
+        return cache, layers
+
+    def fake_materialize(self, layer_id):
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = True
+
+    def synchronous_copy(self):
+        layer_id = self._pending_src_layer
+        assert layer_id is not None
+        for per_layer, target in self.banks:
+            target[: self.num_experts].copy_(per_layer[layer_id])
+
+    def fake_expert_gemm(
+        self,
+        cache,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        *,
+        views,
+        n,
+        alphas,
+        is_prefill,
+    ):
+        checksum = sum(view.float().sum() for view in views)
+        return hidden_states + checksum.to(hidden_states.dtype)
+
+    monkeypatch.setattr(OffloadMoeCache, "materialize_layer", fake_materialize)
+    monkeypatch.setattr(OffloadMoeCache, "copy_missing", synchronous_copy)
+    monkeypatch.setattr(OffloadMoELayer, "_expert_gemm", fake_expert_gemm)
+
+    overlap_cache, overlap_layers = make(True)
+    sync_cache, sync_layers = make(False)
+    hidden = torch.zeros(1, 8)
+    topk_weights = torch.tensor([[0.75, 0.25]])
+    topk_ids = torch.tensor([[0, 2]], dtype=torch.int32)
+
+    def run(layers):
+        out = hidden
+        for layer in layers:
+            out = layer._prefill_routed(out, topk_weights, topk_ids)
+        return out
+
+    overlap_out = run(overlap_layers)
+    sync_out = run(sync_layers)
+
+    assert torch.equal(overlap_out, sync_out)
+    assert overlap_cache._prefill_overlap_buffer_ids == [0, -1, 1, -1]
+    assert overlap_cache.prefill_path_counts() == (2, 1, 1)
+    assert sync_cache.prefill_path_counts() == (0, 3, 1)
+    assert sync_cache.prefill_bank_buffers == []
+    assert overlap_cache.cpu_executor.prefetched == [(1, True)]
 
 
 def test_locked_layer_prefill_materialize_copies_whole_layer_pageable():
