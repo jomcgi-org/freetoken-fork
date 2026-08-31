@@ -904,6 +904,7 @@ class Engine:
             device=self.device,
             swiglu_alpha=getattr(sample, "hidden_act_alpha", 1.702),
             swiglu_limit=getattr(sample, "swiglu_limit", None),
+            disk_lookahead=config.moe_disk_lookahead == "on",
         )
         if (
             config.moe_disk_prefill == "cpu"
@@ -1132,6 +1133,15 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if self.cpu_moe_executor is not None:
+            if batch.is_decode:
+                # Move madvise IO ahead of graph replay / the first eager submit. Each
+                # layer's native routing callback will request only prediction misses.
+                self.cpu_moe_executor.begin_decode_step()
+            else:
+                # Do not carry decode routing across a prefill boundary. The first
+                # subsequent decode step intentionally falls back to reactive advice.
+                self.cpu_moe_executor.reset_disk_lookahead()
         with self.ctx.forward_batch(batch):
             if getattr(batch, "mtp_verify", False):
                 next_tokens_gpu = self._forward_mtp_verify(batch)
@@ -1844,6 +1854,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_prefill": "cpu",
     "moe_disk_decode": "cpu",
     "moe_disk_pager": "madvise",
+    "moe_disk_lookahead": "on",
     "moe_pager_budget_gib": 40.0,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,

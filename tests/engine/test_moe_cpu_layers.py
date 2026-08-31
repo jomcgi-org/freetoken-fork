@@ -303,6 +303,7 @@ def test_engine_config_rejects_invalid_hot_expert_budget(budget):
             dtype=torch.bfloat16,
             moe_hot_expert_budget_gib=budget,
         )
+    assert config.moe_disk_lookahead == "on"
 
 
 def test_engine_config_rejects_invalid_disk_prefill_mode():
@@ -332,6 +333,37 @@ def test_engine_config_rejects_invalid_disk_decode_mode():
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_disk_decode="eager",
+        )
+
+
+@pytest.mark.parametrize("lookahead", ["on", "off"])
+def test_engine_config_accepts_disk_lookahead_modes(lookahead):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        moe_disk_lookahead=lookahead,
+    )
+    assert config.moe_disk_lookahead == lookahead
+
+
+def test_engine_config_rejects_invalid_disk_lookahead_mode():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-disk-lookahead.*on.*off"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_disk_lookahead="auto",
         )
 
 

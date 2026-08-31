@@ -68,6 +68,9 @@ class EngineConfig:
     # DISK bank residency backend. "madvise" preserves the file-mmap path; "uffd"
     # installs FTW expert rows into anonymous mappings under a userspace LRU.
     moe_disk_pager: str = "madvise"
+    # Predict madvise WILLNEED rows from the preceding decode step. UFFD ignores this
+    # setting because its userspace pager already prefetches logical expert rows.
+    moe_disk_lookahead: str = "off"
     moe_pager_budget_gib: float = 40.0
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
@@ -152,6 +155,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-disk-pager must be 'madvise' or 'uffd', got "
                 f"{self.moe_disk_pager!r}"
+            )
+        if self.moe_disk_lookahead not in ("on", "off"):
+            raise ValueError(
+                "--moe-disk-lookahead must be 'on' or 'off', got "
+                f"{self.moe_disk_lookahead!r}"
             )
         if (
             not math.isfinite(float(self.moe_pager_budget_gib))
