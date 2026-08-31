@@ -932,13 +932,16 @@ class OffloadMoeCache:
         if ready is not None:
             ready.synchronize()
         copied: set[tuple[int, int]] = set()
-        for swap in swaps:
-            for name in self.bank_schema:
-                source = self.bank_sources[name][swap.layer_id]
-                target = self.hot_bank_sources[name][swap.layer_id]
-                assert target is not None
-                target[swap.row].copy_(source[swap.incoming_expert])
-            copied.add((swap.layer_id, swap.row))
+        # The banks were created under inference mode; this worker thread starts
+        # outside it, so enter it here or the inplace row install is rejected.
+        with torch.inference_mode():
+            for swap in swaps:
+                for name in self.bank_schema:
+                    source = self.bank_sources[name][swap.layer_id]
+                    target = self.hot_bank_sources[name][swap.layer_id]
+                    assert target is not None
+                    target[swap.row].copy_(source[swap.incoming_expert])
+                copied.add((swap.layer_id, swap.row))
         return copied
 
     def _retire_hot_adaptation_swaps(self, swaps) -> None:
