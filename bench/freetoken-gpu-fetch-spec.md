@@ -1,8 +1,10 @@
-# Spec DRAFT: GPU-fetch decode for DISK layers (FreeToken, patch 7)
+# Spec: GPU-fetch decode for DISK layers (FreeToken, patch 7)
 
-STATUS: draft — confirm against the profile-cycle numbers before dispatch
-(if the spilled layers' CPU cost is no longer material after profile-guided
-selection, deprioritize behind UFFD).
+STATUS: CONFIRMED for dispatch 2026-08-31. node-4 bare-metal (4090 24GB,
+64GB RAM, 7800X3D 8C/16T) measured: best config pins 33GiB banks + 6GiB PLE
+cache, leaving 23 DISK layers on the CPU executor; x1 decode 9.3 tok/s,
+~4.4k major faults/decode step. The spilled layers' CPU + fault cost IS the
+x1 bottleneck. VRAM headroom for extra slots: ~1.9 GiB (22.1/24 used).
 
 ## Workspace
 
@@ -38,11 +40,14 @@ routed experts' rows reached VRAM.
 4. Expert-cache hit tracking must include DISK layers so hot experts stay
    resident in VRAM and fills amortize.
 
-## Open questions for the bench data
+## Answered from the node-4 bench (2026-08-31)
 
-- Realized per-DISK-layer decode cost after profile-guided spill.
-- VRAM headroom for extra slots (L4: ~2 GiB free after graphs).
-- Whether HMM direct reads into slots beat pinned staging fills.
+- Spill is 23 layers at the best 64GB config (33GiB pinned banks): the CPU
+  path costs ~half the step budget at x1 9.3 tok/s. Material; proceed.
+- VRAM headroom: ~1.9 GiB after graphs at the serving config.
+- HMM direct-read vs pinned staging: still unmeasured on the open driver;
+  implement staging as the default, keep the HMM probe behind a flag if
+  cheap, and we A/B on the box.
 
 ## Tests
 

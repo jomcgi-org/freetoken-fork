@@ -316,3 +316,126 @@ plumbing and the CPU executor.
 Upstreaming posture: items 1-5 are coherent PR candidates if we choose;
 the measured findings (GPU-refault law, prefill pathology) are useful to
 upstream regardless of code.
+
+## node-4 BARE METAL (2026-08-31): the real 4090 + 64GB numbers
+
+Hardware: RTX 4090 24GB, Ryzen 7800X3D 8C/16T, 64GB DDR5, 1.9TB NVMe
+(2.5GbE). Driver: NVIDIA OPEN kernel module 610.57.04 + CUDA 13.0. Model:
+Qwen3.8-Flash-Next NVFP4 (FTW 72.7 GiB) + e2m1 quantized PLE table (27 GiB).
+Conversion on bare NVMe: 94 seconds (vs OOM saga on cloud boxes).
+These numbers replace the L4-proxy projections. Serving dir: e2m1 (quantized
+table, sidecar discovery). All runs `--moe-disk-prefill cpu`,
+`--moe-backend offload --moe-cache-auto`, max-running-requests 8.
+
+### Config sweep (load.sh: x1 = 1 stream x 256 tok, x4/x8 = 192 tok/stream)
+
+| config | pinned banks | PLE | x1 | x4 | x8 agg | warm majflt/step |
+|---|---|---|---:|---:|---:|---:|
+| budget52 + cached10 | 33.0 (25 lyr) | cached 10G | 3.8 | 7.2 | 9.6 | ~96,000 |
+| budget40 + cached6 | 33.0 (25 lyr) | cached 6G | 9.3 | 14.0 | 26.8 | ~4,400 |
+| budget44 + cached8 | 36.0 (30 lyr) | cached 8G | 5.1 | 11.7 | 17.3 | ~12,500 |
+| budget36 + cached6 | 30.0 | cached 6G | 9.1 | 16.6 | 24.6 | ~6,300 |
+| budget40 + **hmm** | 39.7 (30 lyr) | HMM | 10.8 | 26.5 | 32.8 | ~670 |
+| budget46 + hmm | 42+ (34 lyr) | HMM | **17.3** | 24.0 | 30.4 | ~4,400 |
+| budget40 + hmm + profile | 39.7 (30 lyr) | HMM | 12.3 | **26.9** | **33.9** | ~580 |
+
+Prefill (441-tok prompt, budget52+cached10 run): 18.3 tok/s cold, 53.8 warm.
+Warmup to first served token: 32-110s from cold NVMe.
+
+### Laws measured on bare metal
+
+1. **The page cache is a tier: pin budget competes with it.** 52G pinned on a
+   64G box leaves ~0 page cache for the ~57G of disk-resident data; every
+   disk access refaults (96k majflt/step, 3.8 tok/s). Dropping to 40G pinned
+   freed ~16G of cache and tripled throughput. Size pin budget to leave the
+   spill working set cached, not to maximize pinned bytes.
+2. **HMM beats the cached/staged PLE backends on bare metal open-driver**:
+   x4 nearly doubled (14.0 -> 26.5). The L4 measurement of ~105ms/step HMM
+   refault tax was a vGPU artifact, not an HMM property. HMM also frees the
+   PLE cache's pin allocation, so more banks pin under the same budget.
+3. **Workload-dependent optimum**: single-stream wants more pinned banks
+   (budget46: 17.3 x1); concurrent throughput wants more page cache
+   (budget40: 33.9 x8). One knob, two optima - pick per deployment.
+4. **Profile-guided spill** (--moe-disk-layer-profile, needs
+   --moe-collect-stats on the profiling server) kept the same head+tail
+   spill set but still cut faults ~15% and set the x4/x8 records.
+5. **GPU-fetch decode is VRAM-bound negative on 24GB**: correct (5/5
+   quality) but 10.4/9.4/13.1 - the ~990 fills/step x ~2.6MB/expert over
+   PCIe plus slot-cache thrash across 43 layers loses to CPU decode + page
+   cache. Keep the flag for >=48GB VRAM boxes; do not use it on a 4090.
+
+### Quality (quality.sh + no-thinking longgen variant)
+
+5/5 PASS (arith, recall, reason, longgen-diversity, longgen-length) on every
+config benched: cached b40c6, b36c6, hmm40, hmm46, hmm+profile, gpufetch.
+The e2m1 quantized PLE table is validated at smoke level: first quality gate
+it has ever passed, closing the top open item from the cloud rounds.
+
+### New fork work landed tonight (branches, pending merge)
+
+- feat/gpu-fetch-decode (95648ea + edce35e fix): --moe-disk-decode gpufetch.
+  One correction round: install indices had to be bounded to the staging
+  ring capacity (kernel requires equal-length index buffers). Benched:
+  negative on 24GB (law 5), retained for big-VRAM targets.
+- feat/prefill-overlap-split (f60d70a): per-layer prefill overlap under
+  split residency (pinned layers overlap, DISK layers CPU-prefill and chain
+  the next pinned layer's prefetch). UNVALIDATED on hardware yet.
+- feat/uffd-pager (66134e0): --moe-disk-pager uffd, userfaultfd +
+  io_uring row-granular pager with byte-budgeted LRU, targets the 4KiB
+  fault amplification (27M pages requested for ~6M rows needed per load
+  run). Linux-only. UNVALIDATED on hardware yet.
+- MTP batched verify (11b/11c): DEFERRED - two Codex workers died silently
+  mid-task (the GDN state rollback makes this the hardest patch). Partial
+  attempt-1 patch preserved in the worktree. Speculation stays parked at
+  break-even.
+
+### Ops notes (bare metal specific)
+
+- Node was dual-homed (2.5GbE + WiFi, same subnet): ARP flux routed bulk
+  traffic over WiFi at ~15-20 MB/s while the wire crawled. Downing wlp13s0
+  took the HF download from 21 to 107 MB/s. Check `ip route show default`
+  count FIRST on any homelab box.
+- Xet-backed HF repos: the hf CLI's Xet path wedged silently mid-download
+  (0 B/s, progress frozen); HF_HUB_DISABLE_XET=1 + hf_transfer recovered it.
+- ft serve leaves the torch-dist port (server port + 1) held by an orphaned
+  scheduler child if the frontend is SIGKILLed: EADDRINUSE on relaunch.
+  fuser -k both ports between serves.
+- flashinfer JIT needs ninja AND nvcc on PATH at pytest time; a venv
+  python invoked by absolute path does not put .venv/bin on PATH (219
+  cascade failures that look real but are env).
+
+## Overnight optimization round (2026-08-31, continued): four patches + close-out
+
+All on the bare-metal champion base (budget40 + HMM PLE + layer profile,
+MRR=8) unless stated. Suite state at close: 1664+ passed, 6 known
+ULP-parity fails only. Everything merged to feat/moe-disk-tier.
+
+| lane | result | verdict |
+|---|---|---|
+| prefill overlap (split residency) | warm prefill 54 -> **116 tok/s**; x1 12.3 -> 16.8 with x4 27.6 / x8 33.8 held | **BIG WIN, merged.** Collapsed the x1-vs-concurrency config tradeoff |
+| expert-dedup CPU decode | x8 33.9 -> **34.0**; measured dedup_ratio 1.39 | marginal win, merged (stats alone worth it) |
+| UFFD pager (after page-granular correction) | faults 580 -> **12.9/step**, 17.5GiB fully resident, 0 evictions; x8 30.1 | works; slightly under madvise throughput, so madvise stays default. UFFD = the bigger-than-RAM capacity lane |
+| GPU-fetch decode | 10.4/9.4/13.1 | negative on 24GB (slot-cache thrash), merged default-off for big-VRAM targets |
+| concurrency ladder | x16 does not fit (GDN state scales per slot); x12 peaks 32.9 < x8 | MRR=8 is the 24GB sweet spot |
+| MTP batched verify | two Codex workers died mid-task | DEFERRED (hardest patch: exact GDN rollback) |
+
+### Endurance + power (final merged tier, sustained x8 x 512-tok gens)
+
+31.0-31.2 tok/s aggregate held across consecutive 130s runs.
+GPU power: **avg 125W, peak 154W** (450W card at ~28% power) -> ~0.25
+tok/s/W. Decode is host/PCIe-bound; the GPU coasts. A 125B-A6B model
+serving 31 tok/s at wall power comparable to a bright lightbulb is the
+efficiency headline.
+
+### Final validated bests (4090 24GB + 64GB RAM, quality 5/5 throughout)
+
+- warm prefill 116 tok/s (441-tok prompt)
+- x1 16.8 / x4 27.6 / x8 34.0 tok/s (single config)
+- sustained x8: ~31 tok/s at 125W avg GPU power
+
+### Remaining known-but-unpursued items
+
+- UFFD for the PLE table (marginal: PLE faults already ~13/step warm).
+- CUDA graph-bs tuning (low value at MRR=8 optimum).
+- MTP speculative decode (parked, Sol-failed-twice; would multiply x1).
+- +64GB RAM: still the biggest single lever (~36 x1 all-pinned upstream).
