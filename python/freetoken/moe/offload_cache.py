@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -247,12 +248,38 @@ class OffloadMoeCache:
         # these compact sources only when ensure_experts_hot staged the layer.
         self.hot_bank_sources: dict[str, list[torch.Tensor | None]] = {}
         self.hot_expert_ids: dict[int, tuple[int, ...]] = {}
+        self.hot_expert_capacity: dict[int, int] = {}
         self.hot_row_for_expert = torch.full(
             (self.num_layers, self.num_experts),
             -1,
             dtype=torch.int32,
             device=self.device,
         )
+        # Online HOT adaptation uses the same fixed compact banks and fixed device
+        # mapping for their whole lifetime. Rows are retired before a worker fills
+        # them, then published only after every bank copy completes.
+        self.hot_adapt_enabled = False
+        self.hot_adapt_interval_steps = 0
+        self.hot_adapt_max_swap_bytes = 0
+        self.hot_adapt_expert_bytes = 0
+        self.hot_adapt_decode_steps = 0
+        self.hot_adapt_ticks = 0
+        self.hot_adapt_swaps = 0
+        self._hot_adapt_ticks_reported = 0
+        self._hot_adapt_swaps_reported = 0
+        self._hot_decay_factor = 1.0
+        self.decayed_decode_freq = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.float32, device=self.device
+        )
+        self._hot_mapping_host: torch.Tensor | None = None
+        self._hot_slot_owners: dict[int, list[int | None]] = {}
+        self._hot_adapt_executor: ThreadPoolExecutor | None = None
+        self._hot_adapt_future: Future | None = None
+        self._hot_adapt_phase: str | None = None
+        self._hot_adapt_swaps_pending = ()
+        self._hot_adapt_snapshot_host: torch.Tensor | None = None
+        self._hot_adapt_snapshot_ready = None
+        self._hot_adapt_copy_stream: torch.cuda.Stream | None = None
         # per-layer host residency: direct GPU movement requires "pinned";
         # LOCKED/PAGEABLE decode on CPU, while DISK may use CPU or the staging ring
         # _unpinned_layers is the derived id set the hot paths test against
@@ -358,6 +385,7 @@ class OffloadMoeCache:
         layer_residency: list[str] | None = None,
         hot_sources: dict[str, list[torch.Tensor | None]] | None = None,
         hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
+        hot_expert_capacity: dict[int, int] | None = None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
         cache per bank, following the format's bank schema.
@@ -409,31 +437,47 @@ class OffloadMoeCache:
             int(layer_id): tuple(int(expert_id) for expert_id in expert_ids)
             for layer_id, expert_ids in (hot_expert_ids or {}).items()
         }
-        if bool(hot_sources) != bool(hot_expert_ids):
-            raise ValueError("HOT expert ids and compact bank sources must be provided together")
+        hot_expert_capacity = {
+            int(layer_id): int(capacity)
+            for layer_id, capacity in (hot_expert_capacity or {}).items()
+        }
+        for layer_id, expert_ids in hot_expert_ids.items():
+            hot_expert_capacity.setdefault(layer_id, len(expert_ids))
+        if bool(hot_sources) != bool(hot_expert_capacity):
+            raise ValueError("HOT expert capacity and compact bank sources must be provided together")
         if hot_sources and set(hot_sources) != set(self.bank_schema):
             raise ValueError(
                 f"HOT banks {sorted(hot_sources)} do not match schema {self.bank_schema}"
             )
-        for layer_id, expert_ids in hot_expert_ids.items():
+        for layer_id, capacity in hot_expert_capacity.items():
+            expert_ids = hot_expert_ids.get(layer_id, ())
             if not 0 <= layer_id < self.num_layers:
                 raise ValueError(f"HOT layer id {layer_id} is out of range")
             if residency[layer_id] != HostResidency.DISK.value:
                 raise ValueError(f"HOT layer {layer_id} is not DISK resident")
-            if not expert_ids or len(set(expert_ids)) != len(expert_ids):
-                raise ValueError(f"HOT expert ids for layer {layer_id} must be non-empty and unique")
+            if capacity <= 0 or capacity > self.num_experts or len(expert_ids) > capacity:
+                raise ValueError(
+                    f"HOT layer {layer_id} capacity must be in [1, {self.num_experts}] "
+                    "and cover its seeds"
+                )
+            if len(set(expert_ids)) != len(expert_ids):
+                raise ValueError(f"HOT expert ids for layer {layer_id} must be unique")
             if any(expert_id < 0 or expert_id >= self.num_experts for expert_id in expert_ids):
                 raise ValueError(
                     f"HOT expert ids for layer {layer_id} must be in [0, {self.num_experts})"
                 )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
-        self.hot_expert_ids = hot_expert_ids
+        self.hot_expert_capacity = hot_expert_capacity
+        self.hot_expert_ids = {
+            layer_id: hot_expert_ids.get(layer_id, ())
+            for layer_id in hot_expert_capacity
+        }
         self.hot_bank_sources = {
             name: list(hot_sources[name]) for name in self.bank_schema
         } if hot_sources else {}
         self.hot_row_for_expert.fill_(-1)
-        for layer_id, expert_ids in hot_expert_ids.items():
+        for layer_id, expert_ids in self.hot_expert_ids.items():
             rows = torch.arange(len(expert_ids), dtype=torch.int32, device=self.device)
             ids = torch.tensor(expert_ids, dtype=torch.long, device=self.device)
             self.hot_row_for_expert[layer_id, ids] = rows
@@ -460,17 +504,28 @@ class OffloadMoeCache:
                     raise ValueError(
                         f"HOT bank {name!r} has {len(compact)} layers, expected {self.num_layers}"
                     )
-                for layer_id, expert_ids in hot_expert_ids.items():
+                for layer_id, capacity in hot_expert_capacity.items():
                     hot = compact[layer_id]
                     if hot is None:
                         raise ValueError(f"HOT bank {name!r} is missing layer {layer_id}")
                     if not hot.is_contiguous() or hot.shape != (
-                        len(expert_ids), *head.shape[1:]
+                        capacity, *head.shape[1:]
                     ) or hot.dtype != head.dtype:
                         raise ValueError(
                             f"HOT bank {name!r} layer {layer_id} has incompatible "
                             f"shape/dtype {hot.shape}/{hot.dtype}"
                         )
+        self._hot_slot_owners = {
+            layer_id: [
+                self.hot_expert_ids[layer_id][row]
+                if row < len(self.hot_expert_ids[layer_id]) else None
+                for row in range(capacity)
+            ]
+            for layer_id, capacity in hot_expert_capacity.items()
+        }
+        self._hot_mapping_host = self.hot_row_for_expert.detach().cpu()
+        if self.device.type == "cuda":
+            self._hot_mapping_host = self._hot_mapping_host.pin_memory()
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if any(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids):
@@ -607,7 +662,7 @@ class OffloadMoeCache:
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
-                if layer_id in self.hot_expert_ids:
+                if layer_id in self.hot_expert_capacity:
                     bank_name = self.bank_schema[bank_id]
                     source = self.hot_bank_sources[bank_name][layer_id]
                     assert source is not None
@@ -777,7 +832,226 @@ class OffloadMoeCache:
 
     def is_hot_split_layer(self, layer_id: int) -> bool:
         """Whether a DISK layer has a compact pinned HOT expert partition."""
-        return layer_id in self.hot_expert_ids
+        return layer_id in self.hot_expert_capacity
+
+    def configure_hot_adaptation(
+        self,
+        *,
+        half_life_steps: int,
+        interval_steps: int,
+        max_swap_bytes: int,
+        expert_bytes: int,
+    ) -> None:
+        """Arm online HOT adaptation before CUDA graph capture."""
+        if interval_steps == 0 or not self.hot_expert_capacity:
+            return
+        if half_life_steps <= 0 or interval_steps < 0:
+            raise ValueError("HOT adaptation steps must use a positive half-life and interval")
+        if max_swap_bytes <= 0 or expert_bytes <= 0:
+            raise ValueError("HOT adaptation byte geometry must be positive")
+        from freetoken.moe.hot_adapt import decay_multiplier
+
+        self.hot_adapt_enabled = True
+        self.hot_adapt_interval_steps = int(interval_steps)
+        self.hot_adapt_max_swap_bytes = int(max_swap_bytes)
+        self.hot_adapt_expert_bytes = int(expert_bytes)
+        self._hot_decay_factor = decay_multiplier(half_life_steps)
+        self._hot_adapt_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="freetoken-hot-adapt"
+        )
+        pin = self.device.type == "cuda"
+        self._hot_adapt_snapshot_host = torch.empty(
+            (self.num_layers, self.num_experts), dtype=torch.float32,
+            device="cpu", pin_memory=pin,
+        )
+        self._hot_adapt_snapshot_device = torch.empty_like(self.decayed_decode_freq)
+        if self.device.type == "cuda":
+            self._hot_adapt_copy_stream = torch.cuda.Stream(device=self.device)
+            self._hot_adapt_snapshot_ready = torch.cuda.Event()
+
+    def _publish_hot_mapping(self) -> None:
+        """Update the fixed device table in place, preserving graph addresses."""
+        assert self._hot_mapping_host is not None
+        self.hot_row_for_expert.copy_(
+            self._hot_mapping_host, non_blocking=self.device.type == "cuda"
+        )
+
+    def _replace_hot_mapping(self, mapping: list[list[int]]) -> None:
+        assert self._hot_mapping_host is not None
+        # This pinned source is fixed too. Retirement's row-copy worker waits on
+        # the mapping-copy event, and the next plan waits on a later snapshot event,
+        # so no phase can mutate it while an earlier H2D copy is still in flight.
+        self._hot_mapping_host.copy_(torch.tensor(mapping, dtype=torch.int32))
+        self._publish_hot_mapping()
+
+    def _hot_mapping_lists(self) -> list[list[int]]:
+        assert self._hot_mapping_host is not None
+        return self._hot_mapping_host.tolist()
+
+    def _plan_hot_adaptation(self, ready, step: int):
+        if ready is not None:
+            ready.synchronize()
+        assert self._hot_adapt_snapshot_host is not None
+        from freetoken.moe.hot_adapt import plan_hot_swaps, recompute_hot_partition
+
+        counts = {
+            layer_id: tuple(float(value) for value in self._hot_adapt_snapshot_host[layer_id])
+            for layer_id in self.hot_expert_capacity
+        }
+        budget_bytes = sum(self.hot_expert_capacity.values()) * self.hot_adapt_expert_bytes
+        desired = recompute_hot_partition(
+            counts,
+            frozenset(self.hot_expert_capacity),
+            budget_bytes=budget_bytes,
+            expert_bytes=self.hot_adapt_expert_bytes,
+            num_experts=self.num_experts,
+        )
+        owners = {layer_id: tuple(rows) for layer_id, rows in self._hot_slot_owners.items()}
+        swaps = plan_hot_swaps(
+            counts,
+            owners,
+            desired,
+            expert_bytes=self.hot_adapt_expert_bytes,
+            max_swap_bytes=self.hot_adapt_max_swap_bytes,
+        )
+        total = sum(sum(layer) for layer in counts.values())
+        hot = sum(
+            counts[layer_id][expert]
+            for layer_id, rows in owners.items()
+            for expert in rows if expert is not None
+        )
+        rate = hot / total if total else 0.0
+        logger.info_rank0(
+            f"MoE HOT adaptation tick step={step}: decayed_hot_pair_rate={rate:.2%}, "
+            f"planned_swaps={len(swaps)}, max_swap_gib="
+            f"{self.hot_adapt_max_swap_bytes / 2**30:.2f}"
+        )
+        return swaps, rate
+
+    def _copy_retired_hot_rows(self, ready, swaps):
+        if ready is not None:
+            ready.synchronize()
+        copied: set[tuple[int, int]] = set()
+        for swap in swaps:
+            for name in self.bank_schema:
+                source = self.bank_sources[name][swap.layer_id]
+                target = self.hot_bank_sources[name][swap.layer_id]
+                assert target is not None
+                target[swap.row].copy_(source[swap.incoming_expert])
+            copied.add((swap.layer_id, swap.row))
+        return copied
+
+    def _retire_hot_adaptation_swaps(self, swaps) -> None:
+        from freetoken.moe.hot_adapt import retire_hot_swaps
+
+        retired = retire_hot_swaps(self._hot_mapping_lists(), swaps)
+        self._replace_hot_mapping(retired)
+        for swap in swaps:
+            self._hot_slot_owners[swap.layer_id][swap.row] = None
+        self.hot_expert_ids = {
+            layer_id: tuple(sorted(owner for owner in owners if owner is not None))
+            for layer_id, owners in self._hot_slot_owners.items()
+        }
+        ready = None
+        if self.device.type == "cuda":
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(self.device))
+        assert self._hot_adapt_executor is not None
+        self._hot_adapt_swaps_pending = swaps
+        self._hot_adapt_phase = "copy"
+        self._hot_adapt_future = self._hot_adapt_executor.submit(
+            self._copy_retired_hot_rows, ready, swaps
+        )
+
+    def _finish_hot_adaptation_swaps(self, copied_rows) -> None:
+        from freetoken.moe.hot_adapt import finish_hot_swaps
+
+        swaps = self._hot_adapt_swaps_pending
+        finished = finish_hot_swaps(self._hot_mapping_lists(), swaps, copied_rows)
+        self._replace_hot_mapping(finished)
+        for swap in swaps:
+            self._hot_slot_owners[swap.layer_id][swap.row] = swap.incoming_expert
+        self.hot_expert_ids = {
+            layer_id: tuple(sorted(owner for owner in owners if owner is not None))
+            for layer_id, owners in self._hot_slot_owners.items()
+        }
+        self.hot_adapt_swaps += len(swaps)
+        self._hot_adapt_swaps_pending = ()
+        self._hot_adapt_phase = None
+        self._hot_adapt_future = None
+
+    def _poll_hot_adaptation(self) -> None:
+        future = self._hot_adapt_future
+        if future is None or not future.done():
+            return
+        if self._hot_adapt_phase == "plan":
+            swaps, _rate = future.result()
+            self._hot_adapt_future = None
+            self._hot_adapt_phase = None
+            if swaps:
+                self._retire_hot_adaptation_swaps(swaps)
+        elif self._hot_adapt_phase == "copy":
+            self._finish_hot_adaptation_swaps(future.result())
+        else:
+            raise RuntimeError("HOT adaptation future completed in an invalid phase")
+
+    def hot_adapt_step_boundary(self) -> None:
+        """Advance adaptation after one decode step without waiting on copy work."""
+        if not self.hot_adapt_enabled:
+            return
+        self.hot_adapt_decode_steps += 1
+        self._poll_hot_adaptation()
+        if self.hot_adapt_decode_steps % self.hot_adapt_interval_steps:
+            return
+        self.hot_adapt_ticks += 1
+        if self._hot_adapt_future is not None:
+            logger.info_rank0(
+                f"MoE HOT adaptation tick step={self.hot_adapt_decode_steps}: "
+                f"copy_or_plan_in_progress, decayed_hot_pair_rate deferred"
+            )
+            return
+        assert self._hot_adapt_snapshot_host is not None
+        self._hot_adapt_snapshot_device.copy_(self.decayed_decode_freq)
+        ready = None
+        if self.device.type == "cuda":
+            assert self._hot_adapt_copy_stream is not None
+            assert self._hot_adapt_snapshot_ready is not None
+            begin = torch.cuda.Event()
+            begin.record(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(self._hot_adapt_copy_stream):
+                self._hot_adapt_copy_stream.wait_event(begin)
+                self._hot_adapt_snapshot_host.copy_(
+                    self._hot_adapt_snapshot_device, non_blocking=True
+                )
+                self._hot_adapt_snapshot_ready.record(self._hot_adapt_copy_stream)
+            ready = self._hot_adapt_snapshot_ready
+        else:
+            self._hot_adapt_snapshot_host.copy_(self._hot_adapt_snapshot_device)
+        assert self._hot_adapt_executor is not None
+        self._hot_adapt_phase = "plan"
+        self._hot_adapt_future = self._hot_adapt_executor.submit(
+            self._plan_hot_adaptation, ready, self.hot_adapt_decode_steps
+        )
+
+    def decayed_hot_pair_rate(self) -> float:
+        """Return the current decayed traffic share covered by published rows."""
+        if not self.hot_adapt_enabled:
+            return 0.0
+        counts = self.decayed_decode_freq.tolist()
+        total = sum(sum(layer) for layer in counts)
+        hot = sum(
+            counts[layer_id][expert]
+            for layer_id, owners in self._hot_slot_owners.items()
+            for expert in owners if expert is not None
+        )
+        return hot / total if total else 0.0
+
+    def shutdown_hot_adaptation(self) -> None:
+        """Drain and release the adaptation worker before bank teardown."""
+        executor = self._hot_adapt_executor
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._hot_adapt_executor = None
 
     def is_gpufetch_layer(self, layer_id: int) -> bool:
         """Whether this file-backed layer decodes through the GPU slot cache."""
@@ -808,9 +1082,18 @@ class OffloadMoeCache:
         result["hot_pair_rate"] = hot_pairs / total_pairs if total_pairs else 0.0
         result["hot_pairs"] = hot_pairs
         result["routed_pairs"] = total_pairs
+        ticks = self.hot_adapt_ticks - self._hot_adapt_ticks_reported
+        swaps = self.hot_adapt_swaps - self._hot_adapt_swaps_reported
+        # A background copy may complete after the status window that contained
+        # its tick. Attribute such completions to one interval instead of dropping
+        # them merely because this report window has no new tick.
+        result["hot_swaps_per_interval"] = swaps / max(ticks, 1)
+        result["decayed_hot_pair_rate"] = self.decayed_hot_pair_rate()
         if reset:
             self.stat_hot_pairs.zero_()
             self.stat_hot_total_pairs.zero_()
+            self._hot_adapt_ticks_reported = self.hot_adapt_ticks
+            self._hot_adapt_swaps_reported = self.hot_adapt_swaps
         return result
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -1119,14 +1402,14 @@ class OffloadMoeCache:
         )
 
     def ensure_experts_hot(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        """Route only this DISK layer's static HOT experts through the slot cache.
+        """Route only this DISK layer's current HOT experts through the slot cache.
 
         HOT routes become cache slots and missing copies use compact pinned source
         rows. COLD routes become -1 for the CPU partial, exactly like hybrid overflow.
         """
         from freetoken.moe.offload_kernels import ensure_experts_hot
 
-        if layer_id not in self.hot_expert_ids:
+        if layer_id not in self.hot_expert_capacity:
             raise ValueError(f"layer {layer_id} has no HOT expert partition")
         self.record_decode_frequency(layer_id, expert_ids)
         self._pending_src_layer = layer_id
@@ -1153,6 +1436,7 @@ class OffloadMoeCache:
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
+        self.decayed_decode_freq.zero_()
         if self.cpu_executor is not None:
             # Graph capture calls reset before live serving. Do not let synthetic
             # warmup routes seed the first real decode prediction.
@@ -1296,7 +1580,7 @@ class OffloadMoeCache:
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers and not (
-            layer_id in self.hot_expert_ids and not self._pending_whole_layer
+            layer_id in self.hot_expert_capacity and not self._pending_whole_layer
         ):
             if self.is_gpufetch_layer(layer_id) and not self._pending_whole_layer:
                 assert self.cpu_executor is not None
@@ -1370,7 +1654,7 @@ class OffloadMoeCache:
 
         for bank_id, (per_layer, cache) in enumerate(self.banks):
             source = per_layer[layer_id]
-            if layer_id in self.hot_expert_ids:
+            if layer_id in self.hot_expert_capacity:
                 source = self.hot_bank_sources[self.bank_schema[bank_id]][layer_id]
                 assert source is not None
             fast_index_copy_jit(

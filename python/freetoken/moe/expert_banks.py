@@ -47,9 +47,13 @@ class ExpertBanks:
     layer_residency: list[str] | None = field(default=None)
     # Compact pinned copies of profile-selected rows from DISK layers. Each schema
     # entry is a num_layers-long list; entries outside the HOT partition are None.
-    # hot_expert_ids[layer] gives the original expert id for each compact row.
+    # hot_expert_ids[layer] seeds the leading compact rows; remaining capacity is
+    # initially unmapped and available to online adaptation.
     hot_sources: dict[str, list[torch.Tensor | None]] = field(default_factory=dict)
     hot_expert_ids: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    # Fixed row capacity of each compact HOT layer. This may exceed the seeded
+    # expert count so online adaptation can start all-cold and fill rows later.
+    hot_expert_capacity: dict[int, int] = field(default_factory=dict)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
@@ -461,6 +465,7 @@ def load_expert_banks(
     layer_residency: list[str] | None = None,
     disk_pager=None,
     hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
+    hot_expert_capacity: dict[int, int] | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -492,7 +497,7 @@ def load_expert_banks(
         layer_residency
         and HostResidency.DISK.value in layer_residency
     )
-    if (wants_disk or hot_expert_ids) and (
+    if (wants_disk or hot_expert_ids or hot_expert_capacity) and (
         not model_path or not is_ftw_checkpoint(model_path)
     ):
         raise ValueError(
@@ -505,6 +510,7 @@ def load_expert_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency, disk_pager=disk_pager,
             hot_expert_ids=hot_expert_ids,
+            hot_expert_capacity=hot_expert_capacity,
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")

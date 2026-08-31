@@ -460,6 +460,7 @@ def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None, disk_pager=None,
     hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
+    hot_expert_capacity: dict[int, int] | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
@@ -551,13 +552,22 @@ def load_ftw_banks(
         int(layer_id): tuple(int(expert_id) for expert_id in expert_ids)
         for layer_id, expert_ids in (hot_expert_ids or {}).items()
     }
-    invalid_hot_layers = set(hot_expert_ids) - disk_layers
+    hot_expert_capacity = {
+        int(layer_id): int(capacity)
+        for layer_id, capacity in (hot_expert_capacity or {}).items()
+    }
+    for layer_id, expert_ids in hot_expert_ids.items():
+        hot_expert_capacity.setdefault(layer_id, len(expert_ids))
+    invalid_hot_layers = (set(hot_expert_ids) | set(hot_expert_capacity)) - disk_layers
     if invalid_hot_layers:
         reader.close()
         raise ValueError(
             f"HOT expert rows are only valid for DISK layers, got layers "
             f"{sorted(invalid_hot_layers)}"
         )
+    if any(capacity <= 0 for capacity in hot_expert_capacity.values()):
+        reader.close()
+        raise ValueError("HOT expert capacities must be positive")
     if disk_layers and flat_entries:
         raise RuntimeError(
             "DISK residency requires per-layer FTW expert banks; this "
@@ -683,12 +693,20 @@ def load_ftw_banks(
         name: [None] * num_layers for name in sources
     }
     hot_bytes = 0
-    for layer_id, expert_ids in sorted(hot_expert_ids.items()):
-        if not expert_ids:
-            continue
+    for layer_id, capacity in sorted(hot_expert_capacity.items()):
+        expert_ids = hot_expert_ids.get(layer_id, ())
+        if len(expert_ids) > capacity:
+            raise ValueError(
+                f"HOT layer {layer_id} seeds {len(expert_ids)} experts into "
+                f"capacity {capacity}"
+            )
         if len(set(expert_ids)) != len(expert_ids):
             raise ValueError(f"HOT expert ids for layer {layer_id} contain duplicates")
         num_experts = next(iter(sources.values()))[layer_id].shape[0]
+        if capacity > num_experts:
+            raise ValueError(
+                f"HOT layer {layer_id} capacity {capacity} exceeds {num_experts} experts"
+            )
         if any(expert_id < 0 or expert_id >= num_experts for expert_id in expert_ids):
             raise ValueError(
                 f"HOT expert ids for layer {layer_id} must be in [0, {num_experts})"
@@ -696,15 +714,16 @@ def load_ftw_banks(
         index = torch.tensor(expert_ids, dtype=torch.long)
         for name, per_layer in sources.items():
             source = per_layer[layer_id]
-            bank = HostBank((len(expert_ids), *source.shape[1:]), source.dtype)
-            torch.index_select(source, 0, index, out=bank.tensor)
+            bank = HostBank((capacity, *source.shape[1:]), source.dtype)
+            if expert_ids:
+                torch.index_select(source, 0, index, out=bank.tensor[:len(expert_ids)])
             bank.pin()
             hot_sources[name][layer_id] = bank.tensor
             hot_bytes += bank.nbytes
     if hot_bytes:
         logger.info(
             f"MoE HOT expert residency: {hot_bytes / 2**30:.2f} GiB pinned compact "
-            f"rows across {len(hot_expert_ids)} DISK layers"
+            f"rows across {len(hot_expert_capacity)} DISK layers"
         )
 
     from freetoken.moe.expert_banks import ExpertBanks
@@ -759,6 +778,7 @@ def load_ftw_banks(
         layer_residency=applied,
         hot_sources=hot_sources if hot_bytes else {},
         hot_expert_ids=hot_expert_ids if hot_bytes else {},
+        hot_expert_capacity=hot_expert_capacity if hot_bytes else {},
     )
 
 
