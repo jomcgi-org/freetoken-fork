@@ -459,6 +459,7 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None, disk_pager=None,
+    hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
@@ -546,6 +547,17 @@ def load_ftw_banks(
     mixed = {e["name"] for e in flat_entries} & per_layer_groups.keys()
     assert not mixed, f"FTW bank(s) mix flat and per-layer row layouts: {sorted(mixed)}"
     disk_layers = {i for i, r in enumerate(residency) if r == HostResidency.DISK.value}
+    hot_expert_ids = {
+        int(layer_id): tuple(int(expert_id) for expert_id in expert_ids)
+        for layer_id, expert_ids in (hot_expert_ids or {}).items()
+    }
+    invalid_hot_layers = set(hot_expert_ids) - disk_layers
+    if invalid_hot_layers:
+        reader.close()
+        raise ValueError(
+            f"HOT expert rows are only valid for DISK layers, got layers "
+            f"{sorted(invalid_hot_layers)}"
+        )
     if disk_layers and flat_entries:
         raise RuntimeError(
             "DISK residency requires per-layer FTW expert banks; this "
@@ -663,6 +675,38 @@ def load_ftw_banks(
             views.append(raw.view(num_experts, *row_shape) if row_shape else raw.view(num_experts))
         sources[name] = views
 
+    # Profile-selected HOT rows get a compact anonymous bank. Only these bytes are
+    # copied from the file mapping and CUDA-pinned; COLD rows remain file-backed.
+    # The compact row order is stable and later becomes expert_id -> source-row in
+    # OffloadMoeCache's graph-safe copy plan.
+    hot_sources: dict[str, list[torch.Tensor | None]] = {
+        name: [None] * num_layers for name in sources
+    }
+    hot_bytes = 0
+    for layer_id, expert_ids in sorted(hot_expert_ids.items()):
+        if not expert_ids:
+            continue
+        if len(set(expert_ids)) != len(expert_ids):
+            raise ValueError(f"HOT expert ids for layer {layer_id} contain duplicates")
+        num_experts = next(iter(sources.values()))[layer_id].shape[0]
+        if any(expert_id < 0 or expert_id >= num_experts for expert_id in expert_ids):
+            raise ValueError(
+                f"HOT expert ids for layer {layer_id} must be in [0, {num_experts})"
+            )
+        index = torch.tensor(expert_ids, dtype=torch.long)
+        for name, per_layer in sources.items():
+            source = per_layer[layer_id]
+            bank = HostBank((len(expert_ids), *source.shape[1:]), source.dtype)
+            torch.index_select(source, 0, index, out=bank.tensor)
+            bank.pin()
+            hot_sources[name][layer_id] = bank.tensor
+            hot_bytes += bank.nbytes
+    if hot_bytes:
+        logger.info(
+            f"MoE HOT expert residency: {hot_bytes / 2**30:.2f} GiB pinned compact "
+            f"rows across {len(hot_expert_ids)} DISK layers"
+        )
+
     from freetoken.moe.expert_banks import ExpertBanks
 
     # a failed mlock leaves a LOCKED layer pageable; the log and labels report what the banks actually settled at
@@ -713,6 +757,8 @@ def load_ftw_banks(
     return ExpertBanks(
         reader.meta("quant_format"), sources, **alpha_kw,
         layer_residency=applied,
+        hot_sources=hot_sources if hot_bytes else {},
+        hot_expert_ids=hot_expert_ids if hot_bytes else {},
     )
 
 

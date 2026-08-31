@@ -55,6 +55,9 @@ class EngineConfig:
     # Optional per-MoE-layer traffic scores used only by automatic FTW DISK spill
     # selection. Explicit moe_disk_layers remains authoritative.
     moe_disk_layer_profile: str | None = None
+    # Compact pinned HOT rows selected from the per-expert section of the DISK
+    # profile. Zero preserves pure layer residency.
+    moe_hot_expert_budget_gib: float = 0.0
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"
@@ -137,6 +140,13 @@ class EngineConfig:
             raise ValueError(
                 "--moe-disk-decode must be 'cpu' or 'gpufetch', got "
                 f"{self.moe_disk_decode!r}"
+            )
+        if (
+            not math.isfinite(float(self.moe_hot_expert_budget_gib))
+            or self.moe_hot_expert_budget_gib < 0
+        ):
+            raise ValueError(
+                "--moe-hot-expert-budget-gib must be a finite non-negative number"
             )
         if self.moe_disk_pager not in ("madvise", "uffd"):
             raise ValueError(

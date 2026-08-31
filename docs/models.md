@@ -75,12 +75,27 @@ For traffic-aware selection, collect a representative decode window with
 curl -s http://127.0.0.1:1919/v1/moe-layer-profile > moe-layer-profile.json
 ```
 
-The file is a JSON object mapping every MoE layer id to realized decode misses per step.
-Pass it on later boots with `--moe-disk-layer-profile moe-layer-profile.json`; automatic
-spill then picks the lowest scores, with ties resolved by layer id. Explicit
-`--moe-disk-layers` always takes precedence. A malformed or incomplete profile produces
-a warning and falls back to the head and tail split. Startup logs include the selected
-layer ids and the available scores.
+The endpoint writes profile version 2. Its `layers` object maps every MoE layer id to
+realized decode misses per step, and `expert_hits` contains one route-count array per
+layer. Pass it on later boots with
+`--moe-disk-layer-profile moe-layer-profile.json`; automatic spill picks the lowest
+layer scores, with ties resolved by layer id. Legacy unversioned layer-only profiles
+remain valid for whole-layer spill selection.
+
+`--moe-hot-expert-budget-gib N` uses the version 2 `expert_hits` section to pin a
+compact top-N expert bank inside every DISK layer. The same N is used for each layer and
+is derived from the byte budget after accounting for whole-layer pins and the
+`FREETOKEN_PIN_BUDGET_GB` ceiling. HOT pairs use the normal GPU slot cache and fused
+copy plan. COLD pairs remain file-backed and run in the CPU executor; their weighted
+partial is combined with the GPU partial through the hybrid decode merge. The default
+budget is 0, which preserves pure whole-layer residency. Expert-granular residency
+currently requires `--moe-disk-decode cpu`.
+
+Explicit `--moe-disk-layers` always takes precedence for layer selection. A malformed
+or incomplete layer-score profile produces a warning and falls back to the head and
+tail split. HOT residency treats a missing or malformed per-expert section as a startup
+error because guessing a partition would silently spend pinned memory. Startup logs
+include selected layer ids, top-N, pinned bytes, and the profiled hot-pair rate.
 
 ### File-backed PLE table
 

@@ -40,11 +40,22 @@ def disk_gpufetch_capacity(
     return min(int(max_tokens) * int(top_k), int(num_experts), int(cache_size))
 
 
-def serialize_moe_layer_profile(stats: dict) -> dict[str, float]:
-    """Serialize per-layer decode stats as layer id to realized misses per step."""
-    profile: dict[str, float] = {}
+MOE_LAYER_PROFILE_VERSION = 2
+
+
+def serialize_moe_layer_profile(
+    stats: dict, expert_hits: list[list[int]] | None = None,
+) -> dict:
+    """Serialize traffic into the versioned layer and per-expert profile format."""
+    layers: dict[str, float] = {}
     for row in stats["per_layer"]:
-        profile[str(int(row["layer"]))] = float(row["missing_per_step"])
+        layers[str(int(row["layer"]))] = float(row["missing_per_step"])
+    profile = {"version": MOE_LAYER_PROFILE_VERSION, "layers": layers}
+    if expert_hits is not None:
+        profile["expert_hits"] = {
+            str(layer_id): [int(count) for count in counts]
+            for layer_id, counts in enumerate(expert_hits)
+        }
     return profile
 
 # quant_format -> bank names, in registration order: the single place a format's bank
@@ -231,6 +242,17 @@ class OffloadMoeCache:
         self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
+        # Compact pinned HOT rows for expert-split DISK layers. The full
+        # bank_sources remain file-backed for the CPU executor; copy_missing uses
+        # these compact sources only when ensure_experts_hot staged the layer.
+        self.hot_bank_sources: dict[str, list[torch.Tensor | None]] = {}
+        self.hot_expert_ids: dict[int, tuple[int, ...]] = {}
+        self.hot_row_for_expert = torch.full(
+            (self.num_layers, self.num_experts),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
         # per-layer host residency: direct GPU movement requires "pinned";
         # LOCKED/PAGEABLE decode on CPU, while DISK may use CPU or the staging ring
         # _unpinned_layers is the derived id set the hot paths test against
@@ -268,10 +290,12 @@ class OffloadMoeCache:
         self.stat_active_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_fetched_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
-        # Opt-in decode routing histogram (per layer, per expert) for cache-skew
-        # analysis. Accumulated in ``ensure_experts`` from the raw expert ids before the
-        # kernel rewrites them to slots. Only accurate with CUDA graphs disabled (the
-        # captured graph would not re-run this host-side scatter on replay).
+        self.stat_hot_pairs = torch.zeros((), dtype=torch.int64, device=self.device)
+        self.stat_hot_total_pairs = torch.zeros((), dtype=torch.int64, device=self.device)
+        # Decode routing histogram (per layer, per expert) for cache-skew analysis and
+        # v2 profiles. The device scatter is captured and replays with each step's raw
+        # ids whenever collect_stats is enabled. collect_decode_freq remains a separate
+        # benchmark opt-in for callers that want only concentration stats.
         self.collect_decode_freq = False
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
@@ -332,6 +356,8 @@ class OffloadMoeCache:
         self,
         sources: dict[str, list[torch.Tensor]],
         layer_residency: list[str] | None = None,
+        hot_sources: dict[str, list[torch.Tensor | None]] | None = None,
+        hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
         cache per bank, following the format's bank schema.
@@ -378,8 +404,39 @@ class OffloadMoeCache:
                     "DISK residency, via --moe-disk-decode gpufetch (set "
                     "cache.cpu_layer_ids before set_bank_sources)"
                 )
+        hot_sources = hot_sources or {}
+        hot_expert_ids = {
+            int(layer_id): tuple(int(expert_id) for expert_id in expert_ids)
+            for layer_id, expert_ids in (hot_expert_ids or {}).items()
+        }
+        if bool(hot_sources) != bool(hot_expert_ids):
+            raise ValueError("HOT expert ids and compact bank sources must be provided together")
+        if hot_sources and set(hot_sources) != set(self.bank_schema):
+            raise ValueError(
+                f"HOT banks {sorted(hot_sources)} do not match schema {self.bank_schema}"
+            )
+        for layer_id, expert_ids in hot_expert_ids.items():
+            if not 0 <= layer_id < self.num_layers:
+                raise ValueError(f"HOT layer id {layer_id} is out of range")
+            if residency[layer_id] != HostResidency.DISK.value:
+                raise ValueError(f"HOT layer {layer_id} is not DISK resident")
+            if not expert_ids or len(set(expert_ids)) != len(expert_ids):
+                raise ValueError(f"HOT expert ids for layer {layer_id} must be non-empty and unique")
+            if any(expert_id < 0 or expert_id >= self.num_experts for expert_id in expert_ids):
+                raise ValueError(
+                    f"HOT expert ids for layer {layer_id} must be in [0, {self.num_experts})"
+                )
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
+        self.hot_expert_ids = hot_expert_ids
+        self.hot_bank_sources = {
+            name: list(hot_sources[name]) for name in self.bank_schema
+        } if hot_sources else {}
+        self.hot_row_for_expert.fill_(-1)
+        for layer_id, expert_ids in hot_expert_ids.items():
+            rows = torch.arange(len(expert_ids), dtype=torch.int32, device=self.device)
+            ids = torch.tensor(expert_ids, dtype=torch.long, device=self.device)
+            self.hot_row_for_expert[layer_id, ids] = rows
         self._configure_prefill_overlap_layers()
         for name in self.bank_schema:
             per_layer = sources[name]
@@ -397,6 +454,23 @@ class OffloadMoeCache:
                 dtype=head.dtype,
                 device=self.device,
             )
+            if hot_sources:
+                compact = hot_sources[name]
+                if len(compact) != self.num_layers:
+                    raise ValueError(
+                        f"HOT bank {name!r} has {len(compact)} layers, expected {self.num_layers}"
+                    )
+                for layer_id, expert_ids in hot_expert_ids.items():
+                    hot = compact[layer_id]
+                    if hot is None:
+                        raise ValueError(f"HOT bank {name!r} is missing layer {layer_id}")
+                    if not hot.is_contiguous() or hot.shape != (
+                        len(expert_ids), *head.shape[1:]
+                    ) or hot.dtype != head.dtype:
+                        raise ValueError(
+                            f"HOT bank {name!r} layer {layer_id} has incompatible "
+                            f"shape/dtype {hot.shape}/{hot.dtype}"
+                        )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()
         if any(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids):
@@ -528,12 +602,16 @@ class OffloadMoeCache:
 
         dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
-        for per_layer, cache in self.banks:
+        for bank_id, (per_layer, cache) in enumerate(self.banks):
             feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
-                if layer_id in self._unpinned_layers:
+                if layer_id in self.hot_expert_ids:
+                    bank_name = self.bank_schema[bank_id]
+                    source = self.hot_bank_sources[bank_name][layer_id]
+                    assert source is not None
+                elif layer_id in self._unpinned_layers:
                     # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
                     # a 0 placeholder keeps the descriptor shape
                     layer_src_ptrs[layer_id].append(0)
@@ -642,6 +720,8 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        self.stat_hot_pairs.zero_()
+        self.stat_hot_total_pairs.zero_()
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
@@ -692,6 +772,10 @@ class OffloadMoeCache:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
         return layer_id in self.cpu_layer_ids
 
+    def is_hot_split_layer(self, layer_id: int) -> bool:
+        """Whether a DISK layer has a compact pinned HOT expert partition."""
+        return layer_id in self.hot_expert_ids
+
     def is_gpufetch_layer(self, layer_id: int) -> bool:
         """Whether this file-backed layer decodes through the GPU slot cache."""
         return (
@@ -715,7 +799,16 @@ class OffloadMoeCache:
     def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
         if self.cpu_executor is None or not self.cpu_executor._disk_banks:
             return {}
-        return self.cpu_executor.disk_prefetch_stats(reset=reset)
+        result = self.cpu_executor.disk_prefetch_stats(reset=reset)
+        hot_pairs = int(self.stat_hot_pairs.item())
+        total_pairs = int(self.stat_hot_total_pairs.item())
+        result["hot_pair_rate"] = hot_pairs / total_pairs if total_pairs else 0.0
+        result["hot_pairs"] = hot_pairs
+        result["routed_pairs"] = total_pairs
+        if reset:
+            self.stat_hot_pairs.zero_()
+            self.stat_hot_total_pairs.zero_()
+        return result
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
@@ -998,11 +1091,7 @@ class OffloadMoeCache:
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        if self.collect_decode_freq:
-            # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
-            # slot ids in place), so snapshot the routing histogram before that happens.
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        self.record_decode_frequency(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
@@ -1019,14 +1108,33 @@ class OffloadMoeCache:
         miss count (for stats). All device-side / fixed-shape, so it is CUDA-graph safe."""
         from freetoken.moe.offload_kernels import ensure_experts_hybrid
 
-        if self.collect_decode_freq:
-            ids = expert_ids.reshape(-1).long()
-            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
+        self.record_decode_frequency(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
+
+    def ensure_experts_hot(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Route only this DISK layer's static HOT experts through the slot cache.
+
+        HOT routes become cache slots and missing copies use compact pinned source
+        rows. COLD routes become -1 for the CPU partial, exactly like hybrid overflow.
+        """
+        from freetoken.moe.offload_kernels import ensure_experts_hot
+
+        if layer_id not in self.hot_expert_ids:
+            raise ValueError(f"layer {layer_id} has no HOT expert partition")
+        self.record_decode_frequency(layer_id, expert_ids)
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        ensure_experts_hot(self, layer_id, expert_ids)
+
+    def record_decode_frequency(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Accumulate raw per-expert route counts before ids are rewritten to slots."""
+        if self.collect_stats or self.collect_decode_freq:
+            ids = expert_ids.reshape(-1).long()
+            self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
@@ -1055,6 +1163,8 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        self.stat_hot_pairs.zero_()
+        self.stat_hot_total_pairs.zero_()
         if self.cpu_executor is not None:
             self.cpu_executor.reset_disk_stats()
 
@@ -1136,9 +1246,11 @@ class OffloadMoeCache:
             })
         return {"per_layer": per_layer}
 
-    def decode_miss_layer_profile(self) -> dict[str, float]:
-        """JSON-ready traffic profile for static DISK spill selection."""
-        return serialize_moe_layer_profile(self.decode_miss_stats_per_layer())
+    def decode_miss_layer_profile(self) -> dict:
+        """JSON-ready layer traffic and per-expert hit profile."""
+        return serialize_moe_layer_profile(
+            self.decode_miss_stats_per_layer(), self.decode_freq.tolist()
+        )
 
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
@@ -1176,7 +1288,9 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if layer_id in self._unpinned_layers:
+        if layer_id in self._unpinned_layers and not (
+            layer_id in self.hot_expert_ids and not self._pending_whole_layer
+        ):
             if self.is_gpufetch_layer(layer_id) and not self._pending_whole_layer:
                 assert self.cpu_executor is not None
                 assert self._gpufetch_num_host is not None
@@ -1247,11 +1361,15 @@ class OffloadMoeCache:
 
         from freetoken.kernel import fast_index_copy_jit
 
-        for per_layer, cache in self.banks:
+        for bank_id, (per_layer, cache) in enumerate(self.banks):
+            source = per_layer[layer_id]
+            if layer_id in self.hot_expert_ids:
+                source = self.hot_bank_sources[self.bank_schema[bank_id]][layer_id]
+                assert source is not None
             fast_index_copy_jit(
                 cache,
                 self.evict_slots,
-                per_layer[layer_id],
+                source,
                 self.src_indices,
                 self.num_indices,
             )

@@ -351,6 +351,11 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        # Optional-feature probe: custom caches (and the DSV4 fixtures) predate
+        # expert-granular residency and expose no hot-split surface.
+        is_hot_split = getattr(cache, "is_hot_split_layer", None)
+        if is_hot_split is not None and is_hot_split(self.layer_id):
+            return self._decode_hot_split(cache, hidden_states, topk_weights, topk_ids)
         if cache.is_gpufetch_layer(self.layer_id):
             cache.ensure_experts(self.layer_id, topk_ids)
             cache.copy_missing()
@@ -367,6 +372,7 @@ class OffloadMoELayer(MoELayer):
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
+            cache.record_decode_frequency(self.layer_id, topk_ids)
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
@@ -405,9 +411,42 @@ class OffloadMoELayer(MoELayer):
         cache.ensure_experts_hybrid(self.layer_id, topk_ids)  # -> slot (hit/fetched) or -1
         if cache.collect_stats:
             cache.record_decode_stats_hybrid(self.layer_id)
-        on_gpu = topk_ids >= 0
+        return self._decode_split_partials(
+            cache, hidden_states, topk_weights, topk_ids, raw
+        )
 
-        cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
+    def _decode_hot_split(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Static profile split for a DISK layer, using the hybrid merge contract."""
+        raw = topk_ids.clone()
+        cache.ensure_experts_hot(self.layer_id, topk_ids)
+        return self._decode_split_partials(
+            cache, hidden_states, topk_weights, topk_ids, raw
+        )
+
+    def _decode_split_partials(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        gpu_ids: torch.Tensor,
+        raw_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Merge GPU-assigned and CPU-assigned weighted route partials.
+
+        Shared by dynamic hybrid overflow and the static HOT/COLD DISK split, so
+        both use the same graph-safe doorbell ordering and numerical merge.
+        """
+        executor = cache.cpu_executor
+        assert executor is not None, "CPU MoE executor was not initialized"
+        on_gpu = gpu_ids >= 0
+
+        cpu_ids = torch.where(on_gpu, raw_ids.new_full((), -1), raw_ids).contiguous()
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -417,7 +456,7 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
-        gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
+        gpu_slots = gpu_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(
             cache,

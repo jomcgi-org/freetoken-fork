@@ -15,6 +15,10 @@ from freetoken.engine.engine import _parse_disk_layers_spec as parse_disk
 from freetoken.engine.engine import _resolve_cpu_layers as resolve
 from freetoken.engine.engine import _resolve_disk_layers as resolve_disk
 from freetoken.engine.engine import _auto_cpu_layers as auto_layers
+from freetoken.engine.engine import _load_hot_expert_profile as load_hot_profile
+from freetoken.engine.engine import _plan_hot_experts as plan_hot
+from freetoken.engine.engine import _profiled_hot_pair_rate as profiled_hot_rate
+from freetoken.engine.engine import _resolve_hot_expert_sets as resolve_hot
 from freetoken.engine.engine import _validate_disk_prefill_task_size as validate_chunk
 
 L = 40
@@ -125,6 +129,85 @@ def test_auto_budget_uses_lowest_profile_scores_with_stable_ties(tmp_path, monke
     assert "([1, 5])" in logs[-1]
 
 
+def test_auto_budget_accepts_versioned_layer_profile(tmp_path, monkeypatch):
+    _write_ftw_index(tmp_path, 4)
+    profile = tmp_path / "traffic-v2.json"
+    profile.write_text(json.dumps({
+        "version": 2,
+        "layers": {"0": 4, "1": 1, "2": 3, "3": 2},
+        "expert_hits": {str(layer): [1, 0] for layer in range(4)},
+    }))
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(201 / 2**30))
+    monkeypatch.setattr(
+        "freetoken.engine.engine._cpu_moe_executor_viable", lambda model_config: True,
+    )
+
+    assert auto_layers(_auto_config(tmp_path, profile), 4) == frozenset({1, 3})
+
+
+def test_hot_partition_uses_equal_top_n_per_disk_layer_and_stable_ties():
+    hits = {
+        1: (9, 2, 9, 1, 0),
+        3: (0, 5, 4, 5, 1),
+    }
+    # 2 layers * 2 experts/layer * 100 bytes/expert.
+    plan = plan_hot(
+        hits, frozenset({1, 3}), budget_bytes=499,
+        expert_bytes=100, num_experts=5,
+    )
+    assert plan == {1: (0, 2), 3: (1, 3)}
+    assert profiled_hot_rate(hits, plan) == pytest.approx((18 + 10) / 36)
+
+
+def test_hot_partition_leaves_sub_round_budget_unused():
+    hits = {0: (3, 2), 1: (1, 4)}
+    assert plan_hot(
+        hits, frozenset({0, 1}), budget_bytes=199,
+        expert_bytes=100, num_experts=2,
+    ) == {}
+
+
+def test_hot_profile_requires_complete_integer_expert_counts(tmp_path):
+    profile = tmp_path / "traffic-v2.json"
+    profile.write_text(json.dumps({
+        "version": 2,
+        "layers": {"0": 1, "1": 2},
+        "expert_hits": {"0": [1, 2, 3], "1": [4, -1, 6]},
+    }))
+    with pytest.raises(ValueError, match="non-negative integers"):
+        load_hot_profile(str(profile), 2, 3)
+
+
+def test_hot_budget_counts_whole_layers_against_global_pin_cap(tmp_path, monkeypatch):
+    index = {
+        "format": "freetoken_weight",
+        "tensors": [
+            {"kind": "experts_bank", "name": "gate_up#L00000", "nbytes": 400},
+            {"kind": "experts_bank", "name": "gate_up#L00001", "nbytes": 400},
+            {"kind": "experts_bank", "name": "gate_up_alpha", "nbytes": 20},
+        ],
+    }
+    (tmp_path / "freetoken_weight.json").write_text(json.dumps(index))
+    profile = tmp_path / "traffic-v2.json"
+    profile.write_text(json.dumps({
+        "version": 2,
+        "layers": {"0": 1, "1": 1},
+        "expert_hits": {"0": [9, 8, 2, 1], "1": [1, 1, 1, 1]},
+    }))
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(620 / 2**30))
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(num_experts=4),
+        moe_hot_expert_budget_gib=1.0,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=str(profile),
+    )
+
+    # 420 bytes are already pinned by the non-DISK layer and alpha. The 620-byte
+    # global ceiling leaves 200 bytes, exactly two 100-byte experts in layer 0.
+    assert resolve_hot(config, frozenset({0}), 2) == {0: (0, 1)}
+
+
 @pytest.mark.parametrize(
     "contents",
     ["{not-json", json.dumps({"0": 1, "1": 2, "2": 3})],
@@ -203,6 +286,23 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     )
     assert config.moe_disk_prefill == "cpu"
     assert config.moe_disk_decode == "cpu"
+    assert config.moe_hot_expert_budget_gib == 0
+
+
+@pytest.mark.parametrize("budget", [-1, float("inf"), float("nan")])
+def test_engine_config_rejects_invalid_hot_expert_budget(budget):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-expert-budget-gib.*finite non-negative"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_expert_budget_gib=budget,
+        )
 
 
 def test_engine_config_rejects_invalid_disk_prefill_mode():
