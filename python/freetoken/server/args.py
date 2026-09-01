@@ -581,6 +581,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--linear-state-cache-ratio",
+        type=float,
+        default=ServerArgs.linear_state_cache_ratio,
+        help=(
+            "GDN/linear-state slot pool as a multiple of --max-running-requests. "
+            "Slots beyond the running requests hold prefix-cache snapshots; raise "
+            "it so multi-turn chats survive between messages (costs VRAM per slot)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
