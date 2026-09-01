@@ -1190,7 +1190,21 @@ class CpuMoeExecutor:
         return _PrefillCoalesceLease(int(layer_id), tuple(selected))
 
     def release_prefill_layer(self, lease: _PrefillCoalesceLease) -> None:
-        """Mark successfully swept rows as one-pass after native compute completes."""
+        """Mark successfully swept rows as one-pass after native compute completes.
+
+        Disabled by default: consecutive prefill chunks share most of their
+        routed experts (Zipf), so eager per-layer eviction forces the next
+        chunk's populate back to disk - measured at 5-11 tok/s vs 56 with the
+        release inert. Single-lane serving has no concurrent decode to
+        protect; page-cache LRU handles pressure. Opt back in with
+        FREETOKEN_PREFILL_EAGER_RELEASE=1 for multi-lane experiments.
+        """
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_PREFILL_EAGER_RELEASE", "").strip() not in (
+            "1", "true", "on",
+        ):
+            return
         banks = self._disk_banks.get(int(lease.layer_id), ())
         pager_groups: dict[object, list] = {}
         for bank in banks:
