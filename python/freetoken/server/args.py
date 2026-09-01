@@ -338,6 +338,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--ple-prefill-gather",
+        choices=["on", "off"],
+        default=ServerArgs.ple_prefill_gather,
+        help=(
+            "Bulk-stage deduplicated PLE rows before each prefill chunk when "
+            "--ple-backend hmm is selected. Decode always keeps direct HMM gathers."
+        ),
+    )
+
+    parser.add_argument(
         "--speculative-mtp",
         choices=["off", "on"],
         default=ServerArgs.speculative_mtp,
