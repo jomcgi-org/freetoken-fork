@@ -76,6 +76,10 @@ class EngineConfig:
     # Predict madvise WILLNEED rows from the preceding decode step. UFFD ignores this
     # setting because its userspace pager already prefetches logical expert rows.
     moe_disk_lookahead: str = "off"
+    # Restore a parked session's compact routed-expert working set at request
+    # admission. Protection is bounded per live session and is strictly advisory.
+    session_expert_prefetch: str = "on"
+    session_protect_experts: int = 64
     # Diagnostic decode instrumentation. Records CUDA phase boundaries and native
     # CPU task spans, then emits interval-averaged per-step timings on the decode log.
     moe_step_timing: bool = False
@@ -199,6 +203,17 @@ class EngineConfig:
                 "--moe-disk-lookahead must be 'on' or 'off', got "
                 f"{self.moe_disk_lookahead!r}"
             )
+        if self.session_expert_prefetch not in ("on", "off"):
+            raise ValueError(
+                "--session-expert-prefetch must be 'on' or 'off', got "
+                f"{self.session_expert_prefetch!r}"
+            )
+        if (
+            isinstance(self.session_protect_experts, bool)
+            or not isinstance(self.session_protect_experts, int)
+            or self.session_protect_experts < 0
+        ):
+            raise ValueError("--session-protect-experts must be a non-negative integer")
         if (
             not math.isfinite(float(self.moe_pager_budget_gib))
             or self.moe_pager_budget_gib <= 0

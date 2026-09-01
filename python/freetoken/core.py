@@ -85,6 +85,10 @@ class Req:
     # Stateful optional-backend matcher. Kept request-owned because decode batches are
     # re-formed every step and each sequence advances through its grammar independently.
     guided_state: Any | None = field(default=None, init=False, repr=False)
+    # Advisory routed-expert working set recovered while this request waited in
+    # the admission queue. It never participates in model math.
+    expert_profile: Any | None = field(default=None, init=False, repr=False)
+    expert_profile_restored: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

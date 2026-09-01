@@ -105,6 +105,7 @@ class DiskPrefixEntry:
     path: Path
     file_bytes: int
     restore_ms: float
+    expert_profile: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -164,10 +165,12 @@ class DiskPrefixStore:
         )
         self._thread.start()
 
-    def _metadata(self, token_ids: torch.Tensor) -> dict[str, str]:
+    def _metadata(
+        self, token_ids: torch.Tensor, tensors: Mapping[str, torch.Tensor]
+    ) -> dict[str, str]:
         with self._lock:
             prefill_rate = self._prefill_tokens_per_s
-        return {
+        metadata = {
             "format": FORMAT,
             "version": str(VERSION),
             "identity": self.identity,
@@ -177,6 +180,11 @@ class DiskPrefixStore:
             "token_hash": token_chain_hash(self.identity, token_ids),
             "prefill_tokens_per_s": str(prefill_rate),
         }
+        if "expert_profile.version" in tensors:
+            metadata["expert_profile_version"] = str(
+                int(tensors["expert_profile.version"].reshape(-1)[0])
+            )
+        return metadata
 
     def _path_for(self, token_ids: torch.Tensor) -> Path:
         key = token_chain_hash(self.identity, token_ids)
@@ -264,7 +272,7 @@ class DiskPrefixStore:
                 }
                 path = self._path_for(job.token_ids)
                 tmp = path.with_name(path.name + _TMP_MARKER + uuid.uuid4().hex)
-                save_file(tensors, str(tmp), metadata=self._metadata(job.token_ids))
+                save_file(tensors, str(tmp), metadata=self._metadata(job.token_ids, tensors))
                 with tmp.open("rb") as f:
                     os.fsync(f.fileno())
                 os.replace(tmp, path)
@@ -325,7 +333,17 @@ class DiskPrefixStore:
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 file_bytes = path.stat().st_size
                 os.utime(path, None)
-                entry = DiskPrefixEntry(tensors, length, path, file_bytes, elapsed_ms)
+                expert_profile = None
+                try:
+                    from freetoken.moe.session_profile import SessionExpertProfile
+
+                    expert_profile = SessionExpertProfile.from_tensors(tensors)
+                except (KeyError, TypeError, ValueError):
+                    # Advisory data must never make otherwise valid KV/GDN state unusable.
+                    expert_profile = None
+                entry = DiskPrefixEntry(
+                    tensors, length, path, file_bytes, elapsed_ms, expert_profile
+                )
                 if record:
                     self.record_restore(entry, length - longer_than)
                 return entry
@@ -337,6 +355,48 @@ class DiskPrefixStore:
                 self._delete(path, "corrupt_entries")
         with self._lock:
             self._stats["misses"] += 1
+        return None
+
+    def lookup_profile_longest(
+        self, token_ids: torch.Tensor, *, longer_than: int = 0
+    ) -> tuple[int, Any] | None:
+        """Read only the tiny advisory field for admission-time warming.
+
+        Unlike ``lookup_longest``, this does not materialize the KV/GDN tensors and does
+        not affect restore hit/miss accounting. Missing or malformed profile fields are
+        treated exactly like an older entry that predates the field.
+        """
+        from freetoken.moe.session_profile import PROFILE_TENSOR_NAMES, SessionExpertProfile
+
+        ids = token_ids.detach().to(device="cpu", dtype=torch.int32).contiguous()
+        with self._lock:
+            lengths = sorted(
+                (n for n in self._lengths if longer_than < n <= ids.numel()), reverse=True
+            )
+        for length in lengths:
+            key = token_chain_hash(self.identity, ids[:length])
+            with self._lock:
+                path = self._entries.get((length, key))
+            if path is None:
+                continue
+            try:
+                with safe_open(str(path), framework="pt", device="cpu") as handle:
+                    meta = handle.metadata() or {}
+                    if meta.get("identity") != self.identity or meta.get("token_hash") != key:
+                        continue
+                    keys = set(handle.keys())
+                    if "expert_profile.version" not in keys:
+                        continue
+                    tensors = {
+                        name: handle.get_tensor(name)
+                        for name in PROFILE_TENSOR_NAMES
+                        if name in keys
+                    }
+                profile = SessionExpertProfile.from_tensors(tensors)
+                if profile is not None:
+                    return length, profile
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
         return None
 
     def observe_prefill_rate(self, tokens_per_s: float) -> None:
@@ -513,6 +573,7 @@ def stage_hybrid_prefix_for_write(
     kv_indices: torch.Tensor,
     linear_slot: int,
     table_idx: int | None,
+    extra_tensors: Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], Any | None]:
     """Stage a hybrid prefix with one reusable per-layer GPU gather buffer."""
     from freetoken.spec_decode import request_state_views
@@ -526,6 +587,7 @@ def stage_hybrid_prefix_for_write(
             linear_slot=linear_slot,
             table_idx=table_idx,
         )
+        tensors.update(extra_tensors or {})
         return stage_tensors_for_write(tensors, device)
 
     locations = kv_indices.to(torch.long)
@@ -588,6 +650,13 @@ def stage_hybrid_prefix_for_write(
         )
         host.copy_(value, non_blocking=True)
         staged[f"slot_state.{name}"] = host
+
+    for name, value in (extra_tensors or {}).items():
+        host = torch.empty(
+            value.shape, dtype=value.dtype, device="cpu", pin_memory=True
+        )
+        host.copy_(value, non_blocking=True)
+        staged[name] = host
 
     ready = torch.cuda.Event()
     ready.record()

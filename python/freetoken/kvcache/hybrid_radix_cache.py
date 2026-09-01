@@ -71,7 +71,7 @@ class HybridRadixCache:
         self.full_protected = 0
         self.mamba_evictable = 0     # number of live, unlocked snapshots
         self.mamba_protected = 0
-        self.on_evict: Callable[[torch.Tensor, torch.Tensor, int], None] | None = None
+        self.on_evict: Callable[[torch.Tensor, torch.Tensor, int, object | None], None] | None = None
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
@@ -89,7 +89,7 @@ class HybridRadixCache:
         return HybridMatch(self.empty, 0, None, self.root)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               mamba_value: int) -> Tuple[int, bool]:
+               mamba_value: int, expert_profile=None) -> Tuple[int, bool]:
         """Insert the committed KV prefix and DONATE ``mamba_value`` at the (page-aligned) end
         boundary node. Returns (matched_prefix_len, mamba_exist). If the boundary node already
         owns a live snapshot, returns mamba_exist=True and does not attach (caller frees the
@@ -106,8 +106,12 @@ class HybridRadixCache:
         if node.is_root():
             return prefix_len, True   # root can't hold a snapshot; report exist so caller frees it
         if node.mamba_value is not None:
+            if expert_profile is not None:
+                node.expert_profile = expert_profile
             return prefix_len, True                 # dedup: caller frees its donated slot
         node.mamba_value = mamba_value              # fills a fresh node or a tombstone
+        if expert_profile is not None:
+            node.expert_profile = expert_profile
         if node.mamba_ref_count == 0:
             self.mamba_evictable += 1
         return prefix_len, False
@@ -215,10 +219,12 @@ class HybridRadixCache:
         if node.mamba_value is not None:
             if self.on_evict is not None:
                 self.on_evict(
-                    self._collect_ids(node), self._collect_kv(node), node.mamba_value
+                    self._collect_ids(node), self._collect_kv(node), node.mamba_value,
+                    node.expert_profile,
                 )
             out.append(node.mamba_value)
             node.mamba_value = None
+            node.expert_profile = None
             if node.mamba_ref_count == 0:
                 self.mamba_evictable -= 1
 

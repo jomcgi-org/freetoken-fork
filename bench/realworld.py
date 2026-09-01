@@ -43,6 +43,7 @@ def _post(base_url: str, payload: dict, timeout: float = 900.0) -> tuple[dict, f
     ttft = None
     usage = {}
     content_len = 0
+    decode_chunk_times: list[float] = []
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
@@ -58,10 +59,24 @@ def _post(base_url: str, payload: dict, timeout: float = 900.0) -> tuple[dict, f
                 delta = choice.get("delta", {})
                 if delta.get("content") or delta.get("reasoning_content"):
                     content_len += len(delta.get("content") or "")
+                    decode_chunk_times.append(time.time() - t0)
                     if ttft is None:
                         ttft = time.time() - t0
     total = time.time() - t0
-    return {"usage": usage, "content_len": content_len}, (ttft if ttft is not None else total), total
+    first64_rate = None
+    steady_rate = None
+    if len(decode_chunk_times) >= 64:
+        span = decode_chunk_times[63] - decode_chunk_times[0]
+        first64_rate = 63 / span if span > 0 else None
+    if len(decode_chunk_times) > 65:
+        span = decode_chunk_times[-1] - decode_chunk_times[64]
+        steady_rate = (len(decode_chunk_times) - 65) / span if span > 0 else None
+    return {
+        "usage": usage,
+        "content_len": content_len,
+        "first64_decode_rate": first64_rate,
+        "steady_decode_rate": steady_rate,
+    }, (ttft if ttft is not None else total), total
 
 
 def _wait_ready(base_url: str, model: str, deadline_s: float = 1800.0) -> None:
@@ -124,9 +139,11 @@ def scenario_agent_resume(base_url: str, model: str, restart_cmd: str | None) ->
         _wait_ready(base_url, model)
         messages.append({"role": "assistant", "content": "Extract the routing table."})
         messages.append({"role": "user", "content": "And the second refactor?"})
-        _, resume_ttft, _ = _post(base_url, {
-            "model": model, "messages": messages, "max_tokens": 60, "temperature": 0})
+        resumed, resume_ttft, _ = _post(base_url, {
+            "model": model, "messages": messages, "max_tokens": 160, "temperature": 0})
         result["post_restart_resume_ttft"] = resume_ttft
+        result["post_restart_first64_decode_rate"] = resumed["first64_decode_rate"]
+        result["post_restart_steady_decode_rate"] = resumed["steady_decode_rate"]
     return result
 
 
@@ -199,6 +216,15 @@ def main() -> int:
                 f"warm follow-up ttft={a['warm_followup_ttft']:.2f}s")
         if "post_restart_resume_ttft" in a:
             line += f" | post-restart resume ttft={a['post_restart_resume_ttft']:.2f}s"
+            first64 = a.get("post_restart_first64_decode_rate")
+            steady = a.get("post_restart_steady_decode_rate")
+            line += (
+                f" | post-restart first64 decode="
+                f"{first64:.2f} tok/s" if first64 is not None
+                else " | post-restart first64 decode=n/a"
+            )
+            if steady is not None:
+                line += f" | post-restart steady decode={steady:.2f} tok/s"
         print(line)
     if "contention" not in skip:
         k = scenario_contention(args.base_url, args.model)

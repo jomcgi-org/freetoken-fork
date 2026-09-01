@@ -113,6 +113,8 @@ class Scheduler(SchedulerIOMixin):
             swa_pool=self.engine.kv_cache,
             kv_cache=self.engine.kv_cache,
             disk_prefix_store=self.disk_prefix_store,
+            moe_offload_cache=self.engine.moe_offload_cache,
+            expert_prefetch_stream=self.engine.stream,
             sliding_window_size=next(
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
@@ -201,7 +203,16 @@ class Scheduler(SchedulerIOMixin):
                     f"{disk['delta_pages_per_step']:.2f}, "
                     f"disk gpufetch fills/step: "
                     f"{disk['gpufetch_fills_per_step']:.2f}, "
-                    f"disk gpufetch fill_us: {disk['gpufetch_fill_us']:.0f}"
+                    f"disk gpufetch fill_us: {disk['gpufetch_fill_us']:.0f}, "
+                    f"resume_prefetch_experts: "
+                    f"{disk.get('resume_prefetch_experts', 0)}, "
+                    f"resume first64 tok/s: "
+                    f"{disk.get('resume_first64_tok_s', 0.0):.2f}, "
+                    f"resume steady tok/s: "
+                    f"{disk.get('resume_steady_tok_s', 0.0):.2f}, "
+                    f"resume warmup/steady: "
+                    f"{disk.get('resume_warmup_ratio', 0.0):.3f}, "
+                    f"protected_experts: {disk.get('protected_experts', 0)}"
                 )
                 if disk.get("pager_backend") == "uffd":
                     message += (
@@ -404,6 +415,10 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        # getattr probe: overlap-loop test doubles predate the engine attribute.
+        engine = getattr(self, "engine", None)
+        if batch.is_decode and engine is not None and engine.moe_offload_cache is not None:
+            engine.moe_offload_cache.record_resume_decode_batch(batch.reqs)
         if getattr(batch, "mtp_verify", False):
             self.engine.resolve_mtp_timing(batch)
         reply: List[DetokenizeMsg] = []

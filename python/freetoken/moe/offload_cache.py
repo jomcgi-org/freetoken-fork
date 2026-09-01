@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterator
@@ -271,6 +272,22 @@ class OffloadMoeCache:
         self.decayed_decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.float32, device=self.device
         )
+        # Session profiles are configured by Engine before graph capture. The fixed
+        # table-indexed sketch is address-stable, so decode collection is capturable;
+        # admission prefetch and protection updates remain outside graph capture.
+        self.session_profile_enabled = False
+        self.session_profile_topk = 0
+        self.session_profile_ids: torch.Tensor | None = None
+        self.session_profile_counts: torch.Tensor | None = None
+        self._session_decay_factor = 1.0
+        self._session_protect_limit = 0
+        from freetoken.moe.session_profile import SessionProtectionRegistry
+
+        self._session_protections = SessionProtectionRegistry()
+        self._session_prefetch_experts = 0
+        self._resume_timing: dict[int, dict[str, float]] = {}
+        self._last_resume_warm_rate = 0.0
+        self._last_resume_steady_rate = 0.0
         self._hot_mapping_host: torch.Tensor | None = None
         self._hot_slot_owners: dict[int, list[int | None]] = {}
         self._hot_adapt_executor: ThreadPoolExecutor | None = None
@@ -869,6 +886,242 @@ class OffloadMoeCache:
             self._hot_adapt_copy_stream = torch.cuda.Stream(device=self.device)
             self._hot_adapt_snapshot_ready = torch.cuda.Event()
 
+    def configure_session_profiles(
+        self,
+        *,
+        max_sessions: int,
+        enabled: bool,
+        protect_experts: int,
+        half_life_steps: int,
+    ) -> None:
+        """Allocate the fixed per-table top-k sketch before CUDA graph capture."""
+        from freetoken.moe.hot_adapt import decay_multiplier
+        from freetoken.moe.session_profile import SESSION_EXPERT_PROFILE_TOPK
+
+        self.session_profile_enabled = bool(enabled)
+        self.session_profile_topk = SESSION_EXPERT_PROFILE_TOPK
+        self._session_protect_limit = max(0, int(protect_experts))
+        self._session_decay_factor = decay_multiplier(half_life_steps)
+        if not self.session_profile_enabled:
+            self.session_profile_ids = None
+            self.session_profile_counts = None
+            return
+        # One extra row is the scheduler's graph-padding request. It is never exported.
+        shape = (int(max_sessions) + 1, self.num_layers, self.session_profile_topk)
+        self.session_profile_ids = torch.full(
+            shape, -1, dtype=torch.int32, device=self.device
+        )
+        self.session_profile_counts = torch.zeros(
+            shape, dtype=torch.float32, device=self.device
+        )
+
+    def _record_session_profile(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Merge this decode layer's routes into each request's bounded top-k sketch."""
+        if not self.session_profile_enabled or self.session_profile_ids is None:
+            return
+        from freetoken.core import get_global_ctx
+
+        try:
+            batch = get_global_ctx().batch
+        except AssertionError:
+            return
+        if not batch.is_decode or batch.active_table_idx is None:
+            return
+        from freetoken.moe.offload_kernels import update_session_profile
+
+        update_session_profile(
+            self, layer_id, expert_ids, batch.active_table_idx.reshape(-1)
+        )
+
+    def activate_session_profile(
+        self, uid: int, table_idx: int, profile, *, restored: bool
+    ) -> None:
+        """Seed the live sketch after resource admission; prefetch already ran at queue entry."""
+        if not self.session_profile_enabled or self.session_profile_ids is None:
+            return
+        self.session_profile_ids[table_idx].fill_(-1)
+        self.session_profile_counts[table_idx].zero_()
+        if profile is not None:
+            tensors = profile.to_tensors()
+            ids = tensors["expert_profile.ids"].to(self.device, dtype=torch.int32)
+            counts = tensors["expert_profile.counts"].to(self.device, dtype=torch.float32)
+            layers = min(ids.shape[0], self.num_layers)
+            self.session_profile_ids[table_idx, :layers].copy_(ids[:layers])
+            self.session_profile_counts[table_idx, :layers].copy_(counts[:layers])
+        if restored and profile is not None:
+            self._resume_timing[int(uid)] = {
+                "steps": 0.0,
+                "first": 0.0,
+                "step64": 0.0,
+                "step65": 0.0,
+                "last": 0.0,
+            }
+
+    def export_session_profile(self, table_idx: int):
+        """Synchronously compact one parked table row into its few-KB host object."""
+        if not self.session_profile_enabled or self.session_profile_ids is None:
+            return None
+        from freetoken.moe.session_profile import SessionExpertProfile
+
+        ids = self.session_profile_ids[table_idx].detach().cpu().tolist()
+        counts = self.session_profile_counts[table_idx].detach().cpu().tolist()
+        out_ids: list[tuple[int, ...]] = []
+        out_counts: list[tuple[float, ...]] = []
+        for layer_ids, layer_counts in zip(ids, counts):
+            pairs = [
+                (int(expert), float(count))
+                for expert, count in zip(layer_ids, layer_counts)
+                if int(expert) >= 0 and math.isfinite(float(count)) and float(count) > 0
+            ]
+            pairs.sort(key=lambda pair: (-pair[1], pair[0]))
+            out_ids.append(tuple(expert for expert, _ in pairs))
+            out_counts.append(tuple(count for _, count in pairs))
+        if not any(out_ids):
+            return None
+        return SessionExpertProfile(tuple(out_ids), tuple(out_counts))
+
+    def admit_session_profile(self, uid: int, profile) -> int:
+        """Plan and enqueue advisory warming at waiting-queue admission."""
+        if not self.session_profile_enabled or profile is None:
+            return 0
+        if self.device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            return 0
+        from freetoken.moe.session_profile import (
+            SESSION_ADAPT_INJECTION_WEIGHT,
+            plan_session_prefetch,
+        )
+
+        plan = plan_session_prefetch(
+            profile,
+            self.layer_residency,
+            hot_experts=self.hot_expert_ids,
+            protect_limit=self._session_protect_limit,
+        )
+        self._session_protections.admit(uid, plan.protected)
+        from freetoken.moe import offload_kernels
+
+        try:
+            for layer_id, experts in plan.promote:
+                ids = torch.tensor(experts, dtype=torch.int32, device=self.device)
+                self._pending_src_layer = layer_id
+                self._pending_whole_layer = False
+                if layer_id in self.hot_expert_capacity:
+                    offload_kernels.ensure_experts_hot(
+                        self, layer_id, ids, record_stats=False
+                    )
+                else:
+                    offload_kernels.ensure_experts(
+                        self, layer_id, ids, record_stats=False
+                    )
+                self.copy_missing()
+                self._boost_protected_slots()
+        except Exception as exc:
+            # ensure_experts publishes slot ownership before the copy. If the copy
+            # fails, invalidate the advisory slot map so no forward can consume an
+            # incompletely filled row.
+            if self.device.type == "cuda":
+                offload_kernels.reset_cache(self)
+            else:
+                self.slot_for_id.fill_(-1)
+                self.id_of_slot.fill_(-1)
+                self.usage.zero_()
+            logger.warning(
+                f"session expert H2D prefetch for request {uid} was skipped: {exc!r}"
+            )
+        try:
+            if self.cpu_executor is not None:
+                for layer_id, experts in plan.willneed:
+                    self.cpu_executor._prefetch_selected(layer_id, experts)
+        except Exception as exc:
+            logger.warning(
+                f"session expert WILLNEED for request {uid} was skipped: {exc!r}"
+            )
+        try:
+            for layer_id, expert, count in profile.ranked_pairs():
+                if layer_id < self.num_layers and expert < self.num_experts:
+                    self.decayed_decode_freq[layer_id, expert] += (
+                        float(count) * SESSION_ADAPT_INJECTION_WEIGHT
+                    )
+            self._boost_protected_slots()
+        except Exception as exc:
+            logger.warning(
+                f"session expert adaptation hint for request {uid} was skipped: {exc!r}"
+            )
+        self._session_prefetch_experts += plan.expert_count
+        return plan.expert_count
+
+    def _boost_protected_slots(self) -> None:
+        if not self.session_profile_enabled or self.session_profile_ids is None:
+            return
+        protected = self._session_protections.all()
+        if not protected:
+            return
+        flat_ids = torch.tensor(
+            [layer * self.num_experts + expert for layer, expert in sorted(protected)],
+            dtype=torch.long,
+            device=self.device,
+        )
+        slots = self.slot_for_id.view(-1).index_select(0, flat_ids)
+        slots = slots[slots >= 0].to(torch.long)
+        if slots.numel():
+            self.usage.index_fill_(0, slots, (1 << 60))
+
+    def release_session_profile(self, uid: int) -> None:
+        old = self._session_protections.release(uid)
+        still = self._session_protections.all()
+        released = [pair for pair in old if pair not in still]
+        if released:
+            flat = torch.tensor(
+                [layer * self.num_experts + expert for layer, expert in released],
+                dtype=torch.long,
+                device=self.device,
+            )
+            slots = self.slot_for_id.view(-1).index_select(0, flat)
+            slots = slots[slots >= 0].to(torch.long)
+            if slots.numel():
+                self.usage.index_fill_(0, slots, int(self.step.item()))
+        timing = self._resume_timing.pop(int(uid), None)
+        if timing is not None:
+            steps, first, step64, step65, last = (
+                timing["steps"], timing["first"], timing["step64"],
+                timing["step65"], timing["last"],
+            )
+            if steps >= 64 and last > first:
+                self._last_resume_warm_rate = 63.0 / max(step64 - first, 1e-9)
+            if steps > 65 and last > step65:
+                self._last_resume_steady_rate = (steps - 65.0) / (last - step65)
+
+    def record_resume_decode_batch(self, reqs) -> None:
+        now = time.perf_counter()
+        for req in reqs:
+            timing = self._resume_timing.get(int(req.uid))
+            if timing is None:
+                continue
+            timing["steps"] += 1.0
+            if timing["steps"] == 1:
+                timing["first"] = now
+            if timing["steps"] == 64:
+                timing["step64"] = now
+            if timing["steps"] == 65:
+                timing["step65"] = now
+            timing["last"] = now
+
+    def session_profile_stats(self, *, reset: bool = False) -> dict[str, float | int]:
+        protected = self._session_protections.all()
+        result = {
+            "resume_prefetch_experts": self._session_prefetch_experts,
+            "protected_experts": len(protected),
+            "resume_first64_tok_s": self._last_resume_warm_rate,
+            "resume_steady_tok_s": self._last_resume_steady_rate,
+            "resume_warmup_ratio": (
+                self._last_resume_warm_rate / self._last_resume_steady_rate
+                if self._last_resume_steady_rate > 0 else 0.0
+            ),
+        }
+        if reset:
+            self._session_prefetch_experts = 0
+        return result
+
     def _publish_hot_mapping(self) -> None:
         """Update the fixed device table in place, preserving graph addresses."""
         assert self._hot_mapping_host is not None
@@ -1000,6 +1253,8 @@ class OffloadMoeCache:
 
     def hot_adapt_step_boundary(self) -> None:
         """Advance adaptation after one decode step without waiting on copy work."""
+        # This runs after graph replay, keeping protection maintenance outside capture.
+        self._boost_protected_slots()
         if not self.hot_adapt_enabled:
             return
         self.hot_adapt_decode_steps += 1
@@ -1092,6 +1347,7 @@ class OffloadMoeCache:
         # them merely because this report window has no new tick.
         result["hot_swaps_per_interval"] = swaps / max(ticks, 1)
         result["decayed_hot_pair_rate"] = self.decayed_hot_pair_rate()
+        result.update(self.session_profile_stats(reset=reset))
         if reset:
             self.stat_hot_pairs.zero_()
             self.stat_hot_total_pairs.zero_()
@@ -1421,6 +1677,7 @@ class OffloadMoeCache:
 
     def record_decode_frequency(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Accumulate raw per-expert route counts before ids are rewritten to slots."""
+        self._record_session_profile(layer_id, expert_ids)
         if self.collect_stats or self.collect_decode_freq:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
@@ -1440,6 +1697,9 @@ class OffloadMoeCache:
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
         self.decayed_decode_freq.zero_()
+        if self.session_profile_ids is not None:
+            self.session_profile_ids.fill_(-1)
+            self.session_profile_counts.zero_()
         if self.cpu_executor is not None:
             # Graph capture calls reset before live serving. Do not let synthetic
             # warmup routes seed the first real decode prediction.

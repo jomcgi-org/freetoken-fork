@@ -33,6 +33,10 @@ class RadixTreeNode:
         # whose end boundary is unchanged. Forward-compat seam for SWA.
         self.mamba_value: int | None = None
         self.mamba_ref_count: int = 0
+        # Advisory routed-expert working set attached to this node's end boundary.
+        # Like mamba_value it stays on the suffix when a node is split, because the
+        # suffix's end boundary is unchanged. Plain radix caches leave it as None.
+        self.expert_profile: Any | None = None
 
         # SWA second currency (SWARadixCache). Unlike the GDN snapshot above, SWA stores NO
         # separate slot: ``value`` (full-pool page indices) is canonical and the swa KV is
