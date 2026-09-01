@@ -198,7 +198,9 @@ def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> di
     index (layer - first_k_dense_replace) so banks have no holes for leading dense layers.
     MTP layer excluded.
     """
-    return load_nvfp4_expert_source_banks(
+    from freetoken.models.glm_moe import validate_glm_nvfp4_bank_geometry
+
+    sources = load_nvfp4_expert_source_banks(
         model_path,
         config,
         _NVFP4_SOURCE_SPEC,
@@ -206,6 +208,7 @@ def load_nvfp4_expert_sources(model_path: str, config, *, layer_sink=None) -> di
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
     )
+    return validate_glm_nvfp4_bank_geometry(config, sources)
 
 
 def load_nvfp4_expert_sources_parallel(
@@ -214,7 +217,9 @@ def load_nvfp4_expert_sources_parallel(
     """parallel: same NVFP4 source banks via the common chunked multi-threaded O_DIRECT reader."""
     from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
 
-    return load_nvfp4_expert_source_banks_parallel(
+    from freetoken.models.glm_moe import validate_glm_nvfp4_bank_geometry
+
+    sources = load_nvfp4_expert_source_banks_parallel(
         model_path,
         config,
         _NVFP4_SOURCE_SPEC,
@@ -224,6 +229,7 @@ def load_nvfp4_expert_sources_parallel(
         chunk=chunk,
         layer_sink=layer_sink,
     )
+    return validate_glm_nvfp4_bank_geometry(config, sources)
 
 
 __all__ = ["iter_weights", "load_nvfp4_expert_sources", "load_nvfp4_expert_sources_parallel"]

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
+from freetoken.models.glm_moe import derive_glm_moe_geometry, glm_shared_expert_count
 
 from .mlp import GlmGatedMLP
 
@@ -24,18 +25,21 @@ class Glm4MoeSparseBlock(BaseOP):
     """
 
     def __init__(self, config: ModelConfig, layer_id: int):
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_experts
+        geometry = derive_glm_moe_geometry(config)
+        self.top_k = geometry.top_k
+        self.num_experts = geometry.num_experts
         self.norm_topk_prob = config.norm_topk_prob
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_group = config.n_group
         self.topk_group = config.topk_group
 
-        self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+        self.gate = LinearReplicated(
+            geometry.hidden_size, geometry.num_experts, has_bias=False
+        )
         # DeepSeek-style selection bias; a registered buffer in HF (kept fp32 there). We
         # store it in the model's bf16 dtype and upcast at use, which is exact enough for
         # the argmax-style top-k selection.
-        self.e_score_correction_bias = torch.empty(config.num_experts)
+        self.e_score_correction_bias = torch.empty(geometry.num_experts)
 
         # The offload cache indexes experts by *MoE* layer (global layer minus
         # first_k_dense_replace), matching how the loader packs the expert banks. The
@@ -44,10 +48,15 @@ class Glm4MoeSparseBlock(BaseOP):
             config,
             layer_id=layer_id - config.first_k_dense_replace,
             renormalize=config.norm_topk_prob,
+            num_experts=geometry.num_experts,
+            top_k=geometry.top_k,
+            hidden_size=geometry.hidden_size,
+            intermediate_size=geometry.intermediate_size,
         )
+        shared_count = glm_shared_expert_count(config)
         self.shared_experts = GlmGatedMLP(
-            config.hidden_size,
-            config.moe_intermediate_size * max(1, config.n_shared_experts),
+            geometry.hidden_size,
+            geometry.intermediate_size * shared_count,
         )
 
     def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
