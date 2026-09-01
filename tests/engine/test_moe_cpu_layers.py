@@ -539,7 +539,8 @@ def test_engine_config_defaults_to_madvise_disk_pager():
         dtype=torch.bfloat16,
     )
     assert config.moe_disk_pager == "madvise"
-    assert config.moe_pager_budget_gib == 40.0
+    assert config.moe_pager_budget_gib is None
+    assert config.host_cache_reserve_gib is None
 
 
 def test_engine_config_rejects_invalid_uffd_settings():

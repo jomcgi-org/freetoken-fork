@@ -818,12 +818,23 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-cache-reserve-gib",
+        type=_nonnegative_float,
+        default=ServerArgs.host_cache_reserve_gib,
+        help=(
+            "Host RAM reserved for the OS and expert-tier file cache. The default is "
+            "max(8 GiB, 15%% of MemTotal)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-pager-budget-gib",
         type=float,
         default=ServerArgs.moe_pager_budget_gib,
         help=(
-            "Maximum resident UFFD expert-row bytes and basis for the bounded CPU "
-            "prefill sweep ceiling in GiB (default: 40)."
+            "Maximum resident UFFD expert-row bytes in GiB, and the basis for the "
+            "bounded CPU prefill sweep ceiling. By default the host-memory governor "
+            "derives it together with the expert pin budget."
         ),
     )
 
