@@ -306,6 +306,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     executor._prefill_coalesce_degrades = 1
     executor._prefill_populate_bytes = 590_000_000
     executor._prefill_populate_ns = 175_000_000
+    executor._prefill_batch_rows = 20_480
+    executor._prefill_batch_gemms = 420
     executor._disk_major_fault_base = 10
     executor._gpufetch_tasks = {}
     monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 16)
@@ -322,6 +324,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["moe_prefill_coalesce_degrades"] == 1
     assert stats["moe_prefill_populate_bytes"] == 590_000_000
     assert stats["moe_prefill_populate_ms"] == 175.0
+    assert stats["moe_prefill_batch_rows"] == 20_480
+    assert stats["moe_prefill_batch_gemms"] == 420
     assert stats["gpufetch_fills_per_step"] == 0.0
     assert stats["gpufetch_fill_us"] == 0.0
     assert stats["per_layer"] == [
@@ -333,6 +337,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert executor._disk_distinct_experts == 0
     assert executor._prefill_coalesce_experts == 0
     assert executor._prefill_coalesce_ns == 0
+    assert executor._prefill_batch_rows == 0
+    assert executor._prefill_batch_gemms == 0
     assert executor._prefill_coalesce_degrades == 0
     assert executor._prefill_populate_bytes == 0
     assert executor._prefill_populate_ns == 0

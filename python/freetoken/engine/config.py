@@ -70,6 +70,9 @@ class EngineConfig:
     # "on" keeps advisory WILLNEED, and "off" preserves the original seam behavior.
     # The setting is inert for the DISK copy path.
     moe_prefill_coalesce: str = "populate"
+    # Group CPU-prefill routes by expert and use the native row-batched NVFP4
+    # W4A8 kernel. Unsupported formats or setup failures retain the serial path.
+    moe_cpu_prefill_batch: str = "on"
     # DISK-layer decode: "cpu" preserves the native CPU executor path; "gpufetch"
     # faults only LRU-missing routed expert rows into a pinned staging ring, copies
     # them into the existing GPU slot cache, and runs the normal GPU expert GEMM.
@@ -184,6 +187,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-prefill-coalesce must be 'populate', 'on', or 'off', got "
                 f"{self.moe_prefill_coalesce!r}"
+            )
+        if self.moe_cpu_prefill_batch not in ("on", "off"):
+            raise ValueError(
+                "--moe-cpu-prefill-batch must be 'on' or 'off', got "
+                f"{self.moe_cpu_prefill_batch!r}"
             )
         if self.moe_disk_decode not in ("cpu", "gpufetch"):
             raise ValueError(

@@ -1362,7 +1362,7 @@ class OffloadMoeCache:
             self.cpu_executor.release_prefill_layer(lease)
 
     def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
-        if self.cpu_executor is None or not self.cpu_executor._disk_banks:
+        if self.cpu_executor is None:
             return {}
         result = self.cpu_executor.disk_prefetch_stats(reset=reset)
         hot_pairs = int(self.stat_hot_pairs.item())

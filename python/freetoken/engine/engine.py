@@ -945,6 +945,8 @@ class Engine:
             prefill_coalesce_budget_bytes=int(
                 getattr(config, "moe_pager_budget_gib", 40.0) * 2**30
             ),
+            prefill_batch=getattr(config, "moe_cpu_prefill_batch", "on"),
+            max_prefill_tokens=getattr(config, "max_extend_tokens", 2048),
         )
         if (
             config.moe_disk_prefill == "cpu"
@@ -1958,6 +1960,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_max_swap_gib": 0.5,
     "moe_disk_prefill": "cpu",
     "moe_prefill_coalesce": "populate",
+    "moe_cpu_prefill_batch": "on",
     "moe_disk_decode": "cpu",
     "moe_disk_pager": "madvise",
     "moe_disk_lookahead": "on",

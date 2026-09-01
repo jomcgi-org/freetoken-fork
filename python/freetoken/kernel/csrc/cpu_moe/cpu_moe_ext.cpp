@@ -287,6 +287,13 @@ float dot_nvfp4_scalar(const uint8_t* packed, const uint8_t* scale, float global
 using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t*, int,
                              const float*, const float*);
 
+// Row-batched W4A8 entry point. ``acts`` contains M quantized activation rows and
+// ``act_scales`` contains their per-16 scales. The weight block is decoded once,
+// then reused across every row before the kernel advances through the packed
+// stream. This is a real MxK by Kx1 kernel, not a wrapper around M GEMVs.
+using nvi8batch_fn = void (*)(float*, const uint8_t*, const uint8_t*, float,
+                              const int8_t*, int, int, const float*, const float*);
+
 [[maybe_unused]] float dot_nvfp4_i8_scalar(const uint8_t* packed, const uint8_t* scale,
                           float global, const int8_t* asi8, int K, const float* e4m3,
                           const float* asb) {
@@ -304,6 +311,28 @@ using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t
     acc += (e4m3[scale[b]] * asb[b]) * (float)isum;
   }
   return acc * (0.5f * global);
+}
+
+void batch_nvfp4_i8_scalar(float* out, const uint8_t* packed, const uint8_t* scale,
+                           float global, const int8_t* acts, int M, int K,
+                           const float* e4m3, const float* act_scales) {
+  std::fill(out, out + M, 0.0f);
+  const int nb = K / 16;
+  for (int b = 0; b < nb; ++b) {
+    const uint8_t* pk = packed + (size_t)b * 8;
+    int8_t wb[16];
+    for (int j = 0; j < 8; ++j) {
+      wb[j] = kE2M1x2[pk[j] & 0xF];
+      wb[8 + j] = kE2M1x2[pk[j] >> 4];
+    }
+    const float ws = 0.5f * global * e4m3[scale[b]];
+    for (int m = 0; m < M; ++m) {
+      const int8_t* a = acts + (size_t)m * K + (size_t)b * 16;
+      int isum = 0;
+      for (int j = 0; j < 16; ++j) isum += (int)wb[j] * (int)a[j];
+      out[m] += ws * act_scales[(size_t)m * nb + b] * (float)isum;
+    }
+  }
 }
 
 #if CPU_MOE_X86
@@ -440,6 +469,53 @@ float dot_nvfp4_i8_vnni(const uint8_t* packed, const uint8_t* scale, float globa
     s += (e4m3[scale[b]] * asb[b]) * (float)isum;
   }
   return s * (0.5f * global);
+}
+
+// Expert-prefill GEMM. Packed weights are the outer stream, while all routed
+// activation rows reuse each decoded pair of 16-K blocks. Each VPDPBUSD therefore
+// serves M rows before the next weight bytes are loaded and decoded.
+__attribute__((target("avx2,avxvnni,fma")))
+void batch_nvfp4_i8_vnni(float* out, const uint8_t* packed, const uint8_t* scale,
+                         float global, const int8_t* acts, int M, int K,
+                         const float* e4m3, const float* act_scales) {
+  std::fill(out, out + M, 0.0f);
+  const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2));
+  const int nb = K / 16;
+  int b = 0;
+  for (; b + 2 <= nb; b += 2) {
+    const __m128i wb = nvfp4_decode_block_i8(packed + (size_t)b * 8, lut);
+    const __m128i wb1 = nvfp4_decode_block_i8(packed + (size_t)(b + 1) * 8, lut);
+    const __m256i w = _mm256_set_m128i(wb1, wb);
+    const __m256i aw = _mm256_sign_epi8(w, w);
+    const float ws0 = 0.5f * global * e4m3[scale[b]];
+    const float ws1 = 0.5f * global * e4m3[scale[b + 1]];
+    for (int m = 0; m < M; ++m) {
+      const int8_t* arow = acts + (size_t)m * K;
+      const __m256i a = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(arow + (size_t)b * 16));
+      const __m256i sa = _mm256_sign_epi8(a, w);
+      const __m256i di = _mm256_dpbusd_avx_epi32(
+          _mm256_setzero_si256(), aw, sa);
+      const float* as = act_scales + (size_t)m * nb;
+      const __m256 scv = _mm256_blend_ps(
+          _mm256_set1_ps(ws0 * as[b]),
+          _mm256_set1_ps(ws1 * as[b + 1]), 0xF0);
+      out[m] += hsum256(_mm256_mul_ps(_mm256_cvtepi32_ps(di), scv));
+    }
+  }
+  for (; b < nb; ++b) {
+    const uint8_t* pk = packed + (size_t)b * 8;
+    const float ws = 0.5f * global * e4m3[scale[b]];
+    for (int m = 0; m < M; ++m) {
+      const int8_t* a = acts + (size_t)m * K + (size_t)b * 16;
+      int isum = 0;
+      for (int j = 0; j < 8; ++j) {
+        isum += (int)kE2M1x2[pk[j] & 0xF] * (int)a[j];
+        isum += (int)kE2M1x2[pk[j] >> 4] * (int)a[8 + j];
+      }
+      out[m] += ws * act_scales[(size_t)m * nb + b] * (float)isum;
+    }
+  }
 }
 
 #if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
@@ -753,6 +829,13 @@ nvi8dot_fn select_nvi8dot() {
   if (cpu_has_avxvnni()) return dot_nvfp4_i8_vnni;
 #endif
   return nullptr;
+}
+
+nvi8batch_fn select_nvi8batch() {
+#if CPU_MOE_X86
+  if (cpu_has_avxvnni()) return batch_nvfp4_i8_vnni;
+#endif
+  return batch_nvfp4_i8_scalar;
 }
 
 // ----------------------- DeepSeek-V4 ds_fp4 (W4A8) ---------------------------
@@ -1072,7 +1155,8 @@ struct MoeTask {
   CpuMoeExecutor* exec;
   int layer_id;
   int num_tokens;
-  bool group_routes;      // persistent decode tasks group routes by expert; prefill does not
+  bool group_routes;      // persistent decode tasks retain their existing grouped schedule
+  bool prefill_batch;     // synchronous prefill uses the expert-batched W4A8 schedule
   const bf16_t* x;     // [num_tokens, H]
   const int32_t* ids;  // [num_tokens, top_k]  (raw expert ids; <0 = skip)
   const float* w;      // [num_tokens, top_k]
@@ -1268,6 +1352,7 @@ struct CpuMoeExecutor {
   dot_fn dot;
   nvdot_fn nvdot;
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
+  nvi8batch_fn nvi8batch = nullptr;  // expert-prefill M-row W4A8 kernel
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
   dsdot_fn dsdot;
@@ -1296,6 +1381,19 @@ struct CpuMoeExecutor {
   std::vector<int> grouped_routes;    // flattened route ids (token * top_k + k)
   std::vector<int> distinct_experts;  // experts with at least one valid route
   std::vector<float> route_y_scratch; // [num_tokens * top_k, H] unweighted down outputs
+  // NVFP4 prefill-only bounded workspace. The bf16 input gather buffer is reused
+  // in place for W4A8 activations after gathering. All
+  // route-indexed arrays are capped by prefill_capacity * top_k and allocated once
+  // by setup_prefill_batch(), outside the per-layer hot path.
+  int prefill_capacity = 0;
+  std::vector<bf16_t> prefill_x_scratch;  // [routes,H], compacted to int8 in-place
+  std::vector<bf16_t> prefill_g_scratch;  // [routes,I] activated intermediate
+  std::vector<int8_t> prefill_gi8_scratch;  // [routes,I] W4A8 down input
+  std::vector<bf16_t> prefill_y_scratch;  // [routes,H] per-route down result
+  std::vector<float> prefill_x_scale_scratch;  // [routes,H/16]
+  std::vector<float> prefill_g_scale_scratch;  // [routes,I/16]
+  std::vector<float> prefill_gate_scratch, prefill_up_scratch;  // [routes] projection temps
+  std::vector<int> route_to_group;  // original token-major route -> grouped row
   std::vector<bf16_t> xq_scratch;  // [max_tokens * H] ds_fp4 fp8-roundtripped input
   // ds_fp4 activations pre-deinterleaved to fp32 (even/odd K) for the row-major dot.
   std::vector<float> xe_scratch, xo_scratch;  // [max_tokens * H/2]   (input)
@@ -1411,6 +1509,7 @@ struct CpuMoeExecutor {
     DotChoice c = select_dot();
     dot = c.fn;
     nvdot = select_nvdot();
+    nvi8batch = select_nvi8batch();
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
@@ -1512,6 +1611,80 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Quantize an interleaved bf16 row directly into the W4A8 [even(8),odd(8)]
+  // block layout. Reading each 16-value block into locals before writing makes
+  // in-place compaction from bf16 to int8 safe.
+  void quant_i8_bf16_pg16(const bf16_t* x, int K, int8_t* asi8, float* asb) {
+    const int nb = K / 16;
+    for (int b = 0; b < nb; ++b) {
+      float xf[16], amax = 0.0f;
+      for (int j = 0; j < 16; ++j) {
+        xf[j] = bf16_to_f32(x[(size_t)b * 16 + j]);
+        amax = std::max(amax, std::fabs(xf[j]));
+      }
+      const float s = amax > 0.0f ? amax / 127.0f : 1.0f;
+      asb[b] = s;
+      const float inv = 1.0f / s;
+      int8_t* o = asi8 + (size_t)b * 16;
+      for (int j = 0; j < 8; ++j) {
+        const int qe = (int)std::lround(xf[2 * j] * inv);
+        const int qo = (int)std::lround(xf[2 * j + 1] * inv);
+        o[j] = (int8_t)std::max(-127, std::min(127, qe));
+        o[8 + j] = (int8_t)std::max(-127, std::min(127, qo));
+      }
+    }
+  }
+
+  bool setup_prefill_batch(int max_prefill_tokens) {
+    if (fmt != WF_NVFP4 || nvi8batch == nullptr || max_prefill_tokens <= 0 ||
+        H % 16 != 0 || I % 16 != 0) {
+      return false;
+    }
+    if (prefill_capacity == max_prefill_tokens) return true;
+    if (prefill_capacity != 0) return false;
+    try {
+      const size_t routes = static_cast<size_t>(max_prefill_tokens) * top_k;
+      std::vector<bf16_t> x(routes * H);
+      std::vector<bf16_t> g(routes * I);
+      std::vector<int8_t> gi8(routes * I);
+      std::vector<bf16_t> y(routes * H);
+      std::vector<float> xs(routes * (H / 16));
+      std::vector<float> gs(routes * (I / 16));
+      std::vector<float> gate(routes);
+      std::vector<float> up(routes);
+      std::vector<int> route_map(routes, -1);
+      grouped_routes.reserve(routes);
+      prefill_x_scratch.swap(x);
+      prefill_g_scratch.swap(g);
+      prefill_gi8_scratch.swap(gi8);
+      prefill_y_scratch.swap(y);
+      prefill_x_scale_scratch.swap(xs);
+      prefill_g_scale_scratch.swap(gs);
+      prefill_gate_scratch.swap(gate);
+      prefill_up_scratch.swap(up);
+      route_to_group.swap(route_map);
+      prefill_capacity = max_prefill_tokens;
+      return true;
+    } catch (const std::exception&) {
+      prefill_capacity = 0;
+      return false;
+    }
+  }
+
+  int64_t prefill_batch_buffer_bytes() const {
+    return static_cast<int64_t>(
+        prefill_x_scratch.size() * sizeof(bf16_t) +
+        prefill_g_scratch.size() * sizeof(bf16_t) +
+        prefill_gi8_scratch.size() * sizeof(int8_t) +
+        prefill_y_scratch.size() * sizeof(bf16_t) +
+        prefill_x_scale_scratch.size() * sizeof(float) +
+        prefill_g_scale_scratch.size() * sizeof(float) +
+        prefill_gate_scratch.size() * sizeof(float) +
+        prefill_up_scratch.size() * sizeof(float) +
+        route_to_group.size() * sizeof(int) +
+        static_cast<size_t>(prefill_capacity) * top_k * sizeof(int));
+  }
+
   // gate_up output row `row` (in [0, 2I)) dotted with activation over K = H. ``e`` is
   // the layer-local expert row (0..num_experts); the layer bases (already resolved
   // once per task/pass by the caller via tbl_at) pick the layer's own tensors.
@@ -1593,6 +1766,7 @@ struct CpuMoeExecutor {
                              layer_id,
                              num_tokens,
                              true,
+                             false,
                              reinterpret_cast<const bf16_t*>(x_ptr),
                              reinterpret_cast<const int32_t*>(ids_ptr),
                              reinterpret_cast<const float*>(w_ptr),
@@ -2031,7 +2205,136 @@ struct CpuMoeExecutor {
     }
   }
 
+  void prepare_prefill_batch(const MoeTask* t) {
+    const size_t rows = grouped_routes.size();
+    if (t->num_tokens > prefill_capacity ||
+        rows > static_cast<size_t>(prefill_capacity) * top_k) {
+      throw std::runtime_error("CPU MoE prefill batch exceeds configured capacity");
+    }
+    for (size_t pos = 0; pos < rows; ++pos) {
+      const int route = grouped_routes[pos];
+      const int tok = route / top_k;
+      std::memcpy(prefill_x_scratch.data() + pos * H,
+                  t->x + static_cast<size_t>(tok) * H,
+                  static_cast<size_t>(H) * sizeof(bf16_t));
+    }
+    // Compact the gathered bf16 rows into the first half of the same allocation.
+    // Increasing row order is overlap-safe because every int8 destination trails
+    // the bf16 source row it replaces. Block scales live in a separate array.
+    int8_t* xi8 = reinterpret_cast<int8_t*>(prefill_x_scratch.data());
+    for (size_t pos = 0; pos < rows; ++pos) {
+      quant_i8_bf16_pg16(
+          prefill_x_scratch.data() + pos * H, H, xi8 + pos * H,
+          prefill_x_scale_scratch.data() + pos * (H / 16));
+    }
+  }
+
+  void do_prefill_batch_expert(const MoeTask* t, int distinct_index) {
+    const int e = distinct_experts[distinct_index];
+    const int begin = expert_offsets[e];
+    const int count = expert_offsets[e + 1] - begin;
+    if (count <= 0) return;
+
+    const uint8_t* gu_packed_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const uint8_t* gu_scale_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    const uint16_t* gu_global_l =
+        reinterpret_cast<const uint16_t*>(tbl_at(gu_global_tbl, t->layer_id));
+    const uint8_t* dn_packed_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* dn_scale_l =
+        reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+    const uint16_t* dn_global_l =
+        reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
+
+    const int8_t* xi8 = reinterpret_cast<const int8_t*>(prefill_x_scratch.data());
+    const int8_t* expert_x = xi8 + static_cast<size_t>(begin) * H;
+    const float* expert_xs =
+        prefill_x_scale_scratch.data() + static_cast<size_t>(begin) * (H / 16);
+    float* gate = prefill_gate_scratch.data() + begin;
+    float* up = prefill_up_scratch.data() + begin;
+    const bool swigluoai = act == ACT_SWIGLUOAI;
+    for (int i = 0; i < I; ++i) {
+      const size_t gr = static_cast<size_t>(e) * (2 * I) + i;
+      const size_t ur = gr + I;
+      nvi8batch(gate, gu_packed_l + gr * (H / 2),
+                 gu_scale_l + gr * (H / 16), fp16_to_f32(gu_global_l[gr]),
+                 expert_x, count, H, e4m3_lut, expert_xs);
+      nvi8batch(up, gu_packed_l + ur * (H / 2),
+                 gu_scale_l + ur * (H / 16), fp16_to_f32(gu_global_l[ur]),
+                 expert_x, count, H, e4m3_lut, expert_xs);
+      for (int m = 0; m < count; ++m) {
+        const int pos = begin + m;
+        const int route = grouped_routes[pos];
+        const float w_in = apply_on_input ? t->w[route] : 1.0f;
+        float gv = gate[m] * w_in;
+        float uv = up[m] * w_in;
+        float activated;
+        if (swigluoai) {
+          if (gv > swiglu_limit) gv = swiglu_limit;
+          if (uv > swiglu_limit) uv = swiglu_limit;
+          else if (uv < -swiglu_limit) uv = -swiglu_limit;
+          activated = gv / (1.0f + std::exp(-gv * swiglu_alpha)) * (uv + 1.0f);
+        } else {
+          activated = act_apply(act, gv) * uv;
+        }
+        prefill_g_scratch[static_cast<size_t>(pos) * I + i] =
+            f32_to_bf16(activated);
+      }
+    }
+
+    for (int m = 0; m < count; ++m) {
+      const size_t pos = static_cast<size_t>(begin + m);
+      quant_i8_bf16_pg16(
+          prefill_g_scratch.data() + pos * I, I,
+          prefill_gi8_scratch.data() + pos * I,
+          prefill_g_scale_scratch.data() + pos * (I / 16));
+    }
+
+    const int8_t* expert_g =
+        prefill_gi8_scratch.data() + static_cast<size_t>(begin) * I;
+    const float* expert_gs =
+        prefill_g_scale_scratch.data() + static_cast<size_t>(begin) * (I / 16);
+    for (int h = 0; h < H; ++h) {
+      const size_t dr = static_cast<size_t>(e) * H + h;
+      nvi8batch(gate, dn_packed_l + dr * (I / 2),
+                 dn_scale_l + dr * (I / 16), fp16_to_f32(dn_global_l[dr]),
+                 expert_g, count, I, e4m3_lut, expert_gs);
+      for (int m = 0; m < count; ++m) {
+        prefill_y_scratch[(static_cast<size_t>(begin + m) * H) + h] =
+            f32_to_bf16(gate[m]);
+      }
+    }
+  }
+
+  void scatter_prefill_batch(const MoeTask* t) {
+    for (int tok = 0; tok < t->num_tokens; ++tok) {
+      bf16_t* y = t->y + static_cast<size_t>(tok) * H;
+      for (int h = 0; h < H; ++h) {
+        float acc = 0.0f;
+        for (int k = 0; k < top_k; ++k) {
+          const int route = tok * top_k + k;
+          const int pos = route_to_group[route];
+          if (pos < 0) continue;
+          const float w_out = apply_on_input ? 1.0f : t->w[route];
+          acc += bf16_to_f32(
+              prefill_y_scratch[static_cast<size_t>(pos) * H + h]) * w_out;
+        }
+        y[h] = f32_to_bf16(acc);
+      }
+    }
+  }
+
   void run_task_body(const MoeTask* t) {
+    if (t->prefill_batch) {
+      for (;;) {
+        const int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= p1_total) break;
+        do_prefill_batch_expert(t, static_cast<int>(p));
+      }
+      return;
+    }
     int local_sense = 0;
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
@@ -2108,7 +2411,13 @@ struct CpuMoeExecutor {
     // stable within each expert group, which also makes grouping deterministic.
     for (int route = 0; route < routes; ++route) {
       const int e = t->ids[route];
-      if (e >= 0 && e < num_experts) grouped_routes[expert_cursor[e]++] = route;
+      if (e >= 0 && e < num_experts) {
+        const int pos = expert_cursor[e]++;
+        grouped_routes[pos] = route;
+        if (t->prefill_batch) route_to_group[route] = pos;
+      } else if (t->prefill_batch) {
+        route_to_group[route] = -1;
+      }
     }
   }
 
@@ -2119,10 +2428,10 @@ struct CpuMoeExecutor {
           std::chrono::duration_cast<std::chrono::nanoseconds>(timing_started).count(),
           std::memory_order_release);
     }
-    if (t->group_routes) build_decode_groups(t);
+    if (t->group_routes || t->prefill_batch) build_decode_groups(t);
     if (run_pre_callback && pre_run_callback) {
       pybind11::gil_scoped_acquire gil;
-      if (t->group_routes) {
+      if (t->group_routes || t->prefill_batch) {
         // The same route D2H used by compute is enough to build the expert union.
         // Hand WILLNEED the compact list plus the original valid-pair count, with
         // no second transfer and no repeated page-advice requests.
@@ -2132,6 +2441,21 @@ struct CpuMoeExecutor {
             t->ids, t->ids + static_cast<size_t>(t->num_tokens) * top_k);
         pre_run_callback(t->layer_id, std::move(ids));
       }
+    }
+    if (t->prefill_batch) {
+      prepare_prefill_batch(t);
+      p1_total = static_cast<int64_t>(distinct_experts.size());
+      p2_total = p3_total = prt_total = 0;
+      p1_next.store(0, std::memory_order_relaxed);
+      done_count.store(0, std::memory_order_relaxed);
+      {
+        std::lock_guard<std::mutex> lk(task_mtx);
+        cur_task = t;
+        ++cur_gen;
+        submitted.store(cur_gen, std::memory_order_release);
+      }
+      task_cv.notify_all();
+      return;
     }
     n_iblk = (I + IBLK - 1) / IBLK;
     n_hblk = (H + HBLK - 1) / HBLK;
@@ -2385,12 +2709,36 @@ struct CpuMoeExecutor {
                  layer_id,
                  num_tokens,
                  false,
+                 false,
                  reinterpret_cast<const bf16_t*>(x_ptr),
                  reinterpret_cast<const int32_t*>(ids_ptr),
                  reinterpret_cast<const float*>(w_ptr),
                  reinterpret_cast<bf16_t*>(y_ptr)};
     submit(&task, run_pre_callback);
     sync(&task);
+  }
+
+  std::vector<int64_t> run_prefill_batch_sync(
+      int layer_id, int num_tokens, uintptr_t x_ptr, uintptr_t ids_ptr,
+      uintptr_t w_ptr, uintptr_t y_ptr) {
+    if (prefill_capacity <= 0 || num_tokens <= 0 || num_tokens > prefill_capacity)
+      throw std::runtime_error("CPU MoE prefill batch is unavailable or over capacity");
+    MoeTask task{this,
+                 layer_id,
+                 num_tokens,
+                 false,
+                 true,
+                 reinterpret_cast<const bf16_t*>(x_ptr),
+                 reinterpret_cast<const int32_t*>(ids_ptr),
+                 reinterpret_cast<const float*>(w_ptr),
+                 reinterpret_cast<bf16_t*>(y_ptr)};
+    submit(&task, false);
+    sync(&task);
+    scatter_prefill_batch(&task);
+    // Logical GEMMs: one fused gate_up projection and one down projection for each
+    // non-empty expert group. Activation is fused between them.
+    return {static_cast<int64_t>(grouped_routes.size()),
+            static_cast<int64_t>(distinct_experts.size()) * 2};
   }
 
   int64_t task_last_run_ns(uintptr_t task) const {
@@ -2471,6 +2819,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("layer_id"), py::arg("num_tokens"), py::arg("x_ptr"),
            py::arg("ids_ptr"), py::arg("w_ptr"), py::arg("y_ptr"),
            py::arg("run_pre_callback"), py::call_guard<py::gil_scoped_release>())
+      .def("setup_prefill_batch", &CpuMoeExecutor::setup_prefill_batch,
+           py::arg("max_prefill_tokens"))
+      .def("prefill_batch_buffer_bytes", &CpuMoeExecutor::prefill_batch_buffer_bytes)
+      .def("run_prefill_batch_sync", &CpuMoeExecutor::run_prefill_batch_sync,
+           py::arg("layer_id"), py::arg("num_tokens"), py::arg("x_ptr"),
+           py::arg("ids_ptr"), py::arg("w_ptr"), py::arg("y_ptr"),
+           py::call_guard<py::gil_scoped_release>())
       .def("set_pre_run_callback", &CpuMoeExecutor::set_pre_run_callback,
            py::arg("callback"))
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,
