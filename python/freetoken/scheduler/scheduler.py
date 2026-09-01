@@ -1231,7 +1231,7 @@ class Scheduler(SchedulerIOMixin):
         self, forward_input: ForwardInput, oom: BaseException
     ) -> ForwardData | None:
         batch = forward_input.batch
-        logger.error_rank0(
+        logger.warning_rank0(
             "Scheduler %s forward OOM for request(s) %s; starting request-level recovery: %r",
             batch.phase,
             [req.uid for req in batch.reqs],
@@ -1266,7 +1266,7 @@ class Scheduler(SchedulerIOMixin):
             retry_input = self._prepare_decode_retry(remaining)
             return retry_input, self._forward(retry_input)
         except _OOM_ERRORS as retry_oom:
-            logger.error_rank0(
+            logger.warning_rank0(
                 "Scheduler decode forward OOM retry failed for request(s) %s; "
                 "aborting the remaining batch: %r",
                 [req.uid for req in remaining],
