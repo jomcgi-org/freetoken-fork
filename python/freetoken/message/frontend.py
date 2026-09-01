@@ -53,6 +53,7 @@ class UserReply(BaseFrontendMsg):
     # Machine-readable class for `error` (see ErrorReplyMsg.code), surfaced as OpenAI's error
     # `code`. None when the failure has no specific class.
     error_code: str | None = None
+    error_status_code: int = 400
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None

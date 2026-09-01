@@ -49,9 +49,10 @@ class GenerationError(Exception):
     arrives. ``code`` carries the stable class (``UserReply.error_code``) when the failure has
     one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose."""
 
-    def __init__(self, message: str, code: str | None = None):
+    def __init__(self, message: str, code: str | None = None, status_code: int = 400):
         super().__init__(message)
         self.code = code
+        self.status_code = status_code
 
 
 # --------------------------------------------------------------------------- #
@@ -651,7 +652,11 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
-            raise GenerationError(ack.error, getattr(ack, "error_code", None))
+            raise GenerationError(
+                ack.error,
+                getattr(ack, "error_code", None),
+                getattr(ack, "error_status_code", 400),
+            )
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
@@ -751,7 +756,11 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     engine_matched_stop: str | None = None
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
-            raise GenerationError(ack.error, getattr(ack, "error_code", None))
+            raise GenerationError(
+                ack.error,
+                getattr(ack, "error_code", None),
+                getattr(ack, "error_status_code", 400),
+            )
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens

@@ -23,6 +23,7 @@ class SchedulerStatusReporter:
     _decode_timing_totals: dict[str, float] = field(default_factory=dict, init=False)
     _constrained_requests: int = field(default=0, init=False)
     _mask_us: float = field(default=0.0, init=False)
+    oom_aborts: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -71,6 +72,9 @@ class SchedulerStatusReporter:
                 queue_priority_bands=queue_priority_bands,
                 max_wait_seconds=max_wait_seconds,
             )
+
+    def record_oom_aborts(self, count: int) -> None:
+        self.oom_aborts += count
 
     def _report_prefill(
         self,
@@ -189,6 +193,7 @@ class SchedulerStatusReporter:
             f"drafted: {drafted}, accepted: {accepted}, "
             f"acceptance rate: {acceptance_rate:.4f}, "
             f"tokens/step: {tokens_per_step:.2f}, "
+            f"oom_aborts: {self.oom_aborts}, "
             f"#queue-req: {queue_reqs}"
             f"{', ' if queue_priority_bands is not None else ''}"
             f"{_priority_queue_msg(queue_priority_bands, max_wait_seconds)}"

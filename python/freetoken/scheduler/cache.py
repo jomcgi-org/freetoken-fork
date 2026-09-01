@@ -506,7 +506,9 @@ class CacheManager:
         self._free(indices)
         self.page_table[req.table_idx, first:last].zero_()
 
-    def cache_req(self, req: Req, *, finished: bool) -> None:
+    def cache_req(self, req: Req, *, finished: bool, failed: bool = False) -> None:
+        if failed:
+            return self._discard_failed_req(req)
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
@@ -568,6 +570,27 @@ class CacheManager:
                     canonical[old_handle.cached_len : cached_len])
             req.cache_handle = new_handle
             self.lock(new_handle)
+
+    def _discard_failed_req(self, req: Req) -> None:
+        """Release an OOM-failed request without publishing partially written state.
+
+        A normal finish commits through ``req.cached_len``. A forward that raises OOM never
+        advances that field, but ``allocate_paged`` has already reserved through
+        ``req.device_len``. Free that entire request-owned tail, unlock the matched prefix,
+        and release secondary-pool state without inserting a radix node or queueing a disk
+        prefix write.
+        """
+        old_handle = req.cache_handle
+        start = old_handle.cached_len
+        end = div_ceil(req.device_len, self.page_size) * self.page_size
+        tail = self.page_table[req.table_idx, start:end]
+        self.unlock(old_handle)
+        if self.swa_paged:
+            self._free_swa(tail)
+        self._free(tail)
+        if self.is_hybrid:
+            self._free_req_slots(req)
+        self.abort_pending_expert_profile(req.uid)
 
     def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
         """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
