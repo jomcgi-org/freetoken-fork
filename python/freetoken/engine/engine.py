@@ -754,6 +754,7 @@ class Engine:
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 moe_disk_prefill=config.moe_disk_prefill,
+                moe_prefill_coalesce=getattr(config, "moe_prefill_coalesce", "on"),
                 moe_disk_decode=config.moe_disk_decode,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
@@ -806,6 +807,10 @@ class Engine:
                         "a custom MoE cache serving --moe-disk-layers must expose "
                         "an assignable moe_disk_prefill attribute"
                     ) from exc
+                if hasattr(cache, "moe_prefill_coalesce"):
+                    cache.moe_prefill_coalesce = getattr(
+                        config, "moe_prefill_coalesce", "on"
+                    )
                 try:
                     cache.moe_disk_decode = config.moe_disk_decode
                 except AttributeError as exc:
@@ -815,6 +820,10 @@ class Engine:
                     ) from exc
             elif hasattr(cache, "moe_disk_prefill"):
                 cache.moe_disk_prefill = config.moe_disk_prefill
+                if hasattr(cache, "moe_prefill_coalesce"):
+                    cache.moe_prefill_coalesce = getattr(
+                        config, "moe_prefill_coalesce", "on"
+                    )
                 if hasattr(cache, "moe_disk_decode"):
                     cache.moe_disk_decode = config.moe_disk_decode
             cache.cpu_layer_ids = cpu_layer_ids
@@ -922,6 +931,13 @@ class Engine:
             swiglu_limit=getattr(sample, "swiglu_limit", None),
             disk_lookahead=config.moe_disk_lookahead == "on",
             step_timing=config.moe_step_timing,
+            prefill_coalesce=(
+                getattr(config, "moe_prefill_coalesce", "on") == "on"
+                and config.moe_disk_prefill == "cpu"
+            ),
+            prefill_coalesce_budget_bytes=int(
+                getattr(config, "moe_pager_budget_gib", 40.0) * 2**30
+            ),
         )
         if (
             config.moe_disk_prefill == "cpu"
@@ -1917,6 +1933,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_interval_steps": 1000,
     "moe_hot_adapt_max_swap_gib": 0.5,
     "moe_disk_prefill": "cpu",
+    "moe_prefill_coalesce": "on",
     "moe_disk_decode": "cpu",
     "moe_disk_pager": "madvise",
     "moe_disk_lookahead": "on",

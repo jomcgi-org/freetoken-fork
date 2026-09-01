@@ -66,6 +66,9 @@ class EngineConfig:
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"
+    # Coalesce a CPU prefill layer's routed expert union into one bounded page sweep.
+    # The setting is inert for the DISK copy path.
+    moe_prefill_coalesce: str = "on"
     # DISK-layer decode: "cpu" preserves the native CPU executor path; "gpufetch"
     # faults only LRU-missing routed expert rows into a pinned staging ring, copies
     # them into the existing GPU slot cache, and runs the normal GPU expert GEMM.
@@ -171,6 +174,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-disk-prefill must be 'cpu' or 'copy', got "
                 f"{self.moe_disk_prefill!r}"
+            )
+        if self.moe_prefill_coalesce not in ("on", "off"):
+            raise ValueError(
+                "--moe-prefill-coalesce must be 'on' or 'off', got "
+                f"{self.moe_prefill_coalesce!r}"
             )
         if self.moe_disk_decode not in ("cpu", "gpufetch"):
             raise ValueError(

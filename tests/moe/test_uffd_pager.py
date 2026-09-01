@@ -12,6 +12,7 @@ class _FakeNativePager:
         self.budget_bytes = budget_bytes
         self.regions = []
         self.prefetches = []
+        self.releases = []
 
     def add_region(self, *args):
         self.regions.append(args)
@@ -23,6 +24,10 @@ class _FakeNativePager:
 
     def is_resident(self, region, row):
         return (region, row) == (0, 3)
+
+    def release_rows(self, regions, rows):
+        self.releases.append((regions, rows))
+        return 7
 
     def stats(self, reset):
         return {
@@ -66,18 +71,23 @@ def test_non_linux_probe_fails_before_native_import(monkeypatch):
 
 
 def test_server_cli_exposes_uffd_pager_flags():
+    from freetoken.engine.config import EngineConfig
     from freetoken.server.args import parse_args
+
+    assert EngineConfig.__dataclass_fields__["moe_prefill_coalesce"].default == "on"
 
     args, _ = parse_args([
         "--model", "/tmp/nonexistent-model",
         "--dtype", "bfloat16",
         "--moe-disk-pager", "uffd",
         "--moe-disk-lookahead", "off",
+        "--moe-prefill-coalesce", "off",
         "--moe-step-timing",
         "--moe-pager-budget-gib", "12.5",
     ])
     assert args.moe_disk_pager == "uffd"
     assert args.moe_disk_lookahead == "off"
+    assert args.moe_prefill_coalesce == "off"
     assert args.moe_step_timing is True
     assert args.moe_pager_budget_gib == 12.5
 
@@ -105,6 +115,8 @@ def test_python_wrapper_deduplicates_rows_and_exposes_stats(monkeypatch):
     assert pager.prefetch([bank0, bank1], [3, 1, 3, -1]) == 11
     assert native.instances[0].prefetches == [([0, 1], [1, 3])]
     assert pager.is_resident(bank0, 3)
+    assert pager.release_prefill_rows([bank0, bank1], [3, 1, 3, -1]) == 7
+    assert native.instances[0].releases == [([0, 1], [1, 3])]
     assert pager.stats()["fills_from_prefetch"] == 3
     assert pager.stats()["pages_installed"] == 4
 

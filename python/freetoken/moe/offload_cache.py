@@ -151,6 +151,7 @@ class OffloadMoeCache:
     # DISK-only prefill policy. LOCKED/PAGEABLE layers always keep the whole-layer
     # pageable copy path.
     moe_disk_prefill: str = "cpu"
+    moe_prefill_coalesce: str = "on"
     # DISK-only decode policy. gpufetch keeps the mmap as the authoritative host
     # bank but fills LRU misses through a bounded pinned staging ring.
     moe_disk_decode: str = "cpu"
@@ -188,6 +189,7 @@ class OffloadMoeCache:
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         assert self.moe_disk_prefill in ("cpu", "copy"), self.moe_disk_prefill
+        assert self.moe_prefill_coalesce in ("on", "off"), self.moe_prefill_coalesce
         assert self.moe_disk_decode in ("cpu", "gpufetch"), self.moe_disk_decode
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
@@ -1330,6 +1332,21 @@ class OffloadMoeCache:
             return 0
         assert self.cpu_executor is not None, "DISK layer requires the CPU MoE executor"
         return self.cpu_executor.prefetch_experts(layer_id, expert_ids, is_prefill=True)
+
+    def prepare_disk_prefill(self, layer_id: int, expert_ids):
+        """Warm one bounded routed union before shared CPU prefill compute."""
+        if self.layer_residency[layer_id] != "disk":
+            return None
+        if self.moe_disk_prefill != "cpu" or self.moe_prefill_coalesce != "on":
+            return None
+        assert self.cpu_executor is not None, "DISK layer requires the CPU MoE executor"
+        return self.cpu_executor.prepare_prefill_layer(layer_id, expert_ids)
+
+    def release_disk_prefill(self, lease) -> None:
+        """Apply one-pass cache advice after the CPU layer has finished."""
+        if lease is not None:
+            assert self.cpu_executor is not None
+            self.cpu_executor.release_prefill_layer(lease)
 
     def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
         if self.cpu_executor is None or not self.cpu_executor._disk_banks:

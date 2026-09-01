@@ -429,6 +429,39 @@ class UffdPager {
         [](uint64_t last_use) { return last_use != 0; });
   }
 
+  size_t release_rows(const std::vector<int>& regions,
+                      const std::vector<int>& rows) {
+    raise_if_error();
+    std::lock_guard<std::mutex> regions_guard(regions_mutex_);
+    std::lock_guard<std::mutex> state_guard(state_mutex_);
+    std::set<std::pair<int, size_t>> pages;
+    for (const int region_id : regions) {
+      for (const int row : rows) {
+        Region& region = checked_region(region_id, row);
+        for (size_t page = row_first_page(region, row);
+             page < row_page_end(region, row); ++page) {
+          pages.emplace(region_id, page);
+        }
+      }
+    }
+    size_t released = 0;
+    for (const auto& [region_id, page] : pages) {
+      Region& region = *regions_[region_id];
+      const uint64_t last_use = region.page_last_use[page];
+      if (!last_use) continue;
+      void* address = reinterpret_cast<void*>(
+          region.start + static_cast<uintptr_t>(page) * page_size_);
+      if (madvise(address, page_size_, MADV_DONTNEED) < 0) {
+        throw_errno("MADV_DONTNEED UFFD prefill page");
+      }
+      page_lru_.erase(std::make_tuple(last_use, region_id, page));
+      region.page_last_use[page] = 0;
+      resident_bytes_ -= page_size_;
+      ++released;
+    }
+    return released;
+  }
+
   py::dict stats(bool reset) {
     std::lock_guard<std::mutex> guard(state_mutex_);
     py::dict histogram;
@@ -803,6 +836,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::call_guard<py::gil_scoped_release>())
       .def("is_resident", &UffdPager::is_resident,
            py::arg("region"), py::arg("row"))
+      .def("release_rows", &UffdPager::release_rows,
+           py::arg("regions"), py::arg("rows"),
+           py::call_guard<py::gil_scoped_release>())
       .def("stats", &UffdPager::stats, py::arg("reset") = false)
       .def("raise_if_error", &UffdPager::raise_if_error);
 #else

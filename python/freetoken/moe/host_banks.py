@@ -89,7 +89,8 @@ class HostBank:
 
     __slots__ = (
         "tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_disk",
-        "_view_offset", "_uffd", "_pager", "_pager_region",
+        "_view_offset", "_uffd", "_pager", "_pager_region", "_file_path",
+        "_map_offset",
     )
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
@@ -111,11 +112,14 @@ class HostBank:
         self._uffd = backing == "uffd"
         self._pager = disk_pager
         self._pager_region = None
+        self._file_path = file_path
+        self._map_offset = 0
         self._view_offset = 0
         if backing == "file":
             if file_path is None:
                 raise ValueError("file-backed HostBank requires file_path")
             map_off = file_offset // mmap.ALLOCATIONGRANULARITY * mmap.ALLOCATIONGRANULARITY
+            self._map_offset = map_off
             self._view_offset = file_offset - map_off
             # Safetensors tensor payloads are not necessarily page aligned. Map from the
             # aligned floor, then expose the tensor at its byte offset within that mapping.
@@ -276,6 +280,39 @@ class HostBank:
     def prefetch_experts(self, expert_ids) -> int:
         """Compatibility name for expert-bank row prefetching."""
         return self.prefetch_rows(expert_ids)
+
+    def release_rows(self, row_ids) -> int:
+        """Mark one-pass DISK rows as non-reusable after prefill.
+
+        File-backed mappings use ``POSIX_FADV_NOREUSE`` when available. Unlike an
+        unconditional ``MADV_DONTNEED``, this does not discard pages that were already
+        part of the decode working set before prefill. Platforms without NOREUSE fall
+        back to DONTNEED on the same page-deduplicated ranges. UFFD residency is owned
+        by its bounded native LRU and is left to that pager.
+        """
+        if not self._disk or self._uffd:
+            return 0
+        stride = self.tensor.stride(0) * self.tensor.element_size()
+        ranges = coalesced_page_ranges(
+            row_ids, stride, limit=self.nbytes, page_offset=self._view_offset,
+        )
+        if not ranges:
+            return 0
+        advice = getattr(os, "POSIX_FADV_NOREUSE", None)
+        if advice is not None and self._file_path is not None:
+            fd = os.open(self._file_path, os.O_RDONLY)
+            try:
+                for start, length in ranges:
+                    os.posix_fadvise(
+                        fd, self._map_offset + start, length, advice,
+                    )
+            finally:
+                os.close(fd)
+        else:
+            for start, length in ranges:
+                end = min(len(self._buf), start + length)
+                self._buf.madvise(mmap.MADV_DONTNEED, start, end - start)
+        return sum((length + _BLK - 1) // _BLK for _start, length in ranges)
 
 
 def coalesced_page_ranges(

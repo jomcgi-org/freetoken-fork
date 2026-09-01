@@ -745,6 +745,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-prefill-coalesce",
+        choices=["on", "off"],
+        default=ServerArgs.moe_prefill_coalesce,
+        help=(
+            "Coalesce each DISK CPU-prefill layer's routed expert rows into one "
+            "bounded page sweep before compute (default: on)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-disk-decode",
         choices=["cpu", "gpufetch"],
         default=ServerArgs.moe_disk_decode,
@@ -811,7 +821,10 @@ def parse_args(
         "--moe-pager-budget-gib",
         type=float,
         default=ServerArgs.moe_pager_budget_gib,
-        help="Maximum resident UFFD expert-row bytes in GiB (default: 40).",
+        help=(
+            "Maximum resident UFFD expert-row bytes and basis for the bounded CPU "
+            "prefill sweep ceiling in GiB (default: 40)."
+        ),
     )
 
     parser.add_argument(
