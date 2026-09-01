@@ -13,6 +13,8 @@ import torch
 from freetoken.models.qwen4_exp.ple import (
     CachedTable,
     ClockSlotAllocator,
+    GpuResidentTable,
+    PrefillGatherTable,
     load_ple_row_profile,
     ple_cache_capacity_rows,
     ple_packed_row_nbytes,
@@ -245,6 +247,101 @@ def test_prefill_union_over_capacity_uses_pure_staged_fallback(tmp_path, caplog)
     assert "falling back to pure disk staging" in caplog.text
 
 
+def test_prefill_gather_deduplicates_and_decode_delegates(tmp_path):
+    table, reference = _mapped_table(tmp_path, "fp8")
+    fallback = GpuResidentTable(reference, dtype=torch.bfloat16)
+    gather = PrefillGatherTable(
+        fallback,
+        table,
+        max_prefill_tokens=2,
+        rows_per_token=3,
+        device=torch.device("cpu"),
+    )
+    ids = torch.tensor([[0, 2, 0], [table.num_rows - 1, 2, 3]])
+    calls = []
+
+    def process_vm_readv(_pid, local, local_count, remote, remote_count, _flags):
+        calls.append((local_count, remote_count))
+        copied = 0
+        for index in range(local_count):
+            ctypes.memmove(local[index].base, remote[index].base, local[index].length)
+            copied += local[index].length
+        return copied
+
+    gather._reader._process_vm_readv = process_vm_readv
+    assert gather._reader._stage_bank.tensor.shape[0] == 2 * 3
+
+    assert gather.prepare_prefill(ids)
+    placeholder = torch.zeros_like(ids)
+    gather.prefetch(placeholder)
+    got = gather.lookup(placeholder)
+    want = reference.index_select(0, ids.reshape(-1)).view(ids.shape[0], -1)
+    assert torch.equal(got, want)
+    assert gather.prefill_gather_rows == 4
+    assert gather.prefill_gather_ms >= 0
+    assert calls == [(8, 8)]
+
+    decode_ids = torch.tensor([[1, 4, 5]])
+    assert torch.equal(gather.lookup(decode_ids), fallback.lookup(decode_ids))
+
+
+def test_prefill_gather_allocation_failure_degrades_to_fallback(
+    tmp_path, monkeypatch, caplog
+):
+    import freetoken.models.qwen4_exp.ple as ple
+
+    table, reference = _mapped_table(tmp_path, "fp8")
+    fallback = GpuResidentTable(reference, dtype=torch.bfloat16)
+
+    def fail_allocation(*args, **kwargs):
+        raise RuntimeError("synthetic staging OOM")
+
+    monkeypatch.setattr(ple, "DiskStagedTable", fail_allocation)
+    gather = PrefillGatherTable(
+        fallback,
+        table,
+        max_prefill_tokens=2,
+        rows_per_token=3,
+        device=torch.device("cpu"),
+    )
+    ids = torch.tensor([[0, 1, 2]])
+
+    assert not gather.enabled
+    assert not gather.prepare_prefill(ids)
+    gather.prefetch(ids)
+    assert torch.equal(gather.lookup(ids), fallback.lookup(ids))
+    assert gather.prefill_gather_fallbacks == 1
+    assert "synthetic staging OOM" in caplog.text
+
+
+def test_prefill_gather_chunk_failure_degrades_only_that_chunk(tmp_path):
+    table, reference = _mapped_table(tmp_path, "fp8")
+    fallback = GpuResidentTable(reference, dtype=torch.bfloat16)
+    gather = PrefillGatherTable(
+        fallback,
+        table,
+        max_prefill_tokens=2,
+        rows_per_token=3,
+        device=torch.device("cpu"),
+    )
+    ids = torch.tensor([[0, 1, 2]])
+    real_stage = gather._reader.stage_prefill_rows
+
+    def fail_chunk(_ids):
+        raise RuntimeError("synthetic per-chunk allocation failure")
+
+    gather._reader.stage_prefill_rows = fail_chunk
+
+    assert not gather.prepare_prefill(ids)
+    gather.prefetch(ids)
+    assert torch.equal(gather.lookup(ids), fallback.lookup(ids))
+
+    gather._reader.stage_prefill_rows = real_stage
+    assert gather.prepare_prefill(ids)
+    gather.prefetch(ids)
+    assert torch.equal(gather.lookup(ids), fallback.lookup(ids))
+
+
 def test_row_profile_roundtrip_and_stable_frequency_order(tmp_path):
     path = tmp_path / "ple-profile.json"
     write_ple_row_profile(str(path), Counter({7: 4, 2: 9, 5: 4}))
@@ -262,6 +359,28 @@ def test_warm_profile_installs_only_cache_capacity(tmp_path):
         False,
     ]
     assert cache.cache_stats()["installed_rows"] == 0
+
+
+@requires_cuda
+@pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
+def test_prefill_gather_cuda_matches_synthetic_shards(tmp_path, table_format):
+    table, reference = _mapped_table(tmp_path, table_format)
+    fallback = GpuResidentTable(reference.cuda(), dtype=torch.bfloat16)
+    gather = PrefillGatherTable(
+        fallback,
+        table,
+        max_prefill_tokens=2,
+        rows_per_token=3,
+        device=torch.device("cuda"),
+    )
+    ids_host = torch.tensor([[0, 2, 0], [table.num_rows - 1, 2, 3]])
+    ids_device = ids_host.cuda()
+
+    assert gather.prepare_prefill(ids_host)
+    gather.prefetch(ids_device)
+    got = gather.lookup(ids_device)
+    want = fallback.lookup(ids_device)
+    assert torch.equal(got, want)
 
 
 @requires_cuda

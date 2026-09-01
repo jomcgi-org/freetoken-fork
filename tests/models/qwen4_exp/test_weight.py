@@ -837,6 +837,31 @@ def test_hmm_startup_probe_and_cuda_graph_replay_match_pinned(checkpoint):
     assert torch.equal(captured, reference.lookup(ids))
 
 
+@requires_cuda
+def test_hmm_prefill_gather_matches_direct_fault_path(checkpoint):
+    from freetoken.models.qwen4_exp.ple import HMMMappedTable, PrefillGatherTable
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    mapped = load_ple_table(folder, args, backend="hmm")
+    hmm = HMMMappedTable(mapped, prefetch=False)
+    gather = PrefillGatherTable(
+        hmm,
+        mapped,
+        max_prefill_tokens=3,
+        rows_per_token=3,
+        device=torch.device("cuda"),
+    )
+    ids_host = torch.tensor([[0, 6, 7], [27, 14, 1], [3, 3, 21]])
+    ids_device = ids_host.cuda()
+    direct = hmm.lookup(ids_device).clone()
+
+    assert gather.prepare_prefill(ids_host)
+    gather.prefetch(ids_device)
+    staged = gather.lookup(ids_device)
+    assert torch.equal(staged, direct)
+
+
 def test_pinned_ple_backend_never_constructs_file_mapping(checkpoint, monkeypatch):
     import freetoken.models.qwen4_exp.weight as weight
 
@@ -886,7 +911,12 @@ def test_hmm_ple_stats_report_major_fault_delta_without_staging(monkeypatch):
     from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
     import freetoken.models.qwen4_exp.ple as ple
 
-    backend = SimpleNamespace(prefetch_pages=0, reset_stats=lambda: None)
+    backend = SimpleNamespace(
+        prefetch_pages=0,
+        prefill_gather_rows=41,
+        prefill_gather_ms=7.25,
+        reset_stats=lambda: None,
+    )
     model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
     model._ple_hmm_backends = [backend]
     model._ple_major_fault_base = 40
@@ -897,6 +927,8 @@ def test_hmm_ple_stats_report_major_fault_delta_without_staging(monkeypatch):
         "ple_prefetch_pages": 0,
         "ple_major_faults": 3,
         "ple_staging_us": 0,
+        "ple_prefill_gather_rows": 41,
+        "ple_prefill_gather_ms": 7.25,
     }
 
 
@@ -1024,6 +1056,34 @@ def test_disk_ple_prepare_replay_handles_mixed_history_abort_and_padding():
     assert torch.equal(embedding.seen[1], torch.tensor([12, 22, 32, 0]))
     assert backend.ids.shape == (4, 16)
     assert model._ple_staging_ns > 0
+
+
+def test_hmm_prefill_prepare_uses_final_host_request_slices():
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+
+    seen = []
+    staged = []
+
+    class Embedding:
+        def host_prefill_row_ids(self, reqs, max_tokens):
+            seen.append((reqs, max_tokens))
+            return torch.tensor([[1, 2], [2, 3]])
+
+    backend = SimpleNamespace(
+        max_prefill_tokens=7,
+        prepare_prefill=lambda ids: staged.append(ids.clone()),
+    )
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model._ple_prefill_gather = [
+        (SimpleNamespace(ple_embedding=Embedding()), backend)
+    ]
+    reqs = [SimpleNamespace(input_ids=torch.tensor([10, 11]), cached_len=0)]
+    batch = SimpleNamespace(is_prefill=True, reqs=reqs)
+
+    model.prepare_prefill_ple(batch)
+
+    assert seen == [(reqs, 7)]
+    assert torch.equal(staged[0], torch.tensor([[1, 2], [2, 3]]))
 
 
 def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
@@ -1191,6 +1251,63 @@ def test_hmm_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     assert attached == model._ple_hmm_backends
     assert probes == [True]
     assert not hasattr(model, "_ple_disk_backends")
+
+
+@pytest.mark.parametrize("setting, expect_gather", [("on", True), ("off", False)])
+def test_hmm_ple_prefill_gather_flag_gates_overlay(
+    monkeypatch, setting, expect_gather
+):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    import freetoken.models.qwen4_exp.ple as ple
+    import freetoken.models.qwen4_exp.weight as weight
+
+    attached = []
+    snapshots = []
+    embedding = SimpleNamespace(
+        attach_table=attached.append,
+        snapshot_host_hash_constants=lambda: snapshots.append(True),
+    )
+    layer = SimpleNamespace(ple_embedding=embedding)
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model.model = SimpleNamespace(ple_layers=[layer])
+    model._config = SimpleNamespace(
+        qwen4_args=SimpleNamespace(num_ngram_heads=16)
+    )
+    table = SimpleNamespace(num_rows=100, head_dim=4)
+    mapped = SimpleNamespace(num_rows=100, head_dim=4, prefetch_pages=0)
+    wrappers = []
+
+    class FakeHMM:
+        def __new__(cls, source):
+            assert source is table
+            return mapped
+
+    class FakeGather:
+        enabled = True
+        staging_nbytes = 123
+
+        def __init__(self, fallback, source, max_tokens, rows_per_token):
+            wrappers.append((fallback, source, max_tokens, rows_per_token))
+
+    mapped.startup_probe = lambda: None
+    monkeypatch.setattr(weight, "load_ple_table", lambda *args, **kwargs: table)
+    monkeypatch.setattr(ple, "HMMMappedTable", FakeHMM)
+    monkeypatch.setattr(ple, "PrefillGatherTable", FakeGather)
+    engine_config = SimpleNamespace(
+        model_path="/tmp/model",
+        ple_backend="hmm",
+        ple_prefill_gather=setting,
+        max_extend_tokens=32,
+        use_dummy_weight=False,
+    )
+
+    reserved = model.load_host_tables(engine_config)
+
+    assert bool(wrappers) is expect_gather
+    assert bool(snapshots) is expect_gather
+    assert reserved == (123 if expect_gather else 0)
+    assert attached == model._ple_hmm_backends
+    assert attached[0] is (model._ple_prefill_gather[0][1] if expect_gather else mapped)
 
 
 def test_load_ple_table_rejects_a_shard_count_mismatch(checkpoint):

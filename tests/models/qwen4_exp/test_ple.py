@@ -27,6 +27,7 @@ from freetoken.models.qwen4_exp.ple import (
     build_ple_metadata,
     commit_ngram_context,
     derive_decode_row_ids_host,
+    derive_prefill_row_ids_host,
     short_conv_reference,
 )
 
@@ -206,6 +207,57 @@ def test_host_decode_hash_matches_device_reference_for_random_histories():
             eos_token_id=EOS,
         )
         assert torch.equal(host, reference)
+
+
+def test_host_prefill_hash_matches_ragged_device_reference():
+    config = _config()
+    layer = _make_layer(config)
+    args = config.qwen4_args
+    sequences = [
+        torch.tensor([3, 4, EOS, 5, 6]),
+        torch.tensor([21, 22, 23, EOS, 24, 25]),
+    ]
+    cached_lens = [2, 1]
+    expected = layer.ple_embedding.row_ids(
+        _meta(
+            [sequences[0][2:].tolist(), sequences[1][1:].tolist()],
+            [[3, 4], [EOS, 21]],
+        )
+    )
+    got = derive_prefill_row_ids_host(
+        sequences,
+        cached_lens,
+        layer_multipliers=layer.ple_embedding.layer_multipliers,
+        vocab_sizes=layer.ple_embedding.ngram_heads_vocab_sizes,
+        offsets=layer.ple_embedding.ngram_heads_offsets,
+        ngram_size=args.ngram_size,
+        heads_per_ngram=args.heads_per_ngram,
+        eos_token_id=EOS,
+        max_tokens=8,
+    )
+    assert torch.equal(got, expected)
+
+
+def test_host_prefill_hash_enforces_chunk_bound_before_hashing():
+    config = _config()
+    layer = _make_layer(config)
+    args = config.qwen4_args
+    kwargs = {
+        "layer_multipliers": layer.ple_embedding.layer_multipliers,
+        "vocab_sizes": layer.ple_embedding.ngram_heads_vocab_sizes,
+        "offsets": layer.ple_embedding.ngram_heads_offsets,
+        "ngram_size": args.ngram_size,
+        "heads_per_ngram": args.heads_per_ngram,
+        "eos_token_id": EOS,
+    }
+    with pytest.raises(ValueError, match="6 tokens.*bound is 5"):
+        derive_prefill_row_ids_host(
+            [torch.arange(4), torch.arange(3)], [0, 1], max_tokens=5, **kwargs
+        )
+    with pytest.raises(ValueError, match="cached length"):
+        derive_prefill_row_ids_host(
+            [torch.arange(2)], [3], max_tokens=5, **kwargs
+        )
 
 
 # --------------------------------------------------------------------------------------

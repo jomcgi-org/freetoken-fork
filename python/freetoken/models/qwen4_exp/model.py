@@ -190,18 +190,49 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         )
         self._ple_table = table
         if backend == "hmm":
-            from .ple import HMMMappedTable, process_major_faults
+            from .ple import HMMMappedTable, PrefillGatherTable, process_major_faults
 
             self._ple_hmm_backends = []
+            self._ple_prefill_gather = []
             self._ple_major_fault_base = process_major_faults()
             self._ple_staging_ns = 0
+            gather_on = getattr(engine_config, "ple_prefill_gather", "on") == "on"
+            args = self._config.qwen4_args
+            max_prefill_tokens = int(
+                getattr(
+                    engine_config,
+                    "max_extend_tokens",
+                    getattr(engine_config, "max_forward_len", 0),
+                )
+            )
+            self._ple_prefill_max_tokens = max_prefill_tokens
+            rows_per_token = int(getattr(args, "num_ngram_heads", 0))
+            reserved = 0
             for ple in ple_layers:
                 mapped = HMMMappedTable(table)
                 if not self._ple_hmm_backends:
                     mapped.startup_probe()
-                self._ple_hmm_backends.append(mapped)
-                ple.ple_embedding.attach_table(mapped)
-            return 0
+                attached = mapped
+                if gather_on and max_prefill_tokens > 0 and rows_per_token > 0:
+                    attached = PrefillGatherTable(
+                        mapped,
+                        table,
+                        max_prefill_tokens,
+                        rows_per_token,
+                    )
+                    if getattr(attached, "enabled", False):
+                        ple.ple_embedding.snapshot_host_hash_constants()
+                        self._ple_prefill_gather.append((ple, attached))
+                        reserved += int(getattr(attached, "staging_nbytes", 0))
+                self._ple_hmm_backends.append(attached)
+                ple.ple_embedding.attach_table(attached)
+            if self._ple_prefill_gather:
+                logger.info_rank0(
+                    f"PLE HMM prefill gather: {max_prefill_tokens} tokens, "
+                    f"{reserved / 2**20:.1f} MiB pinned across "
+                    f"{len(self._ple_prefill_gather)} layer(s)"
+                )
+            return reserved
         if backend == "cached":
             from .ple import (
                 CachedTable,
@@ -347,6 +378,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             "ple_major_faults": None if now is None or base is None else now - base,
             "ple_staging_us": getattr(self, "_ple_staging_ns", 0) / 1_000.0,
         }
+        prefill_gather = [
+            table for table in backends if hasattr(table, "prefill_gather_rows")
+        ]
+        if prefill_gather:
+            result.update({
+                "ple_prefill_gather_rows": sum(
+                    int(table.prefill_gather_rows) for table in prefill_gather
+                ),
+                "ple_prefill_gather_ms": sum(
+                    float(table.prefill_gather_ms) for table in prefill_gather
+                ),
+            })
         cached = [table for table in backends if hasattr(table, "cache_stats")]
         if cached:
             stats = [table.cache_stats() for table in cached]
@@ -385,6 +428,39 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self._ple_major_fault_base = now
             self._ple_staging_ns = 0
         return result
+
+    def prepare_prefill_ple(self, batch: Batch) -> None:
+        """Hash and stage one final host-side prefill chunk before model execution."""
+        gather_layers = getattr(self, "_ple_prefill_gather", None)
+        if not gather_layers or not getattr(batch, "is_prefill", False):
+            return
+        reqs = getattr(batch, "padded_reqs", None)
+        if reqs is None:
+            reqs = batch.reqs
+        for ple, backend in gather_layers:
+            try:
+                row_ids = ple.ple_embedding.host_prefill_row_ids(
+                    reqs,
+                    int(
+                        getattr(
+                            backend,
+                            "max_prefill_tokens",
+                            getattr(self, "_ple_prefill_max_tokens", 0),
+                        )
+                    ),
+                )
+            except (MemoryError, RuntimeError) as exc:
+                degrade = getattr(backend, "degrade_prefill", None)
+                if degrade is not None:
+                    degrade(f"host row-id allocation failed: {exc}")
+                continue
+            backend.prepare_prefill(row_ids)
+
+    def cancel_prefill_ple(self) -> None:
+        for _ple, backend in getattr(self, "_ple_prefill_gather", ()):
+            cancel = getattr(backend, "cancel_prefill", None)
+            if cancel is not None:
+                cancel()
 
     def prepare_cuda_graph_replay(self, batch: Batch) -> None:
         """Stage disk PLE rows and compact ids before a decode graph replay or capture."""
@@ -459,6 +535,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
 
     def forward(self, *, select_last: bool = True) -> torch.Tensor:
         batch = get_global_ctx().batch
+        if batch.is_prefill:
+            self.prepare_prefill_ple(batch)
+        else:
+            self.cancel_prefill_ple()
         return self.lm_head.forward(
             self.model.forward(batch.input_ids, batch), select_last=select_last
         )

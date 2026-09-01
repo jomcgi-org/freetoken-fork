@@ -587,6 +587,39 @@ def test_engine_config_defaults_ple_backend_to_pinned():
         dtype=torch.bfloat16,
     )
     assert config.ple_backend == "pinned"
+    assert config.ple_prefill_gather == "on"
+
+
+@pytest.mark.parametrize("setting", ["on", "off"])
+def test_engine_config_accepts_ple_prefill_gather(setting):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        ple_backend="hmm",
+        ple_prefill_gather=setting,
+    )
+    assert config.ple_prefill_gather == setting
+
+
+def test_engine_config_rejects_invalid_ple_prefill_gather():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--ple-prefill-gather.*on.*off"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            ple_prefill_gather="auto",
+        )
 
 
 def test_engine_config_rejects_invalid_ple_backend():

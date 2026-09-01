@@ -14,8 +14,9 @@ HF reference: ``Qwen4ExpTextNGramEmbedding`` (modeling_qwen4_exp.py:1018) and
 The table is the 47.7 GiB FP8 n-gram store. ``PinnedUVATable`` gathers from a fully pinned host
 bank, ``CachedTable`` keeps a bounded pinned hot-row bank, ``HMMMappedTable`` gathers directly
 from read-only file mappings, and ``DiskStagedTable`` copies requested mapped rows through a
-small pinned bank. ``GpuResidentTable`` is the small-table oracle the host backends are diffed
-against.
+small pinned bank. ``PrefillGatherTable`` bulk-stages deduplicated prefill rows in front of the
+direct HMM decode path. ``GpuResidentTable`` is the small-table oracle the host backends are
+diffed against.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import json
 import math
 import mmap
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
@@ -682,6 +684,7 @@ class DiskStagedTable:
         prefetch: bool = True,
         max_decode_batch_size: int | None = None,
         rows_per_token: int | None = None,
+        interleaved_prefill: bool = False,
     ) -> None:
         from freetoken.moe.host_banks import HostBank
 
@@ -756,6 +759,9 @@ class DiskStagedTable:
                 [bank.tensor.data_ptr() for bank in scale_banks], dtype=torch.int64
             )
         self._has_disk_banks = any(getattr(bank, "_disk", False) for bank in table.banks)
+        self._has_disk_scale_banks = bool(scale_banks) and all(
+            getattr(bank, "_disk", False) for bank in scale_banks
+        )
         self._iov_max = max(1, int(os.sysconf("SC_IOV_MAX")))
         self._process_vm_readv = _PROCESS_VM_READV
         if max_decode_batch_size is not None or rows_per_token is not None:
@@ -795,6 +801,57 @@ class DiskStagedTable:
 
                 self._local_ids_bank.pin()
                 self._local_ids_ptr = device_ptr(self._local_ids_bank.tensor)
+            self._prefill_local_iov = None
+            self._prefill_remote_iov = None
+            if interleaved_prefill:
+                fields = 1 + int(self._scale_row_nbytes > 0)
+                entries = scratch_rows * fields
+                self._prefill_local_iov = torch.empty((entries, 2), dtype=torch.int64)
+                self._prefill_remote_iov = torch.empty((entries, 2), dtype=torch.int64)
+                strides = torch.tensor(
+                    [self._row_nbytes]
+                    + ([self._scale_row_nbytes] if fields == 2 else []),
+                    dtype=torch.int64,
+                )
+                self._prefill_local_iov[:, 1].view(scratch_rows, fields).copy_(
+                    strides.view(1, fields).expand(scratch_rows, fields)
+                )
+                self._prefill_remote_iov[:, 1].view(scratch_rows, fields).copy_(
+                    strides.view(1, fields).expand(scratch_rows, fields)
+                )
+                self._prefill_source_bases = torch.empty(
+                    (len(table.banks), fields), dtype=torch.int64
+                )
+                self._prefill_source_bases[:, 0].copy_(self._shard_bases)
+                self._prefill_dest_bases = torch.tensor(
+                    [self._stage_bank.tensor.data_ptr()]
+                    + (
+                        [self._stage_scale_bank.tensor.data_ptr()]
+                        if fields == 2 and self._stage_scale_bank is not None
+                        else []
+                    ),
+                    dtype=torch.int64,
+                )
+                self._prefill_row_strides = strides
+                self._prefill_stage_rows = torch.arange(scratch_rows, dtype=torch.int64)
+                page_slots = entries * 2
+                self._prefill_page_candidates = torch.empty(
+                    page_slots, dtype=torch.int64
+                )
+                self._prefill_page_sorted = torch.empty(page_slots, dtype=torch.int64)
+                self._prefill_page_order = torch.empty(page_slots, dtype=torch.int64)
+                self._prefill_page_flags = torch.empty(page_slots, dtype=torch.bool)
+                self._prefill_page_local_ids = torch.empty(
+                    page_slots, dtype=torch.int64
+                )
+                self._prefill_unique_pages = torch.empty(
+                    page_slots, dtype=torch.int64
+                )
+                if fields == 2:
+                    assert self._scale_shard_bases is not None
+                    self._prefill_source_bases[:, 1].copy_(
+                        self._scale_shard_bases
+                    )
 
     @property
     def prefetch_pages(self) -> int:
@@ -962,8 +1019,10 @@ class DiskStagedTable:
                 return
             copied_rows += chunk_rows
 
-    def _stage_decode_rows(self, ids: torch.Tensor) -> int:
-        """Allocation-free sort/dedup, page prefetch, and batched row copy for decode."""
+    def _resolve_stage_rows(
+        self, ids: torch.Tensor
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        """Resolve global ids to unique shard rows and compact local ids."""
         flat = ids.reshape(-1)
         count = flat.numel()
         if count > self._sorted_ids.numel():
@@ -972,7 +1031,8 @@ class DiskStagedTable:
                 f"{self._sorted_ids.numel()}"
             )
         if not count:
-            return 0
+            empty = self._shard_ids[:0]
+            return 0, empty, empty
 
         sorted_ids = self._sorted_ids[:count]
         sort_order = self._sort_order[:count]
@@ -1016,6 +1076,13 @@ class DiskStagedTable:
             out=shard_ids,
         )
         torch.remainder(unique, self._rows_per_shard, out=local_rows)
+        return unique_count, shard_ids, local_rows
+
+    def _stage_decode_rows(self, ids: torch.Tensor) -> int:
+        """Allocation-free sort/dedup, page prefetch, and batched row copy for decode."""
+        unique_count, shard_ids, local_rows = self._resolve_stage_rows(ids)
+        if not unique_count:
+            return 0
         addresses = self._remote_iov[:unique_count, 0]
         torch.index_select(self._shard_bases, 0, shard_ids, out=addresses)
         addresses.add_(local_rows, alpha=self._row_nbytes)
@@ -1039,6 +1106,129 @@ class DiskStagedTable:
                 row_nbytes=self._scale_row_nbytes,
                 remote_iov=self._scale_remote_iov,
             )
+        return unique_count
+
+    def _copy_prefill_iovecs(self, count: int) -> None:
+        """Copy one interleaved data and scale row batch into the staging banks."""
+        assert self._prefill_local_iov is not None
+        assert self._prefill_remote_iov is not None
+        local_iov = self._prefill_local_iov[:count]
+        remote_iov = self._prefill_remote_iov[:count]
+        if self._process_vm_readv is None:
+            for local, remote in zip(local_iov.tolist(), remote_iov.tolist()):
+                ctypes.memmove(local[0], remote[0], local[1])
+            return
+        copied_entries = 0
+        iovec_size = ctypes.sizeof(_IOVec)
+        while copied_entries < count:
+            chunk = min(self._iov_max, count - copied_entries)
+            local = ctypes.cast(
+                local_iov.data_ptr() + copied_entries * iovec_size,
+                ctypes.POINTER(_IOVec),
+            )
+            remote = ctypes.cast(
+                remote_iov.data_ptr() + copied_entries * iovec_size,
+                ctypes.POINTER(_IOVec),
+            )
+            expected = int(local_iov[copied_entries : copied_entries + chunk, 1].sum())
+            copied = self._process_vm_readv(
+                os.getpid(), local, chunk, remote, chunk, 0
+            )
+            if copied != expected:
+                self._process_vm_readv = None
+                for local_entry, remote_entry in zip(
+                    local_iov.tolist(), remote_iov.tolist()
+                ):
+                    ctypes.memmove(
+                        local_entry[0], remote_entry[0], local_entry[1]
+                    )
+                return
+            copied_entries += chunk
+
+    def _prefetch_prefill_pages(self, remote_iov: torch.Tensor) -> int:
+        """Deduplicate the interleaved prefill row pages in one WILLNEED sweep."""
+        if not self._has_disk_banks or not remote_iov.numel() or _MADVISE is None:
+            return 0
+        fields = self._prefill_source_bases.shape[1]
+        if fields == 2 and not self._has_disk_scale_banks:
+            remote_iov = remote_iov[0::2]
+        count = remote_iov.shape[0]
+        page_size = mmap.PAGESIZE
+        candidates = self._prefill_page_candidates[: count * 2]
+        candidates[:count].copy_(remote_iov[:, 0])
+        candidates[:count].floor_divide_(page_size).mul_(page_size)
+        candidates[count:].copy_(remote_iov[:, 0]).add_(
+            remote_iov[:, 1]
+        ).sub_(1)
+        candidates[count:].floor_divide_(page_size).mul_(page_size)
+        torch.sort(
+            candidates,
+            out=(
+                self._prefill_page_sorted[: count * 2],
+                self._prefill_page_order[: count * 2],
+            ),
+        )
+        ordered = self._prefill_page_sorted[: count * 2]
+        flags = self._prefill_page_flags[: count * 2]
+        flags[0] = True
+        if ordered.numel() > 1:
+            torch.ne(ordered[1:], ordered[:-1], out=flags[1:])
+        torch.cumsum(
+            flags,
+            dim=0,
+            dtype=torch.int64,
+            out=self._prefill_page_local_ids[: count * 2],
+        )
+        page_ids = self._prefill_page_local_ids[: count * 2].sub_(1)
+        page_count = int(page_ids[-1]) + 1
+        pages = self._prefill_unique_pages[:page_count]
+        pages.scatter_(0, page_ids, ordered)
+
+        start = previous = int(pages[0])
+        for index in range(1, page_count + 1):
+            current = int(pages[index]) if index < page_count else -1
+            if current == previous + page_size:
+                previous = current
+                continue
+            length = previous - start + page_size
+            if _MADVISE(ctypes.c_void_p(start), length, mmap.MADV_WILLNEED):
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+            start = previous = current
+        return page_count
+
+    def stage_prefill_rows(self, ids: torch.Tensor) -> int:
+        """Deduplicate and install one prefill row union with interleaved readv."""
+        if self._prefill_local_iov is None or self._prefill_remote_iov is None:
+            raise RuntimeError("interleaved PLE prefill buffers were not provisioned")
+        unique_count, shard_ids, local_rows = self._resolve_stage_rows(ids)
+        if not unique_count:
+            return 0
+        fields = self._prefill_source_bases.shape[1]
+        remote = self._prefill_remote_iov[: unique_count * fields]
+        local = self._prefill_local_iov[: unique_count * fields]
+        remote_addresses = remote[:, 0].view(unique_count, fields)
+        local_addresses = local[:, 0].view(unique_count, fields)
+        torch.index_select(
+            self._prefill_source_bases, 0, shard_ids, out=remote_addresses
+        )
+        torch.addcmul(
+            remote_addresses,
+            local_rows.view(-1, 1),
+            self._prefill_row_strides.view(1, -1),
+            out=remote_addresses,
+        )
+        local_addresses.copy_(
+            self._prefill_dest_bases.view(1, -1).expand(unique_count, fields)
+        )
+        torch.addcmul(
+            local_addresses,
+            self._prefill_stage_rows[:unique_count].view(-1, 1),
+            self._prefill_row_strides.view(1, -1),
+            out=local_addresses,
+        )
+        self._prefetch_pages += self._prefetch_prefill_pages(remote)
+        self._copy_prefill_iovecs(unique_count * fields)
         return unique_count
 
     def _prepare(self, row_ids: torch.Tensor) -> torch.Tensor:
@@ -1131,6 +1321,301 @@ class DiskStagedTable:
             return rows
         out.copy_(rows)
         return out
+
+
+class PrefillGatherTable:
+    """Bulk-stage HMM rows for prefill while leaving decode on its original backend.
+
+    The host row ids are prepared before the model forward. This overlay deduplicates
+    them with the disk backend's fixed scratch, installs the unique mapped rows with
+    its page-coalesced interleaved ``process_vm_readv`` path, then copies the compact
+    raw bank to CUDA. The lookup kernel reads that device bank through compact local
+    ids. Calls without a prepared prefill, including every decode call, delegate to
+    ``fallback`` unchanged.
+
+    All allocations are bounded by ``max_prefill_tokens * rows_per_token``. If the
+    optional staging allocation or a chunk preparation fails, that chunk delegates to
+    the direct backend instead of failing the request.
+    """
+
+    def __init__(
+        self,
+        fallback: PLETableBackend,
+        table,
+        max_prefill_tokens: int,
+        rows_per_token: int,
+        *,
+        device: torch.device | None = None,
+        enabled: bool = True,
+    ) -> None:
+        max_prefill_tokens = int(max_prefill_tokens)
+        rows_per_token = int(rows_per_token)
+        if max_prefill_tokens < 1 or rows_per_token < 1:
+            raise ValueError("PLE prefill gather bounds must be positive")
+        self.fallback = fallback
+        self.table = table
+        self.num_rows = int(fallback.num_rows)
+        self.head_dim = int(fallback.head_dim)
+        self.dtype = fallback.dtype
+        self.scale = float(getattr(table, "weight_scale", 1.0))
+        self.format = getattr(table, "format", "fp8")
+        self._max_tokens = max_prefill_tokens
+        self._rows_per_token = rows_per_token
+        self._capacity = min(
+            self.num_rows, max_prefill_tokens * rows_per_token
+        )
+        if device is None:
+            device = getattr(fallback, "_device", None)
+        if device is None:
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+        self._device = torch.device(device)
+        self._reader: DiskStagedTable | None = None
+        self._device_data: torch.Tensor | None = None
+        self._device_scales: torch.Tensor | None = None
+        self._device_local_ids: torch.Tensor | None = None
+        self._output: torch.Tensor | None = None
+        self._pending: tuple[torch.Size, int, torch.Tensor | None] | None = None
+        self._host_copy_done: torch.cuda.Event | None = None
+        self._gather_rows = 0
+        self._gather_ns = 0
+        self._fallbacks = 0
+        self._failure_logged = False
+        if enabled:
+            self._allocate(table)
+
+    def degrade_prefill(self, reason: str) -> None:
+        """Clear staged state and select the direct backend for the current chunk."""
+        self._pending = None
+        self._fallbacks += 1
+        self._warn_fallback(reason)
+
+    def cancel_prefill(self) -> None:
+        """Discard a stale prepared chunk before a non-prefill forward."""
+        self._pending = None
+
+    def _allocate(self, table) -> None:
+        data = table.banks[0].tensor
+        scales = getattr(table, "scale_banks", ())
+        try:
+            if self._device.type == "cuda":
+                self._device_data = torch.empty(
+                    (self._capacity, *data.shape[1:]),
+                    dtype=data.dtype,
+                    device=self._device,
+                )
+                if scales:
+                    scale = scales[0].tensor
+                    self._device_scales = torch.empty(
+                        (self._capacity, *scale.shape[1:]),
+                        dtype=scale.dtype,
+                        device=self._device,
+                    )
+                self._device_local_ids = torch.empty(
+                    (self._max_tokens, self._rows_per_token),
+                    dtype=torch.int32,
+                    device=self._device,
+                )
+            self._reader = DiskStagedTable(
+                table,
+                self._capacity,
+                device=self._device,
+                prefetch=False,
+                max_decode_batch_size=self._max_tokens,
+                rows_per_token=self._rows_per_token,
+                interleaved_prefill=True,
+            )
+        except (MemoryError, OSError, RuntimeError) as exc:
+            self._reader = None
+            self._device_data = None
+            self._device_scales = None
+            self._device_local_ids = None
+            if self._device.type == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass
+            self._warn_fallback(f"staging allocation failed: {exc}")
+
+    @property
+    def enabled(self) -> bool:
+        return self._reader is not None
+
+    @property
+    def max_prefill_tokens(self) -> int:
+        return self._max_tokens
+
+    @property
+    def staging_nbytes(self) -> int:
+        reader = self._reader
+        if reader is None:
+            return 0
+        banks = [reader._stage_bank, reader._local_ids_bank]
+        if reader._stage_scale_bank is not None:
+            banks.append(reader._stage_scale_bank)
+        return sum(bank.nbytes for bank in banks if bank is not None)
+
+    @property
+    def prefetch_pages(self) -> int:
+        reader = self._reader
+        return 0 if reader is None else reader.prefetch_pages
+
+    @property
+    def prefill_gather_rows(self) -> int:
+        return self._gather_rows
+
+    @property
+    def prefill_gather_ms(self) -> float:
+        return self._gather_ns / 1_000_000.0
+
+    @property
+    def prefill_gather_fallbacks(self) -> int:
+        return self._fallbacks
+
+    def _warn_fallback(self, reason: str) -> None:
+        if not self._failure_logged:
+            logger.warning_rank0(
+                f"PLE prefill gather unavailable ({reason}); using direct HMM for "
+                "affected chunks"
+            )
+            self._failure_logged = True
+
+    def reset_stats(self) -> None:
+        if self._reader is not None:
+            self._reader.reset_stats()
+        reset = getattr(self.fallback, "reset_stats", None)
+        if reset is not None:
+            reset()
+        self._gather_rows = 0
+        self._gather_ns = 0
+        self._fallbacks = 0
+
+    def prepare_prefill(self, row_ids: torch.Tensor) -> bool:
+        """Prepare one host row-id matrix, returning whether staging succeeded."""
+        self._pending = None
+        reader = self._reader
+        if reader is None:
+            self.degrade_prefill("staging is disabled")
+            return False
+        ids = torch.as_tensor(row_ids, dtype=torch.int64, device="cpu")
+        if ids.ndim != 2 or ids.shape[1] != self._rows_per_token:
+            raise ValueError(
+                f"PLE prefill ids must have shape [T, {self._rows_per_token}], got "
+                f"{tuple(ids.shape)}"
+            )
+        if ids.shape[0] > self._max_tokens:
+            raise ValueError(
+                f"PLE prefill has {ids.shape[0]} tokens, configured bound is "
+                f"{self._max_tokens}"
+            )
+        started = time.perf_counter_ns()
+        try:
+            if self._host_copy_done is not None:
+                self._host_copy_done.synchronize()
+            unique_count = reader.stage_prefill_rows(ids)
+            if self._device.type == "cuda":
+                assert self._device_data is not None
+                assert self._device_local_ids is not None
+                self._device_data[:unique_count].copy_(
+                    reader._stage_bank.tensor[:unique_count], non_blocking=True
+                )
+                if self._device_scales is not None:
+                    assert reader._stage_scale_bank is not None
+                    self._device_scales[:unique_count].copy_(
+                        reader._stage_scale_bank.tensor[:unique_count],
+                        non_blocking=True,
+                    )
+                local_ids = reader.local_ids
+                assert local_ids is not None
+                self._device_local_ids[: ids.shape[0]].copy_(
+                    local_ids[: ids.shape[0]], non_blocking=True
+                )
+                if self._host_copy_done is None:
+                    self._host_copy_done = torch.cuda.Event()
+                self._host_copy_done.record(torch.cuda.current_stream(self._device))
+        except (MemoryError, OSError, RuntimeError) as exc:
+            if self._device.type == "cuda":
+                try:
+                    torch.cuda.current_stream(self._device).synchronize()
+                except RuntimeError:
+                    pass
+            self.degrade_prefill(str(exc))
+            return False
+        self._pending = (ids.shape, unique_count, None)
+        self._gather_rows += unique_count
+        self._gather_ns += time.perf_counter_ns() - started
+        return True
+
+    def _stage_output(self, rows: int) -> torch.Tensor:
+        stage = getattr(self.fallback, "_stage", None)
+        if stage is not None:
+            return stage(rows)
+        if self._output is None or self._output.shape[0] < rows:
+            self._output = torch.empty(
+                (rows, self.head_dim), dtype=self.dtype, device=self._device
+            )
+        return self._output[:rows]
+
+    def _lookup_staged(
+        self, shape: torch.Size, unique_count: int, out: torch.Tensor | None
+    ) -> torch.Tensor:
+        reader = self._reader
+        assert reader is not None
+        if self._device.type == "cuda":
+            from freetoken.kernel.triton.ple import ple_gather_rows
+
+            assert self._device_data is not None
+            assert self._device_local_ids is not None
+            flat_ids = self._device_local_ids[: shape[0]].reshape(-1)
+            rows = ple_gather_rows(
+                self._device_data.data_ptr(),
+                unique_count,
+                self.head_dim,
+                flat_ids,
+                self._stage_output(flat_ids.numel()),
+                self.scale,
+                self.format == "fp8",
+                table_format=self.format,
+                scale_ptr=(
+                    0
+                    if self._device_scales is None
+                    else self._device_scales.data_ptr()
+                ),
+            )
+        else:
+            local_ids = reader.local_ids
+            assert local_ids is not None
+            flat_ids = local_ids[: shape[0]].reshape(-1).long()
+            data = reader._stage_bank.tensor[:unique_count].index_select(0, flat_ids)
+            scales = None
+            if reader._stage_scale_bank is not None:
+                scales = reader._stage_scale_bank.tensor[:unique_count].index_select(
+                    0, flat_ids
+                )
+            rows = dequantize_ple_rows(data, scales, self.format, self.scale)
+        rows = rows.view(*shape[:-1], shape[-1] * self.head_dim)
+        if out is None:
+            return rows
+        out.copy_(rows)
+        return out
+
+    def prefetch(self, row_ids: torch.Tensor) -> None:
+        pending = self._pending
+        if pending is not None and row_ids.shape == pending[0] and pending[2] is None:
+            self._pending = (pending[0], pending[1], row_ids)
+            return
+        self.fallback.prefetch(row_ids)
+
+    def lookup(
+        self, row_ids: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        pending, self._pending = self._pending, None
+        if pending is not None and pending[2] is row_ids:
+            return self._lookup_staged(pending[0], pending[1], out)
+        return self.fallback.lookup(row_ids, out)
 
 
 class CachedTable:
@@ -1878,6 +2363,72 @@ def derive_decode_row_ids_host(
     )
 
 
+def derive_prefill_row_ids_host(
+    sequences: Sequence[Sequence[int] | torch.Tensor],
+    cached_lens: Sequence[int],
+    *,
+    layer_multipliers: Sequence[int] | torch.Tensor,
+    vocab_sizes: Sequence[int] | torch.Tensor,
+    offsets: Sequence[int] | torch.Tensor,
+    ngram_size: int,
+    heads_per_ngram: int,
+    eos_token_id: int,
+    max_tokens: int,
+) -> torch.Tensor:
+    """Compute a ragged prefill chunk's row ids entirely from host token history.
+
+    Each sequence ends at the final token included in this forward and ``cached_lens``
+    marks its first forwarded token. Prefix-cache hits and continuation chunks therefore
+    use the same preceding tokens as the device-side recurrent n-gram context. The total
+    forwarded-token count is checked before allocating the context matrix.
+    """
+    if len(sequences) != len(cached_lens):
+        raise ValueError("prefill sequences and cached lengths must have the same size")
+    max_tokens = int(max_tokens)
+    if max_tokens < 1:
+        raise ValueError("PLE prefill max_tokens must be positive")
+    materialized: list[tuple[torch.Tensor, int]] = []
+    total = 0
+    for sequence, raw_cached in zip(sequences, cached_lens, strict=True):
+        ids = torch.as_tensor(sequence, dtype=torch.int64, device="cpu").reshape(-1)
+        cached = int(raw_cached)
+        if cached < 0 or cached > ids.numel():
+            raise ValueError(
+                f"PLE cached length {cached} is outside sequence length {ids.numel()}"
+            )
+        total += ids.numel() - cached
+        if total > max_tokens:
+            raise ValueError(
+                f"PLE prefill has {total} tokens, configured bound is {max_tokens}"
+            )
+        materialized.append((ids, cached))
+
+    ctx_len = ngram_size - 1
+    contexts = []
+    current = []
+    for ids, cached in materialized:
+        count = ids.numel() - cached
+        if not count:
+            continue
+        prefix = torch.full((ctx_len,), eos_token_id, dtype=torch.int64)
+        padded = torch.cat((prefix, ids))
+        contexts.append(padded.unfold(0, ctx_len, 1)[cached : cached + count])
+        current.append(ids[cached:])
+    expected_heads = (ngram_size - 1) * heads_per_ngram
+    if not current:
+        return torch.empty((0, expected_heads), dtype=torch.int64)
+    return derive_decode_row_ids_host(
+        torch.cat(contexts, dim=0),
+        torch.cat(current, dim=0),
+        layer_multipliers=layer_multipliers,
+        vocab_sizes=vocab_sizes,
+        offsets=offsets,
+        ngram_size=ngram_size,
+        heads_per_ngram=heads_per_ngram,
+        eos_token_id=eos_token_id,
+    )
+
+
 def _is_prime(value: int) -> bool:
     if value < 2:
         return False
@@ -2152,6 +2703,34 @@ class NGramEmbedding(BaseOP):
             product=product,
             boundary=boundary,
             crossed_eos=crossed_eos,
+        )
+
+    def host_prefill_row_ids(self, reqs, max_tokens: int) -> torch.Tensor:
+        """Hash the final host token slices for one scheduled prefill chunk."""
+        if self._host_hash_constants is None:
+            raise RuntimeError("PLE host hash constants were not snapshotted after weight load")
+        sequences = []
+        cached_lens = []
+        for req in reqs:
+            history = req.input_ids
+            cached = int(req.cached_len)
+            device_len = getattr(req, "device_len", None)
+            if device_len is None:
+                extend = int(getattr(req, "extend_len", len(history) - cached))
+                device_len = cached + extend
+            sequences.append(history[: int(device_len)])
+            cached_lens.append(cached)
+        multipliers, sizes, offsets = self._host_hash_constants
+        return derive_prefill_row_ids_host(
+            sequences,
+            cached_lens,
+            layer_multipliers=multipliers,
+            vocab_sizes=sizes,
+            offsets=offsets,
+            ngram_size=self.ngram_size,
+            heads_per_ngram=self.heads_per_ngram,
+            eos_token_id=self.eos_token_id,
+            max_tokens=max_tokens,
         )
 
     @property
@@ -2468,9 +3047,11 @@ __all__ = [
     "PLEMetadata",
     "PLETableBackend",
     "PinnedUVATable",
+    "PrefillGatherTable",
     "build_ple_metadata",
     "dequantize_ple_rows",
     "derive_decode_row_ids_host",
+    "derive_prefill_row_ids_host",
     "derive_ngram_hash_constants",
     "hmm_row_address",
     "process_major_faults",

@@ -94,6 +94,9 @@ class EngineConfig:
     # path; "cached" keeps hot mapped rows in a bounded pinned bank; "disk" stages
     # mapped rows; "hmm" gathers from mapped shards directly.
     ple_backend: str = "pinned"
+    # Bulk-stage a prefill chunk's deduplicated PLE rows when HMM is selected.
+    # Decode remains on the direct HMM path regardless of this setting.
+    ple_prefill_gather: str = "on"
     ple_cache_gib: float = 8.0
     ple_cache_warm: str | None = None
     ple_cache_profile_out: str | None = None
@@ -156,6 +159,11 @@ class EngineConfig:
             raise ValueError(
                 "--ple-backend must be 'pinned', 'cached', 'disk', or 'hmm', got "
                 f"{self.ple_backend!r}"
+            )
+        if self.ple_prefill_gather not in ("on", "off"):
+            raise ValueError(
+                "--ple-prefill-gather must be 'on' or 'off', got "
+                f"{self.ple_prefill_gather!r}"
             )
         if not math.isfinite(float(self.ple_cache_gib)) or self.ple_cache_gib <= 0:
             raise ValueError("--ple-cache-gib must be a finite positive number")
