@@ -82,6 +82,80 @@ def test_hybrid_finish_donates_live_slot():
     assert mr2.cuda_handle.cached_len == 3 and mr2.mamba_value == live
 
 
+def test_hybrid_cache_manager_restores_longer_disk_prefix(tmp_path):
+    from freetoken.kvcache.disk_prefix_cache import DiskPrefixStore
+
+    def qsa_pool(fill: bool):
+        kv = torch.arange(2 * 1 * 64, dtype=torch.float32).view(2, 1, 64, 1, 1, 1)
+        if not fill:
+            kv.zero_()
+        return SimpleNamespace(
+            _kv_buffer=kv,
+            _pending_ring=torch.arange(4 * 1 * 4, dtype=torch.float32).view(4, 1, 4),
+            device=torch.device("cpu"),
+        )
+
+    ids = torch.tensor([21, 22, 23, 24, 25], dtype=torch.int32)
+    writer = DiskPrefixStore(tmp_path, 1 << 20, identity="hybrid-integration")
+    source_pool = _pool()
+    source_qsa = qsa_pool(True)
+    source_table = torch.zeros(4, 64, dtype=torch.int32)
+    source = CacheManager(
+        64,
+        1,
+        source_table,
+        "hybrid_radix",
+        linear_state_pool=source_pool,
+        kv_cache=source_qsa,
+        disk_prefix_store=writer,
+    )
+    cold = source.match_req(_pend(ids.tolist()))
+    live, pp = source_pool.alloc(1)[0], tuple(source_pool.alloc(2))
+    source_pool.conv_states[:, live].fill_(7)
+    source_pool.recurrent_states[:, live].fill_(11)
+    source_table[0, :4] = torch.arange(4, dtype=torch.int32)
+    req = Req(
+        input_ids=ids,
+        table_idx=0,
+        cached_len=4,
+        output_len=1,
+        uid=5,
+        sampling_params=SamplingParams(),
+        cache_handle=cold.cuda_handle,
+    )
+    req.linear_slot_idx, req.mamba_ping_pong = live, pp
+    source.lock(cold.cuda_handle)
+    source.cache_req(req, finished=True)
+    writer.close()
+
+    reader = DiskPrefixStore(tmp_path, 1 << 20, identity="hybrid-integration")
+    target_pool = _pool()
+    target_qsa = qsa_pool(False)
+    target_table = torch.zeros(4, 64, dtype=torch.int32)
+    target = CacheManager(
+        64,
+        1,
+        target_table,
+        "hybrid_radix",
+        linear_state_pool=target_pool,
+        kv_cache=target_qsa,
+        disk_prefix_store=reader,
+    )
+    restored = target.match_req(_pend(ids.tolist()))
+
+    assert restored.cuda_handle.cached_len == 4
+    assert restored.mamba_value is not None
+    assert restored.qsa_pending is not None
+    assert torch.equal(
+        target_qsa._kv_buffer.flatten(2, 3)[:, :, :4],
+        source_qsa._kv_buffer.flatten(2, 3)[:, :, :4],
+    )
+    assert torch.all(target_pool.conv_states[:, restored.mamba_value] == 7)
+    assert torch.all(target_pool.recurrent_states[:, restored.mamba_value] == 11)
+    assert reader.stats()["hits"] == 1
+    reader.close()
+
+
 def test_free_req_slots_idempotent():
     """C2: a finish/abort double-free of the same request must NOT push its GDN slots twice."""
     pool = _pool()

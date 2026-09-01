@@ -64,19 +64,33 @@ def configure_mtp_fused_step(
     batch.mtp_fused = True
 
 
-def snapshot_verify_state(pool, kv_cache, req) -> dict:
-    """Copy all mutable request-local linear and QSA state."""
+def request_state_views(pool, kv_cache, req) -> dict:
+    """Describe all mutable request-local linear and QSA state without copying it."""
     slot = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-    snapshot = {"slot": slot}
+    state = {"slot": slot}
     if pool is not None:
-        snapshot["conv"] = pool.conv_states[:, slot].clone()
-        snapshot["recurrent"] = pool.recurrent_states[:, slot].clone()
-        snapshot["slot_states"] = {
-            name: value[:, slot].clone() for name, value in pool.slot_states.items()
+        state["conv"] = pool.conv_states[:, slot]
+        state["recurrent"] = pool.recurrent_states[:, slot]
+        state["slot_states"] = {
+            name: value[:, slot] for name, value in pool.slot_states.items()
         }
     pending = getattr(kv_cache, "_pending_ring", None)
     if pending is not None:
-        snapshot["qsa_pending"] = pending[req.table_idx].clone()
+        state["qsa_pending"] = pending[req.table_idx]
+    return state
+
+
+def snapshot_verify_state(pool, kv_cache, req) -> dict:
+    """Copy all mutable request-local linear and QSA state."""
+    views = request_state_views(pool, kv_cache, req)
+    snapshot = {"slot": views["slot"]}
+    for name in ("conv", "recurrent", "qsa_pending"):
+        if name in views:
+            snapshot[name] = views[name].clone()
+    if "slot_states" in views:
+        snapshot["slot_states"] = {
+            name: value.clone() for name, value in views["slot_states"].items()
+        }
     return snapshot
 
 
@@ -136,6 +150,7 @@ __all__ = [
     "configure_mtp_fused_step",
     "greedy_accept_prefix",
     "reserve_mtp_window",
+    "request_state_views",
     "restore_verify_state",
     "snapshot_verify_state",
     "validate_mtp_draft_tokens",

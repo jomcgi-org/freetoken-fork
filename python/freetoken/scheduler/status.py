@@ -12,6 +12,7 @@ class SchedulerStatusReporter:
     log: Callable[[str], None]
     clock: Callable[[], float] = time.perf_counter
     decode_log_interval: int = 40
+    disk_prefix_store: object | None = None
     _last_prefill_time: float = field(init=False)
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
@@ -81,6 +82,8 @@ class SchedulerStatusReporter:
         new_tokens = batch.log_new_tokens
         cached_tokens = batch.log_cached_tokens
         input_throughput = new_tokens / gap if gap > 0 else 0.0
+        if self.disk_prefix_store is not None:
+            self.disk_prefix_store.observe_prefill_rate(input_throughput)
         self.log(
             f"Prefill batch, "
             f"#new-seq: {len(batch.reqs)}, "
@@ -92,6 +95,7 @@ class SchedulerStatusReporter:
             f"#running-req: {running_reqs}, "
             f"#queue-req: {queue_reqs}, "
             f"input throughput (token/s): {input_throughput:.2f}"
+            f"{self._disk_prefix_msg()}"
         )
 
     def _report_decode(
@@ -167,6 +171,21 @@ class SchedulerStatusReporter:
             f"tokens/step: {tokens_per_step:.2f}, "
             f"#queue-req: {queue_reqs}"
             f"{timing_msg}"
+            f"{self._disk_prefix_msg()}"
+        )
+
+    def _disk_prefix_msg(self) -> str:
+        if self.disk_prefix_store is None:
+            return ""
+        stats = self.disk_prefix_store.stats()
+        return (
+            f", disk_prefix hits: {stats['hits']}, misses: {stats['misses']}, "
+            f"bytes_restored: {stats['bytes_restored']}, "
+            f"restore_ms: {stats['restore_ms']:.2f}, "
+            f"estimated prefill_ms_saved: {stats['prefill_ms_saved']:.2f}, "
+            f"write_drops: {stats['write_drops']}, "
+            f"corrupt: {stats['corrupt_entries']}, "
+            f"fingerprint_mismatch: {stats['fingerprint_mismatches']}"
         )
 
 

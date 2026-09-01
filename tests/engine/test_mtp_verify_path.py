@@ -36,6 +36,21 @@ def test_engine_config_rejects_more_than_one_mtp_draft():
         )
 
 
+def test_engine_config_disk_prefix_cache_defaults_off_and_requires_directory():
+    base = dict(
+        model_path="unused",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+    )
+    assert EngineConfig(**base).kv_disk_cache_gib == 0
+    with pytest.raises(ValueError, match=r"--kv-disk-cache-dir.*required"):
+        EngineConfig(**base, kv_disk_cache_gib=1.0)
+    configured = EngineConfig(
+        **base, kv_disk_cache_gib=8.0, kv_disk_cache_dir="/nvme/prefixes"
+    )
+    assert configured.kv_disk_cache_dir == "/nvme/prefixes"
+
+
 def test_verify_state_snapshot_restore_round_trip_cpu():
     pool = SimpleNamespace(
         conv_states=torch.arange(2 * 3 * 4, dtype=torch.float32).view(2, 3, 4),

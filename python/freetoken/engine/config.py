@@ -108,6 +108,10 @@ class EngineConfig:
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.
     linear_state_cache_ratio: float = 2.0
+    # Whole-prefix QSA KV plus GDN/PLE state persisted outside VRAM. A zero byte budget keeps
+    # the lane fully disabled. Version 1 supports whole-prefix entries only.
+    kv_disk_cache_dir: str | None = None
+    kv_disk_cache_gib: float = 0.0
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
@@ -135,6 +139,15 @@ class EngineConfig:
 
         validate_speculative_mtp(self.speculative_mtp)
         validate_mtp_draft_tokens(self.mtp_draft_tokens)
+        if (
+            not math.isfinite(float(self.kv_disk_cache_gib))
+            or self.kv_disk_cache_gib < 0
+        ):
+            raise ValueError("--kv-disk-cache-gib must be a finite non-negative number")
+        if self.kv_disk_cache_gib > 0 and not self.kv_disk_cache_dir:
+            raise ValueError(
+                "--kv-disk-cache-dir is required when --kv-disk-cache-gib is positive"
+            )
         if self.ple_backend not in ("pinned", "cached", "disk", "hmm"):
             raise ValueError(
                 "--ple-backend must be 'pinned', 'cached', 'disk', or 'hmm', got "
