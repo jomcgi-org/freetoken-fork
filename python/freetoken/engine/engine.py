@@ -317,6 +317,10 @@ class Engine:
 
         self.device = bind_assigned_gpu(config.tp_info.rank)
         _adjust_config(config)
+        if is_offload_moe_backend(config.moe_backend):
+            from freetoken.engine.host_memory import govern_host_memory
+
+            govern_host_memory(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -629,7 +633,7 @@ class Engine:
             and config.moe_cpu_layers is None
             and config.moe_disk_layers is None
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes) is not None
+            and _config_pin_budget_bytes(config, self._host_tables_bytes) is not None
         ):
             cpu_layer_ids = _auto_cpu_layers(
                 config, num_moe_layers, reserved=self._host_tables_bytes
@@ -661,14 +665,14 @@ class Engine:
         if (
             cpu_layer_ids
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes(self._host_tables_bytes) is not None
+            and _config_pin_budget_bytes(config, self._host_tables_bytes) is not None
         ):
             locked_layer_ids = cpu_layer_ids - disk_layer_ids
         if config.moe_backend == "cpu":
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
-            budget = _pin_budget_bytes(self._host_tables_bytes)
+            budget = _config_pin_budget_bytes(config, self._host_tables_bytes)
             bank_bytes = None
             if budget is not None:
                 bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
@@ -1585,17 +1589,34 @@ def _cpu_moe_executor_viable(model_config) -> bool:
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
-def _pin_budget_bytes(reserved: int = 0) -> int | None:
+def _pin_budget_bytes(
+    reserved: int = 0,
+    *,
+    budget_gib: float | None = None,
+) -> int | None:
     """Bytes this process can still safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere. ``reserved`` subtracts host bytes already pinned outside the expert banks (qwen4_exp's PLE table)."""
-    if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
+    The host-memory governor passes ``budget_gib`` for expert-tier startup. The
+    environment and WSL fallbacks remain for direct helper callers and older
+    duck-typed configs. ``reserved`` subtracts host bytes already pinned outside
+    the expert banks, such as qwen4_exp's PLE table.
+    """
+    if budget_gib is not None:
+        cap = int(float(budget_gib) * 2**30)
+    elif env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         cap = int(float(env) * 2**30)
     elif not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
         return None
     else:
         cap = int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
     return max(0, cap - reserved)
+
+
+def _config_pin_budget_bytes(config, reserved: int = 0) -> int | None:
+    return _pin_budget_bytes(
+        reserved,
+        budget_gib=getattr(config, "moe_pin_budget_gib", None),
+    )
 
 
 def _head_tail_layers(num_moe_layers: int, count: int) -> frozenset[int]:
@@ -1786,7 +1807,7 @@ def _resolve_hot_expert_setup(
         fixed_bytes
         + (num_moe_layers - len(disk_layer_ids)) * num_experts * expert_bytes
     )
-    budget = _pin_budget_bytes(reserved)
+    budget = _config_pin_budget_bytes(config, reserved)
     effective = requested
     if budget is not None:
         available = max(0, budget - pinned_whole)
@@ -1794,7 +1815,7 @@ def _resolve_hot_expert_setup(
         if effective < requested:
             logger.warning_rank0(
                 f"HOT expert budget clipped from {requested / 2**30:.2f} to "
-                f"{effective / 2**30:.2f} GiB by FREETOKEN_PIN_BUDGET_GB after "
+                f"{effective / 2**30:.2f} GiB by the host pin budget after "
                 "whole-layer and fixed-bank pin accounting"
             )
     top_n = min(
@@ -1861,7 +1882,7 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
     hot_reserve = int(
         max(0.0, float(getattr(config, "moe_hot_expert_budget_gib", 0.0))) * 2**30
     )
-    budget = _pin_budget_bytes(reserved + hot_reserve)
+    budget = _config_pin_budget_bytes(config, reserved + hot_reserve)
     if budget is None or bank_bytes <= budget:
         return frozenset()
     if not _cpu_moe_executor_viable(config.model_config):
@@ -1921,7 +1942,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_pager": "madvise",
     "moe_disk_lookahead": "on",
     "moe_step_timing": False,
-    "moe_pager_budget_gib": 40.0,
+    "host_cache_reserve_gib": None,
+    "moe_pager_budget_gib": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,

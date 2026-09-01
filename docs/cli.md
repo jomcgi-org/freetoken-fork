@@ -88,7 +88,8 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-disk-layers` | none | FTW MoE layers kept in the DISK tier and computed on CPU |
 | `--moe-disk-pager` | madvise | DISK residency manager: portable file mmap advice or Linux-only `uffd` page paging with logical row prefetch |
 | `--moe-disk-lookahead` | on | Reuse the preceding decode route set for an early madvise WILLNEED sweep; no-op with `uffd` |
-| `--moe-pager-budget-gib` | 40 | Resident-byte ceiling for the UFFD page LRU |
+| `--host-cache-reserve-gib` | max(8 GiB, 15% of RAM) | Host RAM kept for the OS and expert-tier file cache |
+| `--moe-pager-budget-gib` | auto | Resident-byte ceiling for the UFFD page LRU, fitted with the expert pin budget |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |

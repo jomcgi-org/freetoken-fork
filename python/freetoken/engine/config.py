@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, List
 
@@ -83,7 +83,11 @@ class EngineConfig:
     # Diagnostic decode instrumentation. Records CUDA phase boundaries and native
     # CPU task spans, then emits interval-averaged per-step timings on the decode log.
     moe_step_timing: bool = False
-    moe_pager_budget_gib: float = 40.0
+    # Host expert-tier budgets are resolved together at engine startup. The pin
+    # budget is internal; its explicit input remains FREETOKEN_PIN_BUDGET_GB.
+    host_cache_reserve_gib: float | None = None
+    moe_pager_budget_gib: float | None = None
+    moe_pin_budget_gib: float | None = field(default=None, init=False, repr=False)
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
     # (layer, decode step); the rest of that step's misses are computed on the CPU.
     # -1 (default) = auto: fetch the benched pcie_bw/cpu_bw fraction of each step's
@@ -222,7 +226,14 @@ class EngineConfig:
             or self.session_protect_experts < 0
         ):
             raise ValueError("--session-protect-experts must be a non-negative integer")
-        if (
+        if self.host_cache_reserve_gib is not None and (
+            not math.isfinite(float(self.host_cache_reserve_gib))
+            or self.host_cache_reserve_gib < 0
+        ):
+            raise ValueError(
+                "--host-cache-reserve-gib must be a finite non-negative number"
+            )
+        if self.moe_pager_budget_gib is not None and (
             not math.isfinite(float(self.moe_pager_budget_gib))
             or self.moe_pager_budget_gib <= 0
         ):

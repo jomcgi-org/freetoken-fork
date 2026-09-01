@@ -59,6 +59,15 @@ compute. A process-wide userspace LRU evicts pages with `MADV_DONTNEED` at the c
 resident-byte ceiling. Decode status reports proactive and fault-driven logical fills,
 installed pages, evictions, resident bytes, and a fill-latency histogram.
 
+At offload startup, the host-memory governor reads `MemTotal` and `MemAvailable` from
+`/proc/meminfo`. It reserves `max(8 GiB, 15% of MemTotal)` for the OS and the
+expert-tier file cache by default, then fits the expert pin and UFFD pager budgets
+under the remaining available memory. With neither budget explicit, the split uses
+the measured 28:22 pin-to-pager ratio. `FREETOKEN_PIN_BUDGET_GB`,
+`--moe-pager-budget-gib`, and `--host-cache-reserve-gib` remain explicit overrides.
+Startup rejects an explicit pin plus pager sum above the fitted ceiling instead of
+clamping either value.
+
 UFFD mode requires `/proc/sys/vm/unprivileged_userfaultfd=1` or `CAP_SYS_PTRACE`.
 Startup probes the kernel API and reports the current sysctl value on failure. It also
 requires page-aligned anonymous mapping boundaries. Expert row sizes and FTW file

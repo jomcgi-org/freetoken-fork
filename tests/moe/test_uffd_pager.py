@@ -74,11 +74,13 @@ def test_server_cli_exposes_uffd_pager_flags():
         "--moe-disk-pager", "uffd",
         "--moe-disk-lookahead", "off",
         "--moe-step-timing",
+        "--host-cache-reserve-gib", "9.5",
         "--moe-pager-budget-gib", "12.5",
     ])
     assert args.moe_disk_pager == "uffd"
     assert args.moe_disk_lookahead == "off"
     assert args.moe_step_timing is True
+    assert args.host_cache_reserve_gib == 9.5
     assert args.moe_pager_budget_gib == 12.5
 
 
