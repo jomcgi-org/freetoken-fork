@@ -746,11 +746,12 @@ def parse_args(
 
     parser.add_argument(
         "--moe-prefill-coalesce",
-        choices=["on", "off"],
+        choices=["populate", "on", "off"],
         default=ServerArgs.moe_prefill_coalesce,
         help=(
-            "Coalesce each DISK CPU-prefill layer's routed expert rows into one "
-            "bounded page sweep before compute (default: on)."
+            "Warm each DISK CPU-prefill layer's bounded routed expert union: "
+            "'populate' reads backing-file ranges (default), 'on' uses advisory "
+            "WILLNEED only, and 'off' disables the lease."
         ),
     )
 

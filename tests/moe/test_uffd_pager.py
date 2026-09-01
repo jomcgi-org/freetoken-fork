@@ -74,7 +74,10 @@ def test_server_cli_exposes_uffd_pager_flags():
     from freetoken.engine.config import EngineConfig
     from freetoken.server.args import parse_args
 
-    assert EngineConfig.__dataclass_fields__["moe_prefill_coalesce"].default == "on"
+    assert (
+        EngineConfig.__dataclass_fields__["moe_prefill_coalesce"].default
+        == "populate"
+    )
 
     args, _ = parse_args([
         "--model", "/tmp/nonexistent-model",
@@ -92,6 +95,18 @@ def test_server_cli_exposes_uffd_pager_flags():
     assert args.moe_step_timing is True
     assert args.host_cache_reserve_gib == 9.5
     assert args.moe_pager_budget_gib == 12.5
+
+
+@pytest.mark.parametrize("value", ["populate", "on", "off"])
+def test_server_cli_accepts_all_prefill_coalesce_values(value):
+    from freetoken.server.args import parse_args
+
+    args, _ = parse_args([
+        "--model", "/tmp/nonexistent-model",
+        "--dtype", "bfloat16",
+        "--moe-prefill-coalesce", value,
+    ])
+    assert args.moe_prefill_coalesce == value
 
 
 def test_probe_reports_sysctl_requirement(monkeypatch):
