@@ -106,6 +106,17 @@ class UFFDPager:
         """Return whether every physical page covering a bank row is resident."""
         return bool(self._native.is_resident(bank._pager_region, int(expert_id)))
 
+    def release_prefill_rows(self, banks, expert_ids) -> int:
+        """Discard one-pass prefill pages when the native extension supports it."""
+        release = getattr(self._native, "release_rows", None)
+        if release is None:
+            return 0
+        regions = [int(bank._pager_region) for bank in banks]
+        rows = sorted({int(row) for row in expert_ids if int(row) >= 0})
+        if not regions or not rows:
+            return 0
+        return int(release(regions, rows))
+
     def validate_working_set(self, banks, num_rows: int, *, context: str) -> None:
         """Reject a route union that cannot remain resident through compute."""
         import mmap

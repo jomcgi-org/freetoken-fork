@@ -228,6 +228,31 @@ def test_disk_prefetch_page_dedup_accounts_for_unaligned_tensor_view():
     ) == [(0, 8192)]
 
 
+def test_disk_prefill_release_marks_only_selected_page_ranges_noreuse(
+    tmp_path, monkeypatch,
+):
+    import freetoken.moe.host_banks as host_banks
+
+    source = tmp_path / "experts.ftw"
+    source.write_bytes(b"x" * 8192)
+    bank = host_banks.HostBank(
+        (2, 4096), torch.uint8, backing="file", file_path=str(source),
+    )
+    calls = []
+    monkeypatch.setattr(host_banks.os, "POSIX_FADV_NOREUSE", 5, raising=False)
+    monkeypatch.setattr(
+        host_banks.os,
+        "posix_fadvise",
+        lambda fd, offset, length, advice: calls.append(
+            (offset, length, advice)
+        ),
+        raising=False,
+    )
+
+    assert bank.release_rows([1, 1]) == 1
+    assert calls == [(4096, 4096, 5)]
+
+
 def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     import freetoken.moe.cpu_executor as cpu_executor
 
@@ -239,6 +264,9 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     executor._disk_decode_steps = 6
     executor._disk_route_pairs = 48
     executor._disk_distinct_experts = 30
+    executor._prefill_coalesce_experts = 9
+    executor._prefill_coalesce_ns = 2_500_000
+    executor._prefill_coalesce_degrades = 1
     executor._disk_major_fault_base = 10
     executor._gpufetch_tasks = {}
     monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 16)
@@ -250,6 +278,9 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["major_faults_per_decode_step"] == 2.0
     assert stats["distinct_experts_per_step"] == 5.0
     assert stats["dedup_ratio"] == 1.6
+    assert stats["moe_prefill_coalesce_experts"] == 9
+    assert stats["moe_prefill_coalesce_ms"] == 2.5
+    assert stats["moe_prefill_coalesce_degrades"] == 1
     assert stats["gpufetch_fills_per_step"] == 0.0
     assert stats["gpufetch_fill_us"] == 0.0
     assert stats["per_layer"] == [
@@ -259,6 +290,9 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert executor._disk_prefetch_calls == [0, 0, 0]
     assert executor._disk_route_pairs == 0
     assert executor._disk_distinct_experts == 0
+    assert executor._prefill_coalesce_experts == 0
+    assert executor._prefill_coalesce_ns == 0
+    assert executor._prefill_coalesce_degrades == 0
     assert executor._disk_major_fault_base == 16
 
 
@@ -428,6 +462,162 @@ def test_disk_prefetch_deduplicates_route_union_across_batch():
     assert executor._disk_prefetch_calls == [0, 1]
     assert executor._disk_prefetch_pages == [0, 12]
     assert executor._disk_decode_steps == 0
+
+
+def test_cpu_prefill_coalesce_dedupes_and_releases_after_layer():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    class Bank:
+        def __init__(self):
+            self.calls = []
+            self.releases = []
+
+        def prefetch_experts(self, expert_ids):
+            self.calls.append(list(expert_ids))
+            return len(expert_ids)
+
+        def release_rows(self, expert_ids):
+            self.releases.append(tuple(expert_ids))
+
+    bank = Bank()
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [bank]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_limits = {0: 8}
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+
+    routes = torch.tensor([[7, 2], [7, 1], [2, -1]], dtype=torch.int32)
+    lease = executor.prepare_prefill_layer(0, routes)
+
+    assert lease.experts == (1, 2, 7)
+    assert bank.calls == [[1, 2, 7]]
+    assert executor._prefill_coalesce_experts == 3
+    executor.release_prefill_layer(lease)
+    assert bank.releases == [(1, 2, 7)]
+
+
+def test_cpu_prefill_coalesce_byte_ceiling_caps_distinct_experts():
+    from freetoken.moe.cpu_executor import _prefill_coalesce_limit
+
+    bank = SimpleNamespace(
+        nbytes=8 * 4096,
+        tensor=SimpleNamespace(shape=(8, 4096)),
+        _view_offset=0,
+    )
+
+    assert _prefill_coalesce_limit(
+        [bank], 8, byte_ceiling=3 * 4096, page_size=4096,
+    ) == (3, 4096)
+    assert _prefill_coalesce_limit(
+        [bank], 8, byte_ceiling=4095, page_size=4096,
+    ) == (0, 4096)
+
+
+@pytest.mark.parametrize(
+    ("prefill_mode", "coalesce", "expected_calls"),
+    [
+        ("cpu", "on", 1),
+        ("cpu", "off", 0),
+        ("copy", "on", 0),
+    ],
+)
+def test_cpu_prefill_coalesce_flag_gating(prefill_mode, coalesce, expected_calls):
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    class Executor:
+        def __init__(self):
+            self.calls = []
+
+        def prepare_prefill_layer(self, layer_id, expert_ids):
+            self.calls.append((layer_id, expert_ids))
+            return object()
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.layer_residency = ["disk"]
+    cache.moe_disk_prefill = prefill_mode
+    cache.moe_prefill_coalesce = coalesce
+    cache.cpu_executor = Executor()
+
+    cache.prepare_disk_prefill(0, [1, 2])
+    assert len(cache.cpu_executor.calls) == expected_calls
+
+
+def test_cpu_prefill_coalesce_allocation_failure_degrades_to_fault_path(monkeypatch):
+    import freetoken.moe.cpu_executor as cpu_executor
+
+    executor = cpu_executor.CpuMoeExecutor.__new__(cpu_executor.CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [object()]}
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_limits = {0: 8}
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+    monkeypatch.setattr(
+        cpu_executor,
+        "_dedupe_decode_routes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(MemoryError("bounded alloc")),
+    )
+
+    assert executor.prepare_prefill_layer(0, [1, 2]) is None
+    assert executor._prefill_coalesce_degrades == 1
+    assert executor._prefill_coalesce_experts == 0
+
+
+@pytest.mark.parametrize("model_type", ["qwen4_exp", "glm4_moe"])
+def test_cpu_prefill_coalesce_uses_shared_layer_seam_for_architectures(model_type):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    calls = []
+    output = torch.zeros((2, 8), dtype=torch.bfloat16)
+
+    class Executor:
+        def prefill(self, layer_id, hidden_states, topk_weights, topk_ids):
+            calls.append(("compute", model_type, layer_id))
+            return output
+
+    lease = object()
+    cache = SimpleNamespace(
+        model_config=SimpleNamespace(model_type=model_type),
+        layer_residency=["disk"],
+        moe_disk_prefill="cpu",
+        prefill_overlap=False,
+        cpu_executor=Executor(),
+        prepare_disk_prefill=lambda layer_id, ids: calls.append(
+            ("prepare", model_type, layer_id)
+        ) or lease,
+        release_disk_prefill=lambda actual: calls.append(
+            ("release", model_type, actual)
+        ),
+    )
+    layer = OffloadMoELayer(
+        layer_id=0,
+        num_experts=4,
+        top_k=2,
+        hidden_size=8,
+        intermediate_size=8,
+    )
+    layer.offload_cache = cache
+    hidden = torch.zeros((2, 8), dtype=torch.bfloat16)
+    weights = torch.full((2, 2), 0.5)
+    ids = torch.tensor([[1, 2], [2, 3]], dtype=torch.int32)
+
+    assert layer._prefill_routed(hidden, weights, ids) is output
+    assert calls == [
+        ("prepare", model_type, 0),
+        ("compute", model_type, 0),
+        ("release", model_type, lease),
+    ]
 
 
 def test_disk_decode_route_dedup_stats_track_heavy_recurrence():

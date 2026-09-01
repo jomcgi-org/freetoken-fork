@@ -184,10 +184,11 @@ class Scheduler(SchedulerIOMixin):
         def _status_log(message: str) -> None:
             cache = getattr(self.engine, "moe_offload_cache", None)
             is_decode_status = message.startswith("Decode batch")
-            is_ple_status = is_decode_status or message.startswith("Prefill batch")
+            is_prefill_status = message.startswith("Prefill batch")
+            is_ple_status = is_decode_status or is_prefill_status
             disk = (
                 cache.disk_prefetch_stats(reset=True)
-                if cache is not None and is_decode_status else {}
+                if cache is not None and (is_decode_status or is_prefill_status) else {}
             )
             ple_stats = (
                 self.engine.model.ple_disk_stats(reset=True)
@@ -200,6 +201,10 @@ class Scheduler(SchedulerIOMixin):
                     f"disk major faults: {disk['major_faults']}, "
                     f"disk major faults/decode step: "
                     f"{disk['major_faults_per_decode_step']:.2f}, "
+                    f"moe_prefill_coalesce_experts: "
+                    f"{disk.get('moe_prefill_coalesce_experts', 0)}, "
+                    f"moe_prefill_coalesce_ms: "
+                    f"{disk.get('moe_prefill_coalesce_ms', 0.0):.1f}, "
                     f"disk distinct_experts/step: "
                     f"{disk['distinct_experts_per_step']:.2f}, "
                     f"disk dedup_ratio: {disk['dedup_ratio']:.2f}, "

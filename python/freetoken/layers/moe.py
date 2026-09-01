@@ -489,17 +489,26 @@ class OffloadMoELayer(MoELayer):
             cache.begin_prefill()
         residency = getattr(cache, "layer_residency", ())
         if self.layer_id < len(residency) and residency[self.layer_id] == "disk":
-            # Keep the union-of-routed-experts WILLNEED sweep ahead of either compute
-            # path. The CPU task suppresses its decode-time callback because this
-            # explicit prefetch already covered the whole prefill chunk.
-            cache.prefetch_disk_experts(self.layer_id, topk_ids)
             if cache.moe_disk_prefill == "cpu":
                 executor = cache.cpu_executor
                 assert executor is not None, "DISK layer requires the CPU MoE executor"
-                self._prefetch_next_overlap_layer(cache)
-                return executor.prefill(
-                    self.layer_id, hidden_states, topk_weights, topk_ids
+                prepare = getattr(cache, "prepare_disk_prefill", None)
+                lease = (
+                    prepare(self.layer_id, topk_ids)
+                    if prepare is not None
+                    else cache.prefetch_disk_experts(self.layer_id, topk_ids)
                 )
+                self._prefetch_next_overlap_layer(cache)
+                try:
+                    return executor.prefill(
+                        self.layer_id, hidden_states, topk_weights, topk_ids
+                    )
+                finally:
+                    release = getattr(cache, "release_disk_prefill", None)
+                    if release is not None:
+                        release(lease)
+            # Preserve the existing advisory sweep for the full-layer copy benchmark.
+            cache.prefetch_disk_experts(self.layer_id, topk_ids)
         if cache.prefill_overlap and cache.prefill_overlap_for_layer(self.layer_id):
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(

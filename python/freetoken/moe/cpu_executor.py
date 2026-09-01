@@ -17,6 +17,7 @@ the subsequent capture embeds in its host/memcpy nodes.
 
 from __future__ import annotations
 
+import mmap
 import os
 import threading
 import time
@@ -67,6 +68,12 @@ class _StepTimingEvents:
     hot_done: torch.cuda.Event
     wait_done: torch.cuda.Event
     layer_end: torch.cuda.Event
+
+
+@dataclass(frozen=True)
+class _PrefillCoalesceLease:
+    layer_id: int
+    experts: tuple[int, ...]
 
 
 def _split_step_timing_layers(
@@ -146,6 +153,36 @@ def _dedupe_decode_routes(expert_ids, num_experts: int) -> tuple[list[int], int]
 def _disk_lookahead_allowed(requested: bool, pagers: set) -> bool:
     """Return whether previous-step WILLNEED prediction applies to these banks."""
     return bool(requested and not pagers)
+
+
+def _prefill_coalesce_limit(
+    banks, num_experts: int, byte_ceiling: int, *, page_size: int = mmap.PAGESIZE,
+) -> tuple[int, int]:
+    """Return the bounded expert count and conservative page bytes per expert."""
+    if num_experts <= 0 or byte_ceiling <= 0 or page_size <= 0:
+        return 0, 0
+    per_expert = 0
+    for bank in banks:
+        tensor = getattr(bank, "tensor", None)
+        shape = getattr(tensor, "shape", ())
+        rows = int(shape[0]) if shape else num_experts
+        nbytes = int(getattr(bank, "nbytes", 0))
+        if rows <= 0 or nbytes <= 0 or nbytes % rows:
+            continue
+        row_bytes = nbytes // rows
+        view_offset = int(getattr(bank, "_view_offset", 0))
+        max_pages = max(
+            (
+                (view_offset + (row + 1) * row_bytes + page_size - 1)
+                // page_size
+                - (view_offset + row * row_bytes) // page_size
+            )
+            for row in range(rows)
+        )
+        per_expert += max_pages * page_size
+    if per_expert <= 0:
+        return num_experts, 0
+    return min(num_experts, byte_ceiling // per_expert), per_expert
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -235,6 +272,8 @@ class CpuMoeExecutor:
         swiglu_limit: float | None = None,
         disk_lookahead: bool = True,
         step_timing: bool = False,
+        prefill_coalesce: bool = True,
+        prefill_coalesce_budget_bytes: int = 40 << 30,
     ) -> None:
         from freetoken.kernel import _cpu_moe
 
@@ -293,6 +332,24 @@ class CpuMoeExecutor:
         self._disk_major_fault_base = _major_faults()
         self._disk_prefetch_error: BaseException | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
+        self._prefill_coalesce_enabled = bool(prefill_coalesce)
+        self._prefill_coalesce_experts = 0
+        self._prefill_coalesce_ns = 0
+        self._prefill_coalesce_degrades = 0
+        self._prefill_coalesce_warned = False
+        # Keep half of the pager budget available to the decode working set. Only one
+        # prefill layer is live at a time and its lease is released after compute.
+        self._prefill_coalesce_byte_ceiling = max(
+            0, int(prefill_coalesce_budget_bytes) // 2
+        )
+        self._prefill_coalesce_limits = {
+            layer_id: _prefill_coalesce_limit(
+                banks,
+                self.num_experts,
+                self._prefill_coalesce_byte_ceiling,
+            )[0]
+            for layer_id, banks in self._disk_banks.items()
+        }
         # UFFD already prefetches complete logical rows through its userspace pager.
         # Keep one-step prediction on the madvise path only.
         self._disk_lookahead_enabled = _disk_lookahead_allowed(
@@ -444,6 +501,12 @@ class CpuMoeExecutor:
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
+        if self._disk_banks and self._prefill_coalesce_enabled:
+            logger.info_rank0(
+                "CPU MoE prefill coalesce: page-sweep, "
+                f"per-layer ceiling={self._prefill_coalesce_byte_ceiling / 2**30:.2f} GiB, "
+                f"expert limits={self._prefill_coalesce_limits}"
+            )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
         """Build a CPU int64 tensor of per-layer base addresses for one bank.
@@ -886,6 +949,78 @@ class CpuMoeExecutor:
         self._disk_delta_pages = getattr(self, "_disk_delta_pages", 0) + pages
         return pages
 
+    def prepare_prefill_layer(self, layer_id: int, expert_ids):
+        """Warm one bounded expert union and return its post-compute lease.
+
+        The native executor stores fixed pointers to the original bank mappings, so
+        copied staging rows cannot serve it. This uses the shared page-coalesced
+        WILLNEED path instead. Any allocation or advisory failure leaves compute on
+        the ordinary fault path for this layer.
+        """
+        if not getattr(self, "_prefill_coalesce_enabled", True):
+            return None
+        started = time.perf_counter_ns()
+        try:
+            selected, _route_pairs = _dedupe_decode_routes(
+                expert_ids, self.num_experts
+            )
+            limit = getattr(self, "_prefill_coalesce_limits", {}).get(
+                int(layer_id), self.num_experts
+            )
+            selected = selected[:limit]
+            if not selected:
+                return None
+            self._prefetch_selected(int(layer_id), selected)
+        except (MemoryError, OSError, RuntimeError) as exc:
+            self._prefill_coalesce_degrades = getattr(
+                self, "_prefill_coalesce_degrades", 0
+            ) + 1
+            if not getattr(self, "_prefill_coalesce_warned", False):
+                logger.warning_rank0(
+                    f"CPU MoE prefill coalesce degraded to demand faults: {exc}"
+                )
+                self._prefill_coalesce_warned = True
+            return None
+        finally:
+            self._prefill_coalesce_ns = getattr(
+                self, "_prefill_coalesce_ns", 0
+            ) + time.perf_counter_ns() - started
+        self._prefill_coalesce_experts = getattr(
+            self, "_prefill_coalesce_experts", 0
+        ) + len(selected)
+        return _PrefillCoalesceLease(int(layer_id), tuple(selected))
+
+    def release_prefill_layer(self, lease: _PrefillCoalesceLease) -> None:
+        """Mark successfully swept rows as one-pass after native compute completes."""
+        banks = self._disk_banks.get(int(lease.layer_id), ())
+        pager_groups: dict[object, list] = {}
+        for bank in banks:
+            pager = getattr(bank, "_pager", None)
+            if pager is not None:
+                pager_groups.setdefault(pager, []).append(bank)
+                continue
+            release = getattr(bank, "release_rows", None)
+            if release is None:
+                continue
+            try:
+                release(lease.experts)
+            except (MemoryError, OSError, RuntimeError) as exc:
+                logger.warning_rank0(
+                    f"CPU MoE prefill one-pass advice failed for layer "
+                    f"{lease.layer_id}: {exc}"
+                )
+        for pager, pager_banks in pager_groups.items():
+            release = getattr(pager, "release_prefill_rows", None)
+            if release is None:
+                continue
+            try:
+                release(pager_banks, lease.experts)
+            except (MemoryError, OSError, RuntimeError) as exc:
+                logger.warning_rank0(
+                    f"CPU MoE prefill pager release failed for layer "
+                    f"{lease.layer_id}: {exc}"
+                )
+
     def reset_disk_stats(self) -> None:
         self._disk_prefetch_calls = [0] * self.num_layers
         self._disk_prefetch_pages = [0] * self.num_layers
@@ -895,6 +1030,9 @@ class CpuMoeExecutor:
         self._disk_lookahead_hits = 0
         self._disk_lookahead_routes = 0
         self._disk_delta_pages = 0
+        self._prefill_coalesce_experts = 0
+        self._prefill_coalesce_ns = 0
+        self._prefill_coalesce_degrades = 0
         self._disk_major_fault_base = _major_faults()
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
             self._ext.gpufetch_stats(True)
@@ -959,6 +1097,15 @@ class CpuMoeExecutor:
                 gpufetch_ns / 1_000 / gpufetch_decode_steps
                 if gpufetch_decode_steps else 0.0
             ),
+            "moe_prefill_coalesce_experts": getattr(
+                self, "_prefill_coalesce_experts", 0
+            ),
+            "moe_prefill_coalesce_ms": getattr(
+                self, "_prefill_coalesce_ns", 0
+            ) / 1_000_000,
+            "moe_prefill_coalesce_degrades": getattr(
+                self, "_prefill_coalesce_degrades", 0
+            ),
             "per_layer": per_layer,
         }
         pagers = list(getattr(self, "_disk_pagers", ()))
@@ -1005,6 +1152,9 @@ class CpuMoeExecutor:
             self._disk_lookahead_hits = 0
             self._disk_lookahead_routes = 0
             self._disk_delta_pages = 0
+            self._prefill_coalesce_experts = 0
+            self._prefill_coalesce_ns = 0
+            self._prefill_coalesce_degrades = 0
             self._disk_major_fault_base = now
         return result
 
