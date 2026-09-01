@@ -493,11 +493,11 @@ class OffloadMoELayer(MoELayer):
                 executor = cache.cpu_executor
                 assert executor is not None, "DISK layer requires the CPU MoE executor"
                 prepare = getattr(cache, "prepare_disk_prefill", None)
-                lease = (
-                    prepare(self.layer_id, topk_ids)
-                    if prepare is not None
-                    else cache.prefetch_disk_experts(self.layer_id, topk_ids)
-                )
+                lease = prepare(self.layer_id, topk_ids) if prepare is not None else None
+                if lease is None:
+                    # No coalesce lease (flag off, seam missing, or degraded):
+                    # keep the pre-coalesce union WILLNEED sweep.
+                    cache.prefetch_disk_experts(self.layer_id, topk_ids)
                 self._prefetch_next_overlap_layer(cache)
                 try:
                     return executor.prefill(

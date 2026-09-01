@@ -1334,13 +1334,24 @@ class OffloadMoeCache:
         return self.cpu_executor.prefetch_experts(layer_id, expert_ids, is_prefill=True)
 
     def prepare_disk_prefill(self, layer_id: int, expert_ids):
-        """Warm one bounded routed union before shared CPU prefill compute."""
+        """Warm one bounded routed union before shared CPU prefill compute.
+
+        Returns None whenever coalescing is not active for this layer (flag
+        off, copy prefill, or an executor predating the seam - test doubles
+        included); the caller treats a None lease as "run the original
+        advisory sweep instead".
+        """
         if self.layer_residency[layer_id] != "disk":
             return None
-        if self.moe_disk_prefill != "cpu" or self.moe_prefill_coalesce != "on":
-            return None
         assert self.cpu_executor is not None, "DISK layer requires the CPU MoE executor"
-        return self.cpu_executor.prepare_prefill_layer(layer_id, expert_ids)
+        prepare = getattr(self.cpu_executor, "prepare_prefill_layer", None)
+        if (
+            self.moe_disk_prefill != "cpu"
+            or self.moe_prefill_coalesce != "on"
+            or prepare is None
+        ):
+            return None
+        return prepare(layer_id, expert_ids)
 
     def release_disk_prefill(self, lease) -> None:
         """Apply one-pass cache advice after the CPU layer has finished."""
