@@ -182,7 +182,7 @@ def test_poisoned_cuda_context_logs_loudly_and_exits_nonzero(monkeypatch):
     logs: list[str] = []
 
     class Logger:
-        def error_rank0(self, message, *args):
+        def warning_rank0(self, message, *args):
             logs.append(message % args)
 
         def critical_rank0(self, message, *args):
