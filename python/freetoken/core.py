@@ -89,6 +89,9 @@ class Req:
     # the admission queue. It never participates in model math.
     expert_profile: Any | None = field(default=None, init=False, repr=False)
     expert_profile_restored: bool = field(default=False, init=False, repr=False)
+    # Monotonic scheduler admission order. Decode OOM recovery drops the largest value so
+    # pressure is shed from the request admitted most recently, independent of uid ordering.
+    admission_order: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

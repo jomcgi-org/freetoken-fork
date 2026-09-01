@@ -56,7 +56,12 @@ def _prompt_admitted_reply(msg: PromptAdmittedMsg) -> UserReply:
 
 def _error_reply(msg: ErrorReplyMsg) -> UserReply:
     return UserReply(
-        uid=msg.uid, incremental_output="", finished=True, error=msg.error, error_code=msg.code,
+        uid=msg.uid,
+        incremental_output="",
+        finished=True,
+        error=msg.error,
+        error_code=msg.code,
+        error_status_code=getattr(msg, "status_code", 400),
     )
 
 

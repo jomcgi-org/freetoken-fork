@@ -370,6 +370,40 @@ def test_completion_rejects_token_id_prompts():
     assert "token-id prompt" in body["error"]["message"]
 
 
+def test_scheduler_oom_is_openai_503_without_finish_reason():
+    message = (
+        "server temporarily out of memory for this request size; "
+        "shorten prompt / lower max_tokens"
+    )
+    state = FakeState([
+        UserReply(
+            uid=42,
+            incremental_output="",
+            finished=True,
+            error=message,
+            error_code="server_out_of_memory",
+            error_status_code=503,
+        )
+    ])
+    response = run(
+        handle_chat_completion(
+            chat_request(stream=False), request=None, state=state, model_sampling={}
+        )
+    )
+
+    assert response.status_code == 503
+    body = json.loads(response.body)
+    assert body == {
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "param": None,
+            "code": "server_out_of_memory",
+        }
+    }
+    assert "finish_reason" not in body
+
+
 def test_completion_accepts_text_prompt():
     state = FakeState(
         [UserReply(uid=42, incremental_output="hello", finished=True, prompt_tokens_delta=2, completion_tokens_delta=1)]

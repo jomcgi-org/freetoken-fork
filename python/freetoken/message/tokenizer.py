@@ -134,3 +134,5 @@ class ErrorReplyMsg(BaseTokenizerMsg):
     # can react without parsing prose. Examples are "context_length_exceeded" and
     # "invalid_request_error"; None means the message itself carries the classification.
     code: str | None = None
+    # HTTP status used by protocol adapters for failures discovered after admission.
+    status_code: int = 400

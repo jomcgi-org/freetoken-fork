@@ -10,9 +10,18 @@ from freetoken.core import Batch, Req
 class DecodeManager:
     page_size: int
     running_reqs: Set[Req] = field(default_factory=set)
+    _admission_counter: int = field(default=0, init=False)
 
     def filter_reqs(self, reqs: Iterable[Req]) -> None:
         self.running_reqs = {req for req in self.running_reqs.union(reqs) if req.can_decode}
+
+    def admit_reqs(self, reqs: Iterable[Req]) -> None:
+        reqs = list(reqs)
+        for req in reqs:
+            if req.can_decode:
+                self._admission_counter += 1
+                req.admission_order = self._admission_counter
+        self.filter_reqs(reqs)
 
     def remove_req(self, req: Req) -> None:
         self.running_reqs.discard(req)

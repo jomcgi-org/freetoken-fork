@@ -59,6 +59,13 @@ class ForwardInput(NamedTuple):
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
+_OOM_ERRORS = (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError)
+_OOM_ERROR_MESSAGE = (
+    "server temporarily out of memory for this request size; "
+    "shorten prompt / lower max_tokens"
+)
+_OOM_ERROR_CODE = "server_out_of_memory"
+
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
@@ -134,6 +141,9 @@ class Scheduler(SchedulerIOMixin):
         # inbound control messages, then flush only AFTER _process_last_data publishes any
         # sampled replies from the prior overlapped forward.
         self._pending_abort_acks: Set[int] = set()
+        # Like abort acknowledgements, OOM failures must follow any sampled output from the
+        # prior overlapped batch. Keying by uid also prevents duplicate terminal replies.
+        self._pending_oom_errors: dict[int, ErrorReplyMsg] = {}
         # With multiple tokenizer workers, an AbortBackendMsg and its earlier UserMsg can arrive
         # through different PUSH producers and be observed out of order. Preserve a bounded
         # tombstone so an abort-before-admission request can never be resurrected after its
@@ -346,7 +356,10 @@ class Scheduler(SchedulerIOMixin):
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
-                ongoing_data = (forward_input, self._forward(forward_input))
+                try:
+                    ongoing_data = (forward_input, self._forward(forward_input))
+                except _OOM_ERRORS as oom:
+                    ongoing_data = self._recover_forward_oom(forward_input, oom)
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -355,6 +368,7 @@ class Scheduler(SchedulerIOMixin):
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
+        self._flush_oom_errors()
         self._flush_abort_acks()
         return ongoing_data
 
@@ -380,9 +394,13 @@ class Scheduler(SchedulerIOMixin):
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
-            ongoing_data = (forward_input, self._forward(forward_input))
+            try:
+                ongoing_data = (forward_input, self._forward(forward_input))
+            except _OOM_ERRORS as oom:
+                ongoing_data = self._recover_forward_oom(forward_input, oom)
 
         self._process_last_data(ongoing_data)
+        self._flush_oom_errors()
         self._flush_abort_acks()
 
     @torch.inference_mode()
@@ -783,7 +801,7 @@ class Scheduler(SchedulerIOMixin):
                     )
                 req.qsa_restore_pending = None
 
-    def _free_req_resources(self, req: Req) -> None:
+    def _free_req_resources(self, req: Req, *, failed: bool = False) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
         # abort in the same overlap iteration races _process_last_data and would free it twice --
         # double-freeing its table_idx and (hybrid) GDN slots onto the free-list, handing the same
@@ -793,7 +811,10 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
-        self.cache_manager.cache_req(req, finished=True)
+        if failed:
+            self.cache_manager.cache_req(req, finished=True, failed=True)
+        else:
+            self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
 
@@ -1004,8 +1025,17 @@ class Scheduler(SchedulerIOMixin):
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
         self.cache_manager.allocate_paged(batch.reqs)
+        return self._build_forward_input(batch)
+
+    def _build_forward_input(self, batch: Batch) -> ForwardInput:
+        """Build device metadata for a batch whose request resources are already allocated."""
         if batch.is_prefill:
             self._gather_multimodal(batch)
+            chunked_lens = {
+                req.uid: req.device_len for req in batch.reqs if isinstance(req, ChunkedReq)
+            }
+            if chunked_lens:
+                batch._oom_chunked_device_lens = chunked_lens
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
@@ -1043,6 +1073,12 @@ class Scheduler(SchedulerIOMixin):
             input_tuple=input_mapping,
             write_tuple=write_mapping,
         )
+
+    def _prepare_decode_retry(self, reqs: List[Req]) -> ForwardInput:
+        """Rebuild decode metadata after shedding one request without allocating pages again."""
+        batch = Batch(reqs=reqs, phase="decode")
+        self.engine.graph_runner.pad_batch(batch)
+        return self._build_forward_input(batch)
 
     def _gather_multimodal(self, batch: Batch) -> None:
         """Concatenate per-request vision soft tokens (in request order) for a prefill
@@ -1089,6 +1125,169 @@ class Scheduler(SchedulerIOMixin):
         pending.clear()
         self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
 
+    def _flush_oom_errors(self) -> None:
+        pending = getattr(self, "_pending_oom_errors", None)
+        if not pending:
+            return
+        # A request can finish normally in the prior overlapped batch while the already-launched
+        # next decode step OOMs. Its successful terminal result wins over the speculative OOM.
+        finished_uids = {req.uid for req in getattr(self, "finished_reqs", ())}
+        replies = [msg for uid, msg in pending.items() if uid not in finished_uids]
+        pending.clear()
+        if replies:
+            self.send_result(replies)
+
+    def _record_oom_aborts(self, count: int) -> None:
+        reporter = getattr(self, "status_reporter", None)
+        if reporter is None:
+            return
+        record = getattr(reporter, "record_oom_aborts", None)
+        if record is not None:
+            record(count)
+        else:
+            reporter.oom_aborts = getattr(reporter, "oom_aborts", 0) + count
+
+    def _abort_oom_requests(self, reqs: List[Req]) -> None:
+        pending = getattr(self, "_pending_oom_errors", None)
+        if pending is None:
+            pending = self._pending_oom_errors = {}
+        abort_prefill = getattr(self.prefill_manager, "abort_req", None)
+        remove_decode = getattr(self.decode_manager, "remove_req", None)
+        for req in reqs:
+            if abort_prefill is not None:
+                abort_prefill(req.uid)
+            if remove_decode is not None:
+                remove_decode(req)
+            self._free_req_resources(req, failed=True)
+            pending[req.uid] = ErrorReplyMsg(
+                uid=req.uid,
+                error=_OOM_ERROR_MESSAGE,
+                code=_OOM_ERROR_CODE,
+                status_code=503,
+            )
+        self._record_oom_aborts(len(reqs))
+
+    def _fatal_cuda_context(self, oom: BaseException, context_error: BaseException) -> NoReturn:
+        logger.critical_rank0(
+            "CUDA CONTEXT CORRUPTION after scheduler OOM: recovery probe failed; "
+            "exiting for supervised restart. original=%r probe=%r",
+            oom,
+            context_error,
+        )
+        raise SystemExit(1) from context_error
+
+    def _synchronize_failed_forward(self, oom: BaseException) -> None:
+        stream = getattr(getattr(self, "engine", None), "stream", None)
+        synchronize = getattr(stream, "synchronize", None)
+        if synchronize is None:
+            return
+        try:
+            synchronize()
+        except Exception as context_error:  # noqa: BLE001
+            self._fatal_cuda_context(oom, context_error)
+
+    def _restore_failed_request_lengths(self, forward_input: ForwardInput) -> None:
+        """Restore schedule-time logical lengths if OOM happened after engine bookkeeping."""
+        batch = forward_input.batch
+        if batch.is_decode and getattr(batch, "mtp_verify", False):
+            req = batch.reqs[0]
+            req.cached_len = int(batch.mtp_original_cached_len)
+            req.device_len = int(batch.mtp_allocated_end)
+            return
+        if batch.is_decode:
+            try:
+                allocated_lens = forward_input.write_tuple[1][: len(batch.reqs)].tolist()
+            except (AttributeError, IndexError, TypeError):
+                return
+            for req, allocated_len in zip(batch.reqs, allocated_lens, strict=True):
+                allocated_len = int(allocated_len)
+                if allocated_len >= 1:
+                    req.cached_len = allocated_len - 1
+                    req.device_len = allocated_len
+            return
+        chunked_lens = getattr(batch, "_oom_chunked_device_lens", {})
+        try:
+            allocated_lens = forward_input.write_tuple[1][: len(batch.reqs)].tolist()
+        except (AttributeError, IndexError, TypeError):
+            allocated_lens = [-1] * len(batch.reqs)
+        for req, allocated_len in zip(batch.reqs, allocated_lens, strict=True):
+            allocated_len = int(allocated_len)
+            if allocated_len >= 0:
+                req.device_len = allocated_len
+            elif req.uid in chunked_lens:
+                req.device_len = chunked_lens[req.uid]
+
+    def _clear_cache_and_probe_cuda(self, oom: BaseException) -> None:
+        probe = None
+        try:
+            torch.cuda.empty_cache()
+            probe = torch.empty(1, dtype=torch.uint8, device=self.device)
+        except Exception as context_error:  # noqa: BLE001
+            self._fatal_cuda_context(oom, context_error)
+        finally:
+            del probe
+
+    def _recover_forward_oom(
+        self, forward_input: ForwardInput, oom: BaseException
+    ) -> ForwardData | None:
+        batch = forward_input.batch
+        logger.warning_rank0(
+            "Scheduler %s forward OOM for request(s) %s; starting request-level recovery: %r",
+            batch.phase,
+            [req.uid for req in batch.reqs],
+            oom,
+        )
+        self._synchronize_failed_forward(oom)
+        try:
+            self._restore_failed_request_lengths(forward_input)
+        except Exception as context_error:  # noqa: BLE001
+            self._fatal_cuda_context(oom, context_error)
+
+        if batch.is_prefill:
+            self._abort_oom_requests(batch.reqs)
+            self._clear_cache_and_probe_cuda(oom)
+            return None
+
+        youngest = max(
+            batch.reqs,
+            key=lambda req: (
+                getattr(req, "admission_order", 0),
+                getattr(req, "uid", 0),
+            ),
+        )
+        self._abort_oom_requests([youngest])
+        self._clear_cache_and_probe_cuda(oom)
+        remaining = [req for req in batch.reqs if req is not youngest]
+        if not remaining:
+            return None
+
+        retry_input = None
+        try:
+            retry_input = self._prepare_decode_retry(remaining)
+            return retry_input, self._forward(retry_input)
+        except _OOM_ERRORS as retry_oom:
+            logger.warning_rank0(
+                "Scheduler decode forward OOM retry failed for request(s) %s; "
+                "aborting the remaining batch: %r",
+                [req.uid for req in remaining],
+                retry_oom,
+            )
+            self._synchronize_failed_forward(retry_oom)
+            if retry_input is not None:
+                try:
+                    self._restore_failed_request_lengths(retry_input)
+                except Exception as context_error:  # noqa: BLE001
+                    self._fatal_cuda_context(retry_oom, context_error)
+            self._abort_oom_requests(remaining)
+            self._clear_cache_and_probe_cuda(retry_oom)
+            return None
+
+    def _forward_with_oom_guard(self, forward_input: ForwardInput) -> ForwardData | None:
+        try:
+            return forward_input, self._forward(forward_input)
+        except _OOM_ERRORS as oom:
+            return self._recover_forward_oom(forward_input, oom)
+
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
@@ -1108,7 +1307,14 @@ class Scheduler(SchedulerIOMixin):
             )
         else:
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        if batch.is_prefill:
+            admit_reqs = getattr(self.decode_manager, "admit_reqs", None)
+            if admit_reqs is not None:
+                admit_reqs(batch.reqs)
+            else:
+                self.decode_manager.filter_reqs(batch.reqs)
+        else:
+            self.decode_manager.filter_reqs(batch.reqs)
         return forward_output
 
 
