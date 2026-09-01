@@ -630,6 +630,71 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
   }
   return s * (0.5f * global);
 }
+
+// AVX-512 counterpart of the expert-prefill kernel. Keep the decoded weight group
+// outside the M-row loop, as in the AVX-VNNI implementation, but use EVEX VPDPBUSD
+// so AVX-512 VNNI CPUs do not depend on the distinct AVX-VNNI feature bit.
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+void batch_nvfp4_i8_avx512vnni(float* out, const uint8_t* packed,
+                               const uint8_t* scale, float global,
+                               const int8_t* acts, int M, int K,
+                               const float* e4m3, const float* act_scales) {
+  std::fill(out, out + M, 0.0f);
+  const __m512i lut = _mm512_broadcast_i32x4(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2)));
+  const __m512i idx = _mm512_set_epi64(3, 3, 2, 2, 1, 1, 0, 0);
+  const __m512i mask0F = _mm512_set1_epi8(0x0F);
+  const __m512i idxsc = _mm512_set_epi32(
+      3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+  const __mmask64 hi_half = 0xFF00FF00FF00FF00ULL;
+  const int nb = K / 16;
+  int b = 0;
+  for (; b + 4 <= nb; b += 4) {
+    const __m256i raw = _mm256_loadu_si256(
+        reinterpret_cast<const __m256i*>(packed + (size_t)b * 8));
+    const __m512i src = _mm512_permutexvar_epi64(
+        idx, _mm512_castsi256_si512(raw));
+    const __m512i lo = _mm512_and_si512(src, mask0F);
+    const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(src, 4), mask0F);
+    const __m512i w = _mm512_shuffle_epi8(
+        lut, _mm512_mask_blend_epi8(hi_half, lo, hi));
+    const __m512i aw = _mm512_abs_epi8(w);
+    const __mmask64 neg = _mm512_movepi8_mask(w);
+
+    int sc_raw;
+    memcpy(&sc_raw, scale + b, 4);
+    const __m128i sc4 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(sc_raw));
+    const __m128 ws4 = _mm_mul_ps(
+        _mm_i32gather_ps(e4m3, sc4, 4), _mm_set1_ps(0.5f * global));
+    for (int m = 0; m < M; ++m) {
+      const int8_t* arow = acts + (size_t)m * K;
+      const __m512i a = _mm512_loadu_si512(
+          reinterpret_cast<const __m512i*>(arow + (size_t)b * 16));
+      const __m512i sa = _mm512_mask_sub_epi8(
+          a, neg, _mm512_setzero_si512(), a);
+      const __m512i di = _mm512_dpbusd_epi32(
+          _mm512_setzero_si512(), aw, sa);
+      const __m128 as4 = _mm_loadu_ps(act_scales + (size_t)m * nb + b);
+      const __m512 scv = _mm512_permutexvar_ps(
+          idxsc, _mm512_castps128_ps512(_mm_mul_ps(ws4, as4)));
+      out[m] += _mm512_reduce_add_ps(
+          _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv));
+    }
+  }
+  for (; b < nb; ++b) {
+    const uint8_t* pk = packed + (size_t)b * 8;
+    const float ws = 0.5f * global * e4m3[scale[b]];
+    for (int m = 0; m < M; ++m) {
+      const int8_t* a = acts + (size_t)m * K + (size_t)b * 16;
+      int isum = 0;
+      for (int j = 0; j < 8; ++j) {
+        isum += (int)kE2M1x2[pk[j] & 0xF] * (int)a[j];
+        isum += (int)kE2M1x2[pk[j] >> 4] * (int)a[8 + j];
+      }
+      out[m] += ws * act_scales[(size_t)m * nb + b] * (float)isum;
+    }
+  }
+}
 #endif  // avx512vnni available
 #endif
 
@@ -819,23 +884,48 @@ inline bool cpu_has_avx512vnni() {
 #endif
 }
 
-// Best W4A8 (int8-activation) nvfp4 dot, or nullptr if no SIMD VNNI (caller keeps the
-// faithful fp32 nvdot path). The scalar i8 dot exists only as a correctness reference.
-nvi8dot_fn select_nvi8dot() {
+// Serial and expert-batched W4A8 must resolve from this one feature decision. In
+// particular, AVX-512 VNNI and AVX-VNNI are distinct CPUID features: probing only
+// AVX-VNNI silently sent AVX-512 VNNI servers to the scalar batch kernel.
+enum Nvi8Tier { NVI8_NONE = 0, NVI8_AVXVNNI = 1, NVI8_AVX512VNNI = 2 };
+
+inline Nvi8Tier nvi8_tier_from_flags(bool has_avx512vnni, bool has_avxvnni) {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+  if (has_avx512vnni) return NVI8_AVX512VNNI;
+#else
+  (void)has_avx512vnni;
+#endif
 #if CPU_MOE_X86
-#if defined(CPU_MOE_HAS_AVX512VNNI)
-  if (cpu_has_avx512vnni()) return dot_nvfp4_i8_avx512vnni;
+  if (has_avxvnni) return NVI8_AVXVNNI;
+#else
+  (void)has_avxvnni;
 #endif
-  if (cpu_has_avxvnni()) return dot_nvfp4_i8_vnni;
-#endif
-  return nullptr;
+  return NVI8_NONE;
 }
 
-nvi8batch_fn select_nvi8batch() {
-#if CPU_MOE_X86
-  if (cpu_has_avxvnni()) return batch_nvfp4_i8_vnni;
+inline Nvi8Tier detect_nvi8_tier() {
+  // Keep this probe order identical to the serial path's historical preference.
+  if (cpu_has_avx512vnni()) return NVI8_AVX512VNNI;
+  if (cpu_has_avxvnni()) return NVI8_AVXVNNI;
+  return NVI8_NONE;
+}
+
+struct Nvi8Dispatch {
+  nvi8dot_fn dot;
+  nvi8batch_fn batch;
+  const char* batch_name;
+};
+
+Nvi8Dispatch select_nvi8_dispatch(Nvi8Tier tier) {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+  if (tier == NVI8_AVX512VNNI)
+    return {dot_nvfp4_i8_avx512vnni, batch_nvfp4_i8_avx512vnni, "vnni"};
 #endif
-  return batch_nvfp4_i8_scalar;
+#if CPU_MOE_X86
+  if (tier == NVI8_AVXVNNI)
+    return {dot_nvfp4_i8_vnni, batch_nvfp4_i8_vnni, "vnni"};
+#endif
+  return {nullptr, batch_nvfp4_i8_scalar, "scalar"};
 }
 
 // ----------------------- DeepSeek-V4 ds_fp4 (W4A8) ---------------------------
@@ -1353,6 +1443,7 @@ struct CpuMoeExecutor {
   nvdot_fn nvdot;
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
   nvi8batch_fn nvi8batch = nullptr;  // expert-prefill M-row W4A8 kernel
+  const char* nvi8batch_name = "scalar";
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
   dsdot_fn dsdot;
@@ -1509,7 +1600,10 @@ struct CpuMoeExecutor {
     DotChoice c = select_dot();
     dot = c.fn;
     nvdot = select_nvdot();
-    nvi8batch = select_nvi8batch();
+    const Nvi8Tier nvi8_tier = detect_nvi8_tier();
+    const Nvi8Dispatch nvi8_dispatch = select_nvi8_dispatch(nvi8_tier);
+    nvi8batch = nvi8_dispatch.batch;
+    nvi8batch_name = nvi8_dispatch.batch_name;
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
@@ -1523,12 +1617,13 @@ struct CpuMoeExecutor {
     // nvfp4 (AVX-VNNI only): W4A8 int8 decode when the CPU supports it. q4_0 is always
     // W4A8 (activations pre-quantized to Q8_0); select_q4dot picks VPDPBUSD / VPMADDUBSW
     // / scalar for the tier, so the tag reflects which of those q4dot resolved to.
-    nvi8dot = select_nvi8dot();
+    nvi8dot = nvi8_dispatch.dot;
     use_vnni = (weight_format == WF_NVFP4) && (nvi8dot != nullptr);
     use_q4a8 = (weight_format == WF_Q4_0);
     const char* q4tag = use_q4a8 ? (cpu_has_avxvnni() ? "+vnni(q4_0-w4a8)" : "+q4_0-w4a8") : "";
-    const char* vnni_tag =
-        cpu_has_avx512vnni() ? "+avx512vnni(nvfp4-w4a8)" : "+vnni(nvfp4-w4a8)";
+    const char* vnni_tag = nvi8_tier == NVI8_AVX512VNNI
+                               ? "+avx512vnni(nvfp4-w4a8)"
+                               : "+vnni(nvfp4-w4a8)";
     isa_str = std::string(c.name) + (use_vnni ? vnni_tag : "") + q4tag;
     isa = isa_str.c_str();
     for (int i = 0; i < 16; ++i) e2m1_lut[i] = kE2M1[i];
@@ -1821,6 +1916,7 @@ struct CpuMoeExecutor {
   }
 
   const char* isa_name() const { return isa; }
+  const char* prefill_batch_kernel_name() const { return nvi8batch_name; }
 
   void barrier(int& local_sense) {
     local_sense ^= 1;
@@ -2843,7 +2939,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
-      .def("isa_name", &CpuMoeExecutor::isa_name);
+      .def("isa_name", &CpuMoeExecutor::isa_name)
+      .def("prefill_batch_kernel_name",
+           &CpuMoeExecutor::prefill_batch_kernel_name);
+  // Detection seam for GPU-free dispatch tests. Pointer identity is checked here,
+  // while the Python test controls only the CPUID results supplied to the selector.
+  m.def("prefill_batch_kernel_for_isa_flags",
+        [](bool has_avx512vnni, bool has_avxvnni) {
+          const Nvi8Dispatch d = select_nvi8_dispatch(
+              nvi8_tier_from_flags(has_avx512vnni, has_avxvnni));
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+          if (d.batch == batch_nvfp4_i8_avx512vnni)
+            return std::string("batch_nvfp4_i8_avx512vnni");
+#endif
+#if CPU_MOE_X86
+          if (d.batch == batch_nvfp4_i8_vnni)
+            return std::string("batch_nvfp4_i8_vnni");
+#endif
+          if (d.batch == batch_nvfp4_i8_scalar)
+            return std::string("batch_nvfp4_i8_scalar");
+          return std::string("unknown");
+        },
+        py::arg("has_avx512vnni"), py::arg("has_avxvnni"));
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));

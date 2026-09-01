@@ -576,6 +576,7 @@ class CpuMoeExecutor:
         logger.info_rank0(
             f"CPU MoE prefill batch: "
             f"{'on' if self._prefill_batch_enabled else 'off'}, "
+            f"kernel={getattr(self._ext, 'prefill_batch_kernel_name', lambda: 'unknown')()}, "
             f"capacity={self._prefill_batch_capacity} tokens, "
             f"buffers={self._prefill_batch_buffer_bytes / 2**20:.1f} MiB"
         )

@@ -158,6 +158,37 @@ def test_successful_setup_is_one_time_and_reports_native_bytes():
     assert executor._prefill_batch_buffer_bytes == 1234
 
 
+def test_native_dispatch_uses_vnni_when_isa_flags_expose_it():
+    """The injected CPUID seam checks pointer selection without CUDA or VNNI hardware."""
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        pytest.skip("Linux CPU MoE extension is not built")
+
+    probe = getattr(_cpu_moe, "prefill_batch_kernel_for_isa_flags", None)
+    if probe is None:
+        pytest.skip("CPU MoE extension needs rebuilding for dispatch probe")
+
+    # AVX-512 VNNI is a distinct feature from AVX-VNNI. This is the node-4 case
+    # that previously selected the scalar batch pointer despite serial using VNNI.
+    assert (
+        probe(has_avx512vnni=True, has_avxvnni=False)
+        == "batch_nvfp4_i8_avx512vnni"
+    )
+    assert (
+        probe(has_avx512vnni=True, has_avxvnni=True)
+        == "batch_nvfp4_i8_avx512vnni"
+    )
+    assert (
+        probe(has_avx512vnni=False, has_avxvnni=True)
+        == "batch_nvfp4_i8_vnni"
+    )
+    assert (
+        probe(has_avx512vnni=False, has_avxvnni=False)
+        == "batch_nvfp4_i8_scalar"
+    )
+
+
 def test_batch_run_failure_disables_it_and_retries_serial():
     class RunExtension:
         def __init__(self):
