@@ -1,57 +1,91 @@
 # "MoE on disk" blog handoff
 
-Post 1: **running a 125B MoE on a gaming GPU - what every memory tier
-actually costs**. Source of truth: RESULTS.md (5 rounds + attribution +
-registered predictions). Joe writes final wording; drafts are offers.
+Post 1: **running a 125B MoE on a gaming GPU - 6x faster by teaching every
+memory tier its job**. Source of truth: RESULTS.md (complete: cloud rounds,
+bare-metal program 2026-08-31, program close). Joe writes final wording;
+drafts are offers.
+
+## The story in one table (all bare-metal 4090 24GB + 64GB, quality 5/5)
+
+| | day-1 naive config | final |
+|---|---|---|
+| warm prefill (441 tok) | 18 tok/s | 116 |
+| x1 single stream | 3.8 | 23.1 peak / ~21 sustained |
+| x8 aggregate | 9.6 | 42.2 peak / ~37 sustained |
+| GPU power under load | - | 138W avg (of 450W: host-bound) |
+
+Same hardware, same model, same weights. Every gain is software, each one
+measured, and five attractive ideas measured as LOSSES (that is half the
+story's value).
 
 ## The narrative arc
 
-1. Hook: Qwen3.8-Flash-Next is 125B params; a 4090 has 24GB. Upstream
-   FreeToken needs 128GB RAM. We made it run in 64GB - and measured what
-   each shortcut costs.
-2. The tier laws (the educational core, all measured):
-   - Disk is FREE for router-predicted expert banks: mmap + MADV_RANDOM
-     + page-deduped MADV_WILLNEED after routing = <10 major faults/step.
-   - Disk is FATAL for per-token lookup tables: a flat ~105ms/step tax
-     that is NOT I/O - the GPU re-faults file-backed mappings every
-     CUDA-graph replay (pretouch does nothing). Quantize (47.7->28.8GB)
-     and pin/hot-row-cache instead (62->70% hit rates, CLOCK eviction).
-   - Prefill must never copy whole layers: 17 MINUTES for 6 tokens ->
-     5.5s for 441 by computing only routed experts on CPU.
-   - Batching amortizes every fixed per-step cost: 4.9->11.6 tok/s (L4
-     x8), 29->88.6 (Blackwell x8). Never serve bs=1.
-3. Numbers tables: L4 rounds (the 4090-class envelope) + Blackwell G4
-   -24 (340 tok/s prefill / 88.6 aggregate through the full tier).
-   Replace L4-proxy numbers with bare-metal 4090 measurements when the
-   implementation handoff session runs.
-4. Predicted-vs-measured sidebar: predictions were registered before
-   each round (RESULTS.md round 5 + DSV4 predictions) - honest science
-   angle.
-5. The economics twist: we also priced cloud GPUs vs hosted APIs -
-   self-hosting only wins on OWNED metal or privacy. That's the "why a
-   4090" punchline.
+1. Hook: Qwen3.8-Flash-Next is ~100GiB of quantized weights; a 4090 has
+   24GB and the box 64GB. Upstream wants 128GB RAM. We ran it in 64 and
+   then spent 36 hours finding out what each memory tier actually costs.
+2. The tier laws (the educational core, all measured, in story order):
+   - **The page cache is a tier**: pin budget competes with it. Pinning
+     52 of 64GB collapsed throughput 3x; 40GB pinned tripled it back.
+   - Disk is FREE for router-predicted expert banks (mmap + MADV_RANDOM
+     + deduped WILLNEED after routing) and FATAL for per-token lookup
+     tables on vGPU - but the ~105ms/step HMM tax was a vGPU ARTIFACT:
+     on bare-metal open-driver, HMM WINS (x4 nearly doubled).
+   - Prefill must never copy whole layers (17 min for 6 tokens -> 116
+     tok/s end state), and per-layer overlap under split residency
+     doubled warm prefill (54 -> 116).
+   - **Routing is Zipf, exploit it per-expert not per-layer**: pinning
+     the hot ~6GiB of expert rows (72% of routes) and leaving the cold
+     tail on CPU broke the DDR-bandwidth ceiling: x8 34 -> 42.
+   - **The hierarchy can tune itself**: online decayed counters + bounded
+     background swaps recovered 62.6 -> 73.3% hot-rate under workload
+     drift; no profile capture step needed at all.
+3. The graveyard section (mechanisms that measured NEGATIVE, each with
+   the physics): GPU-fetch decode (<48GB VRAM: slot-cache thrash),
+   hybrid PCIe fetch (local CPU compute wins), UFFD as a throughput
+   path (page-granular either way; it is the bigger-than-RAM capacity
+   lane), lookahead prefetch (48% next-step routing predictability),
+   and MTP speculation twice (marginal tokens must be cheap; a CPU tier
+   makes them full price - even at 72% acceptance).
+4. The measured step anatomy (--moe-step-timing): CPU phases 57-100ms vs
+   GPU 19-40ms with 20-45ms already overlapped - the engines were never
+   idle by accident; what remains is a scheduler-contract change or
+   hardware.
+5. The economics twist stays: hosted APIs crush cloud GPUs; self-hosting
+   wins only on owned metal or privacy - "why a 4090" punchline. 138W
+   for 37 tok/s sustained is the sustainability kicker (cheap green
+   power makes this a non-issue to run 24/7).
 
 ## Attribution rules (RESULTS.md "Attribution" section)
 
 Credit upstream FreeToken explicitly: the engine, #112 residency seams,
-#257 model support, the CPU executor. Ours: DISK banks, CPU prefill, 4
-PLE backends + hot-row cache, quantized tables, spill selection,
-concurrency hardening, MTP v1, the vGPU survival guide, the benchmark
-corpus.
+#257 model support, the CPU executor, the offload LRU. Ours (fork,
+feat/moe-disk-tier): DISK banks + CPU prefill, PLE backends + quantized
+tables, profile-guided spill, prefill overlap under split residency,
+expert dedup, expert-granular residency, online hot-set adaptation,
+UFFD pager, gpufetch, MTP K=1, step timing, the benchmark corpus and the
+negative results.
 
-## Claims to NOT make (until evidence exists)
+## Claims to NOT make
 
-- "Model-agnostic": verified on qwen4_exp ONLY (DSV4 smoke was skipped).
-- e2m1 table quality: numbers exist, QUALITY GATE does not - run
-  quality.sh on the e2m1 config before recommending it in print.
-- MTP speedups: it is lossless but parked at break-even.
-- HMM numbers are L4/vGPU-era; bare-metal HMM unmeasured until the
-  implementation session.
+- "Model-agnostic": verified on qwen4_exp ONLY.
+- Peak vs sustained: 23.1/42.2 are profile-matched peaks; quote ~21/37
+  as the honest sustained-diverse numbers alongside them.
+- MTP: closed negative on THIS box; do not generalize to all-pinned or
+  big-VRAM configs (untested there).
+- Quality: the 5/5 gate is smoke-level (arith/recall/reason/longgen);
+  do not claim benchmark-grade parity.
+- Known cosmetic bug if screenshots show it: hot_swaps/interval prints
+  0.00 while swaps are live.
+
+## Open characterization gaps (fine to mention as future work)
+
+Inter-interval phase variance (~2x, unexplained - the one that might
+still hide throughput), first-request warm-up transient (~2x), mixed
+prefill+decode interference, p99 step latency, swap observability.
 
 ## Future posts
 
-- Post 2: DeepSeek-V4-Flash (already FreeToken-supported) on big-RAM
-  metal (EPYC build) - needs hardware; -24-class was predicted unusable
-  (2-6 tok/s) and skipped.
-- Post 3: GLM-5.3-Flash on RTX PRO 6000 - blocked on engine arch
-  support (KDA + sparse MLA); our tier already suffices once it exists.
+- Post 2: DeepSeek-V4-Flash on big-RAM metal (EPYC build) - needs
+  hardware; -24-class was predicted unusable (2-6 tok/s) and skipped.
+- Post 3: GLM-5.3-Flash on RTX PRO 6000 - blocked on engine arch support
+  (KDA + sparse MLA); the tier + expert-granular residency carry over.
