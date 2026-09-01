@@ -151,7 +151,7 @@ class OffloadMoeCache:
     # DISK-only prefill policy. LOCKED/PAGEABLE layers always keep the whole-layer
     # pageable copy path.
     moe_disk_prefill: str = "cpu"
-    moe_prefill_coalesce: str = "on"
+    moe_prefill_coalesce: str = "populate"
     # DISK-only decode policy. gpufetch keeps the mmap as the authoritative host
     # bank but fills LRU misses through a bounded pinned staging ring.
     moe_disk_decode: str = "cpu"
@@ -189,7 +189,9 @@ class OffloadMoeCache:
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         assert self.moe_disk_prefill in ("cpu", "copy"), self.moe_disk_prefill
-        assert self.moe_prefill_coalesce in ("on", "off"), self.moe_prefill_coalesce
+        assert self.moe_prefill_coalesce in (
+            "populate", "on", "off"
+        ), self.moe_prefill_coalesce
         assert self.moe_disk_decode in ("cpu", "gpufetch"), self.moe_disk_decode
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
@@ -1347,7 +1349,7 @@ class OffloadMoeCache:
         prepare = getattr(self.cpu_executor, "prepare_prefill_layer", None)
         if (
             self.moe_disk_prefill != "cpu"
-            or self.moe_prefill_coalesce != "on"
+            or self.moe_prefill_coalesce == "off"
             or prepare is None
         ):
             return None

@@ -281,6 +281,56 @@ class HostBank:
         """Compatibility name for expert-bank row prefetching."""
         return self.prefetch_rows(expert_ids)
 
+    def populate_rows(self, row_ids, scratch) -> int:
+        """Read selected file-backed rows through one reusable bounded buffer.
+
+        The data is deliberately discarded. Reading the backing file populates the
+        page cache so the executor's fixed mmap pointers encounter minor faults.
+        UFFD banks stay on their pager-owned prefetch path.
+        """
+        if not self._disk or self._uffd:
+            return 0
+        if self._file_path is None:
+            raise OSError("file-backed bank has no source path")
+        dst = memoryview(scratch).cast("B")
+        if not dst:
+            raise ValueError("populate scratch buffer must not be empty")
+        stride = self.tensor.stride(0) * self.tensor.element_size()
+        ranges = coalesced_row_ranges(
+            row_ids,
+            stride,
+            limit=self.nbytes,
+            base_offset=self._map_offset + self._view_offset,
+        )
+        if not ranges:
+            return 0
+        fd = os.open(self._file_path, os.O_RDONLY)
+        total = 0
+        try:
+            for start, length in ranges:
+                done = 0
+                while done < length:
+                    want = min(len(dst), length - done)
+                    if hasattr(os, "preadv"):
+                        got = os.preadv(fd, [dst[:want]], start + done)
+                    else:
+                        data = os.pread(fd, want, start + done)
+                        got = len(data)
+                        dst[:got] = data
+                    if got <= 0:
+                        raise OSError(
+                            f"short populate read: {done} of {length} bytes at {start}"
+                        )
+                    done += got
+                    total += got
+        finally:
+            os.close(fd)
+        return total
+
+    def populate_experts(self, expert_ids, scratch) -> int:
+        """Compatibility name for expert-bank row population."""
+        return self.populate_rows(expert_ids, scratch)
+
     def release_rows(self, row_ids) -> int:
         """Mark one-pass DISK rows as non-reusable after prefill.
 
@@ -354,6 +404,37 @@ def coalesced_page_ranges(
         out.append((start * page_size, (prev - start + 1) * page_size))
         start = prev = page
     out.append((start * page_size, (prev - start + 1) * page_size))
+    return out
+
+
+def coalesced_row_ranges(
+    expert_ids,
+    expert_stride: int,
+    *,
+    limit: int | None = None,
+    base_offset: int = 0,
+) -> list[tuple[int, int]]:
+    """Return sorted, deduplicated exact row ranges, joining adjacent rows.
+
+    Offsets include ``base_offset`` and are suitable for ``preadv`` against the
+    bank's backing file. Unlike :func:`coalesced_page_ranges`, no unrelated bytes
+    sharing a page are included.
+    """
+    if expert_stride <= 0 or base_offset < 0:
+        raise ValueError("expert_stride must be positive and base_offset non-negative")
+    rows = sorted({int(raw) for raw in expert_ids if int(raw) >= 0})
+    out: list[tuple[int, int]] = []
+    for expert_id in rows:
+        start = expert_id * expert_stride
+        end = start + expert_stride
+        if limit is not None and (start >= limit or end > limit):
+            raise ValueError(f"expert id {expert_id} exceeds bank size {limit}")
+        file_start = base_offset + start
+        if out and out[-1][0] + out[-1][1] == file_start:
+            previous_start, previous_length = out[-1]
+            out[-1] = (previous_start, previous_length + expert_stride)
+        else:
+            out.append((file_start, expert_stride))
     return out
 
 
@@ -672,6 +753,7 @@ __all__ = [
     "alloc_layer_banks",
     "born_pinned_default",
     "coalesced_page_ranges",
+    "coalesced_row_ranges",
     "pin_banks",
     "read_file_into",
     "read_range_into",

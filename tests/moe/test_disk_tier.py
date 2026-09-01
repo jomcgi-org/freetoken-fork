@@ -228,6 +228,43 @@ def test_disk_prefetch_page_dedup_accounts_for_unaligned_tensor_view():
     ) == [(0, 8192)]
 
 
+def test_populate_row_ranges_sort_dedupe_and_join_only_adjacent_rows():
+    from freetoken.moe.host_banks import coalesced_row_ranges
+
+    assert coalesced_row_ranges(
+        [4, 2, 3, 3, -1, 0], 10, limit=50, base_offset=100
+    ) == [(100, 10), (120, 30)]
+
+
+def test_disk_populate_reads_coalesced_range_through_bounded_scratch(
+    tmp_path, monkeypatch,
+):
+    import freetoken.moe.host_banks as host_banks
+
+    source = tmp_path / "populate.ftw"
+    source.write_bytes(b"pre" + bytes(range(30)))
+    bank = host_banks.HostBank(
+        (6, 5),
+        torch.uint8,
+        backing="file",
+        file_path=str(source),
+        file_offset=3,
+    )
+    original_preadv = host_banks.os.preadv
+    calls = []
+
+    def tracked_preadv(fd, buffers, offset):
+        calls.append((offset, len(buffers[0])))
+        return original_preadv(fd, buffers, offset)
+
+    monkeypatch.setattr(host_banks.os, "preadv", tracked_preadv)
+    scratch = bytearray(7)
+
+    assert bank.populate_rows([4, 2, 3, 3], scratch) == 15
+    assert calls == [(13, 7), (20, 7), (27, 1)]
+    assert max(length for _offset, length in calls) <= len(scratch)
+
+
 def test_disk_prefill_release_marks_only_selected_page_ranges_noreuse(
     tmp_path, monkeypatch,
 ):
@@ -267,6 +304,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     executor._prefill_coalesce_experts = 9
     executor._prefill_coalesce_ns = 2_500_000
     executor._prefill_coalesce_degrades = 1
+    executor._prefill_populate_bytes = 590_000_000
+    executor._prefill_populate_ns = 175_000_000
     executor._disk_major_fault_base = 10
     executor._gpufetch_tasks = {}
     monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 16)
@@ -281,6 +320,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["moe_prefill_coalesce_experts"] == 9
     assert stats["moe_prefill_coalesce_ms"] == 2.5
     assert stats["moe_prefill_coalesce_degrades"] == 1
+    assert stats["moe_prefill_populate_bytes"] == 590_000_000
+    assert stats["moe_prefill_populate_ms"] == 175.0
     assert stats["gpufetch_fills_per_step"] == 0.0
     assert stats["gpufetch_fill_us"] == 0.0
     assert stats["per_layer"] == [
@@ -293,6 +334,8 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert executor._prefill_coalesce_experts == 0
     assert executor._prefill_coalesce_ns == 0
     assert executor._prefill_coalesce_degrades == 0
+    assert executor._prefill_populate_bytes == 0
+    assert executor._prefill_populate_ns == 0
     assert executor._disk_major_fault_base == 16
 
 
@@ -486,6 +529,7 @@ def test_cpu_prefill_coalesce_dedupes_and_releases_after_layer():
     executor._disk_prefetch_calls = [0]
     executor._disk_prefetch_pages = [0]
     executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_mode = "on"
     executor._prefill_coalesce_limits = {0: 8}
     executor._prefill_coalesce_experts = 0
     executor._prefill_coalesce_ns = 0
@@ -519,12 +563,33 @@ def test_cpu_prefill_coalesce_byte_ceiling_caps_distinct_experts():
     ) == (0, 4096)
 
 
+def test_cpu_prefill_zero_ceiling_returns_lease_without_sweeping():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [object()]}
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_mode = "populate"
+    executor._prefill_coalesce_limits = {0: 0}
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+
+    lease = executor.prepare_prefill_layer(0, [1, 2])
+
+    assert lease.experts == ()
+    assert executor._prefill_coalesce_experts == 0
+
+
 @pytest.mark.parametrize(
     ("prefill_mode", "coalesce", "expected_calls"),
     [
+        ("cpu", "populate", 1),
         ("cpu", "on", 1),
         ("cpu", "off", 0),
-        ("copy", "on", 0),
+        ("copy", "populate", 0),
     ],
 )
 def test_cpu_prefill_coalesce_flag_gating(prefill_mode, coalesce, expected_calls):
@@ -566,9 +631,169 @@ def test_cpu_prefill_coalesce_allocation_failure_degrades_to_fault_path(monkeypa
         lambda *_args, **_kwargs: (_ for _ in ()).throw(MemoryError("bounded alloc")),
     )
 
-    assert executor.prepare_prefill_layer(0, [1, 2]) is None
+    lease = executor.prepare_prefill_layer(0, [1, 2])
+    assert lease.experts == ()
     assert executor._prefill_coalesce_degrades == 1
     assert executor._prefill_coalesce_experts == 0
+
+
+def test_cpu_prefill_populate_reuses_bounded_scratch_and_accounts_bytes():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    class Bank:
+        _pager = None
+
+        def __init__(self):
+            self.scratch_ids = []
+
+        def populate_experts(self, expert_ids, scratch):
+            self.scratch_ids.append((id(scratch), len(scratch), tuple(expert_ids)))
+            return 100 * len(expert_ids)
+
+    bank = Bank()
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [bank]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_mode = "populate"
+    executor._prefill_coalesce_limits = {0: 8}
+    executor._prefill_populate_scratch_bytes = 17
+    executor._prefill_populate_scratch = None
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+    executor._prefill_populate_bytes = 0
+    executor._prefill_populate_ns = 0
+
+    first = executor.prepare_prefill_layer(0, [3, 1, 3])
+    second = executor.prepare_prefill_layer(0, [2])
+
+    assert first.experts == (1, 3)
+    assert second.experts == (2,)
+    assert bank.scratch_ids[0][0] == bank.scratch_ids[1][0]
+    assert [entry[1] for entry in bank.scratch_ids] == [17, 17]
+    assert executor._prefill_populate_bytes == 300
+    assert executor._prefill_populate_ns > 0
+    assert executor._prefill_coalesce_degrades == 0
+
+
+def test_cpu_prefill_populate_failure_falls_back_to_willneed():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    events = []
+
+    class Bank:
+        _pager = None
+
+        def populate_experts(self, expert_ids, scratch):
+            events.append(("populate", tuple(expert_ids)))
+            raise OSError("pread failed")
+
+        def prefetch_experts(self, expert_ids):
+            events.append(("willneed", tuple(expert_ids)))
+            return 2
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [Bank()]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_mode = "populate"
+    executor._prefill_coalesce_limits = {0: 8}
+    executor._prefill_populate_scratch_bytes = 16
+    executor._prefill_populate_scratch = None
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+    executor._prefill_populate_bytes = 0
+    executor._prefill_populate_ns = 0
+
+    lease = executor.prepare_prefill_layer(0, [2, 1])
+
+    assert lease.experts == (1, 2)
+    assert events == [("populate", (1, 2)), ("willneed", (1, 2))]
+    assert executor._prefill_coalesce_degrades == 1
+    assert executor._disk_prefetch_pages == [2]
+
+
+def test_cpu_prefill_populate_degrades_to_willneed_then_faults():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    class Bank:
+        _pager = None
+
+        def populate_experts(self, expert_ids, scratch):
+            raise OSError("pread failed")
+
+        def prefetch_experts(self, expert_ids):
+            raise OSError("madvise failed")
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [Bank()]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_mode = "populate"
+    executor._prefill_coalesce_limits = {0: 8}
+    executor._prefill_populate_scratch_bytes = 16
+    executor._prefill_populate_scratch = None
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+    executor._prefill_populate_bytes = 0
+    executor._prefill_populate_ns = 0
+
+    lease = executor.prepare_prefill_layer(0, [2, 1])
+
+    assert lease.experts == (1, 2)
+    assert executor._prefill_coalesce_degrades == 2
+    assert executor._prefill_coalesce_experts == 2
+    assert executor._prefill_populate_bytes == 0
+
+
+def test_cpu_prefill_populate_keeps_uffd_pager_path():
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    class Pager:
+        def __init__(self):
+            self.calls = []
+
+        def prefetch(self, banks, expert_ids):
+            self.calls.append((banks, tuple(expert_ids)))
+            return 7
+
+    pager = Pager()
+    bank = SimpleNamespace(_pager=pager)
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [bank]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_mode = "populate"
+    executor._prefill_coalesce_limits = {0: 8}
+    executor._prefill_populate_scratch_bytes = 16
+    executor._prefill_populate_scratch = None
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+    executor._prefill_populate_bytes = 0
+    executor._prefill_populate_ns = 0
+
+    lease = executor.prepare_prefill_layer(0, [3, 1, 3])
+
+    assert lease.experts == (1, 3)
+    assert pager.calls == [([bank], (1, 3))]
+    assert executor._disk_prefetch_pages == [7]
+    assert executor._prefill_populate_bytes == 0
 
 
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "glm4_moe"])

@@ -59,6 +59,7 @@ _FLAG_SLOTS_PER_LAYER = 16
 
 # MoeTask::num_tokens and CpuMoeExecutor::create_task use a signed C++ int.
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
+_PREFILL_POPULATE_SCRATCH_BYTES = 32 << 20
 
 
 @dataclass(frozen=True)
@@ -272,7 +273,7 @@ class CpuMoeExecutor:
         swiglu_limit: float | None = None,
         disk_lookahead: bool = True,
         step_timing: bool = False,
-        prefill_coalesce: bool = True,
+        prefill_coalesce: str | bool = "populate",
         prefill_coalesce_budget_bytes: int = 40 << 30,
     ) -> None:
         from freetoken.kernel import _cpu_moe
@@ -332,15 +333,30 @@ class CpuMoeExecutor:
         self._disk_major_fault_base = _major_faults()
         self._disk_prefetch_error: BaseException | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
-        self._prefill_coalesce_enabled = bool(prefill_coalesce)
+        if isinstance(prefill_coalesce, bool):
+            prefill_coalesce = "on" if prefill_coalesce else "off"
+        if prefill_coalesce not in ("populate", "on", "off"):
+            raise ValueError(
+                "prefill_coalesce must be 'populate', 'on', or 'off', got "
+                f"{prefill_coalesce!r}"
+            )
+        self._prefill_coalesce_mode = prefill_coalesce
+        self._prefill_coalesce_enabled = prefill_coalesce != "off"
         self._prefill_coalesce_experts = 0
         self._prefill_coalesce_ns = 0
         self._prefill_coalesce_degrades = 0
         self._prefill_coalesce_warned = False
+        self._prefill_populate_bytes = 0
+        self._prefill_populate_ns = 0
+        self._prefill_populate_scratch = None
         # Keep half of the pager budget available to the decode working set. Only one
         # prefill layer is live at a time and its lease is released after compute.
         self._prefill_coalesce_byte_ceiling = max(
             0, int(prefill_coalesce_budget_bytes) // 2
+        )
+        self._prefill_populate_scratch_bytes = min(
+            _PREFILL_POPULATE_SCRATCH_BYTES,
+            self._prefill_coalesce_byte_ceiling,
         )
         self._prefill_coalesce_limits = {
             layer_id: _prefill_coalesce_limit(
@@ -503,9 +519,10 @@ class CpuMoeExecutor:
         )
         if self._disk_banks and self._prefill_coalesce_enabled:
             logger.info_rank0(
-                "CPU MoE prefill coalesce: page-sweep, "
+                f"CPU MoE prefill coalesce: {self._prefill_coalesce_mode}, "
                 f"per-layer ceiling={self._prefill_coalesce_byte_ceiling / 2**30:.2f} GiB, "
-                f"expert limits={self._prefill_coalesce_limits}"
+                f"expert limits={self._prefill_coalesce_limits}, "
+                f"populate scratch={self._prefill_populate_scratch_bytes / 2**20:.0f} MiB"
             )
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
@@ -883,6 +900,57 @@ class CpuMoeExecutor:
         self._disk_prefetch_pages[layer_id] += pages
         return pages
 
+    def _populate_selected(
+        self, layer_id: int, selected: list[int] | tuple[int, ...]
+    ) -> int:
+        """Populate file-backed rows and retain the UFFD pager's existing path."""
+        banks = self._disk_banks.get(int(layer_id))
+        if not banks or not selected:
+            return 0
+        populated = 0
+        pages = 0
+        pager_groups: dict[object, list] = {}
+        file_banks = []
+        for bank in banks:
+            pager = getattr(bank, "_pager", None)
+            if pager is not None:
+                pager_groups.setdefault(pager, []).append(bank)
+                continue
+            file_banks.append(bank)
+        scratch = getattr(self, "_prefill_populate_scratch", None)
+        if file_banks and scratch is None:
+            scratch_bytes = getattr(
+                self,
+                "_prefill_populate_scratch_bytes",
+                _PREFILL_POPULATE_SCRATCH_BYTES,
+            )
+            if scratch_bytes <= 0:
+                raise MemoryError("populate scratch budget is empty")
+            scratch = bytearray(scratch_bytes)
+            self._prefill_populate_scratch = scratch
+        for bank in file_banks:
+            populate = getattr(bank, "populate_experts", None)
+            if populate is None:
+                raise RuntimeError("file-backed bank lacks populate_experts")
+            bank_bytes = populate(selected, scratch)
+            populated += bank_bytes
+            self._prefill_populate_bytes = getattr(
+                self, "_prefill_populate_bytes", 0
+            ) + bank_bytes
+        for pager, pager_banks in pager_groups.items():
+            pages += pager.prefetch(pager_banks, selected)
+        self._disk_prefetch_calls[layer_id] += 1
+        self._disk_prefetch_pages[layer_id] += pages
+        return populated
+
+    def _record_prefill_degrade(self, message: str, exc: Exception) -> None:
+        self._prefill_coalesce_degrades = getattr(
+            self, "_prefill_coalesce_degrades", 0
+        ) + 1
+        if not getattr(self, "_prefill_coalesce_warned", False):
+            logger.warning_rank0(f"CPU MoE prefill {message}: {exc}")
+            self._prefill_coalesce_warned = True
+
     def begin_decode_step(self) -> int:
         """Prefetch every DISK layer from its previous decode routing set.
 
@@ -953,13 +1021,14 @@ class CpuMoeExecutor:
         """Warm one bounded expert union and return its post-compute lease.
 
         The native executor stores fixed pointers to the original bank mappings, so
-        copied staging rows cannot serve it. This uses the shared page-coalesced
-        WILLNEED path instead. Any allocation or advisory failure leaves compute on
-        the ordinary fault path for this layer.
+        copied staging rows cannot serve it. Populate mode reads exact backing-file
+        row ranges into one reusable scratch buffer, making later mmap accesses minor
+        faults. A populate failure falls back to WILLNEED, then to demand faults.
         """
         if not getattr(self, "_prefill_coalesce_enabled", True):
             return None
         started = time.perf_counter_ns()
+        selected: list[int] = []
         try:
             selected, _route_pairs = _dedupe_decode_routes(
                 expert_ids, self.num_experts
@@ -967,20 +1036,58 @@ class CpuMoeExecutor:
             limit = getattr(self, "_prefill_coalesce_limits", {}).get(
                 int(layer_id), self.num_experts
             )
+            had_selected = bool(selected)
             selected = selected[:limit]
             if not selected:
-                return None
-            self._prefetch_selected(int(layer_id), selected)
-        except (MemoryError, OSError, RuntimeError) as exc:
-            self._prefill_coalesce_degrades = getattr(
-                self, "_prefill_coalesce_degrades", 0
-            ) + 1
-            if not getattr(self, "_prefill_coalesce_warned", False):
-                logger.warning_rank0(
-                    f"CPU MoE prefill coalesce degraded to demand faults: {exc}"
+                # A zero ceiling is a deliberate bound, not permission for the
+                # layer seam to retry an unbounded advisory sweep.
+                return (
+                    _PrefillCoalesceLease(int(layer_id), ())
+                    if had_selected else None
                 )
-                self._prefill_coalesce_warned = True
-            return None
+            mode = getattr(self, "_prefill_coalesce_mode", "on")
+            if mode == "populate":
+                banks = self._disk_banks.get(int(layer_id), ())
+                has_file_banks = any(
+                    getattr(bank, "_pager", None) is None for bank in banks
+                )
+                if not has_file_banks:
+                    try:
+                        self._prefetch_selected(int(layer_id), selected)
+                    except Exception as exc:
+                        self._record_prefill_degrade(
+                            "pager prefetch degraded to demand faults", exc
+                        )
+                else:
+                    populate_started = time.perf_counter_ns()
+                    try:
+                        self._populate_selected(int(layer_id), selected)
+                    except Exception as exc:
+                        self._record_prefill_degrade(
+                            "populate degraded to WILLNEED", exc
+                        )
+                        try:
+                            self._prefetch_selected(int(layer_id), selected)
+                        except Exception as fallback_exc:
+                            self._record_prefill_degrade(
+                                "WILLNEED degraded to demand faults", fallback_exc
+                            )
+                    finally:
+                        self._prefill_populate_ns = getattr(
+                            self, "_prefill_populate_ns", 0
+                        ) + time.perf_counter_ns() - populate_started
+            else:
+                try:
+                    self._prefetch_selected(int(layer_id), selected)
+                except Exception as exc:
+                    self._record_prefill_degrade(
+                        "WILLNEED degraded to demand faults", exc
+                    )
+        except Exception as exc:
+            self._record_prefill_degrade("sweep degraded to demand faults", exc)
+            # A non-None lease suppresses the layer seam's unguarded retry. Empty
+            # experts also make the unchanged release path a no-op.
+            return _PrefillCoalesceLease(int(layer_id), tuple(selected))
         finally:
             self._prefill_coalesce_ns = getattr(
                 self, "_prefill_coalesce_ns", 0
@@ -1033,6 +1140,8 @@ class CpuMoeExecutor:
         self._prefill_coalesce_experts = 0
         self._prefill_coalesce_ns = 0
         self._prefill_coalesce_degrades = 0
+        self._prefill_populate_bytes = 0
+        self._prefill_populate_ns = 0
         self._disk_major_fault_base = _major_faults()
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
             self._ext.gpufetch_stats(True)
@@ -1106,6 +1215,12 @@ class CpuMoeExecutor:
             "moe_prefill_coalesce_degrades": getattr(
                 self, "_prefill_coalesce_degrades", 0
             ),
+            "moe_prefill_populate_bytes": getattr(
+                self, "_prefill_populate_bytes", 0
+            ),
+            "moe_prefill_populate_ms": getattr(
+                self, "_prefill_populate_ns", 0
+            ) / 1_000_000,
             "per_layer": per_layer,
         }
         pagers = list(getattr(self, "_disk_pagers", ()))
@@ -1155,6 +1270,8 @@ class CpuMoeExecutor:
             self._prefill_coalesce_experts = 0
             self._prefill_coalesce_ns = 0
             self._prefill_coalesce_degrades = 0
+            self._prefill_populate_bytes = 0
+            self._prefill_populate_ns = 0
             self._disk_major_fault_base = now
         return result
 
