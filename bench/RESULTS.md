@@ -613,3 +613,31 @@ First run at concurrency 3 collided with the 32k KV pool (agentic
 contexts + 16k max_tokens headroom per stream): instant harness errors.
 Lesson: bench concurrency must respect kv_pool / (context + max_tokens).
 Rerun queued serial on the finished stack.
+
+## Session-prefetch + guard round (2026-09-01, goal pipeline)
+
+- **Session-conditioned expert prefetch MERGED + DEPLOYED**: each session's
+  routed-expert profile (few KB) parks with its state; admission-time
+  prefetch turns queue wait into warm-up; live sessions' experts carry
+  bounded LRU protection. Advisory invariance PROVEN on hardware (the
+  worker's CUDA test failed at construction three ways - Module .to,
+  fp32 inputs, fp32 banks - and only tested anything after repair; 1778
+  total green).
+- **Request-level OOM guard MERGED + DEPLOYED**: forward OOM aborts the
+  request with an actionable 503 and continues; decode OOM sheds the
+  youngest and retries; poisoned CUDA context exits nonzero for systemd.
+  137 scheduler/server tests green. Live-fire at the crash geometry did
+  NOT reproduce the 07:19 OOM (fragmentation-dependent) - the guard is
+  unit-proven, standing watch.
+- **100k context validated end to end**: 93,430-token needle recall PASS
+  (exact retrieval), profile of record: --num-pages 1568 (100,352 tok),
+  MRR 1, --max-extend-length 2048. Novel-content prefill at ~47 tok/s
+  (33 min for a full-context cold load) remains the honest cost.
+- **drop-qwen MERGED** (homelab PR #5515): monolith drains + synthetics
+  now on Luna; qwen session lane retired.
+- Open: 6GB-session state skipped the async store write (bounded queue
+  drop suspected) - giant sessions may silently not park; investigate
+  before relying on session-swap for 90k+ contexts.
+- Ops: repeated 1Password locks mid-pipeline; the dedicated node-4 key
+  carried everything except GitHub pushes (queued). git bundles over scp
+  bridged code to node-4 during the lock.
