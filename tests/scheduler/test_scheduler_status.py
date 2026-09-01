@@ -195,6 +195,44 @@ def test_decode_mtp_timing_is_logged_per_window():
     ]
 
 
+def test_decode_moe_step_timing_is_averaged_on_status_line():
+    rep, logs, clock = _reporter(interval=2)
+    first = _decode_batch(1)
+    first.moe_step_timing = {
+        "cpu_head_us": 1000,
+        "gpu_mid_us": 2000,
+        "cpu_tail_us": 3000,
+        "overlap_us": 400,
+    }
+    second = _decode_batch(1)
+    second.moe_step_timing = {
+        "cpu_head_us": 1200,
+        "gpu_mid_us": 2400,
+        "cpu_tail_us": 3600,
+        "overlap_us": 600,
+    }
+    clock["t"] = 1.0
+    rep.report_batch(first, running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=2, page_size=1)
+    clock["t"] = 2.0
+    rep.report_batch(second, running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=2, page_size=1)
+
+    line = logs[-1]
+    assert "cpu_head_us: 1100" in line
+    assert "gpu_mid_us: 2200" in line
+    assert "cpu_tail_us: 3300" in line
+    assert "overlap_us: 500" in line
+
+
+def test_decode_line_omits_moe_step_timing_when_disabled():
+    rep, logs, clock = _reporter(interval=1)
+    clock["t"] = 1.0
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=2, page_size=1)
+    assert "cpu_head_us" not in logs[-1]
+
+
 def test_interval_is_clamped_to_at_least_one():
     rep, _, _ = _reporter(interval=0)
     assert rep.decode_log_interval == 1

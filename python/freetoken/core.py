@@ -171,6 +171,8 @@ class Batch:
     mtp_draft_us: float = field(default=0.0, init=False)
     mtp_verify_us: float = field(default=0.0, init=False)
     mtp_snapshot_us: float = field(default=0.0, init=False)
+    # Optional decode phase breakdown populated only by --moe-step-timing.
+    moe_step_timing: dict[str, float] | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:

@@ -18,6 +18,8 @@ class SchedulerStatusReporter:
     _decode_generated_tokens: int = field(default=0, init=False)
     _decode_drafted_tokens: int = field(default=0, init=False)
     _decode_accepted_tokens: int = field(default=0, init=False)
+    _decode_timing_count: int = field(default=0, init=False)
+    _decode_timing_totals: dict[str, float] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -110,6 +112,13 @@ class SchedulerStatusReporter:
         )
         self._decode_drafted_tokens += getattr(batch, "mtp_drafted", 0)
         self._decode_accepted_tokens += getattr(batch, "mtp_accepted", 0)
+        timing = getattr(batch, "moe_step_timing", None)
+        if timing is not None:
+            self._decode_timing_count += 1
+            for name in ("cpu_head_us", "gpu_mid_us", "cpu_tail_us", "overlap_us"):
+                self._decode_timing_totals[name] = (
+                    self._decode_timing_totals.get(name, 0.0) + float(timing[name])
+                )
         if getattr(batch, "mtp_drafted", 0):
             self.log(
                 "MTP verify window, route: decode, "
@@ -136,6 +145,15 @@ class SchedulerStatusReporter:
         accepted = self._decode_accepted_tokens
         self._decode_drafted_tokens = 0
         self._decode_accepted_tokens = 0
+        timing_msg = ""
+        if self._decode_timing_count:
+            count = self._decode_timing_count
+            timing_msg = "".join(
+                f", {name}: {self._decode_timing_totals.get(name, 0.0) / count:.0f}"
+                for name in ("cpu_head_us", "gpu_mid_us", "cpu_tail_us", "overlap_us")
+            )
+        self._decode_timing_count = 0
+        self._decode_timing_totals.clear()
         self.log(
             f"Decode batch, "
             f"#running-req: {running_reqs}, "
@@ -148,6 +166,7 @@ class SchedulerStatusReporter:
             f"acceptance rate: {acceptance_rate:.4f}, "
             f"tokens/step: {tokens_per_step:.2f}, "
             f"#queue-req: {queue_reqs}"
+            f"{timing_msg}"
         )
 
 

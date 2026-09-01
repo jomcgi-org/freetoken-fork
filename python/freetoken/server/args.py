@@ -722,6 +722,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-step-timing",
+        action="store_true",
+        default=ServerArgs.moe_step_timing,
+        help=(
+            "Measure CPU-head, GPU-middle, CPU-tail, and within-layer CPU/GPU "
+            "overlap time for decode steps, and append interval averages to the "
+            "decode status line. This diagnostic synchronizes each timed step."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-pager-budget-gib",
         type=float,
         default=ServerArgs.moe_pager_budget_gib,

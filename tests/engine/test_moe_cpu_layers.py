@@ -20,8 +20,64 @@ from freetoken.engine.engine import _plan_hot_experts as plan_hot
 from freetoken.engine.engine import _profiled_hot_pair_rate as profiled_hot_rate
 from freetoken.engine.engine import _resolve_hot_expert_sets as resolve_hot
 from freetoken.engine.engine import _validate_disk_prefill_task_size as validate_chunk
+from freetoken.moe.cpu_executor import (
+    CpuMoeExecutor,
+    _StepTimingEvents,
+    _split_step_timing_layers,
+)
 
 L = 40
+
+
+def test_step_timing_splits_head_and_tail_at_largest_gap():
+    head, tail = _split_step_timing_layers(
+        frozenset(range(9)) | frozenset(range(39, 48)), 48
+    )
+    assert head == tuple(range(9))
+    assert tail == tuple(range(39, 48))
+
+
+@pytest.mark.parametrize(
+    ("layers", "expected"),
+    [
+        ({0, 1, 2}, ((0, 1, 2), ())),
+        ({37, 38, 39}, ((), (37, 38, 39))),
+        (set(), ((), ())),
+    ],
+)
+def test_step_timing_handles_single_edge_phase(layers, expected):
+    assert _split_step_timing_layers(layers, L) == expected
+
+
+def test_step_timing_resolves_phase_boundaries_and_overlap_without_cuda():
+    class Mark:
+        def __init__(self, milliseconds):
+            self.milliseconds = milliseconds
+
+        def elapsed_time(self, other):
+            return other.milliseconds - self.milliseconds
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_layers = 48
+    executor._disk_banks = {8: (), 39: ()}
+    executor._step_timing_events = {
+        (8, 1): _StepTimingEvents(Mark(1), Mark(2), Mark(5), Mark(6), Mark(10)),
+        (39, 1): _StepTimingEvents(Mark(30), Mark(31), Mark(36), Mark(39), Mark(40)),
+    }
+    executor._step_timing_hot_keys = {(8, 1), (39, 1)}
+    executor._tasks = {(8, 1): 108, (39, 1): 139}
+    native_ns = {108: 4_000_000, 139: 8_000_000}
+    executor._ext = SimpleNamespace(task_last_run_ns=native_ns.__getitem__)
+
+    timing = executor.resolve_step_timing(1, Mark(0), Mark(44))
+
+    assert timing == {
+        "cpu_head_us": 10_000,
+        "gpu_mid_us": 20_000,
+        "cpu_tail_us": 14_000,
+        # min(cpu, hot GPU span): min(4ms, 3ms) + min(8ms, 5ms)
+        "overlap_us": 8_000,
+    }
 
 
 def test_explicit_list():
