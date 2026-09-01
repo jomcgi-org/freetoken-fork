@@ -10,6 +10,12 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from freetoken.core import SamplingParams
+from freetoken.guided import (
+    GuidedDecodingUnavailable,
+    import_xgrammar,
+    normalize_response_format,
+    tool_constraint,
+)
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.effort import EFFORT_SCALE, KNOWN_REASONING_EFFORTS
 
@@ -59,6 +65,7 @@ def _thinking_type(req: Any) -> str | None:
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
+    config: Any | None = None,
 ) -> GenSpec:
     """OpenAI ChatCompletionRequest -> GenSpec (the OpenAI 'to_sampling_params')."""
     from .model_meta import effort_toggle_kwargs
@@ -67,17 +74,45 @@ def chat_request_to_genspec(
     thinking_type = _thinking_type(req)
     if req.reasoning_effort or thinking_type:
         ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    guided = normalize_response_format(req.response_format)
+    if req.tool_choice == "required":
+        if guided is not None:
+            raise ValueError(
+                "response_format cannot be combined with tool_choice 'required'"
+            )
+        parser = getattr(config, "tool_call_parser", "qwen3_coder")
+        reasoning_parser = getattr(config, "reasoning_parser", None)
+        reasoning = _guided_reasoning_enabled(reasoning_parser, ctk)
+        guided = tool_constraint(
+            _all_tool_dicts(req.tools),
+            tool_call_parser=parser,
+            model_hint=getattr(config, "model_path", ""),
+            reasoning=reasoning,
+            force_reasoning=reasoning and reasoning_parser in {
+                "qwen3", "glm", "minimax", "deepseekv32"
+            },
+        )
+    elif guided is not None:
+        start_after = _guided_response_start_after(
+            getattr(config, "reasoning_parser", None), ctk
+        )
+        if start_after is not None:
+            guided["start_after"] = start_after
+    if guided is not None and req.stop:
+        raise ValueError("stop is not supported with constrained decoding")
+    sampling_params = resolve_sampling(
+        temperature=req.temperature,
+        top_k=req.top_k,
+        top_p=req.top_p,
+        max_tokens=req.max_tokens,
+        ignore_eos=req.ignore_eos,
+        model_sampling=model_sampling,
+        stop=req.stop,
+    )
+    sampling_params.guided_decoding = guided
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
-        sampling_params=resolve_sampling(
-            temperature=req.temperature,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            max_tokens=req.max_tokens,
-            ignore_eos=req.ignore_eos,
-            model_sampling=model_sampling,
-            stop=req.stop,
-        ),
+        sampling_params=sampling_params,
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
@@ -87,6 +122,32 @@ def chat_request_to_genspec(
 
 def _all_tool_dicts(tools) -> list[dict[str, Any]]:
     return [t.model_dump(exclude_none=True) for t in (tools or [])]
+
+
+def _guided_reasoning_enabled(reasoning_parser: str | None, ctk: dict[str, Any]) -> bool:
+    if not reasoning_parser:
+        return False
+    if reasoning_parser in {"qwen3", "glm", "deepseekv32"}:
+        return ctk.get("enable_thinking") is not False
+    if reasoning_parser == "minimax":
+        return True
+    if reasoning_parser == "minimax_m3":
+        return ctk.get("thinking_mode") == "enabled"
+    return bool(ctk.get("enable_thinking"))
+
+
+def _guided_response_start_after(
+    reasoning_parser: str | None, ctk: dict[str, Any]
+) -> str | None:
+    # Qwen3, GLM, MiniMax-M2, and DeepSeek's parser all expose content after the
+    # same closer. Delaying the matcher preserves unconstrained chain-of-thought.
+    if reasoning_parser in {"qwen3", "glm", "minimax", "deepseekv32"} and (
+        _guided_reasoning_enabled(reasoning_parser, ctk)
+    ):
+        return "</think>"
+    if reasoning_parser == "minimax_m3" and _guided_reasoning_enabled(reasoning_parser, ctk):
+        return "</mm:think>"
+    return None
 
 
 def _maintenance_gate(state: Any) -> JSONResponse | None:
@@ -160,11 +221,6 @@ async def handle_chat_completion(
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
         return create_error_response("logit_bias is not supported")
-    if _response_format_unsupported(req.response_format):
-        return create_error_response(
-            "response_format json_object/json_schema is not supported (no constrained decoding)",
-            param="response_format",
-        )
     if req.n != 1:
         return create_error_response("Only n=1 is supported", param="n")
     # Case/whitespace and the "off" disable synonym stay accepted here because
@@ -185,10 +241,16 @@ async def handle_chat_completion(
             )
 
     try:
-        spec = chat_request_to_genspec(req, model_sampling)
+        spec = chat_request_to_genspec(req, model_sampling, state.config)
     except ValueError as exc:
         return create_error_response(str(exc))
     spec.priority = priority
+    if spec.sampling_params.guided_decoding is not None:
+        try:
+            import_xgrammar()
+        except GuidedDecodingUnavailable as exc:
+            param = "tools" if req.tool_choice == "required" else "response_format"
+            return create_error_response(str(exc), param=param)
 
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
@@ -243,7 +305,7 @@ async def stream_chat_completion_chunks(
 ) -> AsyncIterator[bytes]:
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
-        spec = chat_request_to_genspec(req, {})
+        spec = chat_request_to_genspec(req, {}, state.config)
     yield _sse(
         _chat_chunk(
             req,
@@ -643,7 +705,8 @@ def _usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int = 0) -
 
 
 def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool:
-    # We have no constrained/guided decoding; only plain text ('text' or unset) is honored.
+    # Legacy Completions remains text-only. Chat Completions validates and converts
+    # response_format through normalize_response_format instead.
     return response_format is not None and response_format.get("type") not in (None, "text")
 
 

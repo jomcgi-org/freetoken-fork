@@ -147,6 +147,7 @@ class Scheduler(SchedulerIOMixin):
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
         self.tokenizer = load_tokenizer(config.model_path)
+        self.engine.sampler.set_guided_tokenizer(self.tokenizer)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
         if config.special_token_ckpt and (
@@ -452,14 +453,28 @@ class Scheduler(SchedulerIOMixin):
                         not req.sampling_params.ignore_eos
                         and next_token in self.eos_token_ids
                     )
+                    hit_grammar = bool(
+                        req.guided_state is not None
+                        and req.guided_state.terminated
+                    )
                     matched_stop = (
                         self._match_stop_str(req)
-                        if not hit_eos and req.sampling_params.stop_strs
+                        if (
+                            not hit_eos
+                            and req.guided_state is None
+                            and req.sampling_params.stop_strs
+                        )
                         else None
                     )
-                    finished = hit_length or hit_eos or matched_stop is not None
+                    finished = (
+                        hit_length or hit_eos or hit_grammar or matched_stop is not None
+                    )
                     finish_reason = (
-                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        (
+                            "stop"
+                            if (hit_eos or hit_grammar or matched_stop is not None)
+                            else "length"
+                        )
                         if finished
                         else None
                     )
@@ -634,6 +649,23 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            if msg.sampling_params.guided_decoding is not None:
+                try:
+                    self.engine.sampler.validate_guided(
+                        msg.sampling_params.guided_decoding
+                    )
+                except Exception as exc:  # request-owned schema/backend failure
+                    logger.warning_rank0(
+                        "Guided decoding setup failed for request %d: %s", msg.uid, exc
+                    )
+                    self.send_result([
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error=f"invalid guided decoding request: {exc}",
+                            code="invalid_request_error",
+                        )
+                    ])
+                    return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -929,6 +961,7 @@ class Scheduler(SchedulerIOMixin):
             and batch.is_decode
             and len(batch.reqs) == 1
             and batch.reqs[0].sampling_params.is_greedy
+            and batch.reqs[0].sampling_params.guided_decoding is None
             and batch.reqs[0].mtp_hidden is not None
         )
         if mtp_verify:

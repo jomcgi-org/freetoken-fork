@@ -21,6 +21,8 @@ class SchedulerStatusReporter:
     _decode_accepted_tokens: int = field(default=0, init=False)
     _decode_timing_count: int = field(default=0, init=False)
     _decode_timing_totals: dict[str, float] = field(default_factory=dict, init=False)
+    _constrained_requests: int = field(default=0, init=False)
+    _mask_us: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -42,6 +44,8 @@ class SchedulerStatusReporter:
         queue_priority_bands: dict[str, int] | None = None,
         max_wait_seconds: float = 0.0,
     ) -> None:
+        self._constrained_requests += getattr(batch, "constrained_requests", 0)
+        self._mask_us += getattr(batch, "mask_us", 0.0)
         if batch.is_prefill:
             self._report_prefill(
                 batch,
@@ -170,6 +174,10 @@ class SchedulerStatusReporter:
             )
         self._decode_timing_count = 0
         self._decode_timing_totals.clear()
+        constrained_requests = self._constrained_requests
+        mask_us = self._mask_us
+        self._constrained_requests = 0
+        self._mask_us = 0.0
         self.log(
             f"Decode batch, "
             f"#running-req: {running_reqs}, "
@@ -184,6 +192,7 @@ class SchedulerStatusReporter:
             f"#queue-req: {queue_reqs}"
             f"{', ' if queue_priority_bands is not None else ''}"
             f"{_priority_queue_msg(queue_priority_bands, max_wait_seconds)}"
+            f", constrained_requests: {constrained_requests}, mask_us: {mask_us:.0f}"
             f"{timing_msg}"
             f"{self._disk_prefix_msg()}"
         )

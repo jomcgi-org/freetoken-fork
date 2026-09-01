@@ -71,6 +71,10 @@ ft = "freetoken.cli:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=6.0"]
+# Structured generation. XGrammar publishes CPython manylinux wheels, supports both
+# JSON Schema and model-specific tool-call grammars, and does not narrow the core
+# torch version range. It remains optional so ordinary installs load no grammar code.
+guided = ["xgrammar>=0.2.5,<0.3"]
 # Native fused-kernel packages. Without them the runtime falls back to the pure-Triton
 # kernels in freetoken.kernel.triton (and the 'triton' attention backend). Install
 # `freetoken[accel]` for the full native fast path.

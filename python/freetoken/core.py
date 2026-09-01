@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Tuple
 
 import torch
 
@@ -25,6 +25,9 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # Serialized, engine-neutral grammar request. None is the hot-path sentinel: the
+    # sampler does not import or initialize the optional grammar backend unless this is set.
+    guided_decoding: dict[str, Any] | None = None
 
     @property
     def is_greedy(self) -> bool:
@@ -79,6 +82,9 @@ class Req:
     # request-owned rather than scheduler-global so the ordinary fallback path can
     # update it without changing batching behavior.
     mtp_hidden: torch.Tensor | None = field(default=None, init=False, repr=False)
+    # Stateful optional-backend matcher. Kept request-owned because decode batches are
+    # re-formed every step and each sequence advances through its grammar independently.
+    guided_state: Any | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -174,6 +180,10 @@ class Batch:
     mtp_snapshot_us: float = field(default=0.0, init=False)
     # Optional decode phase breakdown populated only by --moe-step-timing.
     moe_step_timing: dict[str, float] | None = field(default=None, init=False)
+    # Guided-decoding interval accounting. constrained_requests counts newly-created
+    # request matchers; mask_us is CPU mask construction plus mask transfer/application.
+    constrained_requests: int = field(default=0, init=False)
+    mask_us: float = field(default=0.0, init=False)
 
     @property
     def is_prefill(self) -> bool:
