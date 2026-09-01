@@ -166,7 +166,7 @@ def test_cuda_advisory_prefetch_does_not_change_moe_outputs():
         top_k=2,
         hidden_size=8,
         intermediate_size=16,
-    ).to(device)
+    )
     cache = OffloadMoeCache(
         num_layers=1,
         num_experts=4,
