@@ -505,3 +505,16 @@ hot_swaps/interval stat prints 0.00 despite live swaps.
 Ops: node-4 CPU governor pinned to performance (was powersave/EPP-perf);
 DDR confirmed at 6000 MT/s EXPO; GPU never throttles (138W of 450W) - the
 step is host-bound, watts are not the constraint.
+
+## Pipelining investigation (program close)
+
+--moe-step-timing (merged) measured the step anatomy at the final config
+under x8: cpu_head+cpu_tail ~57-100ms per interval vs gpu_mid ~19-40ms,
+overlap already 20-45ms. The doorbell was already late-bound; the engines
+overlap wherever the layer dataflow permits. The only remaining overlap
+(cross-wave staggering) requires breaking the scheduler's
+one-forward-in-flight contract - documented as the seam, out of scope.
+Timing mode costs ~10% (event syncs): diagnostic only.
+
+PROGRAM CLOSED. Every identified software lever on this hardware is now
+implemented, measured, or bounded with a documented reason.
