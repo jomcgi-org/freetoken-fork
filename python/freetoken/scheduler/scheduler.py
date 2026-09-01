@@ -415,8 +415,10 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
-        if batch.is_decode and self.engine.moe_offload_cache is not None:
-            self.engine.moe_offload_cache.record_resume_decode_batch(batch.reqs)
+        # getattr probe: overlap-loop test doubles predate the engine attribute.
+        engine = getattr(self, "engine", None)
+        if batch.is_decode and engine is not None and engine.moe_offload_cache is not None:
+            engine.moe_offload_cache.record_resume_decode_batch(batch.reqs)
         if getattr(batch, "mtp_verify", False):
             self.engine.resolve_mtp_timing(batch)
         reply: List[DetokenizeMsg] = []
