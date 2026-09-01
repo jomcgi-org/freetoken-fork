@@ -21,6 +21,7 @@ import os
 import threading
 import time
 import weakref
+from dataclasses import dataclass
 from functools import partial
 
 import torch
@@ -57,6 +58,38 @@ _FLAG_SLOTS_PER_LAYER = 16
 
 # MoeTask::num_tokens and CpuMoeExecutor::create_task use a signed C++ int.
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
+
+
+@dataclass(frozen=True)
+class _StepTimingEvents:
+    layer_start: torch.cuda.Event
+    overlap_start: torch.cuda.Event
+    hot_done: torch.cuda.Event
+    wait_done: torch.cuda.Event
+    layer_end: torch.cuda.Event
+
+
+def _split_step_timing_layers(
+    layer_ids: set[int] | frozenset[int], num_layers: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Split selected CPU layers at their largest interior gap.
+
+    Head+tail DISK placement therefore maps to two phases. A single contiguous
+    run maps to the edge it touches; a non-edge run maps to the nearer edge.
+    """
+    ordered = tuple(sorted(int(layer_id) for layer_id in layer_ids))
+    if not ordered:
+        return (), ()
+    gaps = [right - left for left, right in zip(ordered, ordered[1:])]
+    if gaps and max(gaps) > 1:
+        split = gaps.index(max(gaps)) + 1
+        return ordered[:split], ordered[split:]
+    if ordered[0] == 0:
+        return ordered, ()
+    if ordered[-1] == num_layers - 1:
+        return (), ordered
+    midpoint = (num_layers - 1) / 2
+    return (ordered, ()) if sum(ordered) / len(ordered) <= midpoint else ((), ordered)
 
 
 def validate_cpu_moe_task_tokens(num_tokens: int, *, source: str) -> int:
@@ -201,6 +234,7 @@ class CpuMoeExecutor:
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         disk_lookahead: bool = True,
+        step_timing: bool = False,
     ) -> None:
         from freetoken.kernel import _cpu_moe
 
@@ -234,6 +268,15 @@ class CpuMoeExecutor:
         self.device = device
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
+        self._step_timing = bool(step_timing)
+        timing_methods = ("task_last_run_ns", "set_task_timing")
+        if self._step_timing and not all(
+            hasattr(_cpu_moe.CpuMoeExecutor, name) for name in timing_methods
+        ):
+            raise RuntimeError(
+                "the CPU MoE extension needs rebuilding for --moe-step-timing; run "
+                "`python setup.py build_ext --inplace` or reinstall the wheel"
+            )
         # The per-layer tensors and their pointer tables must outlive the executor
         # (C++ holds raw addresses into both).
         self._banks: list[torch.Tensor] = []
@@ -311,6 +354,8 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        if self._step_timing:
+            self._ext.set_task_timing(True)
         if self._disk_banks:
             self._disk_callback = partial(_disk_prefetch_callback, weakref.ref(self))
             self._ext.set_pre_run_callback(self._disk_callback)
@@ -329,6 +374,8 @@ class CpuMoeExecutor:
 
         self._io: dict[int, dict[str, torch.Tensor]] = {}
         self._tasks: dict[tuple[int, int], int] = {}
+        self._step_timing_events: dict[tuple[int, int], _StepTimingEvents] = {}
+        self._step_timing_hot_keys: set[tuple[int, int]] = set()
         self._gpufetch_tasks: dict[int, tuple[int, int | None]] = {}
         self._prefill_io: dict[str, torch.Tensor] | None = None
         self._prefill_capacity = 0
@@ -610,6 +657,72 @@ class CpuMoeExecutor:
                     self._flag_slots[key] = slot
                     self._ext.register_flag_task(slot, task)
         return task
+
+    def _timing_for(self, layer_id: int, bs: int) -> _StepTimingEvents | None:
+        if not self._step_timing:
+            return None
+        key = (int(layer_id), int(bs))
+        timing = self._step_timing_events.get(key)
+        if timing is None:
+            # external=True makes the record visible as an event node in a CUDA graph,
+            # so elapsed_time resolves the current replay rather than capture warmup.
+            def event() -> torch.cuda.Event:
+                return torch.cuda.Event(enable_timing=True, external=True)
+
+            timing = _StepTimingEvents(event(), event(), event(), event(), event())
+            self._step_timing_events[key] = timing
+        return timing
+
+    def resolve_step_timing(
+        self,
+        bs: int,
+        step_start: torch.cuda.Event,
+        step_end: torch.cuda.Event,
+    ) -> dict[str, float]:
+        """Resolve one synchronized decode replay into phase and overlap spans."""
+        step_us = float(step_start.elapsed_time(step_end) * 1000.0)
+        phase_ids = {
+            layer_id
+            for layer_id in getattr(self, "_disk_banks", ())
+            if (layer_id, bs) in self._step_timing_events
+        }
+        head, tail = _split_step_timing_layers(phase_ids, self.num_layers)
+        cpu_head_us = gpu_mid_us = cpu_tail_us = 0.0
+        if head and tail:
+            head_end = self._step_timing_events[(head[-1], bs)].layer_end
+            tail_start = self._step_timing_events[(tail[0], bs)].layer_start
+            cpu_head_us = float(step_start.elapsed_time(head_end) * 1000.0)
+            gpu_mid_us = float(head_end.elapsed_time(tail_start) * 1000.0)
+            cpu_tail_us = float(tail_start.elapsed_time(step_end) * 1000.0)
+        elif head:
+            cpu_head_us = step_us
+        elif tail:
+            cpu_tail_us = step_us
+        else:
+            gpu_mid_us = step_us
+
+        overlap_us = 0.0
+        for key in self._step_timing_hot_keys:
+            if key[1] != bs:
+                continue
+            timing = self._step_timing_events[key]
+            hot_us = float(timing.overlap_start.elapsed_time(timing.hot_done) * 1000.0)
+            branch_us = float(
+                timing.overlap_start.elapsed_time(timing.wait_done) * 1000.0
+            )
+            task = self._tasks[key]
+            cpu_us = float(self._ext.task_last_run_ns(task)) / 1000.0
+            # wait_done is max(CPU completion, hot completion). If the CPU finished
+            # last, branch_us - cpu_us estimates its dispatch delay after the common
+            # doorbell marker; otherwise its whole native span overlapped hot work.
+            cpu_delay_us = max(0.0, branch_us - cpu_us) if branch_us > hot_us else 0.0
+            overlap_us += max(0.0, min(cpu_us, hot_us - cpu_delay_us))
+        return {
+            "cpu_head_us": max(0.0, cpu_head_us),
+            "gpu_mid_us": max(0.0, gpu_mid_us),
+            "cpu_tail_us": max(0.0, cpu_tail_us),
+            "overlap_us": max(0.0, overlap_us),
+        }
 
     def register_gpufetch_layer(
         self,
@@ -970,6 +1083,9 @@ class CpuMoeExecutor:
         distinct from the interleaved GPU work) across the overlap window."""
         bs = hidden_states.shape[0]
         io = self._io_for(bs)
+        timing = self._timing_for(layer_id, bs)
+        if timing is not None:
+            timing.layer_start.record(torch.cuda.current_stream())
 
         if self._gpu_prequant:
             # DSV4: apply the reference FP8 round-trip on the GPU (the same kernel the
@@ -997,13 +1113,18 @@ class CpuMoeExecutor:
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.submit_with_cuda_stream(stream, task)
-        return (bs, task, out, slot)
+        if timing is not None:
+            timing.overlap_start.record(torch.cuda.current_stream())
+        return (bs, task, out, slot, timing, int(layer_id))
 
-    def decode_sync(self, pending: tuple) -> torch.Tensor:
+    def decode_sync(self, pending: tuple, *, hot_partial: bool = False) -> torch.Tensor:
         """Issue the CPU-pool sync + the H2D result copy for a prior :meth:`decode_submit`,
         and return the GPU output tensor. With flag-sync the wait is a front-end stream
         memop on done[slot] (set by the CPU coordinator); otherwise a cudaLaunchHostFunc."""
-        bs, task, out, slot = pending
+        bs, task, out, slot, timing, layer_id = pending
+        if timing is not None and hot_partial:
+            timing.hot_done.record(torch.cuda.current_stream())
+            self._step_timing_hot_keys.add((layer_id, bs))
         if slot is not None:
             # Front-end WAIT(done[slot] >= 1): blocks this stream's later nodes without
             # occupying an SM, so GPU utilization stays truthful during the CPU window.
@@ -1013,8 +1134,12 @@ class CpuMoeExecutor:
         else:
             stream = torch.cuda.current_stream().cuda_stream
             self._ext.sync_with_cuda_stream(stream, task)
+        if timing is not None:
+            timing.wait_done.record(torch.cuda.current_stream())
         io = self._io[bs]
         out.copy_(io["y"], non_blocking=True)
+        if timing is not None:
+            timing.layer_end.record(torch.cuda.current_stream())
         return out
 
     def _watchdog_tick(self, suspects: dict) -> None:

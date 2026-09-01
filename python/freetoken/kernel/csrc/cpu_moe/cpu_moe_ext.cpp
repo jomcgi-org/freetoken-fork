@@ -1077,6 +1077,10 @@ struct MoeTask {
   const int32_t* ids;  // [num_tokens, top_k]  (raw expert ids; <0 = skip)
   const float* w;      // [num_tokens, top_k]
   bf16_t* y;           // [num_tokens, H]
+  // Native doorbell-to-completion span for optional per-step diagnostics. Atomics
+  // let Python read the last completed replay after synchronizing its CUDA fence.
+  std::atomic<int64_t> timing_started_ns{0};
+  std::atomic<int64_t> timing_last_run_ns{0};
 };
 
 // One graph-stable DISK -> pinned staging task. The GPU copies num_rows and the
@@ -1276,6 +1280,7 @@ struct CpuMoeExecutor {
   // it to a captured GPU elementwise kernel removes it while keeping the official
   // W4A8 numerics bit-exact. Set via set_input_prequant (see cpu_executor.py).
   bool input_prequant = false;
+  bool task_timing_enabled = false;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
@@ -2108,6 +2113,12 @@ struct CpuMoeExecutor {
   }
 
   void submit(MoeTask* t, bool run_pre_callback = true) {
+    if (task_timing_enabled) {
+      const auto timing_started = std::chrono::steady_clock::now().time_since_epoch();
+      t->timing_started_ns.store(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(timing_started).count(),
+          std::memory_order_release);
+    }
     if (t->group_routes) build_decode_groups(t);
     if (run_pre_callback && pre_run_callback) {
       pybind11::gil_scoped_acquire gil;
@@ -2202,10 +2213,20 @@ struct CpuMoeExecutor {
     task_cv.notify_all();
   }
 
-  void sync() {
+  void sync(MoeTask* timing_task = nullptr) {
     const uint64_t target = submitted.load(std::memory_order_acquire);
     std::unique_lock<std::mutex> lk(sync_mtx);
     sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
+    lk.unlock();
+    if (task_timing_enabled && timing_task != nullptr) {
+      const int64_t started =
+          timing_task->timing_started_ns.load(std::memory_order_acquire);
+      const auto now = std::chrono::steady_clock::now().time_since_epoch();
+      const int64_t ended =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+      timing_task->timing_last_run_ns.store(
+          std::max<int64_t>(0, ended - started), std::memory_order_release);
+    }
   }
 
   void submit_with_cuda_stream(uintptr_t stream, uintptr_t task) {
@@ -2305,7 +2326,7 @@ struct CpuMoeExecutor {
             run_gpufetch(fetch);
           } else if (t != nullptr) {
             submit(t);
-            sync();
+            sync(t);
           }
           // Release: the workers' y stores are visible before the GPU sees done.
           flag_store_release(&done_flags[L], 1);
@@ -2351,7 +2372,7 @@ struct CpuMoeExecutor {
   void run_task(uintptr_t task) {
     MoeTask* t = reinterpret_cast<MoeTask*>(task);
     submit(t);
-    sync();
+    sync(t);
   }
 
   // Synchronous task whose descriptor lives only for this call. Prefill uses one
@@ -2369,8 +2390,15 @@ struct CpuMoeExecutor {
                  reinterpret_cast<const float*>(w_ptr),
                  reinterpret_cast<bf16_t*>(y_ptr)};
     submit(&task, run_pre_callback);
-    sync();
+    sync(&task);
   }
+
+  int64_t task_last_run_ns(uintptr_t task) const {
+    const MoeTask* t = reinterpret_cast<const MoeTask*>(task);
+    return t->timing_last_run_ns.load(std::memory_order_acquire);
+  }
+
+  void set_task_timing(bool enabled) { task_timing_enabled = enabled; }
 
   void set_pre_run_callback(pybind11::function callback) {
     pre_run_callback = std::move(callback);
@@ -2399,7 +2427,7 @@ struct CpuMoeExecutor {
   }
   static void CUDART_CB sync_cb(void* ud) {
     MoeTask* t = reinterpret_cast<MoeTask*>(ud);
-    t->exec->sync();
+    t->exec->sync(t);
   }
   static void CUDART_CB gpufetch_cb(void* ud) {
     GpuFetchTask* t = reinterpret_cast<GpuFetchTask*>(ud);
@@ -2450,6 +2478,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("register_flag_gpufetch_task", &CpuMoeExecutor::register_flag_gpufetch_task,
            py::arg("slot"), py::arg("task"))
       .def("flag_served_count", &CpuMoeExecutor::flag_served_count, py::arg("slot"))
+      .def("task_last_run_ns", &CpuMoeExecutor::task_last_run_ns, py::arg("task"))
+      .def("set_task_timing", &CpuMoeExecutor::set_task_timing, py::arg("enabled"))
       .def("gpufetch_stats", &CpuMoeExecutor::gpufetch_stats, py::arg("reset"))
       .def("gpufetch_error_code", &CpuMoeExecutor::gpufetch_error_code)
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,

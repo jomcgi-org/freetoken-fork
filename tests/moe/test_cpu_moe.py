@@ -509,6 +509,65 @@ def test_cpu_moe_decode_cuda_graph_replay():
     print("cpu moe cuda graph replay OK")
 
 
+def test_step_timing_preserves_greedy_result_and_flag_ordering():
+    """CUDA-gated parity for the diagnostic event nodes and native task clock."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(19)
+    L, E, H, I, top_k, bs = 2, 8, 256, 128, 2, 2
+    layer = 0
+    dev = torch.device("cuda")
+    stream = torch.cuda.Stream()
+    torch.cuda.set_stream(stream)
+    cache = _make_cache(L, E, H, I)
+    ex = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=4,
+        max_tokens=bs,
+        device=dev,
+        step_timing=True,
+    )
+    hidden = torch.randn(bs, H, device=dev, dtype=torch.bfloat16)
+    ids = torch.randint(0, E, (bs, top_k), device=dev, dtype=torch.int32)
+    weights = torch.rand(bs, top_k, device=dev)
+
+    ex.decode(layer, hidden, weights, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        timed = ex.decode(layer, hidden, weights, ids)
+    torch.cuda.synchronize()
+
+    started = torch.cuda.Event(enable_timing=True)
+    ended = torch.cuda.Event(enable_timing=True)
+    started.record()
+    graph.replay()
+    ended.record()
+    ended.synchronize()
+    timing = ex.resolve_step_timing(bs, started, ended)
+
+    ex._step_timing = False
+    plain = ex.decode(layer, hidden, weights, ids)
+    torch.cuda.synchronize()
+
+    assert torch.equal(timed, plain)
+    assert torch.equal(timed.float().argmax(dim=-1), plain.float().argmax(dim=-1))
+    assert timing["gpu_mid_us"] > 0
+    assert (
+        timing["cpu_head_us"] == timing["cpu_tail_us"] == timing["overlap_us"] == 0
+    )
+    task = ex._tasks[(layer, bs)]
+    assert ex._ext.task_last_run_ns(task) > 0
+    if ex._flag_sync:
+        slot = ex._flag_slots[(layer, bs)]
+        assert int(ex._ready[slot]) == 0
+        assert int(ex._done[slot]) == 1
+        assert int(ex._err[slot]) == 0
+
+
 def test_cpu_moe_decode_cuda_graph_replay_mxfp4():
     """gpt-oss mxfp4 path under capture/replay: the host nodes must recompute the
     clamped-swiglu+bias GEMV from the freshly written pinned routing on each replay."""
