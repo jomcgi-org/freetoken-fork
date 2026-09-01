@@ -174,14 +174,14 @@ def test_cuda_advisory_prefetch_does_not_change_moe_outputs():
         device=device,
     )
     cache.set_bank_sources({
-        "gate_up": [torch.randn(4, 32, 8, pin_memory=True)],
-        "down": [torch.randn(4, 8, 16, pin_memory=True)],
+        "gate_up": [torch.randn(4, 32, 8, dtype=torch.bfloat16, pin_memory=True)],
+        "down": [torch.randn(4, 8, 16, dtype=torch.bfloat16, pin_memory=True)],
     })
     cache.configure_session_profiles(
         max_sessions=1, enabled=True, protect_experts=2, half_life_steps=100
     )
     layer.offload_cache = cache
-    hidden = torch.randn(1, 8, device=device)
+    hidden = torch.randn(1, 8, device=device, dtype=torch.bfloat16)
     router = torch.tensor([[4.0, 3.0, 2.0, 1.0]], device=device)
 
     expected = layer.decode_forward(hidden, router)
