@@ -1931,6 +1931,52 @@ _DENSE_MOE_SETTINGS = {
 }
 
 
+_PLE_SETTINGS = {
+    "ple_backend": "pinned",
+    "ple_prefill_gather": "on",
+    "ple_cache_gib": 8.0,
+    "ple_cache_warm": None,
+    "ple_cache_profile_out": None,
+}
+
+
+def _gate_ple_settings(config, model_config, override) -> bool:
+    """Validate Qwen-only PLE flags and return whether the model has a PLE table.
+
+    Programmatic callers and older test doubles may omit any optional setting, so
+    every probe uses ``getattr``. Storage backends other than the default are
+    rejected because they request real table I/O. Auxiliary tuning flags are safe
+    to ignore, but are reset with one clear warning.
+    """
+    ple_args = getattr(model_config, "qwen4_args", None)
+    has_ple = bool(ple_args is not None and getattr(ple_args, "ple_layer_ids", ()))
+    if has_ple:
+        return True
+
+    backend = getattr(config, "ple_backend", _PLE_SETTINGS["ple_backend"])
+    if backend != _PLE_SETTINGS["ple_backend"]:
+        raise ValueError(
+            f"--ple-backend {backend} is only supported for models with a PLE "
+            "n-gram table"
+        )
+
+    ignored = []
+    for name, default in _PLE_SETTINGS.items():
+        if name == "ple_backend":
+            continue
+        value = getattr(config, name, default)
+        if value == default:
+            continue
+        ignored.append(f"--{name.replace('_', '-')}={value!r}")
+        override(name, default)
+    if ignored:
+        logger.warning_rank0(
+            f"{getattr(model_config, 'model_type', 'model')} has no PLE n-gram table; "
+            f"ignoring PLE settings: {', '.join(ignored)}"
+        )
+    return False
+
+
 def _validate_disk_prefill_task_size(config, cache) -> None:
     """Reject scheduler chunks that cannot fit the native task token field."""
     if (
@@ -1960,8 +2006,7 @@ def _adjust_config(config: EngineConfig):
     has_linear_attention = getattr(model_config, "has_linear_attention", False)
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
-    ple_args = getattr(model_config, "qwen4_args", None)
-    has_ple = bool(ple_args is not None and getattr(ple_args, "ple_layer_ids", ()))
+    has_ple = _gate_ple_settings(config, model_config, override)
     explicit_disk_layers = (
         _parse_disk_layers_spec(config.moe_disk_layers, model_config.num_moe_layers)
         if is_moe and config.moe_disk_layers else frozenset()
@@ -2001,13 +2046,7 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_max_bs", 1)
 
     ple_backend = getattr(config, "ple_backend", "pinned")
-    if ple_backend in ("cached", "disk", "hmm"):
-        if not has_ple:
-            raise ValueError(
-                f"--ple-backend {ple_backend} is only supported for models with a PLE "
-                "n-gram table"
-            )
-    if ple_backend in ("cached", "disk"):
+    if has_ple and ple_backend in ("cached", "disk"):
         no_graphs = os.getenv("FREETOKEN_PLE_DISK_NO_GRAPHS", "").strip().lower()
         if no_graphs in ("1", "true", "yes", "on"):
             override("cuda_graph_bs", [])

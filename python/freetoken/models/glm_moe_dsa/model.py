@@ -102,6 +102,12 @@ class GlmMoeDsaForCausalLM(BaseLLMModel):
             )
         super().__init__()
 
+    def _iter_offload_moe_layers(self):
+        """Expose routed experts only; shared experts stay dense and resident."""
+        from freetoken.models.glm_moe import iter_glm_offload_moe_layers
+
+        yield from iter_glm_offload_moe_layers(self)
+
     def prepare_for_runtime(self) -> None:
         """Post-load, pre-KV-sizing hook (engine calls it before the pool family's solve_num_pages):
         materialize every layer's bmm-ready kv_b split and free the checkpoint-layout

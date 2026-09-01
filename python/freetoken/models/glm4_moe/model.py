@@ -71,6 +71,12 @@ class Glm4MoeForCausalLM(BaseLLMModel):
         )
         super().__init__()
 
+    def _iter_offload_moe_layers(self):
+        """Expose routed experts only; shared experts stay dense and resident."""
+        from freetoken.models.glm_moe import iter_glm_offload_moe_layers
+
+        yield from iter_glm_offload_moe_layers(self)
+
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
         return self.lm_head.forward(output)
