@@ -518,3 +518,27 @@ Timing mode costs ~10% (event syncs): diagnostic only.
 
 PROGRAM CLOSED. Every identified software lever on this hardware is now
 implemented, measured, or bounded with a documented reason.
+
+## Hardware predictions, revised by the software program
+
+The program changed the hardware ranking, not just the numbers:
+
+- **+64GB RAM (128 total): downgraded from "obvious" to "nice".** The old
+  case was 9.3 -> ~36 x1 (4x). Software closed most of it: 23.1 -> ~36 is
+  now +55%, and the all-pinned config no longer gets exclusive credit for
+  GPU-computing hot routes - we already do that for 72% of them.
+- **EPYC 8-channel: thesis weakened for this model class.** Its case was
+  "aggregate is DDR-bound, buy channels"; expert-granular residency broke
+  that ceiling by migrating the Zipf head to the GPU tier instead. The
+  8-channel build retreats to true capacity plays: models whose COLD TAIL
+  alone overwhelms 2-channel bandwidth.
+- **RTX PRO 6000 96GB: thesis strengthened.** GPU compute of hot routes
+  is where throughput lives; 96GB holds the entire hot working set,
+  GPU-fetch (measured negative <48GB, kept for exactly this) becomes the
+  cold-tail path, and the GDN-state concurrency cap (the x16 wall) lifts
+  with VRAM. Every shipped mechanism compounds with this card.
+- **DSV4-class bigger models: the registered 2-6 tok/s "unusable"
+  prediction is now stale-pessimistic.** It assumed layer-granular spill
+  with CPU decode dominating; hot-expert pinning + online adaptation
+  change that math IF their routing is also Zipf. Re-register a
+  prediction before testing. (Tier still verified on qwen4_exp only.)
