@@ -1383,6 +1383,9 @@ class PrefillGatherTable:
         self._gather_rows = 0
         self._gather_ns = 0
         self._fallbacks = 0
+        self._failure_logged = False
+        if enabled:
+            self._allocate(table)
 
     def degrade_prefill(self, reason: str) -> None:
         """Clear staged state and select the direct backend for the current chunk."""
@@ -1393,9 +1396,6 @@ class PrefillGatherTable:
     def cancel_prefill(self) -> None:
         """Discard a stale prepared chunk before a non-prefill forward."""
         self._pending = None
-        self._failure_logged = False
-        if enabled:
-            self._allocate(table)
 
     def _allocate(self, table) -> None:
         data = table.banks[0].tensor
