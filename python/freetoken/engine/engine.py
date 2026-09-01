@@ -1203,6 +1203,11 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
+        if args.has_guided:
+            # XGrammar advances on host token ids. This synchronization is deliberately
+            # confined to constrained batches; ordinary overlap scheduling is unchanged.
+            copy_done_event.synchronize()
+            batch.mask_us = self.sampler.finish_guided(batch, args, next_tokens_cpu)
         # Decode host hooks can run before overlap scheduling drains append_host(). Keep the
         # sampled token and its readiness fence on each request until a newer sample replaces it.
         if getattr(batch, "mtp_verify", False):

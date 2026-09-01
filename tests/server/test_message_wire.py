@@ -148,3 +148,19 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
         assert isinstance(out, TokenizeMsg)
         assert out.chat_template_kwargs == payload
         assert out.tools[0]["function"]["parameters"] == payload
+
+
+def test_guided_decoding_schema_survives_sampling_params_wire_roundtrip():
+    schema = {
+        "kind": "json_schema",
+        "schema": {
+            "type": "object",
+            "properties": {"__type__": {"type": "string"}},
+        },
+        "strict": True,
+    }
+    msg = TokenizeMsg(uid=9, text="json", sampling_params=SamplingParams(guided_decoding=schema))
+
+    out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+
+    assert out.sampling_params.guided_decoding == schema

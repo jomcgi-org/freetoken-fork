@@ -17,6 +17,7 @@ class Function(BaseModel):
     name: str
     description: str | None = None
     parameters: dict[str, Any] | None = None
+    strict: bool | None = None
 
 
 class Tool(BaseModel):

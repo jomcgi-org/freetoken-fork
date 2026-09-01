@@ -50,6 +50,7 @@ checkpoint is set:
 | `FREETOKEN_AIME_MIN_FREE_GIB` | `e2e/test_aime.py` — required free GPU memory (default `70`) |
 | `FREETOKEN_TEST_MOE_CACHE_SIZE` | `e2e/test_aime.py` — >0 switches to the offload MoE backend with this cache size |
 | `FREETOKEN_TEST_MEM_RATIO` | `e2e/test_aime.py` — offload-mode memory_ratio (default `0.9`) |
+| `FREETOKEN_GUIDED_TEST_MODEL` | `e2e/test_guided_json.py`: small local model for CUDA JSON generation |
 | `FREETOKEN_REBUILD_TEST_MODEL` | `e2e/test_cache_rebuild.py` — a SMALL local model dir; boots a real server (falls back to `FREETOKEN_TEST_MODEL`) |
 | `FREETOKEN_GEMMA4_GGUF_GLOB` | `models/test_gemma4_gguf_rope.py` — glob matching a local gemma-4 GGUF file |
 

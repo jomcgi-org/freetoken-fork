@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
 from freetoken.utils import is_sm90_supported, nvtx_annotate
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
+    from freetoken.guided import GuidedBatch, XGrammarDecoder
 
 
 @dataclass
@@ -15,6 +16,8 @@ class BatchSamplingArgs:
     temperatures: torch.Tensor | None
     top_k: torch.Tensor | None = None
     top_p: torch.Tensor | None = None
+    guided: "GuidedBatch | None" = None
+    has_guided: bool = False
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -55,10 +58,46 @@ class Sampler:
     device: torch.device
     vocab_size: int
 
+    def __post_init__(self) -> None:
+        self._guided_tokenizer: Any | None = None
+        self._guided_decoder: "XGrammarDecoder | None" = None
+
+    def set_guided_tokenizer(self, tokenizer: Any) -> None:
+        # Store only. XGrammar remains completely unloaded until a constrained request.
+        self._guided_tokenizer = tokenizer
+
+    def _get_guided_decoder(self):
+        if self._guided_decoder is None:
+            if self._guided_tokenizer is None:
+                raise RuntimeError("guided decoding tokenizer was not initialized")
+            from freetoken.guided import XGrammarDecoder
+
+            self._guided_decoder = XGrammarDecoder(self._guided_tokenizer, self.vocab_size)
+        return self._guided_decoder
+
+    def validate_guided(self, spec: dict[str, Any]) -> None:
+        # Compiles into the persistent compiler cache before admission. A bad client
+        # schema becomes a request error instead of killing the scheduler during forward.
+        self._get_guided_decoder().create_state(spec)
+
+    def _prepare_guided(self, batch: Batch):
+        has_guided = any(
+            r.can_decode and r.sampling_params.guided_decoding is not None
+            for r in batch.reqs
+        )
+        if not has_guided:
+            return None, 0, False
+        guided, created = self._get_guided_decoder().prepare(batch.reqs)
+        return guided, created, True
+
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
+        guided, created, has_guided = self._prepare_guided(batch)
+        batch.constrained_requests = created
         if all(p.is_greedy for p in params):
-            return BatchSamplingArgs(temperatures=None)
+            return BatchSamplingArgs(
+                temperatures=None, guided=guided, has_guided=has_guided
+            )
 
         MIN_P = MIN_T = 1e-6
         ts = [max(0.0 if p.is_greedy else p.temperature, MIN_T) for p in params]
@@ -70,11 +109,31 @@ class Sampler:
             top_k = make_device_tensor(top_ks, torch.int32, self.device)
         if any(p < 1.0 for p in top_ps):
             top_p = make_device_tensor(top_ps, torch.float32, self.device)
-        return BatchSamplingArgs(temperatures, top_k=top_k, top_p=top_p)
+        return BatchSamplingArgs(
+            temperatures, top_k=top_k, top_p=top_p,
+            guided=guided, has_guided=has_guided,
+        )
 
     @nvtx_annotate("Sampler")
     def sample(self, logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         with torch.cuda.nvtx.range("Sampler"):
+            if args.guided is not None:
+                assert self._guided_decoder is not None
+                self._guided_decoder.apply_mask(logits, args.guided)
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+
+    def finish_guided(
+        self, batch: Batch, args: BatchSamplingArgs, next_tokens_cpu: torch.Tensor
+    ) -> float:
+        if args.guided is None:
+            # A delayed response grammar can have no active rows yet. It still must
+            # observe unrestricted reasoning tokens to find its activation marker.
+            if self._guided_decoder is not None:
+                self._guided_decoder.observe_dormant(batch.reqs, next_tokens_cpu)
+            return 0.0
+        assert self._guided_decoder is not None
+        self._guided_decoder.accept_tokens(args.guided, next_tokens_cpu)
+        self._guided_decoder.observe_dormant(batch.reqs, next_tokens_cpu)
+        return args.guided.elapsed_us()

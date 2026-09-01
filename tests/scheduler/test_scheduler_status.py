@@ -233,6 +233,35 @@ def test_decode_line_omits_moe_step_timing_when_disabled():
     assert "cpu_head_us" not in logs[-1]
 
 
+def test_guided_decoding_stats_accumulate_and_reset_per_interval():
+    rep, logs, clock = _reporter(interval=2)
+    prefill = _prefill_batch(new_tokens=10, cached_tokens=0, n_seqs=1)
+    prefill.constrained_requests = 1
+    prefill.mask_us = 25.0
+    rep.report_batch(prefill, running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=2, page_size=1)
+    first = _decode_batch(1)
+    first.mask_us = 10.0
+    second = _decode_batch(1)
+    second.mask_us = 15.0
+    clock["t"] = 1.0
+    rep.report_batch(first, running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=2, page_size=1)
+    clock["t"] = 2.0
+    rep.report_batch(second, running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=2, page_size=1)
+
+    assert "constrained_requests: 1, mask_us: 50" in logs[-1]
+
+    clock["t"] = 3.0
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=2, page_size=1)
+    clock["t"] = 4.0
+    rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
+                     kv_used_pages=1, kv_total_pages=2, page_size=1)
+    assert "constrained_requests: 0, mask_us: 0" in logs[-1]
+
+
 def test_interval_is_clamped_to_at_least_one():
     rep, _, _ = _reporter(interval=0)
     assert rep.decode_log_interval == 1
