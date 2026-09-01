@@ -445,6 +445,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-disk-cache-dir",
+        type=str,
+        default=ServerArgs.kv_disk_cache_dir,
+        help="Directory for crash-safe whole-prefix QSA/GDN state entries.",
+    )
+
+    parser.add_argument(
+        "--kv-disk-cache-gib",
+        type=float,
+        default=ServerArgs.kv_disk_cache_gib,
+        help="Disk prefix-cache byte budget in GiB (default: 0, disabled).",
+    )
+
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,

@@ -161,6 +161,68 @@ def test_chunk_and_recurrent_rules_agree():
     )
 
 
+def test_disk_restored_state_has_bit_identical_greedy_continuation(tmp_path):
+    """An actual GDN decode from disk-restored state must equal the warm-state decode exactly."""
+    from types import SimpleNamespace
+
+    from freetoken.kvcache.disk_prefix_cache import (
+        DiskPrefixStore,
+        capture_hybrid_prefix_tensors,
+        restore_hybrid_prefix_tensors,
+        stage_tensors_for_write,
+    )
+
+    op, _ = _make_layer(3, seed=29)
+    ctx = _ctx(3)
+    _, reqs, _ = _prefill(op, ctx, [128], seed=31)
+    req = reqs[0]
+    kv = SimpleNamespace(
+        _kv_buffer=torch.randn(2, 1, 2, 64, 1, 1, device=DEV, dtype=torch.bfloat16),
+        _pending_ring=torch.randn(3, 1, 8, device=DEV, dtype=torch.bfloat16),
+        device=DEV,
+    )
+    locations = torch.arange(128, dtype=torch.int32, device=DEV)
+    tensors = capture_hybrid_prefix_tensors(
+        kv,
+        ctx.linear_state_pool,
+        kv_indices=locations,
+        linear_slot=req.table_idx,
+        table_idx=req.table_idx,
+    )
+    staged, ready = stage_tensors_for_write(tensors, DEV)
+    ids = torch.arange(128, dtype=torch.int32)
+    store = DiskPrefixStore(tmp_path, 1 << 28, identity="cuda-gdn-parity")
+    assert store.enqueue(ids, staged, ready=ready)
+    store.flush()
+    entry = store.lookup_longest(ids)
+    assert entry is not None
+
+    next_hidden = torch.randn(1, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    warm = _decode(op, ctx, [req], next_hidden)
+
+    restored_slot = 2
+    restore_hybrid_prefix_tensors(
+        kv,
+        ctx.linear_state_pool,
+        entry.tensors,
+        kv_indices=locations,
+        linear_slot=restored_slot,
+    )
+    restored_req = Req(
+        input_ids=ids,
+        table_idx=restored_slot,
+        cached_len=0,
+        output_len=1,
+        uid=2,
+        sampling_params=SamplingParams(),
+        cache_handle=None,
+    )
+    restored = _decode(op, ctx, [restored_req], next_hidden)
+    assert torch.equal(warm, restored)
+    assert torch.equal(warm.argmax(dim=-1), restored.argmax(dim=-1))
+    store.close()
+
+
 def test_output_gate_comes_from_the_config():
     """The gate activation is the group config's string, not a hardcoded silu. Both gates track
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""

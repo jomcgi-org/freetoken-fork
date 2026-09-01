@@ -16,7 +16,7 @@ from __future__ import annotations
 import heapq
 import time
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -71,6 +71,7 @@ class HybridRadixCache:
         self.full_protected = 0
         self.mamba_evictable = 0     # number of live, unlocked snapshots
         self.mamba_protected = 0
+        self.on_evict: Callable[[torch.Tensor, torch.Tensor, int], None] | None = None
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
@@ -212,6 +213,10 @@ class HybridRadixCache:
     # ---------------------------------------------------------------- helpers
     def _free_node_mamba(self, node: RadixTreeNode, out: List[int]) -> None:
         if node.mamba_value is not None:
+            if self.on_evict is not None:
+                self.on_evict(
+                    self._collect_ids(node), self._collect_kv(node), node.mamba_value
+                )
             out.append(node.mamba_value)
             node.mamba_value = None
             if node.mamba_ref_count == 0:
@@ -251,6 +256,15 @@ class HybridRadixCache:
             n = n.parent
         vals.reverse()
         return torch.cat(vals) if vals else self.empty
+
+    def _collect_ids(self, node: RadixTreeNode) -> torch.Tensor:
+        keys: List[torch.Tensor] = []
+        n = node
+        while not n.is_root():
+            keys.append(n._key)
+            n = n.parent
+        keys.reverse()
+        return torch.cat(keys) if keys else self.empty
 
     def _leaves(self) -> List[RadixTreeNode]:
         out, stack = [], [self.root]

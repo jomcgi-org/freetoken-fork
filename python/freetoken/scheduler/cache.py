@@ -31,7 +31,8 @@ _SWA_RETAIN_GAP = 16
 
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
-                 linear_state_pool=None, swa_pool=None, sliding_window_size=None):
+                 linear_state_pool=None, swa_pool=None, sliding_window_size=None,
+                 kv_cache=None, disk_prefix_store=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -43,6 +44,8 @@ class CacheManager:
         self.linear_state_pool = linear_state_pool
         self.swa_pool = swa_pool
         self.sliding_window_size = sliding_window_size
+        self.kv_cache = kv_cache
+        self.disk_prefix_store = disk_prefix_store
         self.is_hybrid = type == "hybrid_radix"
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
@@ -56,6 +59,8 @@ class CacheManager:
         if swa_pool is not None:
             self.prefill_chunk_budget = getattr(swa_pool, "prefill_chunk_budget", None)
         self.prefix_cache = self._make_prefix_cache(device, page_size, type)
+        if self.is_hybrid and self.disk_prefix_store is not None:
+            self.prefix_cache.on_evict = self._queue_disk_node
         self.device = device
         self.num_pages = num_pages
         self.page_table = page_table
@@ -104,9 +109,133 @@ class CacheManager:
         if self.is_hybrid:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
+            qsa_pending = None
+            if self.disk_prefix_store is not None and ids.numel() > m.cached_len:
+                entry = self.disk_prefix_store.lookup_longest(
+                    ids, longer_than=m.cached_len, record=False
+                )
+                if entry is not None:
+                    restored = self._restore_disk_prefix(ids, m, entry)
+                    if restored is not None:
+                        m, qsa_pending = restored
             return MatchResult(
-                HybridCacheHandle(m.cached_len, m.node, m.kv_indices), mamba_value=m.mamba_value)
+                HybridCacheHandle(m.cached_len, m.node, m.kv_indices),
+                mamba_value=m.mamba_value,
+                qsa_pending=qsa_pending,
+            )
         return self.prefix_cache.match_prefix(ids)
+
+    def _restore_disk_prefix(self, ids, old_match, entry):
+        """Allocate pool ownership, install a disk entry, then publish its radix node."""
+        import time
+
+        from freetoken.kvcache.disk_prefix_cache import restore_hybrid_prefix_tensors
+
+        started = time.perf_counter()
+        length = entry.length
+        if length % self.page_size or length <= old_match.cached_len:
+            self.disk_prefix_store.invalidate(entry.path)
+            return None
+        old_handle = type("DiskRestoreHandle", (), {
+            "node": old_match.node,
+            "cached_len": old_match.cached_len,
+        })()
+        self.prefix_cache.inc_lock(old_handle.node)
+        allocated = self.empty_indices()
+        slot = None
+        try:
+            needed = length - old_match.cached_len
+            if needed > self.available_size:
+                return None
+            self.ensure_mamba_slots(1)
+            if self.linear_state_pool.num_free_slots < 1:
+                return None
+            slot = self.linear_state_pool.alloc(1)[0]
+            allocated = self._page_to_token(self._allocate(needed // self.page_size))
+            kv_indices = torch.cat((old_match.kv_indices, allocated))
+            qsa_pending = restore_hybrid_prefix_tensors(
+                self.kv_cache,
+                self.linear_state_pool,
+                entry.tensors,
+                kv_indices=kv_indices,
+                linear_slot=slot,
+            )
+            prefix_len, mamba_exist = self.prefix_cache.insert(
+                ids[:length], kv_indices, slot
+            )
+            self._free(kv_indices[old_match.cached_len:prefix_len])
+            if mamba_exist:
+                self.linear_state_pool.free(slot)
+                slot = None
+            match = self.prefix_cache.match_prefix(ids[:length])
+            self.disk_prefix_store.record_restore(
+                entry, length - old_match.cached_len
+            )
+            self.disk_prefix_store.note_restore_install(
+                (time.perf_counter() - started) * 1000.0
+            )
+            return match, qsa_pending
+        except Exception:
+            self.disk_prefix_store.invalidate(entry.path)
+            if slot is not None:
+                self.linear_state_pool.free(slot)
+            if allocated.numel():
+                self._free(allocated)
+            return None
+        finally:
+            self.prefix_cache.dec_lock(old_handle.node)
+
+    def empty_indices(self) -> torch.Tensor:
+        return torch.empty(0, dtype=torch.int32, device=self.device)
+
+    def _queue_disk_prefix(
+        self, req: Req, length: int, kv_indices: torch.Tensor, linear_slot: int
+    ) -> None:
+        store = self.disk_prefix_store
+        if store is None or length <= 0:
+            return
+        if not store.can_enqueue():
+            store.note_write_drop()
+            return
+        from freetoken.kvcache.disk_prefix_cache import (
+            stage_hybrid_prefix_for_write,
+        )
+
+        try:
+            staged, ready = stage_hybrid_prefix_for_write(
+                self.kv_cache,
+                self.linear_state_pool,
+                kv_indices=kv_indices[:length],
+                linear_slot=linear_slot,
+                table_idx=req.table_idx,
+            )
+            store.enqueue(req.input_ids[:length], staged, ready=ready)
+        except Exception:
+            store.note_write_drop()
+
+    def _queue_disk_node(
+        self, token_ids: torch.Tensor, kv_indices: torch.Tensor, linear_slot: int
+    ) -> None:
+        """Retry persistence at the final eviction seam if an earlier queued write was lost."""
+        store = self.disk_prefix_store
+        if store is None or store.contains(token_ids):
+            return
+        if not store.can_enqueue():
+            store.note_write_drop()
+            return
+        from freetoken.kvcache.disk_prefix_cache import stage_hybrid_prefix_for_write
+
+        try:
+            staged, ready = stage_hybrid_prefix_for_write(
+                self.kv_cache,
+                self.linear_state_pool,
+                kv_indices=kv_indices,
+                linear_slot=linear_slot,
+                table_idx=None,
+            )
+            store.enqueue(token_ids, staged, ready=ready)
+        except Exception:
+            store.note_write_drop()
 
     @property
     def available_size(self) -> int:
@@ -393,6 +522,7 @@ class CacheManager:
             ):
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
+                self._queue_disk_prefix(req, L, page_indices, frozen)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:L], page_indices[:L], frozen)
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
@@ -407,6 +537,7 @@ class CacheManager:
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
+                self._queue_disk_prefix(req, insert_len, page_indices, req.linear_slot_idx)
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
@@ -430,6 +561,7 @@ class CacheManager:
             return
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
+        self._queue_disk_prefix(req, L, page_indices, frozen)
         prefix_len, mamba_exist = self.prefix_cache.insert(
             req.input_ids[:L], page_indices[:L], frozen)
         self.unlock(old_handle)
@@ -608,6 +740,8 @@ class CacheManager:
         self.page_table = page_table
         self.free_slots = torch.arange(num_pages, dtype=torch.int32, device=device) * self.page_size
         self.prefix_cache = self._make_prefix_cache(device, self.page_size, self.cache_type)
+        if self.is_hybrid and self.disk_prefix_store is not None:
+            self.prefix_cache.on_evict = self._queue_disk_node
         # The discarded hybrid tree owned donated GDN-snapshot slots; rebuild is idle-only, so
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:

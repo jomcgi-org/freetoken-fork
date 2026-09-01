@@ -194,6 +194,9 @@ class MatchResult(NamedTuple):
     # Hybrid (GDN) models: the restored GDN state snapshot slot for this prefix (None = cold /
     # non-hybrid). Surfaced by HybridRadixCache via CacheManager.match_req.
     mamba_value: int | None = None
+    # Disk-restored QSA carry state is table-local, unlike the donated GDN slot. Admission
+    # installs it after assigning the new request's table row.
+    qsa_pending: torch.Tensor | None = None
     # TODO: support HiCache
 
 

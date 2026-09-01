@@ -66,6 +66,33 @@ class Scheduler(SchedulerIOMixin):
 
         self.engine = Engine(config)
 
+        self.disk_prefix_store = None
+        if config.kv_disk_cache_gib > 0:
+            if config.cache_type != "hybrid_radix":
+                logger.warning_rank0(
+                    "Disk prefix cache is enabled but this model is not using hybrid_radix; "
+                    "the disk prefix lane is disabled"
+                )
+            else:
+                from freetoken.kvcache.disk_prefix_cache import (
+                    DiskPrefixStore,
+                    model_cache_identity,
+                )
+
+                identity, checkpoint_fingerprint, config_hash = model_cache_identity(config)
+                self.disk_prefix_store = DiskPrefixStore(
+                    config.kv_disk_cache_dir,
+                    int(config.kv_disk_cache_gib * (1 << 30)),
+                    identity=identity,
+                    checkpoint_fingerprint=checkpoint_fingerprint,
+                    config_hash=config_hash,
+                )
+                logger.info_rank0(
+                    f"Disk prefix cache enabled at {config.kv_disk_cache_dir!r}, "
+                    f"budget={config.kv_disk_cache_gib:.2f} GiB, "
+                    f"fingerprint={checkpoint_fingerprint}, config={config_hash[:12]}"
+                )
+
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
         self.stream = torch.cuda.Stream(device=self.device)
@@ -84,6 +111,8 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type,
             linear_state_pool=self.engine.linear_state_pool,
             swa_pool=self.engine.kv_cache,
+            kv_cache=self.engine.kv_cache,
+            disk_prefix_store=self.disk_prefix_store,
             sliding_window_size=next(
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
@@ -199,6 +228,7 @@ class Scheduler(SchedulerIOMixin):
         self.status_reporter = SchedulerStatusReporter(
             log=_status_log,
             decode_log_interval=config.decode_log_interval,
+            disk_prefix_store=self.disk_prefix_store,
         )
 
         # Initialize the I/O mixin
@@ -360,6 +390,8 @@ class Scheduler(SchedulerIOMixin):
     def shutdown(self) -> None:
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
+        if self.disk_prefix_store is not None:
+            self.disk_prefix_store.close(wait=True)
         self.engine.shutdown()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
@@ -690,6 +722,13 @@ class Scheduler(SchedulerIOMixin):
             if req.mamba_restore_src is not None:
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
+            if req.qsa_restore_pending is not None:
+                pending = getattr(self.engine.kv_cache, "_pending_ring", None)
+                if pending is not None:
+                    pending[req.table_idx].copy_(
+                        req.qsa_restore_pending.to(device=pending.device)
+                    )
+                req.qsa_restore_pending = None
 
     def _free_req_resources(self, req: Req) -> None:
         # Idempotent: an EOS-finished request can stay in running_reqs (output budget left), so an
