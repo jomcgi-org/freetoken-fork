@@ -150,3 +150,40 @@ def test_batched_prefill_carries_each_new_prompt_admission():
     batch = pm.schedule_next_batch(16)
     assert batch is not None
     assert batch.prompt_admissions == [(1, 3, 0), (2, 5, 0)]
+
+
+def test_higher_priority_request_wins_at_chunk_boundary():
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    pm.clock = lambda: 2.0
+    low = PendingReq(
+        uid=1,
+        input_ids=torch.arange(3 * CHUNK, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=4),
+        priority=0,
+        arrival_time=0.0,
+    )
+    pm.pending_list = [low]
+
+    first = pm.schedule_next_batch(CHUNK)
+    assert first is not None and first.reqs[0].uid == low.uid
+    assert low.chunked_req is not None
+    cm.allocate_paged(first.reqs)
+    for req in first.reqs:
+        req.complete_one()
+
+    high = PendingReq(
+        uid=2,
+        input_ids=torch.arange(CHUNK, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=2),
+        priority=5,
+        arrival_time=1.0,
+    )
+    pm.pending_list.append(high)
+
+    second = pm.schedule_next_batch(CHUNK)
+    assert second is not None
+    assert [req.uid for req in second.reqs] == [high.uid]
+    assert low in pm.pending_list

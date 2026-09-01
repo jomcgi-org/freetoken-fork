@@ -145,6 +145,21 @@ def test_chat_request_accepts_tool_messages_and_assistant_tool_calls():
     assert req.messages[0].tool_calls[0].function.arguments == '{"city":"Paris"}'
 
 
+def test_chat_priority_body_and_header_reach_tokenizer_message():
+    assert chat_request_to_genspec(chat_request(priority=4), {}).priority == 4
+
+    state = FakeState([UserReply(uid=42, incremental_output="ok", finished=True)])
+    request = SimpleNamespace(headers={"x-request-priority": "9"})
+    run(
+        handle_chat_completion(
+            chat_request(priority=4), request=request, state=state, model_sampling={}
+        )
+    )
+
+    assert state.sent is not None
+    assert state.sent.priority == 9
+
+
 def test_chat_request_reasoning_replay_field_aliases():
     # Any replay field name in -> both template-read field names out.
     for field in ("reasoning_content", "reasoning", "thinking"):

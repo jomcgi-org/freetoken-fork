@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Callable, List, Tuple
 
 import torch
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
-from .utils import PendingReq
+from .utils import PendingReq, order_pending_requests, priority_queue_stats
 
 if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle
@@ -242,15 +243,35 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    priority_aging_seconds: float = 30.0
+    clock: Callable[[], float] = time.monotonic
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(
-            PendingReq(req.uid, req.input_ids, req.sampling_params, mm_embeds=req.mm_embeds)
+            PendingReq(
+                req.uid,
+                req.input_ids,
+                req.sampling_params,
+                mm_embeds=req.mm_embeds,
+                priority=req.priority,
+                arrival_time=req.arrival_time,
+            )
         )
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
+
+        # Chunk continuations remain PendingReqs, so this re-ranking happens at every
+        # forward boundary. A newly arrived higher-priority prompt can therefore take the
+        # next admission slot before a low-priority continuation. Once a final prefill moves
+        # into DecodeManager it is running and v1 does not preempt it; prefill/decode mixing
+        # is the extension seam for any future running-request preemption policy.
+        pending_list = order_pending_requests(
+            self.pending_list,
+            now=self.clock(),
+            aging_seconds=self.priority_aging_seconds,
+        )
 
         # estimated offset due to in-flight decode
         adder = PrefillAdder(
@@ -267,7 +288,7 @@ class PrefillManager:
         # once at admission, so continuation chunks (already-chunked reqs) contribute 0.
         log_new_tokens = 0
         log_cached_tokens = 0
-        for pending_req in self.pending_list:
+        for pending_req in pending_list:
             is_continuation = pending_req.chunked_req is not None
             if req := adder.try_add_one(pending_req):
                 pending_req.chunked_req = None
@@ -289,7 +310,7 @@ class PrefillManager:
                 break  # We cannot add more requests
         if len(reqs) == 0:
             return None
-        self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+        self.pending_list = chunked_list + pending_list[len(reqs) :]
         batch = Batch(reqs=reqs, phase="prefill")
         batch.log_new_tokens = log_new_tokens
         batch.log_cached_tokens = log_cached_tokens
@@ -302,6 +323,9 @@ class PrefillManager:
                 self.pending_list.pop(i)
                 return req.chunked_req
         return None
+
+    def queue_stats(self) -> tuple[dict[str, int], float]:
+        return priority_queue_stats(self.pending_list, now=self.clock())
 
     @property
     def runnable(self) -> bool:

@@ -47,6 +47,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+| `--priority-aging-seconds` | 30 | Waiting seconds per effective priority point; `0` disables aging |
 
 ### Choosing a GPU
 

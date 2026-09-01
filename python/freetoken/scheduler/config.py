@@ -18,6 +18,8 @@ class SchedulerConfig(EngineConfig):
     offline_mode: bool = False
     decode_log_interval: int = 40
     special_token_ckpt: bool = False
+    # Waiting requests gain one effective-priority point per interval. 0 disables aging.
+    priority_aging_seconds: float = 30.0
 
     # networking config
     _unique_suffix: str = field(default_factory=_get_pid_suffix)

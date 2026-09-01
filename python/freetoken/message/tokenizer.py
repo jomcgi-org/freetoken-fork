@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from freetoken.core import SamplingParams
@@ -72,6 +73,10 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    # OpenAI-compatible request extension. The timestamp is captured before tokenizer
+    # work so multiple workers cannot accidentally turn tokenizer latency into arrival order.
+    priority: int = 0
+    arrival_time: float = field(default_factory=time.monotonic)
 
 
 @dataclass

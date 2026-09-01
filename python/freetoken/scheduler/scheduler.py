@@ -91,7 +91,10 @@ class Scheduler(SchedulerIOMixin):
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            priority_aging_seconds=config.priority_aging_seconds,
         )
 
         # some alias for easy access
@@ -481,6 +484,7 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+        queue_priority_bands, max_wait_seconds = self.prefill_manager.queue_stats()
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -490,6 +494,8 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
+            queue_priority_bands=queue_priority_bands,
+            max_wait_seconds=max_wait_seconds,
         )
         self.send_result(reply)
 

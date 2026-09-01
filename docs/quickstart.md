@@ -39,6 +39,19 @@ FreeToken serves the OpenAI API (`/v1/chat/completions`, `/v1/responses`,
 `/v1/messages/count_tokens`), so a client library for either works by pointing
 its base URL at the server. 
 
+### Request priority
+
+OpenAI-compatible requests may include an integer `priority` field, or send the
+`x-request-priority` HTTP header. Higher values are admitted first and the header
+wins when both are present. Requests default to priority 0.
+
+Waiting time adds one effective priority point every 30 seconds. Configure the
+interval with `--priority-aging-seconds`; set it to 0 to disable aging. Priority
+only orders waiting prompt admission. It does not preempt an in-flight forward or
+a request already running in decode. A chunked prompt returns to the waiting queue
+between chunks, so a higher-priority request can win at that boundary. Running
+request preemption would require the future prefill-decode mixing seam.
+
 ## Chat in the terminal
 
 A simple TUI to interact with the server:
