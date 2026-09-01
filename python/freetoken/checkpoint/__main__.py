@@ -43,18 +43,22 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
         help="resident MTP routed-expert precision (default: bf16)",
     )
     p.add_argument("--gpu", type=single_gpu_arg, default=None,
-                   help="GPU for the repack: a GPU UUID (GPU-xxxx..., as nvidia-smi -L prints) or "
-                        "an nvidia-smi index (default: the first visible GPU)")
+                   help="optional GPU for the hardware-specific NVFP4 repack: a GPU UUID "
+                        "(GPU-xxxx..., as nvidia-smi -L prints) or an nvidia-smi index "
+                        "(default: CPU, preserving the native NVFP4 layout)")
     ns = p.parse_args(argv)
     if ns.speculative_mtp == "off" and ns.mtp_quant != "bf16":
         p.error("--mtp-quant nvfp4 requires --speculative-mtp on")
 
-    # same as ft serve --gpu: resolve, then bind by UUID at CUDA init
-    try:
-        assign_gpu(ns.gpu)
-        device = f"cuda:{bind_assigned_gpu().index}"
-    except (ValueError, RuntimeError) as e:
-        p.error(str(e))
+    device = "cpu"
+    if ns.gpu is not None:
+        # Same as ft serve --gpu: resolve, then bind by UUID at CUDA init. With no
+        # --gpu the converter remains CPU-only and writes checkpoint-native NVFP4 banks.
+        try:
+            assign_gpu(ns.gpu)
+            device = f"cuda:{bind_assigned_gpu().index}"
+        except (ValueError, RuntimeError) as e:
+            p.error(str(e))
 
     shard_limit = int(ns.shard_gib * (1 << 30))
     shard_limit -= shard_limit % 4096  # keep aligned

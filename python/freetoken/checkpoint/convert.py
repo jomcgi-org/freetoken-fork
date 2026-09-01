@@ -136,6 +136,7 @@ class _ConvertSink:
         self._seen: set[int] = set()
         self.n_written = 0
         self.n_bytes = 0
+        self.max_layer_bytes = 0
 
     def __call__(self, layer_id: int, banks: dict) -> None:
         with self._lock:
@@ -154,6 +155,7 @@ class _ConvertSink:
                 bank.release()
                 self.n_written += 1
             self.n_bytes += nbytes
+            self.max_layer_bytes = max(self.max_layer_bytes, nbytes)
             self._bar.update(nbytes)
             # Cumulative BYTES (not the bank count): the supervisor maps this against the
             # known expert-pool size for a smooth phase-budgeted bar. Total stays 0 (unknown
@@ -228,6 +230,7 @@ def convert_checkpoint(
     device: str | None = None,
     include_mtp: bool = False,
     mtp_quant: str = "bf16",
+    nvfp4_backend: str | None = None,
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -254,13 +257,23 @@ def convert_checkpoint(
             f"FTW conversion runs single-process and the format records no TP layout, "
             f"but TP is already set to size={tp.size}"
         )
-    dev = torch.device(device or "cuda:0")
-    torch.cuda.set_device(dev)
-    torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
+    dev = torch.device(device or "cpu")
+    if dev.type not in ("cpu", "cuda"):
+        raise ValueError(f"FTW conversion device must be CPU or CUDA, got {dev}")
+    if dev.type == "cuda":
+        torch.cuda.set_device(dev)
+        # Initialize the context before backend selection and the first per-layer repack.
+        torch.zeros(1, device=dev)
 
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
                        dtype=dtype, moe_backend=moe_backend)
     mc = cfg.model_config
+    if getattr(mc, "expert_quant", None) == "nvfp4":
+        # A CPU conversion keeps the checkpoint-native six-bank layout, which is portable
+        # and byte-exact. A selected GPU enables the hardware-specific tiled repack. The
+        # repackers only rearrange/fold source NVFP4 buffers and never dequantize weights.
+        backend = nvfp4_backend or ("auto" if dev.type == "cuda" else "triton")
+        object.__setattr__(mc, "nvfp4_backend", backend)
     offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
 
@@ -301,20 +314,39 @@ def convert_checkpoint(
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
     num_layers = None
+    max_bank_layer_bytes = 0
+    expert_bank_geometry = None
     if offload:
-        # Streamable formats (bf16, ds_fp4, nvfp4 on the triton backend, gpt-oss mxfp4, q4_0,
-        # qwen3_5 fp8/bf16-dequant) write each layer to its own FTW entry as it completes (via
-        # the sink) instead of materializing the whole bank set first; the non-streamable ones
-        # (nvfp4 marlin/b12x -- repack mutates the whole bank set in place after load) ignore
-        # the sink. Which happened is per-provider (e.g. nvfp4's backend pick), so it's read
-        # back from ExpertBanks.streamed, not guessed here.
+        geometry_layers = getattr(mc, "num_moe_layers", None)
+        if geometry_layers is None:
+            geometry_layers = int(getattr(mc, "num_layers")) - int(
+                getattr(mc, "first_k_dense_replace", 0)
+            )
+        expert_bank_geometry = {
+            "num_layers": int(geometry_layers),
+            "num_experts": int(getattr(mc, "num_experts", 0)),
+            "hidden_size": int(getattr(mc, "hidden_size", 0)),
+            "moe_intermediate_size": int(getattr(mc, "moe_intermediate_size", 0)),
+        }
+        if any(value <= 0 for value in expert_bank_geometry.values()):
+            raise ValueError(f"invalid expert-bank geometry: {expert_bank_geometry}")
+        # Streamable formats write each layer to its own FTW entry as it completes instead
+        # of materializing the whole bank set. Native NVFP4 streams directly; marlin/b12x
+        # repack one completed layer before forwarding it. Providers that cannot stream
+        # ignore the sink, so the actual behavior comes from ExpertBanks.streamed.
         sink = _ConvertSink(writer)
-        banks = load_expert_banks(model_path, mc, device=dev, dtype=dtype, layer_sink=sink)
+        # Conversion favors the serial safetensors reader deliberately. Its mmap input and
+        # per-layer sink keep resident memory to one expert layer, while the parallel reader
+        # holds whole-shard anonymous prefetch buffers that are unsuitable for a 229 GB source.
+        banks = load_expert_banks(
+            model_path, mc, device=dev, dtype=dtype, parallel=False, layer_sink=sink
+        )
         quant_format = banks.quant_format
         if banks.streamed:
             sink.close()
             num_layers = sink.num_layers  # however many distinct layers the sink actually saw
             n_bank = sink.n_written
+            max_bank_layer_bytes = sink.max_layer_bytes
             assert num_layers > 0, (
                 "provider reported streamed=True but the sink never fired -- the FTW "
                 "would silently have no expert banks"
@@ -343,6 +375,11 @@ def convert_checkpoint(
                 if getattr(banks, an, None) is not None:
                     items.append((an, getattr(banks, an)))
             total_bytes = sum(t.numel() * t.element_size() for _, t in items)
+            max_bank_layer_bytes = sum(
+                tensor.numel() * tensor.element_size() // num_layers
+                for name, tensor in items
+                if name not in ("gate_up_alpha", "down_alpha")
+            )
             bar = byte_bar(total_bytes, "Converting expert banks")
             done_bytes = 0
             _progress("experts", 0, total_bytes)
@@ -379,6 +416,11 @@ def convert_checkpoint(
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.
         "expert_bank_num_layers": num_layers,
+        "expert_bank_geometry": expert_bank_geometry,
+        # Largest completed layer handed to the writer. For streamed GLM NVFP4 this is
+        # the expert-bank resident-data bound, excluding one current source tensor and
+        # small scalar/global-scale bookkeeping.
+        "expert_bank_max_layer_bytes": max_bank_layer_bytes,
         **mtp_ftw_metadata(mtp_quant if include_mtp else None, n_mtp, mtp_expert_bytes),
         "counts": {
             "weight": n_weight,

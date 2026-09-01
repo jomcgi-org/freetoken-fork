@@ -162,22 +162,159 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     return bank_layer
 
 
-def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
+def _alloc_nvfp4_host_banks(
+    num_layers: int, E: int, H: int, I: int, *, force_pageable: bool = False
+):
     """6 NVFP4 source banks, one ``[E, ...]`` tensor per layer (independent allocations),
     unpinned (pin-after-fill): register only after fill to skip cudaHostAlloc's slow
     commit. Caller fills each layer's ``.tensor`` then pins it (per-layer, via
     ``PinPipeline``, as its writes complete)."""
-    from freetoken.moe.host_banks import alloc_layer_banks
+    from freetoken.moe.host_banks import HostBank, alloc_layer_banks
 
     fp8 = torch.float8_e4m3fn
-    return alloc_layer_banks({
+    specs = {
         "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
         "gate_up_scale": ((E, 2 * I, H // 16), fp8),
         "gate_up_global": ((E, 2 * I), torch.float16),
         "down_packed": ((E, H, I // 2), torch.uint8),
         "down_scale": ((E, H, I // 16), fp8),
         "down_global": ((E, H), torch.float16),
-    }, num_layers)
+    }
+    if not force_pageable:
+        return alloc_layer_banks(specs, num_layers)
+    # The converter releases a completed layer with MADV_DONTNEED. Force anonymous mmap
+    # even when FREETOKEN_BANK_CUDA_ALLOC asks serving banks to be born pinned, since a
+    # born-pinned allocation cannot be released and would make conversion grow by layer.
+    return {
+        name: [HostBank(shape, dtype, backing="mmap") for _ in range(num_layers)]
+        for name, (shape, dtype) in specs.items()
+    }
+
+
+def _stream_nvfp4_expert_source_banks(
+    folder: str,
+    weight_map: dict,
+    config,
+    spec: Nvfp4ExpertSourceSpec,
+    *,
+    drop_page_cache: DropPageCache,
+    primary: bool,
+    layer_sink,
+) -> dict[str, list[torch.Tensor]]:
+    """Converter path with a strict one-expert-layer resident-memory bound.
+
+    Safetensors shards may interleave layers, so relying on shard order can leave several
+    partially filled layer banks resident. Group names by config-derived bank layer first,
+    then allocate, fill, write, and release exactly one layer at a time. Packed E2M1 bytes
+    and e4m3 block-scale bytes are copied verbatim. Only scalar ``weight_scale_2`` values
+    are expanded into the runtime's per-output-row fp16 global banks.
+    """
+    E = int(getattr(config, "num_experts"))
+    H = int(getattr(config, "hidden_size"))
+    I = int(getattr(config, "moe_intermediate_size"))
+    num_layers = _num_moe_layers(config)
+
+    by_layer: list[dict[str, list[tuple[str, re.Match[str]]]]] = [
+        collections.defaultdict(list) for _ in range(num_layers)
+    ]
+    for name, shard in weight_map.items():
+        match = spec.key_pattern.match(name)
+        if match is None:
+            continue
+        bank_layer = _bank_layer(spec, int(match.group("layer")), config)
+        if bank_layer is not None:
+            by_layer[bank_layer][shard].append((name, match))
+
+    completed: dict[str, list[torch.Tensor]] = collections.defaultdict(list)
+    expected_bulk = E * 6
+    expected_globals = E * 3
+    for bank_layer, shards in enumerate(
+        tqdm(by_layer, desc=f"Loading {spec.desc} by layer", disable=not primary)
+    ):
+        host_banks = _alloc_nvfp4_host_banks(1, E, H, I, force_pageable=True)
+        tensors = {name: banks[0].tensor for name, banks in host_banks.items()}
+        globals_map: dict[tuple[int, int, str], torch.Tensor] = {}
+
+        # Scalar globals must be available before block scales are placed. They remain
+        # layer-local instead of accumulating for the whole checkpoint.
+        for shard in sorted(shards):
+            path = os.path.join(folder, shard)
+            with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+                for name, match in shards[shard]:
+                    if match.group("kind") != "weight_scale_2":
+                        continue
+                    key = (
+                        int(match.group("layer")),
+                        int(match.group("expert")),
+                        match.group("proj"),
+                    )
+                    if key in globals_map:
+                        raise ValueError(f"{spec.desc}: duplicate global scale {name}")
+                    globals_map[key] = handle.get_tensor(name).to(
+                        dtype=torch.float16, copy=True
+                    )
+            drop_page_cache(path)
+
+        placed = 0
+        for shard in sorted(shards):
+            path = os.path.join(folder, shard)
+            with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+                for name, match in shards[shard]:
+                    kind = match.group("kind")
+                    if kind == "weight_scale_2":
+                        continue
+                    layer = int(match.group("layer"))
+                    expert = int(match.group("expert"))
+                    proj = match.group("proj")
+                    role = spec.proj_to_role.get(proj)
+                    if role is None:
+                        raise ValueError(
+                            f"{spec.desc}: unknown NVFP4 expert projection {proj!r}"
+                        )
+                    tensor = handle.get_tensor(name)
+                    if kind == "weight":
+                        if role == "gate":
+                            tensors["gate_up_packed"][expert, :I] = tensor
+                        elif role == "up":
+                            tensors["gate_up_packed"][expert, I:] = tensor
+                        elif role == "down":
+                            tensors["down_packed"][expert] = tensor
+                        else:
+                            raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
+                    elif kind == "weight_scale":
+                        key = (layer, expert, proj)
+                        if key not in globals_map:
+                            raise ValueError(f"{spec.desc}: missing global scale for {name}")
+                        global_scale = globals_map[key]
+                        if role == "gate":
+                            tensors["gate_up_scale"][expert, :I] = tensor
+                            tensors["gate_up_global"][expert, :I] = global_scale
+                        elif role == "up":
+                            tensors["gate_up_scale"][expert, I:] = tensor
+                            tensors["gate_up_global"][expert, I:] = global_scale
+                        elif role == "down":
+                            tensors["down_scale"][expert] = tensor
+                            tensors["down_global"][expert] = global_scale
+                        else:
+                            raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
+                    else:
+                        raise ValueError(
+                            f"{spec.desc}: unknown NVFP4 expert tensor kind {kind!r}"
+                        )
+                    placed += 1
+            drop_page_cache(path)
+
+        if len(globals_map) != expected_globals or placed != expected_bulk:
+            raise ValueError(
+                f"{spec.desc}: bank layer {bank_layer} loaded {placed} bulk tensors and "
+                f"{len(globals_map)} global scales, expected {expected_bulk} and "
+                f"{expected_globals} from config geometry E={E}, H={H}, I={I}"
+            )
+        layer_sink(bank_layer, {name: banks[0] for name, banks in host_banks.items()})
+        for name, tensor in tensors.items():
+            completed[name].append(tensor)
+
+    return dict(completed)
 
 
 def load_nvfp4_expert_source_banks(
@@ -208,6 +345,17 @@ def load_nvfp4_expert_source_banks(
     index_path = os.path.join(folder, "model.safetensors.index.json")
     with open(index_path, encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
+
+    if layer_sink is not None:
+        return _stream_nvfp4_expert_source_banks(
+            folder,
+            weight_map,
+            config,
+            spec,
+            drop_page_cache=drop_page_cache,
+            primary=primary,
+            layer_sink=layer_sink,
+        )
 
     E = config.num_experts
     H = config.hidden_size
@@ -334,6 +482,18 @@ def load_nvfp4_expert_source_banks_parallel(
     placement. bulk weight/weight_scale read via chunked multi-threaded O_DIRECT reader
     (iter_expert_tensors_parallel); tiny globals (``weight_scale_2``) stay serial (negligible
     bytes). ``layer_sink``: see :func:`load_nvfp4_expert_source_banks`."""
+    if layer_sink is not None:
+        # Whole-shard anonymous prefetch buffers defeat the converter's layer memory bound.
+        # Keep the API behavior streamable, but route conversion through the mmap reader.
+        return load_nvfp4_expert_source_banks(
+            model_path,
+            config,
+            spec,
+            drop_page_cache=drop_page_cache,
+            primary=primary,
+            layer_sink=layer_sink,
+        )
+
     from freetoken.models.weight import iter_expert_tensors_parallel
 
     folder = download_hf_weight(model_path)

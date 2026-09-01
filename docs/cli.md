@@ -157,7 +157,9 @@ ft checkpoint --model <hf_dir> --out <ftw_dir> [--dtype bfloat16] [--moe-backend
 Converts an HF safetensors checkpoint to FTW, FreeToken's self-contained
 fast-load format; point `ft serve --model` at the output dir. `--moe-backend
 offload` (default) packs experts into offload banks; `--moe-backend triton`
-keeps them dense for resident serving. See the FTW caveats in
+keeps them dense for resident serving. Conversion is CPU-only by default and
+preserves native NVFP4 banks. Pass `--gpu` to select the hardware-specific
+Marlin or FlashInfer repack when available. See the FTW caveats in
 [models.md](models.md#notes).
 
 ## ft bench bw
