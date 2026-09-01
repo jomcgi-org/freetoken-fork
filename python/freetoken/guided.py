@@ -217,7 +217,7 @@ class XGrammarDecoder:
         started = time.perf_counter_ns()
         bitmask = self.xgr.allocate_token_bitmask(logits.shape[0], self.vocab_size)
         self.batch_matcher.batch_fill_next_token_bitmask(
-            guided.states, bitmask, indices=guided.rows
+            [state.matcher for state in guided.states], bitmask, indices=guided.rows
         )
         guided.cpu_us += (time.perf_counter_ns() - started) / 1000.0
 
