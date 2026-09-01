@@ -767,6 +767,26 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--session-expert-prefetch",
+        choices=["on", "off"],
+        default=ServerArgs.session_expert_prefetch,
+        help=(
+            "Admission-time restore of a session's routed-expert profile into the GPU "
+            "slot cache and disk page cache (default: on)."
+        ),
+    )
+
+    parser.add_argument(
+        "--session-protect-experts",
+        type=int,
+        default=ServerArgs.session_protect_experts,
+        help=(
+            "Maximum profiled experts receiving an LRU protection boost per live "
+            "session (default: 64; 0 disables protection)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-step-timing",
         action="store_true",
         default=ServerArgs.moe_step_timing,

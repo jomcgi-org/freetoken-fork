@@ -26,6 +26,7 @@ class GraphCaptureBuffer:
     positions: torch.Tensor
     logits: torch.Tensor
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
+    request_table_idx: torch.Tensor  # scheduler table rows for session route collection
     # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
     fla_cu_seqlens: torch.Tensor
 
@@ -37,6 +38,7 @@ class GraphCaptureBuffer:
             positions=torch.zeros(bs, dtype=torch.int32, device=device),
             logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
             table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
+            request_table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
         )
 
@@ -49,6 +51,7 @@ class GraphCaptureBuffer:
         batch.out_loc = self.out_loc[_slice]
         batch.positions = self.positions[_slice]
         batch.linear_table_idx = self.table_idx[_slice]
+        batch.active_table_idx = self.request_table_idx[_slice]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
@@ -63,6 +66,8 @@ class GraphCaptureBuffer:
         self.positions[_slice] = batch.positions
         if batch.linear_table_idx is not None:
             self.table_idx[_slice] = batch.linear_table_idx
+        if batch.active_table_idx is not None:
+            self.request_table_idx[_slice] = batch.active_table_idx
 
 
 def _determine_cuda_graph_bs(

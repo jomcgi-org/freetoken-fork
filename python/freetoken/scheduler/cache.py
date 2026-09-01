@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, List, Tuple
 
 import torch
@@ -32,7 +32,8 @@ _SWA_RETAIN_GAP = 16
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None,
-                 kv_cache=None, disk_prefix_store=None):
+                 kv_cache=None, disk_prefix_store=None, moe_offload_cache=None,
+                 expert_prefetch_stream=None):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -46,6 +47,8 @@ class CacheManager:
         self.sliding_window_size = sliding_window_size
         self.kv_cache = kv_cache
         self.disk_prefix_store = disk_prefix_store
+        self.moe_offload_cache = moe_offload_cache
+        self.expert_prefetch_stream = expert_prefetch_stream
         self.is_hybrid = type == "hybrid_radix"
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
@@ -125,6 +128,77 @@ class CacheManager:
             )
         return self.prefix_cache.match_prefix(ids)
 
+    def lookup_expert_profile(self, input_ids: torch.Tensor):
+        """Return the deepest VRAM or disk profile without restoring heavyweight state."""
+        if (
+            self.cache_type not in ("radix", "hybrid_radix")
+            or self.moe_offload_cache is None
+            or not getattr(self.moe_offload_cache, "session_profile_enabled", False)
+        ):
+            return None
+        ids = input_ids[: max(0, int(input_ids.numel()) - 1)]
+        if ids.numel() == 0:
+            return None
+        match = self.prefix_cache.match_prefix(ids)
+        if self.is_hybrid:
+            best_len = match.cached_len
+            node = match.node
+        else:
+            best_len = match.cuda_handle.cached_len
+            node = getattr(match.cuda_handle, "node", None)
+        best = getattr(node, "expert_profile", None)
+        if self.disk_prefix_store is not None:
+            disk = self.disk_prefix_store.lookup_profile_longest(ids)
+            if disk is not None and disk[0] >= best_len:
+                best_len, best = disk
+        return best
+
+    def admit_expert_profile(self, uid: int, input_ids: torch.Tensor):
+        profile = self.lookup_expert_profile(input_ids)
+        cache = self.moe_offload_cache
+        if profile is None or cache is None:
+            return None
+        stream_ctx = (
+            torch.cuda.stream(self.expert_prefetch_stream)
+            if self.expert_prefetch_stream is not None and self.device.type == "cuda"
+            else nullcontext()
+        )
+        with stream_ctx:
+            cache.admit_session_profile(uid, profile)
+        return profile
+
+    def activate_expert_profile(
+        self, uid: int, table_idx: int, profile, *, restored: bool
+    ) -> None:
+        if self.moe_offload_cache is not None:
+            self.moe_offload_cache.activate_session_profile(
+                uid, table_idx, profile, restored=restored
+            )
+
+    def abort_pending_expert_profile(self, uid: int) -> None:
+        if self.moe_offload_cache is not None:
+            stream_ctx = (
+                torch.cuda.stream(self.expert_prefetch_stream)
+                if self.expert_prefetch_stream is not None and self.device.type == "cuda"
+                else nullcontext()
+            )
+            with stream_ctx:
+                self.moe_offload_cache.release_session_profile(uid)
+
+    def _park_expert_profile(self, req: Req):
+        cache = self.moe_offload_cache
+        if cache is None:
+            return None
+        profile = cache.export_session_profile(req.table_idx)
+        stream_ctx = (
+            torch.cuda.stream(self.expert_prefetch_stream)
+            if self.expert_prefetch_stream is not None and self.device.type == "cuda"
+            else nullcontext()
+        )
+        with stream_ctx:
+            cache.release_session_profile(req.uid)
+        return profile
+
     def _restore_disk_prefix(self, ids, old_match, entry):
         """Allocate pool ownership, install a disk entry, then publish its radix node."""
         import time
@@ -161,7 +235,7 @@ class CacheManager:
                 linear_slot=slot,
             )
             prefix_len, mamba_exist = self.prefix_cache.insert(
-                ids[:length], kv_indices, slot
+                ids[:length], kv_indices, slot, expert_profile=entry.expert_profile
             )
             self._free(kv_indices[old_match.cached_len:prefix_len])
             if mamba_exist:
@@ -189,7 +263,8 @@ class CacheManager:
         return torch.empty(0, dtype=torch.int32, device=self.device)
 
     def _queue_disk_prefix(
-        self, req: Req, length: int, kv_indices: torch.Tensor, linear_slot: int
+        self, req: Req, length: int, kv_indices: torch.Tensor, linear_slot: int,
+        expert_profile=None,
     ) -> None:
         store = self.disk_prefix_store
         if store is None or length <= 0:
@@ -208,13 +283,15 @@ class CacheManager:
                 kv_indices=kv_indices[:length],
                 linear_slot=linear_slot,
                 table_idx=req.table_idx,
+                extra_tensors=(expert_profile.to_tensors() if expert_profile is not None else None),
             )
             store.enqueue(req.input_ids[:length], staged, ready=ready)
         except Exception:
             store.note_write_drop()
 
     def _queue_disk_node(
-        self, token_ids: torch.Tensor, kv_indices: torch.Tensor, linear_slot: int
+        self, token_ids: torch.Tensor, kv_indices: torch.Tensor, linear_slot: int,
+        expert_profile=None,
     ) -> None:
         """Retry persistence at the final eviction seam if an earlier queued write was lost."""
         store = self.disk_prefix_store
@@ -232,6 +309,7 @@ class CacheManager:
                 kv_indices=kv_indices,
                 linear_slot=linear_slot,
                 table_idx=None,
+                extra_tensors=(expert_profile.to_tensors() if expert_profile is not None else None),
             )
             store.enqueue(token_ids, staged, ready=ready)
         except Exception:
@@ -446,6 +524,10 @@ class CacheManager:
         #                                           We should free it if the request has finished.
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
+        parked_profile = (
+            self._park_expert_profile(req)
+            if finished and self.cache_type == "radix" else None
+        )
         # Multimodal requests are never inserted into the shared prefix cache (see
         # ``match_req``). Their KV pages stay owned by the active request and are freed
         # on completion; nothing is exposed for cross-request reuse.
@@ -459,6 +541,8 @@ class CacheManager:
             return
         insert_ids = req.input_ids[: req.cached_len]
         cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
+        if parked_profile is not None and hasattr(new_handle, "node"):
+            new_handle.node.expert_profile = parked_profile
         # unlock until all operations on handle is done
         self.unlock(old_handle)
         # this part is already in the prefix cache, free it. A naive-SWA request (swa_paged, no
@@ -496,6 +580,7 @@ class CacheManager:
         pool = self.linear_state_pool
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
+        parked_profile = self._park_expert_profile(req) if finished else None
 
         if req.mm_embeds is not None:
             self.unlock(old_handle)
@@ -522,9 +607,13 @@ class CacheManager:
             ):
                 frozen_idx = 1 - req.mamba_next_track_idx
                 frozen = req.mamba_ping_pong[frozen_idx]
-                self._queue_disk_prefix(req, L, page_indices, frozen)
+                self._queue_disk_prefix(
+                    req, L, page_indices, frozen, expert_profile=parked_profile
+                )
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:L], page_indices[:L], frozen)
+                    req.input_ids[:L], page_indices[:L], frozen,
+                    expert_profile=parked_profile,
+                )
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
@@ -537,9 +626,14 @@ class CacheManager:
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
-                self._queue_disk_prefix(req, insert_len, page_indices, req.linear_slot_idx)
+                self._queue_disk_prefix(
+                    req, insert_len, page_indices, req.linear_slot_idx,
+                    expert_profile=parked_profile,
+                )
                 prefix_len, mamba_exist = self.prefix_cache.insert(
-                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
+                    req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx,
+                    expert_profile=parked_profile,
+                )
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx

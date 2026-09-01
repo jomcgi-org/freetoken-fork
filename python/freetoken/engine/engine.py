@@ -834,6 +834,14 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        configure_sessions = getattr(cache, "configure_session_profiles", None)
+        if configure_sessions is not None:
+            configure_sessions(
+                max_sessions=config.max_running_req,
+                enabled=config.session_expert_prefetch == "on",
+                protect_experts=config.session_protect_experts,
+                half_life_steps=config.moe_hot_adapt_halflife_steps,
+            )
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)

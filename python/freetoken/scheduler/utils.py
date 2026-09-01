@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, List, Sequence, TypeVar
 
 import torch
 
@@ -21,6 +21,7 @@ class PendingReq:
     mm_embeds: torch.Tensor | None = None
     priority: int = 0
     arrival_time: float = field(default_factory=time.monotonic)
+    expert_profile: Any | None = None
 
     @property
     def input_len(self) -> int:

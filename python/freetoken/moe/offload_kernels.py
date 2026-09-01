@@ -16,7 +16,9 @@ _HYBRID_FETCH_BY_RECENCY = (
 )
 
 
-def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+def ensure_experts(
+    cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
+) -> None:
     """Make this layer's routed experts resident; rewrite ``expert_ids`` to slot ids.
 
     Delegates to flashlib's slot cache. ``id_base`` maps this layer's expert ids into the
@@ -35,7 +37,7 @@ def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
         cache.src_indices,
         cache.evict_slots,
         cache.num_indices,
-        stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
+        stats=cache.lru_stats[layer_id] if cache.collect_stats and record_stats else None,
         id_base=layer_id * cache.num_experts,
     )
 
@@ -60,15 +62,19 @@ def ensure_experts_hybrid(
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
 
 
-def ensure_experts_hot(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+def ensure_experts_hot(
+    cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
+) -> None:
     """Current HOT/COLD split for a file-backed DISK layer.
 
     HOT experts use normal LRU slots and compact pinned source rows. COLD routes are
     rewritten to -1 for the CPU partial. The single fixed-shape launch is graph-safe.
     """
     if not expert_ids.is_cuda:
-        return _ensure_experts_hot_cpu(cache, layer_id, expert_ids)
-    _ensure_experts_hot_gpu(cache, layer_id, expert_ids)
+        return _ensure_experts_hot_cpu(
+            cache, layer_id, expert_ids, record_stats=record_stats
+        )
+    _ensure_experts_hot_gpu(cache, layer_id, expert_ids, record_stats=record_stats)
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -99,6 +105,76 @@ def materialize_layer(cache, layer_id: int) -> None:
 
 def reset_cache(cache) -> None:
     _reset_cache_gpu(cache)
+
+
+def update_session_profile(
+    cache, layer_id: int, expert_ids: torch.Tensor, table_ids: torch.Tensor
+) -> None:
+    """One bounded heavy-hitter update per request for this decode layer."""
+    batch = int(table_ids.numel())
+    if batch == 0 or expert_ids.numel() % batch:
+        return
+    routes = expert_ids.reshape(batch, -1)
+    max_sessions = cache.session_profile_ids.shape[0] - 1
+    if not expert_ids.is_cuda:
+        from freetoken.moe.session_profile import update_profile_sketch
+
+        valid = table_ids.reshape(-1).long() < max_sessions
+        selected = table_ids.reshape(-1).long()[valid]
+        if selected.numel() == 0:
+            return
+        old_ids = cache.session_profile_ids[selected, layer_id]
+        old_counts = cache.session_profile_counts[selected, layer_id]
+        new_ids, new_counts = update_profile_sketch(
+            old_ids, old_counts, routes[valid], decay=cache._session_decay_factor
+        )
+        cache.session_profile_ids[:, layer_id].index_copy_(0, selected, new_ids)
+        cache.session_profile_counts[:, layer_id].index_copy_(0, selected, new_counts)
+        return
+    _update_session_profile_kernel[(batch,)](
+        cache.session_profile_ids,
+        cache.session_profile_counts,
+        routes,
+        table_ids,
+        layer_id,
+        cache.num_layers,
+        max_sessions,
+        cache._session_decay_factor,
+        PROFILE_K=cache.session_profile_topk,
+        ROUTE_K=routes.shape[1],
+    )
+
+
+@triton.jit
+def _update_session_profile_kernel(
+    ids_ptr,
+    counts_ptr,
+    routes_ptr,
+    table_ids_ptr,
+    layer_id,
+    num_layers,
+    max_sessions,
+    decay,
+    PROFILE_K: tl.constexpr,
+    ROUTE_K: tl.constexpr,
+):
+    request = tl.program_id(0)
+    table = tl.load(table_ids_ptr + request)
+    valid_request = table < max_sessions
+    offsets = tl.arange(0, PROFILE_K)
+    base = (table * num_layers + layer_id) * PROFILE_K
+    ids = tl.load(ids_ptr + base + offsets)
+    counts = tl.load(counts_ptr + base + offsets).to(tl.float32) * decay
+    for route_idx in range(ROUTE_K):
+        expert = tl.load(routes_ptr + request * ROUTE_K + route_idx)
+        matches = (ids == expert) & (expert >= 0) & valid_request
+        present = tl.sum(matches.to(tl.int32), axis=0) > 0
+        victim = tl.argmin(counts, axis=0)
+        replace = (offsets == victim) & ~present & (expert >= 0) & valid_request
+        ids = tl.where(replace, expert, ids)
+        counts = counts + matches.to(tl.float32) + replace.to(tl.float32)
+    tl.store(ids_ptr + base + offsets, ids, mask=valid_request)
+    tl.store(counts_ptr + base + offsets, counts, mask=valid_request)
 
 
 
@@ -136,7 +212,9 @@ def _ensure_experts_hybrid_gpu(
     )
 
 
-def _ensure_experts_hot_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+def _ensure_experts_hot_gpu(
+    cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool
+) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     _ensure_experts_hot_kernel[(1,)](
@@ -160,6 +238,7 @@ def _ensure_experts_hot_gpu(cache, layer_id: int, expert_ids: torch.Tensor) -> N
         cache.cache_size,
         cache._hot_decay_factor,
         HOT_ADAPT=cache.hot_adapt_enabled,
+        RECORD_STATS=record_stats,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         num_warps=8 if block_c >= 2048 else 4,
@@ -229,7 +308,9 @@ def _ensure_experts_hybrid_cpu(
         flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
 
 
-def _ensure_experts_hot_cpu(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+def _ensure_experts_hot_cpu(
+    cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
+) -> None:
     """CPU reference for the current HOT/COLD split kernel."""
     raw = [int(expert) for expert in expert_ids.view(-1).tolist()]
     hot_row = cache.hot_row_for_expert[layer_id].tolist()
@@ -274,13 +355,14 @@ def _ensure_experts_hot_cpu(cache, layer_id: int, expert_ids: torch.Tensor) -> N
         cache.src_indices[idx] = hot_row[expert]
 
     hot_pairs = sum(hot_row[expert] >= 0 for expert in raw)
-    if cache.hot_adapt_enabled:
+    if cache.hot_adapt_enabled and record_stats:
         counts = torch.bincount(
             torch.tensor(raw, dtype=torch.long), minlength=cache.num_experts
         ).to(torch.float32)
         cache.decayed_decode_freq[layer_id].mul_(cache._hot_decay_factor).add_(counts)
-    cache.stat_hot_pairs += hot_pairs
-    cache.stat_hot_total_pairs += len(raw)
+    if record_stats:
+        cache.stat_hot_pairs += hot_pairs
+        cache.stat_hot_total_pairs += len(raw)
     flat = expert_ids.view(-1)
     for idx, expert in enumerate(raw):
         flat[idx] = (
@@ -533,6 +615,7 @@ def _ensure_experts_hot_kernel(
     cache_size: tl.constexpr,
     decay_factor,
     HOT_ADAPT: tl.constexpr,
+    RECORD_STATS: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -555,7 +638,7 @@ def _ensure_experts_hot_kernel(
         route_count += (off_e == expert).to(tl.int32)
     is_active = (route_count > 0) & eligible
     hot_pairs = tl.sum(tl.where(eligible, route_count, 0))
-    if HOT_ADAPT:
+    if HOT_ADAPT and RECORD_STATS:
         decayed = tl.load(decayed_freq_ptr + base + off_e, mask=e_mask, other=0.0)
         tl.store(
             decayed_freq_ptr + base + off_e,
@@ -569,11 +652,12 @@ def _ensure_experts_hot_kernel(
     num_missing = tl.sum(is_missing.to(tl.int32))
     tl.store(num_indices_ptr, num_missing.to(tl.int64))
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
-    tl.store(stat_hot_pairs_ptr, tl.load(stat_hot_pairs_ptr) + hot_pairs.to(tl.int64))
-    tl.store(
-        stat_total_pairs_ptr,
-        tl.load(stat_total_pairs_ptr) + num_active.to(tl.int64),
-    )
+    if RECORD_STATS:
+        tl.store(stat_hot_pairs_ptr, tl.load(stat_hot_pairs_ptr) + hot_pairs.to(tl.int64))
+        tl.store(
+            stat_total_pairs_ptr,
+            tl.load(stat_total_pairs_ptr) + num_active.to(tl.int64),
+        )
     tl.store(usage_ptr + slot, step, mask=is_active & (slot >= 0))
 
     if num_missing > 0:

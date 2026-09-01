@@ -109,6 +109,13 @@ class PrefillAdder:
             linear_slot_idx = pool.alloc(1)[0]
             ping_pong = tuple(pool.alloc(2))
 
+        self.cache_manager.activate_expert_profile(
+            req.uid,
+            table_idx,
+            req.expert_profile,
+            restored=cached_len > 0,
+        )
+
         return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, mr.qsa_pending
 
     def _add_one_req(
@@ -196,6 +203,10 @@ class PrefillAdder:
         req.mamba_restore_src = restore_src
         req.qsa_restore_pending = qsa_restore_pending
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
+        req.expert_profile = pending_req.expert_profile
+        req.expert_profile_restored = bool(
+            pending_req.expert_profile is not None and cached_len > 0
+        )
         return req
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
@@ -257,16 +268,21 @@ class PrefillManager:
     clock: Callable[[], float] = time.monotonic
 
     def add_one_req(self, req: UserMsg) -> None:
-        self.pending_list.append(
-            PendingReq(
-                req.uid,
-                req.input_ids,
-                req.sampling_params,
-                mm_embeds=req.mm_embeds,
-                priority=req.priority,
-                arrival_time=req.arrival_time,
-            )
+        pending = PendingReq(
+            req.uid,
+            req.input_ids,
+            req.sampling_params,
+            mm_embeds=req.mm_embeds,
+            priority=req.priority,
+            arrival_time=req.arrival_time,
         )
+        # This is the multi-lane payoff seam: the request has just entered the
+        # waiting queue, before it owns a table row or reaches first prefill.
+        if req.mm_embeds is None:
+            pending.expert_profile = self.cache_manager.admit_expert_profile(
+                req.uid, req.input_ids
+            )
+        self.pending_list.append(pending)
 
     def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
         if len(self.pending_list) == 0:
@@ -331,6 +347,7 @@ class PrefillManager:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
+                self.cache_manager.abort_pending_expert_profile(uid)
                 return req.chunked_req
         return None
 

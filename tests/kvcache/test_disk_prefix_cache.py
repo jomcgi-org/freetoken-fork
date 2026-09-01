@@ -13,6 +13,7 @@ from freetoken.kvcache.disk_prefix_cache import (
     capture_hybrid_prefix_tensors,
     restore_hybrid_prefix_tensors,
 )
+from freetoken.moe.session_profile import SessionExpertProfile
 
 
 def _payload(seed: int = 0) -> dict[str, torch.Tensor]:
@@ -52,6 +53,42 @@ def test_store_round_trip_with_synthetic_hybrid_state(tmp_path):
     stats = store.stats()
     assert stats["hits"] == 1
     assert stats["bytes_restored"] == entry.file_bytes
+    store.close()
+
+
+def test_store_round_trip_preserves_optional_versioned_expert_profile(tmp_path):
+    ids = torch.tensor([21, 22, 23, 24], dtype=torch.int32)
+    profile = SessionExpertProfile(
+        ids=((3, 1), (), (7,)),
+        counts=((9.0, 2.5), (), (4.0,)),
+    )
+    payload = {**_payload(), **profile.to_tensors()}
+    store = _store(tmp_path)
+    assert store.enqueue(ids, payload)
+    store.flush()
+
+    lightweight = store.lookup_profile_longest(torch.tensor([21, 22, 23, 24, 25]))
+    assert lightweight is not None
+    assert lightweight[0] == 4
+    assert lightweight[1].ids == profile.ids
+
+    entry = store.lookup_longest(ids)
+    assert entry is not None
+    assert entry.expert_profile is not None
+    assert entry.expert_profile.ids == profile.ids
+    store.close()
+
+
+def test_store_entry_without_expert_profile_restores_as_before(tmp_path):
+    ids = torch.tensor([31, 32, 33, 34], dtype=torch.int32)
+    store = _store(tmp_path)
+    assert store.enqueue(ids, _payload())
+    store.flush()
+
+    assert store.lookup_profile_longest(ids) is None
+    entry = store.lookup_longest(ids)
+    assert entry is not None
+    assert entry.expert_profile is None
     store.close()
 
 
