@@ -542,3 +542,74 @@ The program changed the hardware ranking, not just the numbers:
   with CPU decode dominating; hot-expert pinning + online adaptation
   change that math IF their routing is also Zipf. Re-register a
   prediction before testing. (Tier still verified on qwen4_exp only.)
+
+## Serving program (round 2, 2026-09-01): from benchmark box to production endpoint
+
+The throughput program made the box fast; this round made it a SERVER.
+Trigger: node-4 went live as the platform's inference endpoint
+(tailscale bridge to GKE) and Joe's actual chat experience exposed
+everything a load generator cannot.
+
+### Commit trajectory (feat/moe-disk-tier)
+
+- 7641002 expose --linear-state-cache-ratio (multi-turn prefix reuse
+  died because GDN snapshot slots were unreachable-by-flag; 48 -> 64)
+- 3eeecbd disk-backed prefix state cache ("LMCache lane": 500G NVMe
+  store, fingerprint-keyed, crash-safe, async write-back)
+- 7da2bc6 bench/realworld.py scenario scorecard (the acceptance gate:
+  conversation TTFT, agent resume across restart, contention, JSON
+  validity)
+- 27d3f91 request priority scheduling (priority field/header, aging
+  bound, reorder at forward boundaries)
+- 8547bd1 guided decoding via optional XGrammar (response_format
+  json_object/json_schema, tool_choice required)
+- 9c21d11 fix: first constrained request crashed the scheduler
+  (GuidedState wrappers vs raw matchers)
+- pending: session-conditioned expert prefetch (park each session's
+  routed-expert profile with its state; prefetch at admission; protect
+  live sessions' experts from LRU thrash), prefill-transient OOM guard
+
+### Scorecard: broken first run vs deployed stack
+
+| leg | first run | deployed |
+|---|---|---|
+| conversation first-turn TTFT | 13.3s | 7.2s |
+| follow-up TTFT p50 | 4.2s | 4.1s |
+| agent 10k-context cold TTFT | 870s | 14.8s |
+| post-restart session resume | - | 13.8s (restarts ~free) |
+| interactive TTFT under load | 86s | 23.0s |
+| structured output | engine crash | 5/5 valid JSON |
+
+Live UX proof: a 6.3k-token conversation matched 6272 cached tokens,
+prefilled 24, streamed within ~2s. Joe: "Wow!! immediately streaming at
+a useable speed."
+
+### Production lessons (each cost real debugging)
+
+1. **Hidden client requests are the silent killer**: Open WebUI fires
+   2-4 auxiliary LLM calls per message (title/tags/follow-ups); on a
+   one-forward engine they queue ahead of the user AND their prompts
+   thrash the GDN snapshot slots, zeroing prefix reuse. Fix: disable at
+   env level; structurally, session-aware eviction protection.
+2. **KV is 64KB/token on this model, not 24KB** (the 0.19GiB/8256 log
+   line undercounts). True 24G ceiling: ~100k tokens single-lane
+   (1568 pages + activation headroom); 106k booted but OOM'd on GDN
+   conv-prefill transients under load. 1M context = 64G KV = 96G-card
+   or host-KV territory, not 48G as first estimated.
+3. **A request-level OOM kills the scheduler process** (prefill
+   transient at full KV) - the frontend survives as a zombie answering
+   GETs. Guard patch queued: fail the request, not the process.
+4. Session park/restore to NVMe makes restarts and (by extension) spot
+   preemptions nearly free: the KV-swap-single-lane-session-multiplex
+   pattern is the cloud-transition design (L4 spot ~$0.25/hr mirrors
+   the 4090's 24G exactly).
+5. Chunked prefill trades: 512-token chunks re-read disk banks ~16x
+   (congestion collapse, measured); 8192 blocks interactive for tens of
+   seconds. 1024-2048 is the band; adaptive chunking remains future work.
+
+### Model-bench attempt (aborted, rerun queued)
+
+First run at concurrency 3 collided with the 32k KV pool (agentic
+contexts + 16k max_tokens headroom per stream): instant harness errors.
+Lesson: bench concurrency must respect kv_pool / (context + max_tokens).
+Rerun queued serial on the finished stack.
