@@ -151,6 +151,43 @@ def _dedupe_decode_routes(expert_ids, num_experts: int) -> tuple[list[int], int]
     return sorted(set(valid)), len(valid)
 
 
+def _group_prefill_routes(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+) -> dict[int, list[tuple[int, float]]]:
+    """Reference grouping used by GPU-free tests and diagnostics.
+
+    The native hot path mirrors this stable token-major grouping without creating
+    Python objects. Invalid route ids are skipped, matching the serial executor.
+    """
+    ids = topk_ids.detach().cpu().reshape(topk_ids.shape[0], -1)
+    weights = topk_weights.detach().cpu().reshape_as(ids)
+    groups: dict[int, list[tuple[int, float]]] = {}
+    for token in range(ids.shape[0]):
+        for slot in range(ids.shape[1]):
+            expert = int(ids[token, slot])
+            if 0 <= expert < num_experts:
+                groups.setdefault(expert, []).append(
+                    (token, float(weights[token, slot]))
+                )
+    return groups
+
+
+def _prefill_batch_buffer_nbytes(
+    max_tokens: int, top_k: int, hidden_size: int, intermediate_size: int,
+) -> int:
+    """Bytes in the native route-bounded NVFP4 prefill workspace."""
+    rows = int(max_tokens) * int(top_k)
+    return rows * (
+        4 * int(hidden_size)
+        + 3 * int(intermediate_size)
+        + int(hidden_size) // 4
+        + int(intermediate_size) // 4
+        + 16
+    )
+
+
 def _disk_lookahead_allowed(requested: bool, pagers: set) -> bool:
     """Return whether previous-step WILLNEED prediction applies to these banks."""
     return bool(requested and not pagers)
@@ -275,6 +312,8 @@ class CpuMoeExecutor:
         step_timing: bool = False,
         prefill_coalesce: str | bool = "populate",
         prefill_coalesce_budget_bytes: int = 40 << 30,
+        prefill_batch: str | bool = "on",
+        max_prefill_tokens: int | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
 
@@ -349,6 +388,22 @@ class CpuMoeExecutor:
         self._prefill_populate_bytes = 0
         self._prefill_populate_ns = 0
         self._prefill_populate_scratch = None
+        if isinstance(prefill_batch, bool):
+            prefill_batch = "on" if prefill_batch else "off"
+        if prefill_batch not in ("on", "off"):
+            raise ValueError(
+                f"prefill_batch must be 'on' or 'off', got {prefill_batch!r}"
+            )
+        self._prefill_batch_requested = prefill_batch == "on"
+        self._prefill_batch_enabled = False
+        self._prefill_batch_warned = False
+        self._prefill_batch_rows = 0
+        self._prefill_batch_gemms = 0
+        self._prefill_batch_degrades = 0
+        self._prefill_batch_capacity = int(
+            max_prefill_tokens if max_prefill_tokens is not None else max_tokens
+        )
+        self._prefill_batch_buffer_bytes = 0
         # Keep half of the pager budget available to the decode working set. Only one
         # prefill layer is live at a time and its lease is released after compute.
         self._prefill_coalesce_byte_ceiling = max(
@@ -427,6 +482,7 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        self._configure_prefill_batch()
         if self._step_timing:
             self._ext.set_task_timing(True)
         if self._disk_banks:
@@ -517,6 +573,12 @@ class CpuMoeExecutor:
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
+        logger.info_rank0(
+            f"CPU MoE prefill batch: "
+            f"{'on' if self._prefill_batch_enabled else 'off'}, "
+            f"capacity={self._prefill_batch_capacity} tokens, "
+            f"buffers={self._prefill_batch_buffer_bytes / 2**20:.1f} MiB"
+        )
         if self._disk_banks and self._prefill_coalesce_enabled:
             logger.info_rank0(
                 f"CPU MoE prefill coalesce: {self._prefill_coalesce_mode}, "
@@ -524,6 +586,27 @@ class CpuMoeExecutor:
                 f"expert limits={self._prefill_coalesce_limits}, "
                 f"populate scratch={self._prefill_populate_scratch_bytes / 2**20:.0f} MiB"
             )
+
+    def _configure_prefill_batch(self) -> None:
+        if not self._prefill_batch_requested:
+            return
+        setup = getattr(self._ext, "setup_prefill_batch", None)
+        run_batch = getattr(self._ext, "run_prefill_batch_sync", None)
+        try:
+            if setup is None or run_batch is None:
+                raise RuntimeError("compiled extension lacks the batched entry point")
+            if not setup(self._prefill_batch_capacity):
+                raise RuntimeError(
+                    f"batched NVFP4 kernel unavailable for format "
+                    f"{self.quant_format!r}"
+                )
+            self._prefill_batch_enabled = True
+            buffer_bytes = getattr(
+                self._ext, "prefill_batch_buffer_bytes", lambda: 0
+            )
+            self._prefill_batch_buffer_bytes = int(buffer_bytes())
+        except Exception as exc:
+            self._degrade_prefill_batch("setup degraded to serial", exc)
 
     def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
         """Build a CPU int64 tensor of per-layer base addresses for one bank.
@@ -951,6 +1034,15 @@ class CpuMoeExecutor:
             logger.warning_rank0(f"CPU MoE prefill {message}: {exc}")
             self._prefill_coalesce_warned = True
 
+    def _degrade_prefill_batch(self, message: str, exc: Exception) -> None:
+        self._prefill_batch_enabled = False
+        self._prefill_batch_degrades = getattr(
+            self, "_prefill_batch_degrades", 0
+        ) + 1
+        if not getattr(self, "_prefill_batch_warned", False):
+            logger.warning_rank0(f"CPU MoE {message}: {exc}")
+            self._prefill_batch_warned = True
+
     def begin_decode_step(self) -> int:
         """Prefetch every DISK layer from its previous decode routing set.
 
@@ -1142,6 +1234,9 @@ class CpuMoeExecutor:
         self._prefill_coalesce_degrades = 0
         self._prefill_populate_bytes = 0
         self._prefill_populate_ns = 0
+        self._prefill_batch_rows = 0
+        self._prefill_batch_gemms = 0
+        self._prefill_batch_degrades = 0
         self._disk_major_fault_base = _major_faults()
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
             self._ext.gpufetch_stats(True)
@@ -1221,6 +1316,15 @@ class CpuMoeExecutor:
             "moe_prefill_populate_ms": getattr(
                 self, "_prefill_populate_ns", 0
             ) / 1_000_000,
+            "moe_prefill_batch_rows": getattr(
+                self, "_prefill_batch_rows", 0
+            ),
+            "moe_prefill_batch_gemms": getattr(
+                self, "_prefill_batch_gemms", 0
+            ),
+            "moe_prefill_batch_degrades": getattr(
+                self, "_prefill_batch_degrades", 0
+            ),
             "per_layer": per_layer,
         }
         pagers = list(getattr(self, "_disk_pagers", ()))
@@ -1272,6 +1376,9 @@ class CpuMoeExecutor:
             self._prefill_coalesce_degrades = 0
             self._prefill_populate_bytes = 0
             self._prefill_populate_ns = 0
+            self._prefill_batch_rows = 0
+            self._prefill_batch_gemms = 0
+            self._prefill_batch_degrades = 0
             self._disk_major_fault_base = now
         return result
 
@@ -1320,15 +1427,39 @@ class CpuMoeExecutor:
                 "the CPU MoE extension needs rebuilding for DISK CPU prefill; run "
                 "`python setup.py build_ext --inplace` or reinstall the wheel"
             )
-        self._ext.run_task_sync(
-            layer_id,
-            bs,
-            io["x"].data_ptr(),
-            io["ids"].data_ptr(),
-            io["w"].data_ptr(),
-            io["y"].data_ptr(),
-            False,
-        )
+        if self._prefill_batch_enabled and bs <= self._prefill_batch_capacity:
+            try:
+                rows, gemms = self._ext.run_prefill_batch_sync(
+                    layer_id,
+                    bs,
+                    io["x"].data_ptr(),
+                    io["ids"].data_ptr(),
+                    io["w"].data_ptr(),
+                    io["y"].data_ptr(),
+                )
+                self._prefill_batch_rows += int(rows)
+                self._prefill_batch_gemms += int(gemms)
+            except Exception as exc:
+                self._degrade_prefill_batch("batch run degraded to serial", exc)
+                self._ext.run_task_sync(
+                    layer_id,
+                    bs,
+                    io["x"].data_ptr(),
+                    io["ids"].data_ptr(),
+                    io["w"].data_ptr(),
+                    io["y"].data_ptr(),
+                    False,
+                )
+        else:
+            self._ext.run_task_sync(
+                layer_id,
+                bs,
+                io["x"].data_ptr(),
+                io["ids"].data_ptr(),
+                io["w"].data_ptr(),
+                io["y"].data_ptr(),
+                False,
+            )
         out = torch.empty_like(hidden_states)
         out.copy_(io["y"], non_blocking=False)
         return out

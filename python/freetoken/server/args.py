@@ -756,6 +756,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-cpu-prefill-batch",
+        choices=["on", "off"],
+        default=ServerArgs.moe_cpu_prefill_batch,
+        help=(
+            "Group CPU-prefill routes by expert and run row-batched NVFP4 W4A8 "
+            "matmuls (default: on). Setup failures fall back to the serial path."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-disk-decode",
         choices=["cpu", "gpufetch"],
         default=ServerArgs.moe_disk_decode,
