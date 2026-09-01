@@ -78,6 +78,7 @@ from .generation import (
     with_keepalive,
 )
 from .request_logger import log_request
+from .priority import resolve_request_priority
 
 # Seconds of event silence before a keep-alive frame is emitted on the stream.
 # codex's stream-idle timeout (default 300s) only resets on a data-bearing SSE
@@ -106,6 +107,7 @@ class ResponsesRequest(BaseModel):
     background: bool = False
     metadata: dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
+    priority: int = 0
 
 
 def register_responses_routes(
@@ -152,10 +154,12 @@ async def handle_responses(
         return _error_response(400, "max_output_tokens must be a positive integer")
     default_max = getattr(state.config, "max_output_tokens", None) or DEFAULT_MAX_OUTPUT_TOKENS
     try:
+        priority = resolve_request_priority(req.priority, request)
         spec = convert_responses_to_genspec(
             req, model_sampling, default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
+        spec.priority = priority
         uid = await submit_generation(spec, state)
     except ValueError as exc:
         return _error_response(400, str(exc))
@@ -249,6 +253,7 @@ def convert_responses_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=template_tools,
         parser_tools=parser_tools,
+        priority=req.priority,
     )
 
 

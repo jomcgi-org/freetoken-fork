@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -111,6 +112,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be a positive integer") from exc
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
+        return n
+
+    def _nonnegative_float(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative number") from exc
+        if not math.isfinite(n) or n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
         return n
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
@@ -388,6 +398,16 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.decode_log_interval,
         help="Print one decode scheduler status line every N decode forwards.",
+    )
+
+    parser.add_argument(
+        "--priority-aging-seconds",
+        type=_nonnegative_float,
+        default=ServerArgs.priority_aging_seconds,
+        help=(
+            "Seconds a waiting request needs to gain one effective priority point "
+            "(default: 30; 0 disables aging)."
+        ),
     )
 
     kv_capacity_group = parser.add_mutually_exclusive_group()

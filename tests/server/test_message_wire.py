@@ -7,6 +7,8 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import torch
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
@@ -22,6 +24,7 @@ from freetoken.message import (
     MoeLayerProfileResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
+    UserMsg,
     UserReply,
 )
 from freetoken.core import SamplingParams
@@ -84,6 +87,28 @@ def test_prompt_admitted_msg_roundtrip():
     out = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(out, PromptAdmittedMsg)
     assert (out.uid, out.prompt_tokens, out.cached_tokens) == (42, 1234, 500)
+
+
+def test_request_priority_messages_roundtrip():
+    tokenize = TokenizeMsg(
+        uid=7,
+        text="hi",
+        sampling_params=SamplingParams(),
+        priority=9,
+        arrival_time=123.5,
+    )
+    decoded_tokenize = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(tokenize))
+    assert (decoded_tokenize.priority, decoded_tokenize.arrival_time) == (9, 123.5)
+
+    backend = UserMsg(
+        uid=7,
+        input_ids=torch.tensor([1, 2], dtype=torch.int32),
+        sampling_params=SamplingParams(),
+        priority=9,
+        arrival_time=123.5,
+    )
+    decoded_backend = BaseBackendMsg.decoder(backend.encoder())
+    assert (decoded_backend.priority, decoded_backend.arrival_time) == (9, 123.5)
 
 
 def test_user_reply_token_deltas_round_trip():

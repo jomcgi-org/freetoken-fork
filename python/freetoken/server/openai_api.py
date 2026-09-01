@@ -21,7 +21,6 @@ from .api_models import (
     ToolChoiceObject,
 )
 from .function_call_parser import ToolCallItem
-from .request_logger import log_request
 from .generation import (
     ContentDelta,
     GenDone,
@@ -38,6 +37,8 @@ from .generation import (
     resolve_sampling,
     submit_generation,
 )
+from .priority import resolve_request_priority
+from .request_logger import log_request
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
@@ -80,6 +81,7 @@ def chat_request_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
+        priority=req.priority,
     )
 
 
@@ -150,6 +152,10 @@ async def handle_chat_completion(
     state: Any,
     model_sampling: dict[str, Any],
 ):
+    try:
+        priority = resolve_request_priority(req.priority, request)
+    except ValueError as exc:
+        return create_error_response(str(exc), param="x-request-priority")
     if req.function_call is not None:
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
@@ -182,6 +188,7 @@ async def handle_chat_completion(
         spec = chat_request_to_genspec(req, model_sampling)
     except ValueError as exc:
         return create_error_response(str(exc))
+    spec.priority = priority
 
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
@@ -382,6 +389,10 @@ async def handle_completion(
     state: Any,
     model_sampling: dict[str, Any],
 ):
+    try:
+        priority = resolve_request_priority(req.priority, request)
+    except ValueError as exc:
+        return create_error_response(str(exc), param="x-request-priority")
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         return create_error_response(unsupported)
@@ -397,7 +408,12 @@ async def handle_completion(
             return create_error_response("Streaming completions only support a single text prompt")
         uid = state.new_user()
         await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(req, model_sampling))
+            TokenizeMsg(
+                uid=uid,
+                text=prompts[0],
+                sampling_params=_resolve_sampling(req, model_sampling),
+                priority=priority,
+            )
         )
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
@@ -410,7 +426,14 @@ async def handle_completion(
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
         uid = state.new_user()
-        await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
+        await state.send_one(
+            TokenizeMsg(
+                uid=uid,
+                text=prompt,
+                sampling_params=_resolve_sampling(req, model_sampling),
+                priority=priority,
+            )
+        )
         text = ""
         finish_reason = "stop"
         async for ack in state.wait_for_ack(uid):

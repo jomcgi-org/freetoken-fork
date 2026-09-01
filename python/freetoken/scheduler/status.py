@@ -39,6 +39,8 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        queue_priority_bands: dict[str, int] | None = None,
+        max_wait_seconds: float = 0.0,
     ) -> None:
         if batch.is_prefill:
             self._report_prefill(
@@ -49,6 +51,8 @@ class SchedulerStatusReporter:
                 kv_total_pages=kv_total_pages,
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
+                queue_priority_bands=queue_priority_bands,
+                max_wait_seconds=max_wait_seconds,
             )
         elif batch.is_decode:
             self._report_decode(
@@ -60,6 +64,8 @@ class SchedulerStatusReporter:
                 page_size=page_size,
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
+                queue_priority_bands=queue_priority_bands,
+                max_wait_seconds=max_wait_seconds,
             )
 
     def _report_prefill(
@@ -72,6 +78,8 @@ class SchedulerStatusReporter:
         kv_total_pages: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        queue_priority_bands: dict[str, int] | None = None,
+        max_wait_seconds: float = 0.0,
     ) -> None:
         now = self.clock()
         gap = now - self._last_prefill_time
@@ -94,6 +102,8 @@ class SchedulerStatusReporter:
             f"{_mamba_msg(mamba_slots)}"
             f"#running-req: {running_reqs}, "
             f"#queue-req: {queue_reqs}, "
+            f"{_priority_queue_msg(queue_priority_bands, max_wait_seconds)}"
+            f"{', ' if queue_priority_bands is not None else ''}"
             f"input throughput (token/s): {input_throughput:.2f}"
             f"{self._disk_prefix_msg()}"
         )
@@ -109,6 +119,8 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
+        queue_priority_bands: dict[str, int] | None = None,
+        max_wait_seconds: float = 0.0,
     ) -> None:
         self._decode_forward_count += 1
         self._decode_generated_tokens += getattr(batch, "generated_tokens", 0) or len(
@@ -170,6 +182,8 @@ class SchedulerStatusReporter:
             f"acceptance rate: {acceptance_rate:.4f}, "
             f"tokens/step: {tokens_per_step:.2f}, "
             f"#queue-req: {queue_reqs}"
+            f"{', ' if queue_priority_bands is not None else ''}"
+            f"{_priority_queue_msg(queue_priority_bands, max_wait_seconds)}"
             f"{timing_msg}"
             f"{self._disk_prefix_msg()}"
         )
@@ -207,3 +221,15 @@ def _swa_msg(swa_tokens: tuple[int, int] | None) -> str:
         return ""
     used, total = swa_tokens
     return f"#swa-token: {used}/{total}, swa usage: {_usage_ratio(used, total):.2f}, "
+
+
+def _priority_queue_msg(bands: dict[str, int] | None, max_wait_seconds: float) -> str:
+    if bands is None:
+        return ""
+    return (
+        "#queue-priority: "
+        f"negative={bands.get('negative', 0)}/"
+        f"zero={bands.get('zero', 0)}/"
+        f"positive={bands.get('positive', 0)}, "
+        f"max_wait_seconds: {max_wait_seconds:.2f}"
+    )

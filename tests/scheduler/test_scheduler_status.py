@@ -53,6 +53,24 @@ def test_prefill_line_reports_tokens_and_throughput():
     assert "input throughput (token/s): 60.00" in line
 
 
+def test_status_line_reports_priority_bands_and_max_wait():
+    rep, logs, clock = _reporter()
+    clock["t"] = 1.0
+    rep.report_batch(
+        _prefill_batch(new_tokens=10, cached_tokens=0, n_seqs=1),
+        running_reqs=1,
+        queue_reqs=6,
+        kv_used_pages=1,
+        kv_total_pages=10,
+        page_size=1,
+        queue_priority_bands={"negative": 1, "zero": 3, "positive": 2},
+        max_wait_seconds=12.345,
+    )
+
+    assert "#queue-priority: negative=1/zero=3/positive=2" in logs[-1]
+    assert "max_wait_seconds: 12.35" in logs[-1]
+
+
 def test_mamba_slots_reported_only_when_provided():
     rep, logs, clock = _reporter()
     clock["t"] = 1.0
