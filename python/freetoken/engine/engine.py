@@ -619,6 +619,7 @@ class Engine:
         )
         disk_bank_checkpoint = resolved_bank_source in ("ftw", "index")
         disk_layer_ids = _resolve_disk_layers(config, num_moe_layers)
+        gpu_prefill_plan = None
         if disk_layer_ids and not disk_bank_checkpoint:
             raise ValueError(
                 "--moe-disk-layers requires FTW or a supported safetensors bank index"
@@ -637,9 +638,17 @@ class Engine:
             and config.moe_backend in ("offload", "hybrid")
             and _config_pin_budget_bytes(config, self._host_tables_bytes) is not None
         ):
-            cpu_layer_ids = _auto_cpu_layers(
+            gpu_prefill_plan = _auto_gpu_prefill_plan(
                 config, num_moe_layers, reserved=self._host_tables_bytes
             )
+            cpu_layer_ids = _auto_cpu_layers(
+                config,
+                num_moe_layers,
+                reserved=self._host_tables_bytes,
+                plan=gpu_prefill_plan,
+            )
+            if gpu_prefill_plan is not None and not gpu_prefill_plan.chosen_layer_ids:
+                object.__setattr__(config, "moe_prefill_overlap", False)
             if disk_bank_checkpoint:
                 disk_layer_ids = cpu_layer_ids
                 if config.moe_disk_decode == "gpufetch":
@@ -734,6 +743,18 @@ class Engine:
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
+                if (
+                    gpu_prefill_plan is not None
+                    and gpu_prefill_plan.chosen_layer_ids
+                    and config.moe_prefill_overlap
+                    and not overlap
+                ):
+                    raise ValueError(
+                        "GPU prefill residency selected pinned overlap layers, but "
+                        f"--moe-cache-auto resolved only {size} expert slots and cannot "
+                        f"provide the required two-layer buffer of "
+                        f"{2 * config.model_config.num_experts} slots"
+                    )
                 object.__setattr__(config, "moe_cache_size", size)
                 object.__setattr__(config, "moe_prefill_overlap", overlap)
                 if config.num_page_override is None:
@@ -845,7 +866,8 @@ class Engine:
             "MoE prefill paths: "
             f"overlap={overlap_layers} pinned layers, "
             f"non-overlap={sync_layers + cpu_layers} layers "
-            f"(sync={sync_layers}, CPU={cpu_layers} DISK)"
+            f"(sync={sync_layers}, CPU={cpu_layers} DISK); "
+            f"{_gpu_prefill_plan_log(gpu_prefill_plan)}"
         )
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
@@ -1652,6 +1674,239 @@ def _head_tail_layers(num_moe_layers: int, count: int) -> frozenset[int]:
     )
 
 
+class _GpuPrefillResidencyPlan(NamedTuple):
+    candidate_layer_ids: tuple[int, ...]
+    chosen_layer_ids: tuple[int, ...]
+    layer_bytes: tuple[int, ...]
+    budget_bytes: int | None
+    reserved_bytes: int
+    setting: str
+    reason: str
+
+    @property
+    def chosen_bytes(self) -> int:
+        return sum(self.layer_bytes[layer_id] for layer_id in self.chosen_layer_ids)
+
+
+def _gpu_prefill_layer_order(num_moe_layers: int) -> tuple[int, ...]:
+    """Return the existing middle-first inverse of head-and-tail spill order."""
+    all_layers = frozenset(range(num_moe_layers))
+    previous = frozenset()
+    order = []
+    for keep in range(1, num_moe_layers + 1):
+        pinned = all_layers - _head_tail_layers(num_moe_layers, num_moe_layers - keep)
+        added = pinned - previous
+        assert len(added) == 1
+        order.extend(added)
+        previous = pinned
+    return tuple(order)
+
+
+def _plan_gpu_prefill_layers(
+    layer_bytes: tuple[int, ...],
+    *,
+    budget_bytes: int | None,
+    reserved_bytes: int = 0,
+    setting: str = "auto",
+    traffic_scores: dict[int, float] | None = None,
+) -> _GpuPrefillResidencyPlan:
+    """Reserve pinned GPU-prefill layers before the remaining host-tier split."""
+    if not layer_bytes or any(size <= 0 for size in layer_bytes):
+        raise ValueError("GPU prefill residency requires positive bytes for every MoE layer")
+    if reserved_bytes < 0:
+        raise ValueError("GPU prefill residency reserved bytes must be non-negative")
+
+    current_order = _gpu_prefill_layer_order(len(layer_bytes))
+    if traffic_scores is not None:
+        missing = set(range(len(layer_bytes))) - traffic_scores.keys()
+        if missing:
+            raise ValueError(
+                f"GPU prefill traffic profile is missing layer ids {sorted(missing)}"
+            )
+        current_rank = {layer_id: rank for rank, layer_id in enumerate(current_order)}
+        candidate_ids = tuple(
+            sorted(
+                current_order,
+                key=lambda layer_id: (
+                    -traffic_scores[layer_id],
+                    current_rank[layer_id],
+                ),
+            )
+        )
+        ordering_reason = "highest traffic first"
+    else:
+        candidate_ids = current_order
+        ordering_reason = "the current middle-first ordering"
+
+    normalized = str(setting).strip().lower()
+    available = (
+        math.inf
+        if budget_bytes is None
+        else max(0, int(budget_bytes) - int(reserved_bytes))
+    )
+    if normalized == "off":
+        chosen_ids: tuple[int, ...] = ()
+        reason = "off requested; reserved no GPU prefill layers"
+    elif normalized == "auto":
+        chosen = []
+        remaining = available
+        for layer_id in candidate_ids:
+            size = layer_bytes[layer_id]
+            if size <= remaining:
+                chosen.append(layer_id)
+                remaining -= size
+        chosen_ids = tuple(chosen)
+        if not chosen_ids:
+            smallest = min(layer_bytes)
+            available_text = (
+                "uncapped" if budget_bytes is None else f"{int(available)} bytes"
+            )
+            raise ValueError(
+                "--moe-gpu-prefill-layers auto cannot fit one MoE layer: "
+                f"smallest layer is {smallest} bytes but the pin budget leaves "
+                f"{available_text} after {reserved_bytes} reserved bytes; raise "
+                "FREETOKEN_PIN_BUDGET_GB or pass --moe-gpu-prefill-layers off"
+            )
+        reason = (
+            f"auto fit {len(chosen_ids)}/{len(candidate_ids)} candidates using "
+            f"{ordering_reason}"
+        )
+    else:
+        try:
+            forced = int(normalized)
+        except ValueError as exc:
+            raise ValueError(
+                "--moe-gpu-prefill-layers must be 'auto', 'off', or a positive integer"
+            ) from exc
+        if forced < 1 or forced > len(candidate_ids):
+            raise ValueError(
+                f"--moe-gpu-prefill-layers {forced} is outside [1, {len(candidate_ids)}]"
+            )
+        chosen_ids = candidate_ids[:forced]
+        required = sum(layer_bytes[layer_id] for layer_id in chosen_ids)
+        if required > available:
+            available_text = (
+                "uncapped" if budget_bytes is None else f"{int(available)} bytes"
+            )
+            raise ValueError(
+                f"--moe-gpu-prefill-layers {forced} requires {required} bytes for "
+                f"layers {list(chosen_ids)}, but the pin budget leaves {available_text} "
+                f"after {reserved_bytes} reserved bytes"
+            )
+        reason = (
+            f"forced exactly {forced} GPU prefill layers using {ordering_reason}"
+        )
+
+    return _GpuPrefillResidencyPlan(
+        candidate_layer_ids=candidate_ids,
+        chosen_layer_ids=chosen_ids,
+        layer_bytes=layer_bytes,
+        budget_bytes=budget_bytes,
+        reserved_bytes=reserved_bytes,
+        setting=normalized,
+        reason=reason,
+    )
+
+
+def _moe_bank_layer_geometry(
+    config: EngineConfig, num_moe_layers: int,
+) -> tuple[tuple[int, ...], int] | None:
+    """Return per-layer row bytes and fixed pinned bytes without loading banks."""
+    from freetoken.moe.expert_banks import bank_bytes_estimate
+
+    meta_path = os.path.join(config.model_path, "freetoken_weight.json")
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, encoding="utf-8") as f:
+                tensors = json.load(f).get("tensors", [])
+            per_layer = [0] * num_moe_layers
+            flat_bytes = 0
+            fixed_bytes = 0
+            for tensor in tensors:
+                if tensor.get("kind") != "experts_bank":
+                    continue
+                name = str(tensor.get("name", ""))
+                base, marker, raw_layer = name.rpartition("#L")
+                logical_name = base if marker and raw_layer.isdecimal() else name
+                size = int(tensor["nbytes"])
+                if logical_name in ("gate_up_alpha", "down_alpha"):
+                    fixed_bytes += size
+                elif marker and raw_layer.isdecimal():
+                    layer_id = int(raw_layer)
+                    if not 0 <= layer_id < num_moe_layers:
+                        raise ValueError(
+                            f"FTW expert bank layer id {layer_id} is outside "
+                            f"[0, {num_moe_layers})"
+                        )
+                    per_layer[layer_id] += size
+                else:
+                    flat_bytes += size
+            if flat_bytes:
+                per_layer_size, remainder = divmod(flat_bytes, num_moe_layers)
+                if remainder:
+                    raise ValueError(
+                        f"flat FTW expert banks use {flat_bytes} row bytes, which is not "
+                        f"divisible by {num_moe_layers} MoE layers"
+                    )
+                per_layer = [size + per_layer_size for size in per_layer]
+            if all(per_layer):
+                return tuple(per_layer), fixed_bytes
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            logger.warning_rank0(
+                f"Could not read per-layer FTW bank geometry: {exc}; using model estimate"
+            )
+
+    estimated = bank_bytes_estimate(config.model_config)
+    if not estimated:
+        return None
+    layer_size, remainder = divmod(estimated, num_moe_layers)
+    if remainder or layer_size <= 0:
+        return None
+    return (layer_size,) * num_moe_layers, 0
+
+
+def _auto_gpu_prefill_plan(
+    config: EngineConfig, num_moe_layers: int, reserved: int = 0,
+) -> _GpuPrefillResidencyPlan | None:
+    geometry = _moe_bank_layer_geometry(config, num_moe_layers)
+    if geometry is None:
+        return None
+    layer_bytes, fixed_bytes = geometry
+    hot_reserve = int(
+        max(0.0, float(getattr(config, "moe_hot_expert_budget_gib", 0.0))) * 2**30
+    )
+    profile_path = getattr(config, "moe_disk_layer_profile", None)
+    scores = (
+        _load_disk_layer_profile(profile_path, num_moe_layers)
+        if profile_path else None
+    )
+    setting = getattr(config, "moe_gpu_prefill_layers", "auto")
+    return _plan_gpu_prefill_layers(
+        layer_bytes,
+        budget_bytes=_config_pin_budget_bytes(config),
+        reserved_bytes=reserved + hot_reserve + fixed_bytes,
+        setting=setting,
+        traffic_scores=scores,
+    )
+
+
+def _gpu_prefill_plan_log(plan: _GpuPrefillResidencyPlan | None) -> str:
+    if plan is None:
+        return "GPU residency planner unavailable (bank geometry unknown)"
+    budget = "uncapped" if plan.budget_bytes is None else f"{plan.budget_bytes} B"
+    available = (
+        "uncapped"
+        if plan.budget_bytes is None
+        else f"{max(0, plan.budget_bytes - plan.reserved_bytes)} B"
+    )
+    return (
+        f"GPU candidates={list(plan.candidate_layer_ids)}, "
+        f"chosen={list(plan.chosen_layer_ids)}, bytes={plan.chosen_bytes} B; "
+        f"{plan.reason}; budget={budget} - reserved={plan.reserved_bytes} B "
+        f"= available={available}"
+    )
+
+
 def _load_disk_layer_profile(
     path: str, num_moe_layers: int,
 ) -> dict[int, float] | None:
@@ -1894,36 +2149,38 @@ def _resolve_hot_expert_sets(
     )[0]
 
 
-def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
-    """Pick CPU MoE layers automatically when banks exceed the pin budget.
+def _auto_cpu_layers(
+    config: EngineConfig,
+    num_moe_layers: int,
+    reserved: int = 0,
+    *,
+    plan: _GpuPrefillResidencyPlan | None = None,
+) -> frozenset[int]:
+    """Reserve GPU prefill layers first, then return the CPU or DISK remainder."""
+    from freetoken.moe.expert_banks import resolve_bank_source
 
-    Disk-mappable checkpoints use the lowest-traffic layers from a complete profile, or the
-    U-shaped head-and-tail default. Other checkpoints use the same head-and-tail
-    selection for LOCKED residency.
-    """
-    from freetoken.moe.expert_banks import (
-        bank_bytes_estimate,
-        ftw_bank_bytes,
-        resolve_bank_source,
-    )
-
-    bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
-    if not bank_bytes:
+    plan = plan or _auto_gpu_prefill_plan(config, num_moe_layers, reserved)
+    if plan is None:
         return frozenset()
-    hot_reserve = int(
-        max(0.0, float(getattr(config, "moe_hot_expert_budget_gib", 0.0))) * 2**30
-    )
-    budget = _config_pin_budget_bytes(config, reserved + hot_reserve)
-    if budget is None or bank_bytes <= budget:
+    cpu_ids = frozenset(range(num_moe_layers)) - frozenset(plan.chosen_layer_ids)
+    if not cpu_ids:
         return frozenset()
     if not _cpu_moe_executor_viable(config.model_config):
+        if plan.setting != "auto":
+            raise ValueError(
+                f"--moe-gpu-prefill-layers {plan.setting} leaves {len(cpu_ids)} "
+                "layers on the CPU or DISK path, but the CPU MoE executor cannot "
+                "serve this model"
+            )
+        budget = plan.budget_bytes
+        budget_text = "uncapped" if budget is None else f"{budget / 2**30:.2f} GiB"
         logger.info_rank0(
-            f"--moe-cpu-layers auto: banks {bank_bytes / 2**30:.2f} GiB exceed the "
-            f"pin budget {budget / 2**30:.2f} GiB, but the CPU MoE executor cannot "
+            f"--moe-cpu-layers auto: the GPU prefill reservation leaves "
+            f"{len(cpu_ids)} CPU layers under pin budget {budget_text}, but the CPU MoE "
+            "executor cannot "
             f"serve this model; keeping every layer pinned on the GPU offload path"
         )
         return frozenset()
-    n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
     disk_mappable = (
         config.model_path
         and resolve_bank_source(
@@ -1931,34 +2188,19 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
         ) in ("ftw", "index")
     )
     if disk_mappable:
-        profile_path = getattr(config, "moe_disk_layer_profile", None)
-        scores = (
-            _load_disk_layer_profile(profile_path, num_moe_layers)
-            if profile_path else None
-        )
-        if scores is not None:
-            ids = frozenset(
-                sorted(range(num_moe_layers), key=lambda layer_id: (scores[layer_id], layer_id))[:n]
-            )
-            score_log = {layer_id: scores[layer_id] for layer_id in sorted(ids)}
-            action = (
-                f"mapping {n} lowest-traffic MoE layers from the checkpoint on DISK; "
-                f"layer scores {score_log}"
-            )
-        else:
-            ids = _head_tail_layers(num_moe_layers, n)
-            action = (
-                f"mapping {n} head+tail MoE layers from the checkpoint on DISK; "
-                "layer scores unavailable"
-            )
+        action = f"mapping {len(cpu_ids)} remaining MoE layers from the checkpoint on DISK"
     else:
-        ids = _head_tail_layers(num_moe_layers, n)
-        action = f"locking {n} head+tail MoE layers; layer scores unavailable"
+        action = f"locking {len(cpu_ids)} remaining MoE layers"
+    total_bytes = sum(plan.layer_bytes) + plan.reserved_bytes
+    budget = plan.budget_bytes
+    budget_text = "uncapped" if budget is None else f"{budget / 2**30:.2f} GiB"
     logger.info_rank0(
-        f"MoE bank residency auto: banks {bank_bytes / 2**30:.2f} GiB > pin budget "
-        f"{budget / 2**30:.2f} GiB; {action} for CPU decode ({sorted(ids)})"
+        f"MoE bank residency auto: banks and reserves {total_bytes / 2**30:.2f} GiB, "
+        f"pin budget {budget_text}; reserved GPU prefill layers "
+        f"{list(plan.chosen_layer_ids)} first, then {action} for CPU decode "
+        f"({sorted(cpu_ids)})"
     )
-    return ids
+    return cpu_ids
 
 
 # MoE-only knobs and the value each resolves to on a dense model. moe_backend is handled
@@ -1986,6 +2228,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
+    "moe_gpu_prefill_layers": "auto",
     "moe_prefill_hit_d2d": False,
     "moe_collect_stats": False,
     "expert_load": "auto",
@@ -2073,6 +2316,19 @@ def _adjust_config(config: EngineConfig):
         _parse_disk_layers_spec(config.moe_disk_layers, model_config.num_moe_layers)
         if is_moe and config.moe_disk_layers else frozenset()
     )
+    gpu_prefill_setting = getattr(config, "moe_gpu_prefill_layers", "auto")
+    if (
+        is_moe
+        and str(gpu_prefill_setting).lower() != "auto"
+        and (
+            getattr(config, "moe_cpu_layers", None) is not None
+            or getattr(config, "moe_disk_layers", None) is not None
+        )
+    ):
+        raise ValueError(
+            "--moe-gpu-prefill-layers controls automatic host residency and cannot "
+            "be combined with --moe-cpu-layers or --moe-disk-layers"
+        )
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
