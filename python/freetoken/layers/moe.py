@@ -598,6 +598,12 @@ class OffloadMoELayer(MoELayer):
                 cache, hidden_states, topk_weights, raw_ids
             )
 
+        # Cold routes carry zero weight but the slot-indexed kernels still read
+        # the clamped row, and slot 0 may never have been written. Point them at
+        # a slot this chunk has resident so unwritten scales cannot leak NaN.
+        fill_slot = gpu_slots[on_gpu].reshape(-1)[0]
+        gpu_slots = torch.where(on_gpu, gpu_slots, fill_slot).contiguous()
+
         try:
             # Keep the original activations intact for the cold CPU partial and
             # for the full-CPU OOM fallback.
