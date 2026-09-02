@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -306,6 +307,7 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     executor._prefill_coalesce_degrades = 1
     executor._prefill_populate_bytes = 590_000_000
     executor._prefill_populate_ns = 175_000_000
+    executor._prefill_populate_overlap_ns = 125_000_000
     executor._prefill_batch_rows = 20_480
     executor._prefill_batch_gemms = 420
     executor._disk_major_fault_base = 10
@@ -324,6 +326,7 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["moe_prefill_coalesce_degrades"] == 1
     assert stats["moe_prefill_populate_bytes"] == 590_000_000
     assert stats["moe_prefill_populate_ms"] == 175.0
+    assert stats["moe_prefill_populate_overlap_ms"] == 125.0
     assert stats["moe_prefill_batch_rows"] == 20_480
     assert stats["moe_prefill_batch_gemms"] == 420
     assert stats["gpufetch_fills_per_step"] == 0.0
@@ -342,6 +345,7 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert executor._prefill_coalesce_degrades == 0
     assert executor._prefill_populate_bytes == 0
     assert executor._prefill_populate_ns == 0
+    assert executor._prefill_populate_overlap_ns == 0
     assert executor._disk_major_fault_base == 16
 
 
@@ -802,6 +806,120 @@ def test_cpu_prefill_populate_keeps_uffd_pager_path():
     assert executor._prefill_populate_bytes == 0
 
 
+def _overlap_executor(bank):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [bank]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_mode = "populate"
+    executor._prefill_coalesce_limits = {0: 8}
+    executor._prefill_populate_scratch_bytes = 32
+    executor._prefill_populate_scratch = None
+    executor._prefill_populate_overlap = None
+    executor._prefill_populate_overlap_lock = threading.Lock()
+    executor._prefill_populate_overlap_ns = 0
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+    executor._prefill_populate_bytes = 0
+    executor._prefill_populate_ns = 0
+    return executor
+
+
+def test_cpu_prefill_populate_overlap_joins_and_warms_actual_delta():
+    started = threading.Event()
+    release = threading.Event()
+
+    class Bank:
+        _pager = None
+
+        def __init__(self):
+            self.calls = []
+
+        def populate_experts(self, expert_ids, scratch):
+            self.calls.append((tuple(expert_ids), id(scratch), len(scratch)))
+            if len(self.calls) == 1:
+                started.set()
+                assert release.wait(timeout=2)
+            return 100 * len(expert_ids)
+
+    bank = Bank()
+    executor = _overlap_executor(bank)
+    overlap = executor.schedule_prefill_layer_overlap(0, [2, 1, 2])
+    assert overlap is not None
+    assert started.wait(timeout=2)
+    # Represents useful tail-layer compute while the populate is blocked.
+    assert not release.wait(timeout=0.01)
+    release.set()
+
+    lease = executor.prepare_prefill_layer(0, [3, 2, 1])
+
+    assert lease.experts == (1, 2, 3)
+    assert [call[0] for call in bank.calls] == [(1, 2), (3,)]
+    assert bank.calls[0][1:] == bank.calls[1][1:] == (bank.calls[0][1], 32)
+    assert executor._prefill_populate_overlap is None
+    assert executor._prefill_populate_overlap_ns > 0
+    assert executor._prefill_coalesce_degrades == 0
+
+
+def test_cpu_prefill_populate_overlap_failure_degrades_without_escaping():
+    events = []
+
+    class Bank:
+        _pager = None
+
+        def populate_experts(self, expert_ids, scratch):
+            events.append(("populate", tuple(expert_ids)))
+            raise OSError("synthetic background read failure")
+
+        def prefetch_experts(self, expert_ids):
+            events.append(("willneed", tuple(expert_ids)))
+            return 2
+
+    executor = _overlap_executor(Bank())
+    overlap = executor.schedule_prefill_layer_overlap(0, [2, 1])
+    assert overlap is not None
+
+    lease = executor.prepare_prefill_layer(0, [1, 2])
+
+    assert lease.experts == (1, 2)
+    assert events == [("populate", (1, 2)), ("willneed", (1, 2))]
+    assert executor._prefill_coalesce_degrades == 1
+    assert executor._prefill_populate_overlap is None
+
+
+def test_cpu_prefill_populate_overlap_cancel_drains_mid_read():
+    started = threading.Event()
+    release = threading.Event()
+
+    class Bank:
+        _pager = None
+
+        def populate_experts(self, expert_ids, scratch):
+            started.set()
+            assert release.wait(timeout=2)
+            return 0
+
+    executor = _overlap_executor(Bank())
+    overlap = executor.schedule_prefill_layer_overlap(0, [1, 2])
+    assert overlap is not None
+    assert started.wait(timeout=2)
+
+    executor.cancel_prefill_populate_overlap(wait=False)
+    assert overlap.cancel.is_set()
+    assert overlap.thread is not None and overlap.thread.is_alive()
+    release.set()
+    executor.cancel_prefill_populate_overlap(wait=True)
+
+    assert executor._prefill_populate_overlap is None
+    assert not overlap.thread.is_alive()
+
+
 @pytest.mark.parametrize("model_type", ["qwen4_exp", "glm4_moe"])
 def test_cpu_prefill_coalesce_uses_shared_layer_seam_for_architectures(model_type):
     from freetoken.distributed import set_tp_info, try_get_tp_info
@@ -830,6 +948,9 @@ def test_cpu_prefill_coalesce_uses_shared_layer_seam_for_architectures(model_typ
         release_disk_prefill=lambda actual: calls.append(
             ("release", model_type, actual)
         ),
+        schedule_next_chunk_disk_prefill=lambda layer_id, ids: calls.append(
+            ("schedule", model_type, layer_id)
+        ),
     )
     layer = OffloadMoELayer(
         layer_id=0,
@@ -848,6 +969,7 @@ def test_cpu_prefill_coalesce_uses_shared_layer_seam_for_architectures(model_typ
         ("prepare", model_type, 0),
         ("compute", model_type, 0),
         ("release", model_type, lease),
+        ("schedule", model_type, 0),
     ]
 
 
