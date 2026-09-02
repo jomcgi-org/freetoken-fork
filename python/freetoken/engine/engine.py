@@ -18,7 +18,11 @@ from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
 from freetoken.moe.expert_banks import load_expert_banks
-from freetoken.moe.offload_cache import OffloadMoeCache, attach_offload_moe_cache
+from freetoken.moe.offload_cache import (
+    OffloadMoeCache,
+    attach_offload_moe_cache,
+    hot_dynamic_slot_reserve,
+)
 from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
 
 from .config import EngineConfig
@@ -2091,11 +2095,13 @@ def _resolve_hot_expert_setup(
     pinned_layers = num_moe_layers - num_disk_layers
     top_k = int(config.model_config.num_experts_per_tok)
     overlap_layer_slots = num_experts if config.moe_prefill_overlap else 0
-    dynamic_floor = (2 if config.moe_prefill_overlap else 1) * num_experts
+    dynamic_floor = hot_dynamic_slot_reserve(
+        num_slots, num_experts, config.moe_prefill_overlap
+    )
     # Keep enough evictable slots for one prefill overlap layer's routed set
     # plus decode top_k in every pinned layer: overlap_layer_slots +
-    # top_k * pinned_layers. The cache's existing one/two-layer floor still wins
-    # when it is larger.
+    # top_k * pinned_layers. The cache-scaled one/two-layer floor still wins when
+    # it is larger.
     fetch_reserve = max(
         dynamic_floor,
         overlap_layer_slots + top_k * pinned_layers,
@@ -2105,6 +2111,12 @@ def _resolve_hot_expert_setup(
         num_experts,
         requested // (expert_bytes * num_disk_layers),
     )
+    if budget_limit <= 0:
+        logger.warning_rank0(
+            "HOT expert budget cannot fit one expert in every DISK layer; "
+            "expert-granular residency is disabled"
+        )
+        return {}, {}, expert_bytes
     slot_limit = min(num_experts, available_slots // num_disk_layers)
     if slot_limit <= 0:
         refusal = (
@@ -2118,12 +2130,6 @@ def _resolve_hot_expert_setup(
         logger.warning_rank0(refusal)
         raise ValueError(refusal)
     top_n = min(budget_limit, slot_limit)
-    if top_n <= 0:
-        logger.warning_rank0(
-            "HOT expert budget cannot fit one expert in every DISK layer; "
-            "expert-granular residency is disabled"
-        )
-        return {}, {}, expert_bytes
     capacity = {layer_id: top_n for layer_id in sorted(disk_layer_ids)}
     actual = top_n * len(capacity) * expert_bytes
     if budget_limit < slot_limit:

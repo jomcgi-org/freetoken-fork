@@ -157,8 +157,13 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
     sched.table_manager = SimpleNamespace(page_table=None)
     # DSV4-like manager: prefill_chunk_budget tracks the (about-to-shrink) window pool; no shared
     # page table, so rebuild_cache's prefix-cache rebuild branch is skipped.
+    quiesced = []
     cache_manager = SimpleNamespace(
-        prefill_chunk_budget=5000, rebuild=lambda *a: None, check_integrity=lambda: None)
+        prefill_chunk_budget=5000,
+        rebuild=lambda *a: None,
+        check_integrity=lambda: None,
+        quiesce_lazy_restores=lambda: quiesced.append(True),
+    )
     sched.cache_manager = cache_manager
     sched.table_manager.rebuild = lambda pt: None
     sched.table_manager.token_pool = None
@@ -167,4 +172,5 @@ def test_rebuild_cache_refreshes_prefill_budget(monkeypatch):
 
     cache_manager.prefill_chunk_budget = 1000  # the (stubbed) engine rebuild shrank the pool
     Scheduler.rebuild_cache(sched, num_pages=16)
+    assert quiesced == [True]
     assert sched.prefill_budget == 1000  # tracks the shrunk cap, not the stale 5000

@@ -317,7 +317,11 @@ class Scheduler(SchedulerIOMixin):
         """
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
-        self.cache_manager.quiesce_lazy_restores()
+        quiesce_lazy_restores = getattr(
+            self.cache_manager, "quiesce_lazy_restores", None
+        )
+        if quiesce_lazy_restores is not None:
+            quiesce_lazy_restores()
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
