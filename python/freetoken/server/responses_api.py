@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from openai.types.responses import (
     Response,
     ResponseCompletedEvent,
@@ -57,6 +57,7 @@ from openai.types.responses.response_usage import (
 )
 from pydantic import BaseModel, ConfigDict
 
+from .disconnect import DisconnectAwareStreamingResponse
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     KEEPALIVE,
@@ -69,6 +70,7 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    await_with_disconnect,
     generate_events,
     generate_full,
     render_messages,
@@ -172,10 +174,15 @@ async def handle_responses(
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
-        return StreamingResponse(events, media_type="text/event-stream")
+        return DisconnectAwareStreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/responses")
+        result = await await_with_disconnect(
+            generate_full(uid, spec, state, source="/v1/responses"),
+            request=request,
+            state=state,
+            uid=uid,
+        )
     except GenerationError as exc:
         return _error_response(exc.status_code, str(exc), exc.code)
     response = build_responses_response(result, req, response_id, created, cache_report=cache_report)

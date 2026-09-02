@@ -159,6 +159,9 @@ class Scheduler(SchedulerIOMixin):
         # tombstone so an abort-before-admission request can never be resurrected after its
         # terminal accounting acknowledgement has already been published.
         self._abort_tombstones: dict[int, None] = {}
+        # Natural decode completions retained long enough to recognize a late disconnect
+        # while the already-produced HTTP body is draining. Values are insertion ordered.
+        self._completed_uids: dict[int, None] = {}
         self._forward_iter = 0  # global forward counter; drives the SWA proactive-eviction cadence
         # The launched-but-not-yet-drained batch (overlap): set at the top of each overlap_loop
         # iteration so the abort handler can tell whether a request's forward is still in flight
@@ -485,14 +488,20 @@ class Scheduler(SchedulerIOMixin):
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this
                         # drain point frees the chunk's pages/slots exactly once.
-                        self._free_req_resources(req)
+                        if getattr(req, "abort_discard", False):
+                            Scheduler._discard_client_req_resources(self, req)
+                        else:
+                            self._free_req_resources(req)
                     continue
                 if req.aborted:
                     # Aborted while this final-chunk prefill / decode step was in flight: free
                     # here (the forward is drained) and finish the request. No DetokenizeMsg --
                     # the abort ack flushed after this method stays the uid's terminal reply.
                     self.decode_manager.remove_req(req)
-                    self._free_req_resources(req)
+                    if getattr(req, "abort_discard", False):
+                        Scheduler._discard_client_req_resources(self, req)
+                    else:
+                        self._free_req_resources(req)
                     new_finished_reqs.add(req)
                     continue
                 if req in self.finished_reqs:
@@ -574,6 +583,7 @@ class Scheduler(SchedulerIOMixin):
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
+                    Scheduler._remember_completed_uid(self, req.uid)
                 elif batch.is_prefill and req.table_idx != -1:
                     # for prefill, non-chunk req, cache the prefix.
                     # Polymorphic: the DSV4 naive manager keeps the request's slots (no-op);
@@ -740,10 +750,29 @@ class Scheduler(SchedulerIOMixin):
                     return
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
-            logger.debug_rank0("Aborting request %d", msg.uid)
+            # A disconnect can race the terminal sample through the tokenizer queues. Once
+            # decode has finished, resources are already released and the output is merely
+            # draining, so the successful completion wins and no abort is recorded or acked.
+            completed = getattr(self, "_completed_uids", {})
+            if msg.uid in completed or any(
+                getattr(req, "uid", None) == msg.uid
+                for req in getattr(self, "finished_reqs", ())
+            ):
+                logger.debug_rank0(
+                    "Ignoring abort for completed request %d while output drains", msg.uid
+                )
+                return
+
+            client_disconnected = getattr(msg, "client_disconnected", False)
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is None:
                 tombstones = self._abort_tombstones = {}
+            if client_disconnected and msg.uid in tombstones:
+                return
+            phase, tokens_processed = (
+                Scheduler._abort_diagnostics(self, msg.uid)
+                if client_disconnected else ("queued", 0)
+            )
             tombstones[msg.uid] = None
             # Unknown aborts normally consume their tombstone when the cross-worker UserMsg
             # catches up. Bound hostile/no-followup abort traffic without affecting realistic
@@ -761,19 +790,37 @@ class Scheduler(SchedulerIOMixin):
                 # forward in flight (e.g. a decode req starved behind a long chunked prefill)
                 # is freed immediately -- deferring would leak until its next batch, which
                 # strict prefill-priority puts arbitrarily far away.
+                last_data = getattr(self, "_last_data", None)
                 inflight = (
-                    self._last_data is not None
-                    and req_to_free in self._last_data[0].batch.reqs
+                    last_data is not None
+                    and req_to_free in last_data[0].batch.reqs
                 )
                 if inflight:
                     req_to_free.aborted = True
+                    req_to_free.abort_discard = client_disconnected
+                elif client_disconnected:
+                    # Match OOM recovery's failed cleanup. A disconnect may be observed at
+                    # any forward boundary, so do not publish its request-owned tail to the
+                    # prefix cache or park a session profile. Shared matched prefixes remain.
+                    Scheduler._discard_client_req_resources(self, req_to_free)
                 else:
                     self._free_req_resources(req_to_free)
+            if client_disconnected:
+                Scheduler._record_client_abort(self)
+                logger.warning_rank0(
+                    "Client abort request_id=%d, phase=%s, tokens_processed=%d",
+                    msg.uid,
+                    phase,
+                    tokens_processed,
+                )
             # Always acknowledge the abort, even when the request already left the manager,
             # but NOT yet: overlap_loop still has to publish the prior forward's sampled reply.
             # _flush_abort_acks runs after _process_last_data, making this a true terminal
             # accounting barrier for FrontendManager/prepare-stop.
-            self._pending_abort_acks.add(msg.uid)
+            pending_acks = getattr(self, "_pending_abort_acks", None)
+            if pending_acks is None:
+                pending_acks = self._pending_abort_acks = set()
+            pending_acks.add(msg.uid)
         elif isinstance(msg, CacheRebuildBackendMsg):
             # v1 scope: only if_idle, single-rank, non-owned-KV. drain mode and TP rebuild
             # need the drain-gate / all-rank failure-agreement machinery (deferred), so we
@@ -856,6 +903,64 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
+
+    def _abort_diagnostics(self, uid: int) -> tuple[str, int]:
+        """Return the scheduler phase and committed token positions for an abort."""
+        last_data = getattr(self, "_last_data", None)
+        if last_data is not None:
+            batch = last_data[0].batch
+            for req in getattr(batch, "reqs", ()):
+                if getattr(req, "uid", None) == uid:
+                    return batch.phase, max(0, int(getattr(req, "cached_len", 0)))
+
+        prefill = getattr(self, "prefill_manager", None)
+        for pending in getattr(prefill, "pending_list", ()):
+            if getattr(pending, "uid", None) != uid:
+                continue
+            chunk = getattr(pending, "chunked_req", None)
+            if chunk is not None:
+                return "prefill", max(0, int(getattr(chunk, "cached_len", 0)))
+            return "queued", 0
+
+        decode = getattr(self, "decode_manager", None)
+        for req in getattr(decode, "running_reqs", ()):
+            if getattr(req, "uid", None) == uid:
+                return "decode", max(0, int(getattr(req, "cached_len", 0)))
+        # The abort may beat its UserMsg across tokenizer workers. It is queued from the
+        # scheduler's perspective and the tombstone below will drop it before admission.
+        return "queued", 0
+
+    def _discard_client_req_resources(self, req: Req) -> None:
+        """Release a disconnected request through the OOM guard's no-commit path.
+
+        A successful forward leaves device_len one position ahead of cached_len for the next
+        sample. That next position has not been allocated yet. OOM recovery restores this
+        length from its write metadata; disconnect cleanup performs the equivalent adjustment
+        before calling the same failed cleanup path.
+        """
+        cached_len = getattr(req, "cached_len", None)
+        device_len = getattr(req, "device_len", None)
+        if cached_len is not None and device_len is not None and device_len > cached_len:
+            req.device_len = cached_len
+        self._free_req_resources(req, failed=True)
+
+    def _record_client_abort(self) -> None:
+        reporter = getattr(self, "status_reporter", None)
+        if reporter is None:
+            return
+        record = getattr(reporter, "record_client_abort", None)
+        if record is not None:
+            record()
+        else:
+            reporter.client_aborts = getattr(reporter, "client_aborts", 0) + 1
+
+    def _remember_completed_uid(self, uid: int) -> None:
+        completed = getattr(self, "_completed_uids", None)
+        if completed is None:
+            completed = self._completed_uids = {}
+        completed[uid] = None
+        while len(completed) > 65_536:
+            completed.pop(next(iter(completed)))
 
     def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is

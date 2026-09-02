@@ -24,6 +24,7 @@ class SchedulerStatusReporter:
     _constrained_requests: int = field(default=0, init=False)
     _mask_us: float = field(default=0.0, init=False)
     oom_aborts: int = field(default=0, init=False)
+    client_aborts: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         now = self.clock()
@@ -76,6 +77,9 @@ class SchedulerStatusReporter:
     def record_oom_aborts(self, count: int) -> None:
         self.oom_aborts += count
 
+    def record_client_abort(self) -> None:
+        self.client_aborts += 1
+
     def _report_prefill(
         self,
         batch: Batch,
@@ -110,6 +114,7 @@ class SchedulerStatusReporter:
             f"{_mamba_msg(mamba_slots)}"
             f"#running-req: {running_reqs}, "
             f"#queue-req: {queue_reqs}, "
+            f"client_aborts: {self.client_aborts}, "
             f"{_priority_queue_msg(queue_priority_bands, max_wait_seconds)}"
             f"{', ' if queue_priority_bands is not None else ''}"
             f"input throughput (token/s): {input_throughput:.2f}"
@@ -194,6 +199,7 @@ class SchedulerStatusReporter:
             f"acceptance rate: {acceptance_rate:.4f}, "
             f"tokens/step: {tokens_per_step:.2f}, "
             f"oom_aborts: {self.oom_aborts}, "
+            f"client_aborts: {self.client_aborts}, "
             f"#queue-req: {queue_reqs}"
             f"{', ' if queue_priority_bands is not None else ''}"
             f"{_priority_queue_msg(queue_priority_bands, max_wait_seconds)}"

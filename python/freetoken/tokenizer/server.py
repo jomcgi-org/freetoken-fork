@@ -293,7 +293,13 @@ def tokenize_worker(
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
-                    data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]
+                    data=[
+                        AbortBackendMsg(
+                            uid=msg.uid,
+                            client_disconnected=getattr(msg, "client_disconnected", False),
+                        )
+                        for msg in abort_msg
+                    ]
                 )
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]

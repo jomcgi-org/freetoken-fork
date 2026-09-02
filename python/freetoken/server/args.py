@@ -33,6 +33,9 @@ class ServerArgs(SchedulerConfig):
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
+    # Cancel scheduler work when the HTTP peer goes away. Kept as on/off to match the CLI
+    # spelling and leave room for future disconnect policies without adding inverse flags.
+    abort_on_disconnect: str = "on"
     # Report the prefix-cache hit in each response's usage block (OpenAI
     # prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens, Responses
     # input_tokens_details.cached_tokens). Mirrors sglang's --enable-cache-report.
@@ -274,6 +277,13 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.max_output_tokens,
         help="Default max output tokens for requests that omit one (default 32k).",
+    )
+
+    parser.add_argument(
+        "--abort-on-disconnect",
+        choices=["on", "off"],
+        default=ServerArgs.abort_on_disconnect,
+        help="Abort queued or running generation when its HTTP client disconnects.",
     )
 
     parser.add_argument(

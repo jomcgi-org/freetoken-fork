@@ -136,6 +136,34 @@ def test_decode_lines_are_throttled_to_every_nth_forward():
     assert "gen throughput (token/s): 3.00" in line
 
 
+def test_status_lines_include_cumulative_client_aborts():
+    rep, logs, clock = _reporter(interval=1)
+    rep.record_client_abort()
+    rep.record_client_abort()
+
+    clock["t"] = 1.0
+    rep.report_batch(
+        _prefill_batch(new_tokens=1, cached_tokens=0, n_seqs=1),
+        running_reqs=1,
+        queue_reqs=0,
+        kv_used_pages=1,
+        kv_total_pages=2,
+        page_size=1,
+    )
+    assert "client_aborts: 2" in logs[-1]
+
+    clock["t"] = 2.0
+    rep.report_batch(
+        _decode_batch(1),
+        running_reqs=1,
+        queue_reqs=0,
+        kv_used_pages=1,
+        kv_total_pages=2,
+        page_size=1,
+    )
+    assert "client_aborts: 2" in logs[-1]
+
+
 def test_decode_counter_resets_each_interval():
     rep, logs, clock = _reporter(interval=2)
     clock["t"] = 1.0

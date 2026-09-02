@@ -18,7 +18,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from .anthropic_models import (
     AnthropicContentBlock,
@@ -32,6 +32,7 @@ from .anthropic_models import (
     AnthropicStreamEvent,
     AnthropicUsage,
 )
+from .disconnect import DisconnectAwareStreamingResponse
 from .generation import (
     KEEPALIVE,
     ContentDelta,
@@ -43,6 +44,7 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    await_with_disconnect,
     count_prompt_tokens,
     generate_events,
     generate_full,
@@ -129,10 +131,15 @@ async def handle_anthropic_messages(
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
-        return StreamingResponse(events, media_type="text/event-stream")
+        return DisconnectAwareStreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/messages")
+        result = await await_with_disconnect(
+            generate_full(uid, spec, state, source="/v1/messages"),
+            request=request,
+            state=state,
+            uid=uid,
+        )
     except GenerationError as exc:
         return _anthropic_error_response(
             exc.status_code,
