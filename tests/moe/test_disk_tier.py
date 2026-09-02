@@ -55,7 +55,7 @@ def test_ftw_disk_banks_are_aligned_mapped_and_byte_exact(tmp_path):
         assert mapped.prefetch_experts([0, 0]) >= 1
 
 
-def test_ftw_load_builds_compact_hot_rows_and_keeps_cold_rows_file_backed(
+def test_ftw_load_keeps_all_hot_and_cold_rows_file_backed(
     tmp_path, monkeypatch,
 ):
     from freetoken.checkpoint.ftw import load_ftw_banks
@@ -74,13 +74,11 @@ def test_ftw_load_builds_compact_hot_rows_and_keeps_cold_rows_file_backed(
     )
     assert banks is not None
     assert banks.hot_expert_ids == {0: (1, 4)}
-    assert torch.equal(banks.hot_sources["gate_up"][0], gate_up[[1, 4]])
-    assert torch.equal(banks.hot_sources["down"][0], down[[1, 4]])
+    assert banks.hot_sources == {}
     assert banks.sources["gate_up"][0]._freetoken_host_bank.residency is HostResidency.DISK
-    assert banks.hot_sources["gate_up"][0]._freetoken_host_bank.residency is not HostResidency.DISK
 
 
-def test_ftw_load_allocates_all_cold_hot_capacity(tmp_path, monkeypatch):
+def test_ftw_load_records_all_cold_hot_capacity_without_allocating_mirror(tmp_path, monkeypatch):
     from freetoken.checkpoint.ftw import load_ftw_banks
     from freetoken.moe.host_banks import HostResidency
 
@@ -99,7 +97,7 @@ def test_ftw_load_allocates_all_cold_hot_capacity(tmp_path, monkeypatch):
     assert banks is not None
     assert banks.hot_expert_ids == {0: ()}
     assert banks.hot_expert_capacity == {0: 2}
-    assert banks.hot_sources["gate_up"][0].shape == (2, 4, 3)
+    assert banks.hot_sources == {}
 
 
 def test_disk_residency_rejects_non_ftw_checkpoint(tmp_path):
@@ -114,12 +112,12 @@ def test_disk_residency_rejects_non_ftw_checkpoint(tmp_path):
         )
 
 
-def test_cache_registers_compact_hot_sources_and_static_row_map():
+def test_cache_stages_hot_sources_into_protected_gpu_rows():
     from freetoken.moe.host_banks import HostResidency
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     cache = OffloadMoeCache(
-        num_layers=1, num_experts=5, cache_size=5, device=torch.device("cpu"),
+        num_layers=1, num_experts=5, cache_size=7, device=torch.device("cpu"),
         prefill_overlap=False, decode_target="cpu",
     )
     cache.cpu_layer_ids = frozenset({0})
@@ -127,15 +125,15 @@ def test_cache_registers_compact_hot_sources_and_static_row_map():
         "gate_up": [torch.arange(5 * 4 * 3).view(5, 4, 3)],
         "down": [torch.arange(5 * 3 * 2).view(5, 3, 2)],
     }
-    hot_sources = {
-        "gate_up": [sources["gate_up"][0][[1, 4]].contiguous()],
-        "down": [sources["down"][0][[1, 4]].contiguous()],
-    }
     cache.set_bank_sources(
         sources,
         layer_residency=[HostResidency.DISK.value],
-        hot_sources=hot_sources,
         hot_expert_ids={0: (1, 4)},
+    )
+    row_bytes = sum(bank[0][0].numel() * bank[0].element_size() for bank in sources.values())
+    cache.configure_hot_adaptation(
+        half_life_steps=2, interval_steps=0,
+        max_swap_bytes=row_bytes, expert_bytes=row_bytes,
     )
 
     assert cache.is_hot_split_layer(0)
@@ -145,7 +143,7 @@ def test_cache_registers_compact_hot_sources_and_static_row_map():
     assert ids[0, 1].item() == -1
     assert ids[0, 0].item() >= 0
     assert ids[1, 0].item() >= 0
-    assert cache.src_indices[:2].tolist() == [0, 1]
+    assert cache.num_indices.item() == 0
 
 
 def test_disk_stats_report_hot_pair_rate_and_reset():
@@ -1455,7 +1453,7 @@ def test_disk_gpufetch_decode_matches_cpu_executor(tmp_path):
     cache = OffloadMoeCache(
         num_layers=1,
         num_experts=experts,
-        cache_size=experts,
+        cache_size=experts + 2,
         device=device,
         prefill_overlap=False,
         moe_disk_decode="gpufetch",
@@ -1553,6 +1551,14 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
         hot_sources=banks.hot_sources,
         hot_expert_ids=banks.hot_expert_ids,
     )
+    row_bytes = sum(
+        source[0][0].numel() * source[0].element_size()
+        for source in banks.sources.values()
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2, interval_steps=0,
+        max_swap_bytes=row_bytes, expert_bytes=row_bytes,
+    )
     executor = CpuMoeExecutor(
         cache,
         top_k=top_k,
@@ -1614,7 +1620,7 @@ def test_disk_hot_adaptation_forced_tick_preserves_decode_parity(tmp_path):
 
     device = torch.device("cuda")
     cache = OffloadMoeCache(
-        num_layers=1, num_experts=experts, cache_size=experts, device=device,
+        num_layers=1, num_experts=experts, cache_size=experts + 2, device=device,
         prefill_overlap=False, decode_target="cpu",
     )
     cache.cpu_layer_ids = frozenset({0})

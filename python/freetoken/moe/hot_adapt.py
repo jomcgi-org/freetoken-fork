@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 
+# Covers the fixed mapped-host mapping/snapshot tensors and one row of rounding
+# when max_swap_bytes is smaller than, or not divisible by, an expert row.
+HOT_STAGING_HEADROOM_BYTES = 64 << 20
+
+
 @dataclass(frozen=True)
 class HotSwap:
     """Install ``incoming_expert`` into one fixed HOT bank row."""
@@ -15,6 +20,25 @@ class HotSwap:
     row: int
     incoming_expert: int
     outgoing_expert: int | None
+
+
+def hot_staging_rows(max_swap_bytes: int, expert_bytes: int) -> int:
+    """Rows in the reusable host staging bank.
+
+    Adaptation itself remains bounded by ``floor(max_swap / expert_bytes)``.
+    One row is retained when that quotient is zero so a profiled initial set and
+    a runtime cache rebuild can still be streamed without a full host mirror.
+    """
+    if max_swap_bytes < 0 or expert_bytes <= 0:
+        raise ValueError("HOT staging requires a non-negative swap bound and positive rows")
+    return max(1, max_swap_bytes // expert_bytes)
+
+
+def hot_staging_budget_bytes(max_swap_bytes: int) -> int:
+    """Conservative governor charge for staging payload plus fixed control data."""
+    if max_swap_bytes < 0:
+        raise ValueError("HOT staging swap bound must be non-negative")
+    return max_swap_bytes + HOT_STAGING_HEADROOM_BYTES
 
 
 def decay_multiplier(half_life_steps: int, elapsed_steps: int = 1) -> float:
