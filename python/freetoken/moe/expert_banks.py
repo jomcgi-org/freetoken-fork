@@ -486,7 +486,7 @@ def bank_bytes_per_expert(model_config) -> int | None:
     return total // (layers * experts)
 
 
-def load_expert_banks(
+def _load_expert_banks_impl(
     model_path: str,
     model_config,
     *,
@@ -616,6 +616,56 @@ def load_expert_banks(
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
                                         decode_target, layer_sink)
     return _echo_residency(banks, layer_residency, residency_plan)
+
+
+def load_expert_banks(
+    model_path: str,
+    model_config,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    dummy: bool = False,
+    parallel: bool | None = None,
+    workers: int = 8,
+    chunk: int = _PARALLEL_CHUNK,
+    decode_target: str = "gpu",
+    layer_sink=None,
+    layer_residency: list[str] | None = None,
+    disk_pager=None,
+    hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
+    hot_expert_capacity: dict[int, int] | None = None,
+    bank_source: str = "auto",
+    hugepages: str = "auto",
+) -> ExpertBanks:
+    """Load expert banks under one THP policy and emit its startup probe report."""
+    from freetoken.moe.host_banks import (
+        format_hugepage_status,
+        read_meminfo_hugepages,
+        requested_hugepages,
+    )
+
+    before = read_meminfo_hugepages()
+    with requested_hugepages(hugepages):
+        banks = _load_expert_banks_impl(
+            model_path,
+            model_config,
+            device=device,
+            dtype=dtype,
+            dummy=dummy,
+            parallel=parallel,
+            workers=workers,
+            chunk=chunk,
+            decode_target=decode_target,
+            layer_sink=layer_sink,
+            layer_residency=layer_residency,
+            disk_pager=disk_pager,
+            hot_expert_ids=hot_expert_ids,
+            hot_expert_capacity=hot_expert_capacity,
+            bank_source=bank_source,
+        )
+    after = read_meminfo_hugepages()
+    logger.info_rank0(format_hugepage_status(banks, hugepages, before, after))
+    return banks
 
 
 def _echo_residency(banks: ExpertBanks, requested, plan) -> ExpertBanks:

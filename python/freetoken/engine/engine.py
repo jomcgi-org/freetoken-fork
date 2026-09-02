@@ -736,6 +736,7 @@ class Engine:
                 layer_residency=requested_residency,
                 disk_pager=disk_pager,
                 bank_source=getattr(config, "bank_source", "auto"),
+                hugepages=getattr(config, "moe_bank_hugepages", "auto"),
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -2275,6 +2276,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_collect_stats": False,
     "expert_load": "auto",
     "bank_source": "auto",
+    "moe_bank_hugepages": "auto",
 }
 
 

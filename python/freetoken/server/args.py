@@ -641,6 +641,17 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--moe-bank-hugepages",
+        default=ServerArgs.moe_bank_hugepages,
+        choices=["auto", "on", "off"],
+        help=(
+            "Transparent huge pages for expert-bank mappings. 'auto' advises eligible "
+            "Linux mappings and otherwise disables silently; 'on' requires runtime "
+            "MADV_HUGEPAGE support; 'off' disables the advice."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",
