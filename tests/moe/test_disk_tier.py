@@ -316,6 +316,7 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["prefetch_calls"] == 6
     assert stats["pages_requested"] == 36
     assert stats["major_faults"] == 6
+    assert stats["major_faults_unit"] == "kernel_events_4KiB_or_2MiB"
     assert stats["major_faults_per_decode_step"] == 2.0
     assert stats["distinct_experts_per_step"] == 5.0
     assert stats["dedup_ratio"] == 1.6

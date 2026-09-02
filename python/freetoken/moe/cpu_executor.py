@@ -143,7 +143,7 @@ _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
 
 
 def _major_faults() -> int | None:
-    """Process major-fault count from Linux procfs, or ``None`` when unavailable."""
+    """Linux major-fault events, whose granularity may be 4 KiB or one THP."""
     try:
         with open("/proc/self/stat", encoding="utf-8") as f:
             tail = f.read().rpartition(") ")[2].split()
@@ -1421,6 +1421,7 @@ class CpuMoeExecutor:
             "prefetch_calls": sum(self._disk_prefetch_calls),
             "pages_requested": sum(self._disk_prefetch_pages),
             "major_faults": major_faults,
+            "major_faults_unit": "kernel_events_4KiB_or_2MiB",
             "major_faults_per_decode_step": (
                 major_faults / decode_steps
                 if major_faults is not None and decode_steps else 0.0

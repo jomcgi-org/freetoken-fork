@@ -31,6 +31,10 @@ class EngineConfig:
     expert_load: str = "auto"
     # Expert bank source: FTW, a byte-identical safetensors index, or automatic detection.
     bank_source: str = "auto"
+    # Transparent huge pages for anonymous and eligible file-backed expert banks.
+    # "auto" advises supported Linux mappings, "on" requires Linux support, and
+    # "off" preserves ordinary page mappings.
+    moe_bank_hugepages: str = "auto"
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
@@ -170,6 +174,11 @@ class EngineConfig:
             raise ValueError(
                 "--bank-source must be 'auto', 'ftw', or 'index', got "
                 f"{self.bank_source!r}"
+            )
+        if self.moe_bank_hugepages not in ("auto", "on", "off"):
+            raise ValueError(
+                "--moe-bank-hugepages must be 'auto', 'on', or 'off', got "
+                f"{self.moe_bank_hugepages!r}"
             )
         if (
             not math.isfinite(float(self.kv_disk_cache_gib))

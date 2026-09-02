@@ -23,6 +23,8 @@ import math
 import mmap
 import os
 import queue
+import re
+import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +37,8 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 _BLK = 4096  # O_DIRECT alignment (page size)
+_HUGEPAGE = 2 << 20
+_HUGEPAGE_MODES = ("auto", "on", "off")
 
 
 class HostResidency(str, Enum):
@@ -54,7 +58,246 @@ class HostResidency(str, Enum):
 _DEFAULT_CHUNK = 8 << 20
 
 # Hold the mmaps for the process lifetime; the offload cache reads from these banks forever.
-_LIVE_BUFFERS: list[mmap.mmap] = []
+_LIVE_BUFFERS: list[object] = []
+
+
+def hugepages_supported(*, platform: str | None = None) -> bool:
+    """Return whether this runtime exposes Linux transparent-hugepage advice."""
+    return (
+        (sys.platform if platform is None else platform) == "linux"
+        and hasattr(mmap, "MADV_HUGEPAGE")
+    )
+
+
+def hugepages_enabled(mode: str, *, supported: bool | None = None) -> bool:
+    """Resolve the CLI policy without probing or allocating a mapping."""
+    if mode not in _HUGEPAGE_MODES:
+        raise ValueError(
+            "--moe-bank-hugepages must be 'auto', 'on', or 'off', got "
+            f"{mode!r}"
+        )
+    available = hugepages_supported() if supported is None else supported
+    if mode == "on" and not available:
+        raise RuntimeError(
+            "--moe-bank-hugepages on requires Linux MADV_HUGEPAGE support"
+        )
+    return mode != "off" and available
+
+
+def hugepage_row_alignment(
+    row_stride: int, row0_offset: int = 0, *, hugepage_size: int = _HUGEPAGE,
+) -> tuple[int, int] | None:
+    """Return ``(first_row, period)`` whose starts are hugepage aligned.
+
+    ``None`` means no row start can align for this immutable packed layout. The
+    result describes alignment arithmetic only and never adds padding to FTW.
+    """
+    if row_stride <= 0 or hugepage_size <= 0:
+        raise ValueError("row_stride and hugepage_size must be positive")
+    offset = row0_offset % hugepage_size
+    divisor = math.gcd(row_stride, hugepage_size)
+    if offset % divisor:
+        return None
+    period = hugepage_size // divisor
+    if period == 1:
+        return 0, 1
+    first = (
+        (-offset // divisor)
+        * pow(row_stride // divisor, -1, period)
+    ) % period
+    return first, period
+
+
+def _round_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _libc_mmap(
+    length: int, *, address: int = 0, prot: int, flags: int,
+    fd: int = -1, offset: int = 0,
+) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    result = libc.mmap(
+        ctypes.c_void_p(address), ctypes.c_size_t(length), prot, flags, fd,
+        ctypes.c_longlong(offset),
+    )
+    failed = ctypes.c_void_p(-1).value
+    if result == failed:
+        err = ctypes.get_errno()
+        raise OSError(err, f"mmap({length} bytes): {os.strerror(err)}")
+    return int(result)
+
+
+def _libc_munmap(address: int, length: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.munmap(ctypes.c_void_p(address), ctypes.c_size_t(length)):
+        err = ctypes.get_errno()
+        raise OSError(err, f"munmap({length} bytes): {os.strerror(err)}")
+
+
+class _AlignedFileMapping:
+    """Own a file VMA placed at a 2 MiB-aligned address on Linux."""
+
+    __slots__ = ("address", "length", "_reserve", "_reserve_length", "buffer")
+
+    def __init__(self, fd: int, length: int, offset: int) -> None:
+        map_length = _round_up(length, mmap.PAGESIZE)
+        reserve_length = map_length + _HUGEPAGE
+        anonymous = getattr(mmap, "MAP_ANONYMOUS", getattr(mmap, "MAP_ANON", 0x20))
+        reserve = _libc_mmap(
+            reserve_length,
+            prot=0,
+            flags=mmap.MAP_PRIVATE | anonymous,
+        )
+        address = _round_up(reserve, _HUGEPAGE)
+        try:
+            mapped = _libc_mmap(
+                map_length,
+                address=address,
+                prot=mmap.PROT_READ,
+                flags=mmap.MAP_SHARED | 0x10,  # MAP_FIXED inside our reservation
+                fd=fd,
+                offset=offset,
+            )
+            if mapped != address:
+                raise OSError(f"fixed mmap returned {mapped:#x}, wanted {address:#x}")
+        except BaseException:
+            _libc_munmap(reserve, reserve_length)
+            raise
+        raw = (ctypes.c_ubyte * length).from_address(address)
+        self.address = address
+        self.length = length
+        self._reserve = reserve
+        self._reserve_length = reserve_length
+        self.buffer = memoryview(raw).cast("B").toreadonly()
+
+    def close(self) -> None:
+        if self._reserve:
+            reserve, length = self._reserve, self._reserve_length
+            self._reserve = 0
+            _libc_munmap(reserve, length)
+
+    def __del__(self) -> None:
+        if self._reserve:
+            try:
+                self.close()
+            except OSError:
+                pass
+
+
+def _aligned_anonymous_mapping(length: int) -> tuple[mmap.mmap, memoryview, int]:
+    raw = mmap.mmap(
+        -1,
+        length + _HUGEPAGE,
+        flags=mmap.MAP_PRIVATE,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    raw_address = ctypes.addressof(ctypes.c_char.from_buffer(raw))
+    offset = (-raw_address) % _HUGEPAGE
+    address = raw_address + offset
+    return raw, memoryview(raw)[offset:offset + length], address
+
+
+def _madvise(address: int, length: int, advice: int) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.madvise(
+        ctypes.c_void_p(address), ctypes.c_size_t(length), ctypes.c_int(advice)
+    ):
+        err = ctypes.get_errno()
+        raise OSError(err, f"madvise({length} bytes): {os.strerror(err)}")
+
+
+def _filesystem_type(path: str) -> str:
+    """Best-effort Linux mountinfo lookup used in per-bank probe reporting."""
+    if sys.platform != "linux":
+        return "unavailable"
+    try:
+        target = os.path.realpath(path)
+        best = (0, "unknown")
+        with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+            for line in handle:
+                left, right = line.rstrip().split(" - ", 1)
+                fields = left.split()
+                mountpoint = fields[4].replace("\\040", " ")
+                if target == mountpoint or target.startswith(mountpoint.rstrip("/") + "/"):
+                    if len(mountpoint) >= best[0]:
+                        best = (len(mountpoint), right.split()[0])
+        return best[1]
+    except (OSError, ValueError, IndexError):
+        return "unknown"
+
+
+_SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
+
+
+def _mappings_huge_kib(
+    mappings: list[tuple[int, int, int]],
+) -> dict[int, dict[str, int]] | None:
+    """Read smaps once and sum hugepage counters for overlapping mappings."""
+    if sys.platform != "linux":
+        return None
+    if not mappings:
+        return {}
+    fields = ("AnonHugePages", "FilePmdMapped", "ShmemPmdMapped")
+    totals = {key: {field: 0 for field in fields} for key, _addr, _length in mappings}
+    overlaps: set[int] = set()
+    current: list[int] = []
+    try:
+        with open("/proc/self/smaps", encoding="utf-8") as handle:
+            for line in handle:
+                match = _SMAPS_HEADER.match(line)
+                if match:
+                    start, end = (int(value, 16) for value in match.groups())
+                    current = [
+                        key for key, address, length in mappings
+                        if start < address + length and end > address
+                    ]
+                    overlaps.update(current)
+                    continue
+                if current:
+                    key, separator, value = line.partition(":")
+                    if separator and key in fields:
+                        amount = int(value.split()[0])
+                        for mapping_key in current:
+                            totals[mapping_key][key] += amount
+    except (OSError, ValueError, IndexError):
+        return None
+    return {key: totals[key] for key in overlaps}
+
+
+def _mapping_huge_kib(address: int, length: int) -> dict[str, int] | None:
+    result = _mappings_huge_kib([(0, address, length)])
+    return None if result is None else result.get(0)
+
+
+def read_meminfo_hugepages(path: str = "/proc/meminfo") -> dict[str, int] | None:
+    """Read the system-wide THP counters requested in the startup report."""
+    values: dict[str, int] = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                key, separator, raw = line.partition(":")
+                if separator and key in ("AnonHugePages", "FileHugePages"):
+                    values[key] = int(raw.split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return values if len(values) == 2 else None
+
+
+_requested_hugepage_mode = "auto"
+
+
+@contextlib.contextmanager
+def requested_hugepages(mode: str):
+    """Install the bank-mapping THP policy for one expert-bank load."""
+    global _requested_hugepage_mode
+    hugepages_enabled(mode)
+    previous, _requested_hugepage_mode = _requested_hugepage_mode, mode
+    try:
+        yield
+    finally:
+        _requested_hugepage_mode = previous
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -68,6 +311,10 @@ def born_pinned_default() -> bool:
     """Whether PINNED serving banks use cudaHostAlloc instead of mmap + register-after-fill.
 
     Off by default: registered mmaps already read at the PCIe roofline and lazy mmaps commit pages only on fill. ``FREETOKEN_BANK_CUDA_ALLOC`` overrides."""
+    if hugepages_enabled(_requested_hugepage_mode):
+        # cudaHostAlloc does not let us choose or advise its backing VMA. THP mode
+        # therefore uses the normal fill-then-cudaHostRegister mmap path.
+        return False
     env = _env_born_pinned()
     if env is not None:
         return env
@@ -90,7 +337,8 @@ class HostBank:
     __slots__ = (
         "tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_disk",
         "_view_offset", "_uffd", "_pager", "_pager_region", "_file_path",
-        "_map_offset",
+        "_map_offset", "_mapping", "_mapping_addr", "_mapping_length",
+        "_hugepage_status",
     )
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
@@ -99,15 +347,16 @@ class HostBank:
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
-            born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
+            born = born_pinned_default() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
         assert backing in ("mmap", "cuda", "file", "uffd"), backing
+        huge_enabled = hugepages_enabled(_requested_hugepage_mode)
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
-        allocation_alignment = mmap.PAGESIZE if backing == "uffd" else _BLK
-        asize = (
-            (self.nbytes + allocation_alignment - 1) // allocation_alignment
-        ) * allocation_alignment
+        allocation_alignment = _HUGEPAGE if huge_enabled and backing != "cuda" else (
+            mmap.PAGESIZE if backing == "uffd" else _BLK
+        )
+        asize = _round_up(self.nbytes, allocation_alignment)
         self._disk = backing in ("file", "uffd")
         self._uffd = backing == "uffd"
         self._pager = disk_pager
@@ -115,10 +364,25 @@ class HostBank:
         self._file_path = file_path
         self._map_offset = 0
         self._view_offset = 0
+        self._mapping = None
+        self._mapping_addr = 0
+        self._mapping_length = 0
+        self._hugepage_status = {
+            "mode": _requested_hugepage_mode,
+            "backing": backing,
+            "attempted": False,
+            "advised": False,
+            "reason": "disabled" if not huge_enabled else "not attempted",
+            "filesystem": "anonymous" if backing != "file" else "unknown",
+            "alignment_error": None,
+            "pin_before_kib": None,
+            "pin_after_kib": None,
+        }
         if backing == "file":
             if file_path is None:
                 raise ValueError("file-backed HostBank requires file_path")
-            map_off = file_offset // mmap.ALLOCATIONGRANULARITY * mmap.ALLOCATIONGRANULARITY
+            map_alignment = _HUGEPAGE if huge_enabled else mmap.ALLOCATIONGRANULARITY
+            map_off = file_offset // map_alignment * map_alignment
             self._map_offset = map_off
             self._view_offset = file_offset - map_off
             # Safetensors tensor payloads are not necessarily page aligned. Map from the
@@ -127,17 +391,31 @@ class HostBank:
             map_len = self._view_offset + self.nbytes
             fd = os.open(file_path, os.O_RDONLY)
             try:
-                self._buf = mmap.mmap(
-                    fd, map_len, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ,
-                    offset=map_off,
-                )
+                if huge_enabled:
+                    try:
+                        self._mapping = _AlignedFileMapping(fd, map_len, map_off)
+                        self._buf = self._mapping.buffer
+                        self._mapping_addr = self._mapping.address
+                    except OSError as exc:
+                        if _requested_hugepage_mode == "on":
+                            raise
+                        self._mapping = self._buf = mmap.mmap(
+                            fd,
+                            map_len,
+                            flags=mmap.MAP_SHARED,
+                            prot=mmap.PROT_READ,
+                            offset=map_off,
+                        )
+                        self._hugepage_status["alignment_error"] = str(exc)
+                else:
+                    self._mapping = self._buf = mmap.mmap(
+                        fd, map_len, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ,
+                        offset=map_off,
+                    )
             finally:
                 os.close(fd)
-            try:
-                self._buf.madvise(mmap.MADV_RANDOM)
-            except (AttributeError, OSError):
-                pass
-            _LIVE_BUFFERS.append(self._buf)
+            self._mapping_length = map_len
+            _LIVE_BUFFERS.append(self._mapping)
             self._pinned = False
         elif backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
@@ -148,21 +426,30 @@ class HostBank:
             raw.zero_()  # keep the anonymous-mmap guarantee: unwritten regions stay zero
             off = (-raw.data_ptr()) % _BLK
             self._buf = raw.numpy()[off:off + asize]
+            self._mapping = raw
             self.addr = raw.data_ptr() + off
+            self._mapping_addr = self.addr
+            self._mapping_length = asize
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            if self._uffd:
-                self._buf = mmap.mmap(
+            if huge_enabled:
+                self._mapping, self._buf, self.addr = _aligned_anonymous_mapping(asize)
+            elif self._uffd:
+                self._mapping = self._buf = mmap.mmap(
                     -1, asize, flags=mmap.MAP_PRIVATE,
                     prot=mmap.PROT_READ | mmap.PROT_WRITE,
                 )
+                self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             else:
-                self._buf = mmap.mmap(-1, asize)
+                self._mapping = self._buf = mmap.mmap(-1, asize)
+                self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             # Both are lazy anonymous address space; pages materialize only on fill.
-            _LIVE_BUFFERS.append(self._buf)
-            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            _LIVE_BUFFERS.append(self._mapping)
+            self._mapping_addr = self.addr
+            self._mapping_length = asize
             self._pinned = False
+            self._apply_hugepage_advice()
             if self._uffd:
                 if file_path is None or disk_pager is None:
                     raise ValueError(
@@ -189,10 +476,36 @@ class HostBank:
             ).view(*shape)
         if self._disk:
             self.addr = self.tensor.data_ptr()
+        if backing == "file":
+            if not self._mapping_addr:
+                self._mapping_addr = self.addr - self._view_offset
+            try:
+                _madvise(self._mapping_addr, self._mapping_length, mmap.MADV_RANDOM)
+            except (AttributeError, OSError):
+                pass
+            self._hugepage_status["filesystem"] = _filesystem_type(file_path)
+            self._apply_hugepage_advice()
         # The CPU executor only receives tensors. Keep the owning mapping reachable from
         # each direct FTW view so it can issue expert-granular prefetches.
         self.tensor._freetoken_host_bank = self
         self._locked = False
+
+    def _apply_hugepage_advice(self) -> None:
+        if not hugepages_enabled(_requested_hugepage_mode):
+            return
+        status = self._hugepage_status
+        status["attempted"] = True
+        try:
+            _madvise(
+                self._mapping_addr,
+                self._mapping_length,
+                mmap.MADV_HUGEPAGE,
+            )
+        except (AttributeError, OSError) as exc:
+            status["reason"] = f"unsupported ({exc})"
+            return
+        status["advised"] = True
+        status["reason"] = "MADV_HUGEPAGE accepted"
 
     @property
     def residency(self) -> HostResidency:
@@ -220,12 +533,16 @@ class HostBank:
         from freetoken.kernel.pinned import host_register
 
         try:
+            before = _mapping_huge_kib(self._mapping_addr, self._mapping_length)
             host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
             raise RuntimeError(
                 f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
+        after = _mapping_huge_kib(self._mapping_addr, self._mapping_length)
+        self._hugepage_status["pin_before_kib"] = before
+        self._hugepage_status["pin_after_kib"] = after
 
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
@@ -233,7 +550,7 @@ class HostBank:
         For buffers that are done being read (the converter). No-op for born-pinned banks: registered pages cannot be dropped."""
         if self._pinned or self._uffd:
             return
-        self._buf.madvise(mmap.MADV_DONTNEED)
+        _madvise(self._mapping_addr, self._mapping_length, mmap.MADV_DONTNEED)
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
@@ -271,8 +588,10 @@ class HostBank:
         pages = 0
         for advise_start, length in ranges:
             advise_end = min(len(self._buf), advise_start + length)
-            self._buf.madvise(
-                mmap.MADV_WILLNEED, advise_start, advise_end - advise_start,
+            _madvise(
+                self._mapping_addr + advise_start,
+                advise_end - advise_start,
+                mmap.MADV_WILLNEED,
             )
             pages += (advise_end - advise_start + _BLK - 1) // _BLK
         return pages
@@ -361,7 +680,9 @@ class HostBank:
         else:
             for start, length in ranges:
                 end = min(len(self._buf), start + length)
-                self._buf.madvise(mmap.MADV_DONTNEED, start, end - start)
+                _madvise(
+                    self._mapping_addr + start, end - start, mmap.MADV_DONTNEED
+                )
         return sum((length + _BLK - 1) // _BLK for _start, length in ranges)
 
 
@@ -436,6 +757,144 @@ def coalesced_row_ranges(
         else:
             out.append((file_start, expert_stride))
     return out
+
+
+def _tensor_host_bank(tensor):
+    """Find a HostBank through tensor views created by legacy flat FTW banks."""
+    seen: set[int] = set()
+    current = tensor
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        owner = getattr(current, "_freetoken_host_bank", None)
+        if owner is not None:
+            return owner
+        current = getattr(current, "_base", None)
+    return None
+
+
+def _layer_ranges(layer_ids: list[int]) -> str:
+    if not layer_ids:
+        return "none"
+    ranges: list[str] = []
+    start = previous = layer_ids[0]
+    for layer in layer_ids[1:]:
+        if layer == previous + 1:
+            previous = layer
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = layer
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def _pin_measurement(status: dict) -> str:
+    before = status.get("pin_before_kib")
+    after = status.get("pin_after_kib")
+    if before is None or after is None:
+        return "pin-thp=not-measured"
+    before_kib = before["AnonHugePages"] + before["ShmemPmdMapped"]
+    after_kib = after["AnonHugePages"] + after["ShmemPmdMapped"]
+    if before_kib == 0:
+        outcome = "unobserved-before-register"
+    elif after_kib >= before_kib:
+        outcome = "retained"
+    else:
+        outcome = "split-or-dropped"
+    return f"pin-thp={before_kib}->{after_kib}KiB({outcome})"
+
+
+def format_hugepage_status(
+    banks,
+    mode: str,
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+) -> str:
+    """Build the single startup line listing grouped per-bank mapping results."""
+    owners: dict[int, object] = {}
+    for tensors in banks.sources.values():
+        for tensor in tensors:
+            owner = _tensor_host_bank(tensor)
+            if owner is not None:
+                owners[id(owner)] = owner
+    observed_by_owner = _mappings_huge_kib([
+        (key, owner._mapping_addr, owner._mapping_length)
+        for key, owner in owners.items()
+    ])
+    details: list[str] = []
+    for name, tensors in banks.sources.items():
+        grouped: dict[str, list[int]] = {}
+        observed_kib = 0
+        observed_available = False
+        seen_owners: set[int] = set()
+        for layer_id, tensor in enumerate(tensors):
+            owner = _tensor_host_bank(tensor)
+            if owner is None:
+                description = "unmanaged tensor"
+            else:
+                status = owner._hugepage_status
+                if id(owner) not in seen_owners:
+                    seen_owners.add(id(owner))
+                    observed = status.get("pin_after_kib")
+                    if observed is None and observed_by_owner is not None:
+                        observed = observed_by_owner.get(id(owner))
+                    if observed is not None:
+                        observed_available = True
+                        if status["backing"] == "file":
+                            observed_kib += (
+                                observed["FilePmdMapped"]
+                                + observed["ShmemPmdMapped"]
+                            )
+                        else:
+                            observed_kib += (
+                                observed["AnonHugePages"]
+                                + observed["ShmemPmdMapped"]
+                            )
+                mapping_alignment = (
+                    "base=2MiB" if owner._mapping_addr % _HUGEPAGE == 0
+                    else f"base-offset={owner._mapping_addr % _HUGEPAGE}"
+                )
+                row_stride = int(tensor.stride(0) * tensor.element_size())
+                alignment = hugepage_row_alignment(
+                    row_stride, int(tensor.data_ptr()) % _HUGEPAGE
+                )
+                if alignment is None:
+                    rows = "rows=none-aligned"
+                elif alignment[1] == 1:
+                    rows = "rows=all-aligned"
+                else:
+                    rows = f"rows={alignment[0]}+every-{alignment[1]}"
+                if status["advised"] and status.get("alignment_error"):
+                    state = "advised-with-unaligned-fallback"
+                else:
+                    state = "advised" if status["advised"] else status["reason"]
+                description = (
+                    f"{status['backing']}/{status['filesystem']} {state} "
+                    f"{mapping_alignment} {rows} stride={row_stride}B "
+                    f"{_pin_measurement(status)}"
+                )
+            grouped.setdefault(description, []).append(layer_id)
+        groups = [
+            f"L{_layer_ranges(layer_ids)} {description}"
+            for description, layer_ids in grouped.items()
+        ]
+        observed_text = (
+            f"observed-thp={observed_kib}KiB"
+            if observed_available else "observed-thp=unavailable"
+        )
+        details.append(f"{name}: " + ", ".join(groups) + f" {observed_text}")
+    if before is None or after is None:
+        delta = "AnonHugePages/FileHugePages delta=unavailable"
+    else:
+        delta = (
+            "meminfo delta "
+            f"AnonHugePages={after['AnonHugePages'] - before['AnonHugePages']:+d}KiB "
+            f"FileHugePages={after['FileHugePages'] - before['FileHugePages']:+d}KiB"
+        )
+    mapping_list = "; ".join(details) if details else "no bank mappings"
+    return (
+        f"MoE bank hugepages: mode={mode}; {mapping_list}; {delta}; "
+        "fault counts are kernel fault events (one event may cover 4KiB or 2MiB)"
+    )
 
 
 _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
