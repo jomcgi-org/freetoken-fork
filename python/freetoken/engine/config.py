@@ -69,10 +69,10 @@ class EngineConfig:
     # Protected GPU HOT row capacity for DISK layers. A profile seeds the rows;
     # without one, online adaptation starts the fixed partition all-cold.
     moe_hot_expert_budget_gib: float = 0.0
-    # Online HOT-set adaptation. Interval 0 disables it. The accumulator decays
-    # once per decode step and the copy bound limits convergence work per tick.
+    # Online HOT-set adaptation. "auto" derives the fill cadence from the HOT
+    # allocation and swap bound; an integer retains a fixed cadence, with 0 off.
     moe_hot_adapt_halflife_steps: int = 2000
-    moe_hot_adapt_interval_steps: int = 1000
+    moe_hot_adapt_interval_steps: str | int = "auto"
     moe_hot_adapt_max_swap_gib: float = 0.5
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
@@ -245,12 +245,15 @@ class EngineConfig:
             or self.moe_hot_adapt_halflife_steps <= 0
         ):
             raise ValueError("--moe-hot-adapt-halflife-steps must be a positive integer")
-        if (
-            isinstance(self.moe_hot_adapt_interval_steps, bool)
-            or not isinstance(self.moe_hot_adapt_interval_steps, int)
-            or self.moe_hot_adapt_interval_steps < 0
+        interval = self.moe_hot_adapt_interval_steps
+        if interval != "auto" and (
+            isinstance(interval, bool)
+            or not isinstance(interval, int)
+            or interval < 0
         ):
-            raise ValueError("--moe-hot-adapt-interval-steps must be a non-negative integer")
+            raise ValueError(
+                "--moe-hot-adapt-interval-steps must be 'auto' or a non-negative integer"
+            )
         if (
             not math.isfinite(float(self.moe_hot_adapt_max_swap_gib))
             or self.moe_hot_adapt_max_swap_gib <= 0

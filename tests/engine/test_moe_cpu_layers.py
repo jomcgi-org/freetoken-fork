@@ -514,7 +514,7 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_gpu_prefill_layers == "auto"
     assert config.moe_hot_expert_budget_gib == 0
     assert config.moe_hot_adapt_halflife_steps == 2000
-    assert config.moe_hot_adapt_interval_steps == 1000
+    assert config.moe_hot_adapt_interval_steps == "auto"
     assert config.moe_hot_adapt_max_swap_gib == 0.5
 
 
@@ -550,7 +550,7 @@ def test_engine_config_rejects_invalid_hot_adapt_half_life(half_life):
         )
 
 
-@pytest.mark.parametrize("interval", [-1, 1.5, True])
+@pytest.mark.parametrize("interval", [-1, 1.5, True, "fixed"])
 def test_engine_config_rejects_invalid_hot_adapt_interval(interval):
     import torch
 

@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 
 from freetoken.moe.hot_adapt import (
+    HOT_ADAPT_MAX_STAGING_FRACTION,
     HOT_STAGING_HEADROOM_BYTES,
+    HotAdaptIntervalController,
     HotSwap,
     finish_hot_swaps,
     hot_staging_budget_bytes,
@@ -15,6 +17,94 @@ from freetoken.moe.hot_adapt import (
     retire_hot_swaps,
     update_decayed_counts,
 )
+
+
+@pytest.mark.parametrize(
+    ("hot_gib", "expected_ticks", "expected_interval"),
+    [(48, 96, 20), (6, 12, 166)],
+)
+def test_auto_interval_arithmetic(hot_gib, expected_ticks, expected_interval):
+    controller = HotAdaptIntervalController.create(
+        "auto",
+        hot_budget_bytes=hot_gib << 30,
+        max_swap_bytes=512 << 20,
+    )
+
+    assert controller.fill_ticks == expected_ticks
+    assert controller.fill_interval == expected_interval
+    assert controller.current_interval == expected_interval
+    assert controller.steady_interval == 1000
+
+
+def test_auto_interval_switches_to_steady_after_full_rerank():
+    controller = HotAdaptIntervalController.create(
+        "auto", hot_budget_bytes=48 << 30, max_swap_bytes=512 << 20,
+    )
+
+    switched, backed_off, _ = controller.complete_tick(
+        partition_full=False,
+        tick_interval=controller.current_interval,
+        staging_seconds=0.0,
+        covered_seconds=1.0,
+    )
+    assert not switched
+    assert not backed_off
+    assert controller.current_interval == 20
+
+    switched, backed_off, _ = controller.complete_tick(
+        partition_full=True,
+        tick_interval=controller.current_interval,
+        staging_seconds=0.0,
+        covered_seconds=1.0,
+    )
+    assert switched
+    assert not backed_off
+    assert controller.current_interval == 1000
+
+    switched, _, _ = controller.complete_tick(
+        partition_full=True,
+        tick_interval=controller.current_interval,
+        staging_seconds=0.0,
+        covered_seconds=1.0,
+    )
+    assert not switched
+
+
+def test_auto_interval_backs_off_when_staging_exceeds_wall_fraction():
+    controller = HotAdaptIntervalController.create(
+        "auto", hot_budget_bytes=48 << 30, max_swap_bytes=512 << 20,
+    )
+
+    switched, backed_off, backoff_interval = controller.complete_tick(
+        partition_full=False,
+        tick_interval=controller.current_interval,
+        staging_seconds=HOT_ADAPT_MAX_STAGING_FRACTION + 0.01,
+        covered_seconds=1.0,
+    )
+
+    assert not switched
+    assert backed_off
+    assert backoff_interval == 40
+    assert controller.current_interval == 40
+    assert controller.current_interval >= controller.fill_interval
+
+
+def test_explicit_interval_bypasses_auto_transition_and_backoff():
+    controller = HotAdaptIntervalController.create(
+        37, hot_budget_bytes=48 << 30, max_swap_bytes=512 << 20,
+    )
+
+    switched, backed_off, _ = controller.complete_tick(
+        partition_full=True,
+        tick_interval=controller.current_interval,
+        staging_seconds=1.0,
+        covered_seconds=1.0,
+    )
+
+    assert not controller.auto
+    assert not switched
+    assert not backed_off
+    assert controller.current_interval == 37
 
 
 def test_staging_geometry_is_bounded_by_swap_delta_plus_headroom():

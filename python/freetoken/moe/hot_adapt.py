@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -10,6 +9,86 @@ from typing import Mapping, Sequence
 # Covers the fixed mapped-host mapping/snapshot tensors and one row of rounding
 # when max_swap_bytes is smaller than, or not divisible by, an expert row.
 HOT_STAGING_HEADROOM_BYTES = 64 << 20
+HOT_ADAPT_TARGET_FILL_TOKENS = 2000
+HOT_ADAPT_STEADY_INTERVAL_STEPS = 1000
+HOT_ADAPT_MAX_STAGING_FRACTION = 0.25
+
+
+@dataclass
+class HotAdaptIntervalController:
+    """Allocation-derived HOT adaptation cadence and its runtime state."""
+
+    auto: bool
+    fill_ticks: int
+    fill_interval: int
+    steady_interval: int
+    current_interval: int
+    target_fill_tokens: int
+    fill_complete: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        interval_steps: str | int,
+        *,
+        hot_budget_bytes: int,
+        max_swap_bytes: int,
+        target_fill_tokens: int = HOT_ADAPT_TARGET_FILL_TOKENS,
+        steady_interval: int = HOT_ADAPT_STEADY_INTERVAL_STEPS,
+    ) -> HotAdaptIntervalController:
+        if hot_budget_bytes <= 0 or max_swap_bytes <= 0:
+            raise ValueError("HOT adaptation interval geometry must be positive")
+        if target_fill_tokens <= 0 or steady_interval <= 0:
+            raise ValueError("HOT adaptation interval targets must be positive")
+        fill_ticks = (hot_budget_bytes + max_swap_bytes - 1) // max_swap_bytes
+        fill_interval = max(1, target_fill_tokens // fill_ticks)
+        auto = interval_steps == "auto"
+        if not auto and (
+            isinstance(interval_steps, bool)
+            or not isinstance(interval_steps, int)
+            or interval_steps < 0
+        ):
+            raise ValueError("HOT adaptation interval must be 'auto' or non-negative")
+        current = fill_interval if auto else int(interval_steps)
+        return cls(
+            auto=auto,
+            fill_ticks=fill_ticks,
+            fill_interval=fill_interval,
+            steady_interval=steady_interval,
+            current_interval=current,
+            target_fill_tokens=target_fill_tokens,
+        )
+
+    def complete_tick(
+        self,
+        *,
+        partition_full: bool,
+        tick_interval: int,
+        staging_seconds: float,
+        covered_seconds: float,
+    ) -> tuple[bool, bool, int]:
+        """Apply a completed tick and return switch, back-off, and back-off floor."""
+        if not self.auto:
+            return False, False, self.current_interval
+
+        backed_off = (
+            covered_seconds > 0
+            and staging_seconds
+            > HOT_ADAPT_MAX_STAGING_FRACTION * covered_seconds
+        )
+        backoff_interval = max(self.fill_interval, tick_interval * 2)
+        if backed_off:
+            self.current_interval = max(self.current_interval, backoff_interval)
+
+        switched = not self.fill_complete and partition_full
+        if switched:
+            self.fill_complete = True
+            self.current_interval = max(
+                self.current_interval,
+                self.fill_interval,
+                self.steady_interval,
+            )
+        return switched, backed_off, backoff_interval
 
 
 @dataclass(frozen=True)

@@ -2061,7 +2061,8 @@ def _resolve_hot_expert_setup(
         raise ValueError(
             "--moe-hot-expert-budget-gib requires --moe-disk-decode cpu"
         )
-    adapt_enabled = getattr(config, "moe_hot_adapt_interval_steps", 1000) > 0
+    interval = getattr(config, "moe_hot_adapt_interval_steps", "auto")
+    adapt_enabled = interval == "auto" or interval > 0
     if not config.moe_disk_layer_profile and not adapt_enabled:
         raise ValueError(
             "static --moe-hot-expert-budget-gib requires --moe-disk-layer-profile; "
@@ -2256,7 +2257,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_layer_profile": None,
     "moe_hot_expert_budget_gib": 0.0,
     "moe_hot_adapt_halflife_steps": 2000,
-    "moe_hot_adapt_interval_steps": 1000,
+    "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
     "moe_disk_prefill": "cpu",
     "moe_prefill_coalesce": "populate",
