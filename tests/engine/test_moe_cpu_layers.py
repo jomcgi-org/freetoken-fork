@@ -169,6 +169,20 @@ def test_auto_budget_spills_ftw_head_and_tail_layers_to_disk(tmp_path, monkeypat
     assert auto_layers(_auto_config(tmp_path), 4) == frozenset({0, 3})
 
 
+def test_hot_gpu_budget_is_not_reserved_from_host_pin_budget(tmp_path, monkeypatch):
+    _write_ftw_index(tmp_path, 4)
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(201 / 2**30))
+    monkeypatch.setattr(
+        "freetoken.engine.engine._cpu_moe_executor_viable", lambda model_config: True,
+    )
+    config = _auto_config(tmp_path)
+    config.moe_hot_expert_budget_gib = 100 / 2**30
+
+    # HOT capacity is VRAM-backed. It must not consume 100 bytes from the
+    # 201-byte host pin budget and force a third layer onto DISK.
+    assert auto_layers(config, 4) == frozenset({0, 3})
+
+
 def test_auto_budget_uses_lowest_profile_scores_with_stable_ties(tmp_path, monkeypatch):
     _write_ftw_index(tmp_path, 6)
     profile = tmp_path / "traffic.json"
@@ -246,7 +260,7 @@ def test_hot_profile_requires_complete_integer_expert_counts(tmp_path):
         load_hot_profile(str(profile), 2, 3)
 
 
-def test_hot_budget_counts_whole_layers_against_global_pin_cap(tmp_path, monkeypatch):
+def test_hot_budget_is_independent_of_host_pin_budget(tmp_path, monkeypatch):
     index = {
         "format": "freetoken_weight",
         "tensors": [
@@ -262,18 +276,118 @@ def test_hot_budget_counts_whole_layers_against_global_pin_cap(tmp_path, monkeyp
         "layers": {"0": 1, "1": 1},
         "expert_hits": {"0": [9, 8, 2, 1], "1": [1, 1, 1, 1]},
     }))
-    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(620 / 2**30))
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(1 / 2**30))
     config = SimpleNamespace(
         model_path=str(tmp_path),
-        model_config=SimpleNamespace(num_experts=4),
+        model_config=SimpleNamespace(num_experts=4, num_experts_per_tok=1),
+        moe_cache_size=20,
+        moe_prefill_overlap=False,
         moe_hot_expert_budget_gib=1.0,
         moe_disk_decode="cpu",
         moe_disk_layer_profile=str(profile),
     )
 
-    # 420 bytes are already pinned by the non-DISK layer and alpha. The 620-byte
-    # global ceiling leaves 200 bytes, exactly two 100-byte experts in layer 0.
-    assert resolve_hot(config, frozenset({0}), 2) == {0: (0, 1)}
+    # The one-byte host pin budget cannot clip the GPU HOT budget. The requested
+    # budget and slot capacity both permit all four rows in the DISK layer.
+    assert resolve_hot(
+        config, frozenset({0}), 2, reserved=10 * 2**30
+    ) == {0: (0, 1, 2, 3)}
+
+
+def test_hot_plan_capacity_is_bounded_by_gpu_slots(tmp_path, monkeypatch):
+    num_layers = 4
+    num_experts = 8
+    index = {
+        "format": "freetoken_weight",
+        "tensors": [
+            {
+                "kind": "experts_bank",
+                "name": f"gate_up#L{layer_id:05d}",
+                "nbytes": 100 * num_experts,
+            }
+            for layer_id in range(num_layers)
+        ],
+    }
+    (tmp_path / "freetoken_weight.json").write_text(json.dumps(index))
+    profile = tmp_path / "traffic-v2.json"
+    profile.write_text(json.dumps({
+        "version": 2,
+        "layers": {str(layer_id): 1 for layer_id in range(num_layers)},
+        "expert_hits": {
+            str(layer_id): list(range(num_experts, 0, -1))
+            for layer_id in range(num_layers)
+        },
+    }))
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(
+            num_experts=num_experts,
+            num_experts_per_tok=5,
+        ),
+        moe_cache_size=28,
+        moe_prefill_overlap=True,
+        moe_hot_expert_budget_gib=1.0,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=str(profile),
+    )
+    logs = []
+    monkeypatch.setattr("freetoken.engine.engine.logger.info_rank0", logs.append)
+
+    # Reserve max(2E, E + top_k * pinned_layers) = max(16, 8 + 5 * 2)
+    # = 18 slots.
+    # The remaining 10 slots permit five HOT rows in each of two DISK layers.
+    plan = resolve_hot(config, frozenset({0, 3}), num_layers)
+
+    assert plan == {0: (0, 1, 2, 3, 4), 3: (0, 1, 2, 3, 4)}
+    assert "bound=slots" in logs[-1]
+    assert "slot_limit=5" in logs[-1]
+
+
+def test_hot_plan_refuses_when_slot_bound_leaves_zero_rows(tmp_path):
+    num_layers = 4
+    num_experts = 8
+    index = {
+        "format": "freetoken_weight",
+        "tensors": [
+            {
+                "kind": "experts_bank",
+                "name": f"gate_up#L{layer_id:05d}",
+                "nbytes": 100 * num_experts,
+            }
+            for layer_id in range(num_layers)
+        ],
+    }
+    (tmp_path / "freetoken_weight.json").write_text(json.dumps(index))
+    profile = tmp_path / "traffic-v2.json"
+    profile.write_text(json.dumps({
+        "version": 2,
+        "layers": {str(layer_id): 1 for layer_id in range(num_layers)},
+        "expert_hits": {
+            str(layer_id): [1] * num_experts for layer_id in range(num_layers)
+        },
+    }))
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(
+            num_experts=num_experts,
+            num_experts_per_tok=5,
+        ),
+        moe_cache_size=19,
+        moe_prefill_overlap=True,
+        moe_hot_expert_budget_gib=1.0,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=str(profile),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"slot bound cannot fit one protected row in each of 2 DISK layers; "
+            r"moe_cache_size=19, fetch_reserve=18.*available_slots=1, "
+            r"required_hot_slots=2"
+        ),
+    ):
+        resolve_hot(config, frozenset({0, 3}), num_layers)
 
 
 def test_hot_budget_without_profile_starts_all_cold_when_adaptation_is_on(
@@ -289,7 +403,9 @@ def test_hot_budget_without_profile_starts_all_cold_when_adaptation_is_on(
     monkeypatch.delenv("FREETOKEN_PIN_BUDGET_GB", raising=False)
     config = SimpleNamespace(
         model_path=str(tmp_path),
-        model_config=SimpleNamespace(num_experts=4),
+        model_config=SimpleNamespace(num_experts=4, num_experts_per_tok=1),
+        moe_cache_size=8,
+        moe_prefill_overlap=False,
         moe_hot_expert_budget_gib=200 / 2**30,
         moe_hot_adapt_interval_steps=1000,
         moe_disk_decode="cpu",

@@ -658,12 +658,6 @@ class Engine:
                 f"MoE DISK layers selected explicitly: {sorted(disk_layer_ids)}; "
                 "layer profile scores not consulted"
             )
-        hot_expert_ids, hot_expert_capacity, hot_expert_bytes = _resolve_hot_expert_setup(
-            config,
-            disk_layer_ids,
-            num_moe_layers,
-            reserved=self._host_tables_bytes,
-        )
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -737,8 +731,6 @@ class Engine:
                 ),
                 layer_residency=requested_residency,
                 disk_pager=disk_pager,
-                hot_expert_ids=hot_expert_ids,
-                hot_expert_capacity=hot_expert_capacity,
                 bank_source=getattr(config, "bank_source", "auto"),
             )
             if config.moe_cache_auto:
@@ -771,6 +763,13 @@ class Engine:
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+            hot_expert_ids, hot_expert_capacity, hot_expert_bytes = (
+                _resolve_hot_expert_setup(
+                    config,
+                    disk_layer_ids,
+                    num_moe_layers,
+                )
+            )
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -796,8 +795,8 @@ class Engine:
                 banks.sources,
                 layer_residency=banks.layer_residency,
                 hot_sources=banks.hot_sources,
-                hot_expert_ids=banks.hot_expert_ids,
-                hot_expert_capacity=banks.hot_expert_capacity,
+                hot_expert_ids=hot_expert_ids,
+                hot_expert_capacity=hot_expert_capacity,
             )
             cache.configure_hot_adaptation(
                 half_life_steps=config.moe_hot_adapt_halflife_steps,
@@ -1872,9 +1871,8 @@ def _auto_gpu_prefill_plan(
     if geometry is None:
         return None
     layer_bytes, fixed_bytes = geometry
-    hot_reserve = int(
-        max(0.0, float(getattr(config, "moe_hot_expert_budget_gib", 0.0))) * 2**30
-    )
+    # HOT rows live in protected GPU slots (hot-mirror-delta), so they no
+    # longer reserve host pin bytes against the GPU prefill plan.
     profile_path = getattr(config, "moe_disk_layer_profile", None)
     scores = (
         _load_disk_layer_profile(profile_path, num_moe_layers)
@@ -1884,7 +1882,7 @@ def _auto_gpu_prefill_plan(
     return _plan_gpu_prefill_layers(
         layer_bytes,
         budget_bytes=_config_pin_budget_bytes(config),
-        reserved_bytes=reserved + hot_reserve + fixed_bytes,
+        reserved_bytes=reserved + fixed_bytes,
         setting=setting,
         traffic_scores=scores,
     )
@@ -2035,6 +2033,9 @@ def _resolve_hot_expert_setup(
     reserved: int = 0,
 ) -> tuple[dict[int, tuple[int, ...]], dict[int, int], int]:
     """Resolve initial rows, fixed capacity, and logical bytes per HOT row."""
+    # Retain the old keyword for compatibility. HOT rows consume GPU slots now,
+    # so host-side reservations do not reduce their capacity.
+    _ = reserved
     requested = int(config.moe_hot_expert_budget_gib * 2**30)
     if requested <= 0:
         return {}, {}, 0
@@ -2073,7 +2074,7 @@ def _resolve_hot_expert_setup(
         or indexed_bank_byte_breakdown(config.model_path)
     )
     if breakdown is not None:
-        row_total, fixed_bytes = breakdown
+        row_total, _ = breakdown
         divisor = num_moe_layers * num_experts
         if row_total % divisor:
             raise ValueError(
@@ -2082,29 +2083,41 @@ def _resolve_hot_expert_setup(
         expert_bytes = row_total // divisor
     else:
         expert_bytes = bank_bytes_per_expert(config.model_config)
-        fixed_bytes = 0
     if not expert_bytes:
         raise ValueError("could not determine bytes per expert for HOT residency")
 
-    pinned_whole = (
-        fixed_bytes
-        + (num_moe_layers - len(disk_layer_ids)) * num_experts * expert_bytes
+    num_disk_layers = len(disk_layer_ids)
+    num_slots = int(config.moe_cache_size)
+    pinned_layers = num_moe_layers - num_disk_layers
+    top_k = int(config.model_config.num_experts_per_tok)
+    overlap_layer_slots = num_experts if config.moe_prefill_overlap else 0
+    dynamic_floor = (2 if config.moe_prefill_overlap else 1) * num_experts
+    # Keep enough evictable slots for one prefill overlap layer's routed set
+    # plus decode top_k in every pinned layer: overlap_layer_slots +
+    # top_k * pinned_layers. The cache's existing one/two-layer floor still wins
+    # when it is larger.
+    fetch_reserve = max(
+        dynamic_floor,
+        overlap_layer_slots + top_k * pinned_layers,
     )
-    budget = _config_pin_budget_bytes(config, reserved)
-    effective = requested
-    if budget is not None:
-        available = max(0, budget - pinned_whole)
-        effective = min(effective, available)
-        if effective < requested:
-            logger.warning_rank0(
-                f"HOT expert budget clipped from {requested / 2**30:.2f} to "
-                f"{effective / 2**30:.2f} GiB by the host pin budget after "
-                "whole-layer and fixed-bank pin accounting"
-            )
-    top_n = min(
+    available_slots = max(0, num_slots - fetch_reserve)
+    budget_limit = min(
         num_experts,
-        effective // (expert_bytes * len(disk_layer_ids)),
+        requested // (expert_bytes * num_disk_layers),
     )
+    slot_limit = min(num_experts, available_slots // num_disk_layers)
+    if slot_limit <= 0:
+        refusal = (
+            "MoE HOT expert plan refused: slot bound cannot fit one protected "
+            f"row in each of {num_disk_layers} DISK layers; "
+            f"moe_cache_size={num_slots}, fetch_reserve={fetch_reserve} "
+            f"(dynamic_floor={dynamic_floor}, overlap_layer_slots="
+            f"{overlap_layer_slots}, top_k={top_k}, pinned_layers={pinned_layers}), "
+            f"available_slots={available_slots}, required_hot_slots={num_disk_layers}"
+        )
+        logger.warning_rank0(refusal)
+        raise ValueError(refusal)
+    top_n = min(budget_limit, slot_limit)
     if top_n <= 0:
         logger.warning_rank0(
             "HOT expert budget cannot fit one expert in every DISK layer; "
@@ -2113,25 +2126,36 @@ def _resolve_hot_expert_setup(
         return {}, {}, expert_bytes
     capacity = {layer_id: top_n for layer_id in sorted(disk_layer_ids)}
     actual = top_n * len(capacity) * expert_bytes
+    if budget_limit < slot_limit:
+        bound_source = "budget"
+    elif slot_limit < budget_limit:
+        bound_source = "slots"
+    else:
+        bound_source = "budget+slots"
+    bound_log = (
+        f"bound={bound_source} (budget_limit={budget_limit}, "
+        f"slot_limit={slot_limit}, slots={num_slots}, fetch_reserve={fetch_reserve})"
+    )
     if hits is None:
         plan = {layer_id: () for layer_id in sorted(disk_layer_ids)}
         logger.info_rank0(
             f"MoE HOT expert plan: all-cold startup with {top_n}/{num_experts} row "
             f"capacity in each of {len(plan)} DISK layers, {actual / 2**30:.2f} GiB "
-            "pinned; online adaptation will warm the partition"
+            f"protected GPU, {bound_log}; online adaptation will warm the partition"
         )
     else:
         plan = _plan_hot_experts(
             hits,
             disk_layer_ids,
-            budget_bytes=effective,
+            budget_bytes=actual,
             expert_bytes=expert_bytes,
             num_experts=num_experts,
         )
         logger.info_rank0(
             f"MoE HOT expert plan: top {top_n}/{num_experts} experts in each of "
-            f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB pinned, profiled "
-            f"hot_pair_rate={_profiled_hot_pair_rate(hits, plan):.1%}"
+            f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB protected GPU, "
+            f"{bound_log}, profiled hot_pair_rate="
+            f"{_profiled_hot_pair_rate(hits, plan):.1%}"
         )
     return plan, capacity, expert_bytes
 

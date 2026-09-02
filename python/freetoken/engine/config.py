@@ -62,8 +62,8 @@ class EngineConfig:
     # Optional per-MoE-layer traffic scores used only by automatic DISK spill
     # selection. Explicit moe_disk_layers remains authoritative.
     moe_disk_layer_profile: str | None = None
-    # Compact pinned HOT row capacity for DISK layers. A profile seeds the rows;
-    # without one, online adaptation starts the fixed bank all-cold.
+    # Protected GPU HOT row capacity for DISK layers. A profile seeds the rows;
+    # without one, online adaptation starts the fixed partition all-cold.
     moe_hot_expert_budget_gib: float = 0.0
     # Online HOT-set adaptation. Interval 0 disables it. The accumulator decays
     # once per decode step and the copy bound limits convergence work per tick.
