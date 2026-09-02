@@ -41,7 +41,7 @@ def _split_hot_cold_routes(
     cpu_ids = torch.where(on_gpu, raw_ids.new_full((), -1), raw_ids).contiguous()
     gpu_ids = slot_ids.clamp_min(0)
     gpu_weights = torch.where(
-        on_gpu, topk_weights, topk_weights.new_zeros(())
+        on_gpu, topk_weights, torch.zeros_like(topk_weights)
     ).contiguous()
     return on_gpu, cpu_ids, gpu_ids, gpu_weights
 
@@ -583,9 +583,13 @@ class OffloadMoELayer(MoELayer):
             )
 
         try:
+            # The bf16 prefill implementation uses ``hidden_states`` as its output
+            # buffer. Keep the original activations intact for the cold CPU partial
+            # and for the full-CPU OOM fallback.
+            gpu_hidden_states = hidden_states.clone()
             gpu_routed = self._expert_gemm(
                 cache,
-                hidden_states,
+                gpu_hidden_states,
                 gpu_weights,
                 gpu_slots,
                 views=cache.bank_views(),
