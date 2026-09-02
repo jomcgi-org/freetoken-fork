@@ -208,7 +208,16 @@ class GraphRunner:
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        lazy_restore_pending = getattr(batch, "lazy_restore_pending", False) or any(
+            getattr(req, "lazy_kv_restore", None) is not None
+            and not req.lazy_kv_restore.complete
+            for req in batch.reqs
+        )
+        return (
+            batch.is_decode
+            and batch.size <= self.max_graph_bs
+            and not lazy_restore_pending
+        )
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
@@ -221,6 +230,14 @@ class GraphRunner:
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
+        if any(
+            getattr(req, "lazy_kv_restore", None) is not None
+            and not req.lazy_kv_restore.complete
+            for req in batch.reqs
+        ):
+            # Keep this batch eager even if the reader finishes between padding and submit.
+            # Otherwise an unpadded size could be replayed through a graph captured at another size.
+            batch.lazy_restore_pending = True
         padded_size = (  # choose the first available batch size
             next(bs for bs in self.graph_bs_list if bs >= batch.size)
             if self.can_use_cuda_graph(batch)

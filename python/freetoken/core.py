@@ -58,6 +58,8 @@ class Req:
     mamba_last_track_seqlen: int | None = None      # chunk-aligned committed len of the last snapshot
     mamba_restore_src: int | None = None            # on a prefix hit: tree snapshot slot to COW into the live slot (first chunk only)
     qsa_restore_pending: torch.Tensor | None = None # disk hit: table-local QSA carry installed with the GDN COW
+    lazy_kv_restore: Any | None = None              # disk hit: page-presence/fault tracker
+    restore_started_at: float | None = None         # monotonic timestamp for first-token stats
     swa_evicted_seqlen: int = 0                      # SWA radix: positions < this had their swa KV freed (slid out of window) during decode
     decode_batch_idx: int = 0                        # SWA radix: # of decode forwards done; the proactive free_swa skips the first (overlap guard)
     # Set once, at the first sampled tool-call opener token (scheduler detection): the state
@@ -187,6 +189,9 @@ class Batch:
     mtp_snapshot_us: float = field(default=0.0, init=False)
     # Optional decode phase breakdown populated only by --moe-step-timing.
     moe_step_timing: dict[str, float] | None = field(default=None, init=False)
+    # Incomplete disk-restored QSA pages require the eager backend so selected misses can be
+    # installed before the paged gather. It clears naturally when every tracker completes.
+    lazy_restore_pending: bool = field(default=False, init=False)
     # Guided-decoding interval accounting. constrained_requests counts newly-created
     # request matchers; mask_us is CPU mask construction plus mask transfer/application.
     constrained_requests: int = field(default=0, init=False)

@@ -116,7 +116,16 @@ class PrefillAdder:
             restored=cached_len > 0,
         )
 
-        return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value, mr.qsa_pending
+        return (
+            handle,
+            table_idx,
+            linear_slot_idx,
+            ping_pong,
+            mr.mamba_value,
+            mr.qsa_pending,
+            mr.lazy_kv_restore,
+            mr.restore_started_at,
+        )
 
     def _add_one_req(
         self,
@@ -129,6 +138,8 @@ class PrefillAdder:
         next_track_idx: int = 0,
         restore_src: int | None = None,
         qsa_restore_pending: torch.Tensor | None = None,
+        lazy_kv_restore=None,
+        restore_started_at: float | None = None,
         swa_evicted_seqlen: int = 0,
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
@@ -202,6 +213,8 @@ class PrefillAdder:
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
         req.qsa_restore_pending = qsa_restore_pending
+        req.lazy_kv_restore = lazy_kv_restore
+        req.restore_started_at = restore_started_at
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
         req.expert_profile = pending_req.expert_profile
         req.expert_profile_restored = bool(
@@ -223,6 +236,8 @@ class PrefillAdder:
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
                 restore_src=None,  # continuation chunk already has live state
+                lazy_kv_restore=chunked_req.lazy_kv_restore,
+                restore_started_at=chunked_req.restore_started_at,
                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
             )
 
@@ -234,6 +249,8 @@ class PrefillAdder:
                 ping_pong,
                 restore_src,
                 qsa_restore_pending,
+                lazy_kv_restore,
+                restore_started_at,
             ) = resource
             req = self._add_one_req(
                 pending_req=pending_req,
@@ -245,6 +262,8 @@ class PrefillAdder:
                 next_track_idx=0,
                 restore_src=restore_src,
                 qsa_restore_pending=qsa_restore_pending,
+                lazy_kv_restore=lazy_kv_restore,
+                restore_started_at=restore_started_at,
             )
             if req is None:
                 # no aligned chunk this pass: undo the admission (a continuation keeps its

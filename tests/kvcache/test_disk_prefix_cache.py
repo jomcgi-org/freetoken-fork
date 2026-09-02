@@ -4,14 +4,23 @@ import os
 import threading
 from types import SimpleNamespace
 
+import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 from freetoken.kvcache.disk_prefix_cache import (
+    BLOCK_INDEX_TENSOR,
+    BlockPresence,
     DiskPrefixStore,
+    FORMAT,
+    LazyKVRestore,
     capture_hybrid_prefix_tensors,
+    make_block_index,
+    priority_streaming_plan,
     restore_hybrid_prefix_tensors,
+    token_chain_hash,
+    validate_block_index,
 )
 from freetoken.moe.session_profile import SessionExpertProfile
 
@@ -54,6 +63,165 @@ def test_store_round_trip_with_synthetic_hybrid_state(tmp_path):
     assert stats["hits"] == 1
     assert stats["bytes_restored"] == entry.file_bytes
     store.close()
+
+
+def test_page_index_round_trip_enables_lazy_payload_lookup(tmp_path):
+    ids = torch.arange(8, dtype=torch.int32)
+    payload = {**_payload(), BLOCK_INDEX_TENSOR: make_block_index(8, 2)}
+    store = _store(tmp_path)
+    assert store.enqueue(ids, payload)
+    store.flush()
+
+    entry = store.lookup_longest(ids)
+    assert entry is not None and entry.supports_lazy_restore
+    assert "qsa_kv" not in entry.tensors
+    assert torch.equal(entry.block_index, torch.tensor([0, 2, 4, 6, 8]))
+    assert torch.equal(validate_block_index(entry.block_index, 8), entry.block_index)
+    store.close()
+
+
+def test_lazy_restore_off_materializes_indexed_entry(tmp_path):
+    ids = torch.arange(8, dtype=torch.int32)
+    writer = _store(tmp_path)
+    assert writer.enqueue(ids, {**_payload(), BLOCK_INDEX_TENSOR: make_block_index(8, 2)})
+    writer.close()
+
+    reader = DiskPrefixStore(
+        tmp_path, 1 << 20, identity="model-a", lazy_restore=False
+    )
+    entry = reader.lookup_longest(ids)
+    assert entry is not None and not entry.supports_lazy_restore
+    assert torch.equal(entry.tensors["qsa_kv"], _payload()["qsa_kv"])
+    reader.close()
+
+
+def test_version_one_entry_without_block_index_falls_back_to_eager(tmp_path):
+    ids = torch.arange(8, dtype=torch.int32)
+    key = token_chain_hash("model-a", ids)
+    path = tmp_path / f"{ids.numel():012d}-{key}.safetensors"
+    save_file(
+        {**_payload(), "token_ids": ids},
+        str(path),
+        metadata={
+            "format": FORMAT,
+            "version": "1",
+            "identity": "model-a",
+            "checkpoint_fingerprint": "model-a",
+            "config_hash": "config-a",
+            "token_count": str(ids.numel()),
+            "token_hash": key,
+            "prefill_tokens_per_s": "0",
+        },
+    )
+    store = _store(tmp_path)
+    entry = store.lookup_longest(ids)
+    assert entry is not None and not entry.supports_lazy_restore
+    assert torch.equal(entry.tensors["qsa_kv"], _payload()["qsa_kv"])
+    store.close()
+
+
+def test_priority_plan_keeps_sink_then_streams_newest_first():
+    eager, streamed = priority_streaming_plan(num_blocks=10, hot_blocks=3)
+    assert eager == (0, 9, 8, 7)
+    assert streamed == (6, 5, 4, 3, 2, 1)
+    assert sorted((*eager, *streamed)) == list(range(10))
+
+
+def test_lazy_reader_installs_only_requested_pages_into_physical_mapping(tmp_path):
+    ids = torch.arange(8, dtype=torch.int32)
+    payload = {**_payload(), BLOCK_INDEX_TENSOR: make_block_index(8, 2)}
+    store = _store(tmp_path)
+    assert store.enqueue(ids, payload)
+    store.flush()
+    entry = store.lookup_longest(ids)
+    assert entry is not None and entry.supports_lazy_restore
+
+    target = SimpleNamespace(
+        _kv_buffer=torch.zeros(2, 3, 4, 2),
+        device=torch.device("cpu"),
+    )
+    locations = torch.tensor([4, 5, 0, 1, 6, 7, 2, 3], dtype=torch.int32)
+    restore = LazyKVRestore(
+        target,
+        entry,
+        kv_indices=locations,
+        already_resident_tokens=0,
+        hot_blocks=1,
+    )
+    restore.install_eager()
+    assert restore.presence.resident(0)
+    assert restore.presence.resident(3)
+    assert not restore.presence.resident(1)
+    completed = []
+    restore.set_on_complete(lambda: completed.append(True))
+    restore._finish_once()
+    assert completed == []
+    restore.ensure_blocks([2, 1])
+
+    logical = target._kv_buffer.flatten(2, 3).index_select(2, locations.to(torch.long))
+    assert torch.equal(logical, payload["qsa_kv"])
+    assert restore.complete
+    assert completed == [True]
+    store.close()
+
+
+def test_lazy_reader_rejects_a_block_index_with_the_wrong_cache_page_size(tmp_path):
+    ids = torch.arange(8, dtype=torch.int32)
+    store = _store(tmp_path)
+    assert store.enqueue(
+        ids, {**_payload(), BLOCK_INDEX_TENSOR: make_block_index(8, 2)}
+    )
+    store.flush()
+    entry = store.lookup_longest(ids)
+    assert entry is not None
+    target = SimpleNamespace(
+        _kv_buffer=torch.zeros(2, 3, 4, 2),
+        _page_size=4,
+        device=torch.device("cpu"),
+    )
+
+    with pytest.raises(ValueError, match="does not match cache page size"):
+        LazyKVRestore(
+            target,
+            entry,
+            kv_indices=torch.arange(8, dtype=torch.int32),
+            already_resident_tokens=0,
+            hot_blocks=1,
+        )
+    store.close()
+
+
+def test_block_presence_never_publishes_a_torn_install():
+    presence = BlockPresence(1)
+    half_written = threading.Event()
+    finish_write = threading.Event()
+    installed = bytearray(8)
+
+    def load(_block):
+        installed[:4] = b"abcd"
+        half_written.set()
+        assert finish_write.wait(timeout=2)
+        installed[4:] = b"efgh"
+
+    owner = threading.Thread(target=lambda: presence.install(0, load))
+    owner.start()
+    assert half_written.wait(timeout=2)
+    waiter_done = threading.Event()
+    observed = []
+
+    def wait_for_resident():
+        presence.install(0, load)
+        observed.append(bytes(installed))
+        waiter_done.set()
+
+    waiter = threading.Thread(target=wait_for_resident)
+    waiter.start()
+    assert not waiter_done.wait(timeout=0.05)
+    finish_write.set()
+    owner.join(timeout=2)
+    waiter.join(timeout=2)
+    assert observed == [b"abcdefgh"]
+    assert presence.resident(0)
 
 
 def test_store_round_trip_preserves_optional_versioned_expert_profile(tmp_path):
@@ -109,6 +277,29 @@ def test_lru_budget_evicts_oldest_entry(tmp_path):
     assert len(list(tmp_path.glob("*.safetensors"))) == 1
     assert reopened.stats()["lru_evictions"] == 1
     reopened.close()
+
+
+def test_lazy_lookup_pins_its_entry_across_an_lru_pass(tmp_path):
+    ids = torch.arange(8, dtype=torch.int32)
+    other_ids = torch.arange(20, 28, dtype=torch.int32)
+    store = _store(tmp_path, budget=1 << 20)
+    indexed = {**_payload(), BLOCK_INDEX_TENSOR: make_block_index(8, 2)}
+    assert store.enqueue(ids, indexed)
+    assert store.enqueue(other_ids, indexed)
+    store.flush()
+
+    entry = store.lookup_longest(ids, pin_lazy_path=True)
+    assert entry is not None and entry.lazy_path_pinned
+    other = next(path for path in tmp_path.glob("*.safetensors") if path != entry.path)
+    os.utime(entry.path, ns=(1, 1))
+    os.utime(other, ns=(2, 2))
+    store.budget_bytes = max(entry.path.stat().st_size, other.stat().st_size)
+    store._enforce_budget()
+
+    assert entry.path.exists()
+    assert not other.exists()
+    store.release_entry_pin(entry)
+    store.close()
 
 
 def test_fingerprint_mismatch_is_skipped_and_counted(tmp_path):

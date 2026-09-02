@@ -129,9 +129,11 @@ class EngineConfig:
     # ceil(ratio * max_running_req) extra slots.
     linear_state_cache_ratio: float = 2.0
     # Whole-prefix QSA KV plus GDN/PLE state persisted outside VRAM. A zero byte budget keeps
-    # the lane fully disabled. Version 1 supports whole-prefix entries only.
+    # the lane fully disabled. Version 2 adds a page index to whole-prefix entries.
     kv_disk_cache_dir: str | None = None
     kv_disk_cache_gib: float = 0.0
+    # Demand-load page-indexed disk QSA KV. Older entries without an index fall back to eager.
+    lazy_restore: str = "on"
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
     # window tier: the DEFAULT window-pool size = max(working-set floor, ratio x full-pool tokens).
     # < 1.0 trades retained window-prefix capacity for memory savings; must be in (0, 1]. It is the
@@ -172,6 +174,10 @@ class EngineConfig:
         if self.kv_disk_cache_gib > 0 and not self.kv_disk_cache_dir:
             raise ValueError(
                 "--kv-disk-cache-dir is required when --kv-disk-cache-gib is positive"
+            )
+        if self.lazy_restore not in ("on", "off"):
+            raise ValueError(
+                f"--lazy-restore must be 'on' or 'off', got {self.lazy_restore!r}"
             )
         if self.ple_backend not in ("pinned", "cached", "disk", "hmm"):
             raise ValueError(

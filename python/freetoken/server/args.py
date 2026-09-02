@@ -489,6 +489,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--lazy-restore",
+        type=str,
+        choices=["on", "off"],
+        default=ServerArgs.lazy_restore,
+        help=(
+            "Demand-load page-indexed QSA KV during disk prefix restore. Entries without "
+            "a block index fall back to eager restore."
+        ),
+    )
+
+    parser.add_argument(
         "--enable-cache-report",
         action="store_true",
         default=ServerArgs.enable_cache_report,

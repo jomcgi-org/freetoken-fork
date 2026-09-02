@@ -1,8 +1,8 @@
 """Crash-safe whole-prefix storage for hybrid KV and recurrent state.
 
 Entries use safetensors so startup can validate metadata without reading tensor data and a
-corrupt file cannot execute pickled code. Version 1 intentionally stores one complete prefix
-per file. Chunked or delta-encoded entries can be added without changing the lookup contract.
+corrupt file cannot execute pickled code. Version 2 adds a page index for demand-loading QSA KV;
+version 1 entries remain readable through the eager restore path.
 """
 
 from __future__ import annotations
@@ -16,19 +16,22 @@ import queue
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 
 FORMAT = "freetoken_disk_prefix"
-VERSION = 1
+VERSION = 2
+_READABLE_VERSIONS = frozenset((1, VERSION))
 _SUFFIX = ".safetensors"
 _TMP_MARKER = ".tmp-"
+BLOCK_INDEX_TENSOR = "qsa_block_index"
 
 
 def _stable_json_value(value: Any) -> Any:
@@ -106,6 +109,100 @@ class DiskPrefixEntry:
     file_bytes: int
     restore_ms: float
     expert_profile: Any | None = None
+    block_index: torch.Tensor | None = None
+    restore_started_at: float = 0.0
+    lazy_path_pinned: bool = False
+
+    @property
+    def supports_lazy_restore(self) -> bool:
+        return (
+            self.block_index is not None
+            and "qsa_kv" not in self.tensors
+            and "qsa_index" in self.tensors
+        )
+
+
+def make_block_index(length: int, page_size: int) -> torch.Tensor:
+    """Inclusive token boundaries for page-granular QSA KV reads."""
+    if length <= 0 or page_size <= 0 or length % page_size:
+        raise ValueError(
+            f"QSA block index needs positive page-aligned geometry, got "
+            f"length={length}, page_size={page_size}"
+        )
+    return torch.arange(0, length + 1, page_size, dtype=torch.int64)
+
+
+def validate_block_index(index: torch.Tensor, length: int) -> torch.Tensor:
+    """Validate and normalize a stored block index without trusting advisory metadata."""
+    normalized = index.detach().to(device="cpu", dtype=torch.int64).contiguous()
+    if normalized.ndim != 1 or normalized.numel() < 2:
+        raise ValueError("QSA block index must be a one-dimensional boundary vector")
+    if int(normalized[0]) != 0 or int(normalized[-1]) != length:
+        raise ValueError("QSA block index does not span the stored prefix")
+    widths = normalized[1:] - normalized[:-1]
+    if torch.any(widths <= 0) or torch.any(widths != widths[0]):
+        raise ValueError("QSA block index must contain fixed-width increasing pages")
+    return normalized
+
+
+def priority_streaming_plan(
+    num_blocks: int, hot_blocks: int
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return eager and background block ids, preserving the sink and newest KV first."""
+    if num_blocks < 0 or hot_blocks < 0:
+        raise ValueError("block counts must be non-negative")
+    if num_blocks == 0:
+        return (), ()
+    recent_start = max(0, num_blocks - hot_blocks)
+    eager = tuple(dict.fromkeys((0, *range(num_blocks - 1, recent_start - 1, -1))))
+    eager_set = set(eager)
+    streamed = tuple(block for block in range(num_blocks - 1, -1, -1) if block not in eager_set)
+    return eager, streamed
+
+
+class BlockPresence:
+    """Thread-safe no-torn publication for one lazy restore's fixed block set."""
+
+    ABSENT = 0
+    LOADING = 1
+    RESIDENT = 2
+
+    def __init__(self, num_blocks: int) -> None:
+        self._states = [self.ABSENT] * num_blocks
+        self._condition = threading.Condition()
+        self._error: BaseException | None = None
+
+    @property
+    def complete(self) -> bool:
+        with self._condition:
+            return all(state == self.RESIDENT for state in self._states)
+
+    def resident(self, block: int) -> bool:
+        with self._condition:
+            return self._states[block] == self.RESIDENT
+
+    def install(self, block: int, loader: Callable[[int], None]) -> bool:
+        """Install one block once, and return only after its complete bytes are published."""
+        with self._condition:
+            while self._states[block] == self.LOADING and self._error is None:
+                self._condition.wait()
+            if self._error is not None:
+                raise RuntimeError("lazy QSA KV restore failed") from self._error
+            if self._states[block] == self.RESIDENT:
+                return False
+            self._states[block] = self.LOADING
+        try:
+            loader(block)
+        except BaseException as exc:
+            with self._condition:
+                self._states[block] = self.ABSENT
+                self._error = exc
+                self._condition.notify_all()
+            raise
+        with self._condition:
+            self._states[block] = self.RESIDENT
+            self._condition.notify_all()
+        return True
 
 
 @dataclass(frozen=True)
@@ -127,6 +224,8 @@ class DiskPrefixStore:
         checkpoint_fingerprint: str = "",
         config_hash: str = "",
         queue_size: int = 2,
+        lazy_restore: bool = True,
+        hot_blocks: int = 32,
     ) -> None:
         if budget_bytes <= 0:
             raise ValueError("disk prefix budget must be positive")
@@ -138,6 +237,8 @@ class DiskPrefixStore:
         self.identity = identity
         self.checkpoint_fingerprint = checkpoint_fingerprint
         self.config_hash = config_hash
+        self.lazy_restore = bool(lazy_restore)
+        self.hot_blocks = max(0, int(hot_blocks))
         self._entries: dict[tuple[int, str], Path] = {}
         self._lengths: set[int] = set()
         self._stats: dict[str, float | int] = {
@@ -145,6 +246,10 @@ class DiskPrefixStore:
             "misses": 0,
             "bytes_restored": 0,
             "restore_ms": 0.0,
+            "restore_eager_ms": 0.0,
+            "blocks_faulted": 0,
+            "blocks_streamed": 0,
+            "first_token_after_restore_ms": 0.0,
             "prefill_ms_saved": 0.0,
             "fingerprint_mismatches": 0,
             "corrupt_entries": 0,
@@ -156,6 +261,9 @@ class DiskPrefixStore:
         }
         self._prefill_tokens_per_s = 0.0
         self._lock = threading.Lock()
+        self._budget_lock = threading.Lock()
+        self._lazy_restores: set[LazyKVRestore] = set()
+        self._lazy_path_pins: dict[Path, int] = {}
         self._queue: queue.Queue[_WriteJob | None] = queue.Queue(maxsize=queue_size)
         self._closed = False
         self._scan()
@@ -198,7 +306,10 @@ class DiskPrefixStore:
             try:
                 with safe_open(str(path), framework="pt", device="cpu") as handle:
                     meta = handle.metadata() or {}
-                if meta.get("format") != FORMAT or int(meta.get("version", "-1")) != VERSION:
+                if (
+                    meta.get("format") != FORMAT
+                    or int(meta.get("version", "-1")) not in _READABLE_VERSIONS
+                ):
                     raise ValueError("unsupported disk prefix format")
                 if meta.get("identity") != self.identity:
                     with self._lock:
@@ -302,7 +413,12 @@ class DiskPrefixStore:
                 self._queue.task_done()
 
     def lookup_longest(
-        self, token_ids: torch.Tensor, *, longer_than: int = 0, record: bool = True
+        self,
+        token_ids: torch.Tensor,
+        *,
+        longer_than: int = 0,
+        record: bool = True,
+        pin_lazy_path: bool = False,
     ) -> DiskPrefixEntry | None:
         started = time.perf_counter()
         ids = token_ids.detach().to(device="cpu", dtype=torch.int32).contiguous()
@@ -317,14 +433,35 @@ class DiskPrefixStore:
                 path = self._entries.get((length, key))
             if path is None:
                 continue
+            path_pinned = False
             try:
                 with safe_open(str(path), framework="pt", device="cpu") as handle:
                     meta = handle.metadata() or {}
-                if meta.get("identity") != self.identity:
-                    with self._lock:
-                        self._stats["fingerprint_mismatches"] += 1
-                    continue
-                tensors = load_file(str(path), device="cpu")
+                    if meta.get("identity") != self.identity:
+                        with self._lock:
+                            self._stats["fingerprint_mismatches"] += 1
+                        continue
+                    keys = set(handle.keys())
+                    block_index = None
+                    if (
+                        self.lazy_restore
+                        and BLOCK_INDEX_TENSOR in keys
+                        and "qsa_kv" in keys
+                        and "qsa_index" in keys
+                    ):
+                        block_index = validate_block_index(
+                            handle.get_tensor(BLOCK_INDEX_TENSOR), length
+                        )
+                        tensors = {
+                            name: handle.get_tensor(name)
+                            for name in keys
+                            if name not in ("qsa_kv", BLOCK_INDEX_TENSOR)
+                        }
+                    else:
+                        tensors = {name: handle.get_tensor(name) for name in keys}
+                    path_pinned = pin_lazy_path and block_index is not None
+                    if path_pinned:
+                        self._pin_path(path)
                 stored_ids = tensors.get("token_ids")
                 if stored_ids is None or not torch.equal(stored_ids.to(torch.int32), prefix):
                     raise ValueError("stored token ids do not match request prefix")
@@ -342,12 +479,22 @@ class DiskPrefixStore:
                     # Advisory data must never make otherwise valid KV/GDN state unusable.
                     expert_profile = None
                 entry = DiskPrefixEntry(
-                    tensors, length, path, file_bytes, elapsed_ms, expert_profile
+                    tensors,
+                    length,
+                    path,
+                    file_bytes,
+                    elapsed_ms,
+                    expert_profile,
+                    block_index,
+                    started,
+                    path_pinned,
                 )
                 if record:
                     self.record_restore(entry, length - longer_than)
                 return entry
             except Exception:
+                if path_pinned:
+                    self._release_path_pin(path)
                 with self._lock:
                     self._entries.pop((length, key), None)
                     if not any(n == length for n, _ in self._entries):
@@ -414,6 +561,19 @@ class DiskPrefixStore:
         with self._lock:
             self._stats["restore_ms"] += float(elapsed_ms)
 
+    def note_restore_eager(self, elapsed_ms: float) -> None:
+        with self._lock:
+            self._stats["restore_eager_ms"] += float(elapsed_ms)
+
+    def note_lazy_blocks(self, *, faulted: int = 0, streamed: int = 0) -> None:
+        with self._lock:
+            self._stats["blocks_faulted"] += int(faulted)
+            self._stats["blocks_streamed"] += int(streamed)
+
+    def note_first_token_after_restore(self, elapsed_ms: float) -> None:
+        with self._lock:
+            self._stats["first_token_after_restore_ms"] = float(elapsed_ms)
+
     def record_restore(self, entry: DiskPrefixEntry, tokens_restored: int) -> None:
         with self._lock:
             self._stats["hits"] += 1
@@ -440,6 +600,14 @@ class DiskPrefixStore:
         return result
 
     def _enforce_budget(self) -> None:
+        with self._budget_lock:
+            self._enforce_budget_locked()
+
+    def _enforce_budget_locked(self) -> None:
+        with self._lock:
+            pinned_paths = {
+                restore.entry.path for restore in self._lazy_restores
+            } | set(self._lazy_path_pins)
         records: list[tuple[int, int, Path]] = []
         for path in self.directory.glob(f"*{_SUFFIX}"):
             try:
@@ -451,6 +619,8 @@ class DiskPrefixStore:
         for _, size, path in sorted(records):
             if total <= self.budget_bytes:
                 break
+            if path in pinned_paths:
+                continue
             try:
                 path.unlink()
                 total -= size
@@ -476,6 +646,41 @@ class DiskPrefixStore:
         self._closed = True
         self._queue.put(None)
         self._thread.join()
+        if wait:
+            with self._lock:
+                lazy_restores = tuple(self._lazy_restores)
+            for restore in lazy_restores:
+                restore.join()
+
+    def register_lazy_restore(self, restore: LazyKVRestore) -> None:
+        with self._lock:
+            self._lazy_restores.add(restore)
+
+    def release_entry_pin(self, entry: DiskPrefixEntry) -> None:
+        if entry.lazy_path_pinned:
+            self._release_path_pin(entry.path)
+
+    def _pin_path(self, path: Path) -> None:
+        # Serialize with the complete LRU pass so it cannot snapshot the old pin set and then
+        # unlink this path after lookup has committed to a lazy reader.
+        with self._budget_lock:
+            if not path.exists():
+                raise FileNotFoundError(path)
+            with self._lock:
+                self._lazy_path_pins[path] = self._lazy_path_pins.get(path, 0) + 1
+
+    def _release_path_pin(self, path: Path) -> None:
+        with self._lock:
+            count = self._lazy_path_pins.get(path, 0)
+            if count <= 1:
+                self._lazy_path_pins.pop(path, None)
+            else:
+                self._lazy_path_pins[path] = count - 1
+
+    def finish_lazy_restore(self, restore: LazyKVRestore) -> None:
+        with self._lock:
+            self._lazy_restores.discard(restore)
+        self._enforce_budget()
 
 
 def capture_hybrid_prefix_tensors(
@@ -492,6 +697,9 @@ def capture_hybrid_prefix_tensors(
     length = int(kv_indices.numel())
     flat = kv_cache._kv_buffer.flatten(2, 3)
     tensors = {"qsa_kv": flat.index_select(2, kv_indices.to(torch.long))}
+    page_size = getattr(kv_cache, "_page_size", None)
+    if page_size is not None:
+        tensors[BLOCK_INDEX_TENSOR] = make_block_index(length, int(page_size))
     cmp_buffer = getattr(kv_cache, "_cmp_k_buffer", None)
     if cmp_buffer is not None:
         ratio = int(kv_cache.index_ratio)
@@ -521,16 +729,18 @@ def restore_hybrid_prefix_tensors(
     *,
     kv_indices: torch.Tensor,
     linear_slot: int,
+    restore_kv: bool = True,
 ) -> torch.Tensor | None:
     """Install paged data and recurrent state, returning table-local QSA pending state."""
     device = kv_cache.device
     flat = kv_cache._kv_buffer.flatten(2, 3)
     locations = kv_indices.to(torch.long)
-    source_kv = tensors["qsa_kv"]
-    kv_scratch = torch.empty(source_kv[:, 0].shape, dtype=source_kv.dtype, device=device)
-    for layer in range(flat.shape[1]):
-        kv_scratch.copy_(source_kv[:, layer])
-        flat[:, layer].index_copy_(1, locations, kv_scratch)
+    if restore_kv:
+        source_kv = tensors["qsa_kv"]
+        kv_scratch = torch.empty(source_kv[:, 0].shape, dtype=source_kv.dtype, device=device)
+        for layer in range(flat.shape[1]):
+            kv_scratch.copy_(source_kv[:, layer])
+            flat[:, layer].index_copy_(1, locations, kv_scratch)
     if "qsa_index" in tensors:
         ratio = int(kv_cache.index_ratio)
         rows = locations[::ratio] // ratio
@@ -548,6 +758,188 @@ def restore_hybrid_prefix_tensors(
     for name, target in linear_pool.slot_states.items():
         target[:, linear_slot].copy_(tensors[f"slot_state.{name}"])
     return tensors.get("qsa_pending")
+
+
+class LazyKVRestore:
+    """Demand-load one disk prefix's QSA KV pages into their allocated device pages."""
+
+    def __init__(
+        self,
+        kv_cache,
+        entry: DiskPrefixEntry,
+        *,
+        kv_indices: torch.Tensor,
+        already_resident_tokens: int,
+        hot_blocks: int,
+        on_block: Callable[[str], None] | None = None,
+        on_complete: Callable[[], None] | None = None,
+    ) -> None:
+        if entry.block_index is None:
+            raise ValueError("lazy QSA KV restore needs a stored block index")
+        self.kv_cache = kv_cache
+        self.entry = entry
+        self.block_index = validate_block_index(entry.block_index, entry.length)
+        self.page_size = int(self.block_index[1] - self.block_index[0])
+        cache_page_size = getattr(kv_cache, "_page_size", self.page_size)
+        if self.page_size != int(cache_page_size):
+            raise ValueError(
+                f"stored QSA page size {self.page_size} does not match cache page size "
+                f"{cache_page_size}"
+            )
+        if already_resident_tokens % self.page_size:
+            raise ValueError("resident prefix length must be page-aligned")
+        if not 0 <= already_resident_tokens <= entry.length:
+            raise ValueError("resident prefix length is outside the stored entry")
+        locations = kv_indices.detach().to(device="cpu", dtype=torch.int64).contiguous()
+        if locations.numel() != entry.length:
+            raise ValueError("lazy QSA KV restore locations do not span the entry")
+        logical_pages = locations.view(-1, self.page_size)
+        offsets = torch.arange(self.page_size, dtype=torch.int64)
+        if torch.any(logical_pages != logical_pages[:, :1] + offsets):
+            raise ValueError("lazy QSA KV restore needs contiguous physical cache pages")
+        if torch.any(logical_pages[:, 0] % self.page_size):
+            raise ValueError("lazy QSA KV restore needs page-aligned physical cache pages")
+        self.physical_pages = tuple(
+            int(locations[offset]) // self.page_size
+            for offset in range(0, entry.length, self.page_size)
+        )
+        if len(set(self.physical_pages)) != len(self.physical_pages):
+            raise ValueError("lazy QSA KV restore cannot alias physical cache pages")
+        self.first_lazy_block = already_resident_tokens // self.page_size
+        self.presence = BlockPresence(len(self.physical_pages))
+        for block in range(self.first_lazy_block):
+            self.presence.install(block, lambda _: None)
+        self._on_block = on_block
+        self._on_complete = on_complete
+        self._completed_callback = False
+        self._callback_lock = threading.Lock()
+        self._copy_stream = (
+            torch.cuda.Stream(device=self.kv_cache.device)
+            if self.kv_cache.device.type == "cuda"
+            else None
+        )
+        eager, streamed = priority_streaming_plan(
+            len(self.physical_pages) - self.first_lazy_block, hot_blocks
+        )
+        self.eager_blocks = tuple(self.first_lazy_block + block for block in eager)
+        self.stream_blocks = tuple(self.first_lazy_block + block for block in streamed)
+        self._thread: threading.Thread | None = None
+
+    @property
+    def complete(self) -> bool:
+        return self.presence.complete
+
+    def install_eager(self) -> None:
+        if not self.eager_blocks:
+            return
+        with safe_open(str(self.entry.path), framework="pt", device="cpu") as handle:
+            for block in self.eager_blocks:
+                self._install(
+                    block,
+                    "eager",
+                    loader=lambda selected, source=handle: self._load_block(
+                        selected, source
+                    ),
+                )
+
+    def start_background(self) -> None:
+        if not self.stream_blocks:
+            self._finish_once()
+            return
+        self._thread = threading.Thread(
+            target=self._stream_main,
+            name="ft-lazy-kv-restore",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def set_on_complete(self, callback: Callable[[], None]) -> None:
+        self._on_complete = callback
+
+    def join(self) -> None:
+        if self._thread is not None:
+            self._thread.join()
+
+    def ensure_blocks(self, blocks: Sequence[int]) -> None:
+        for block in dict.fromkeys(int(block) for block in blocks if block >= 0):
+            if block < self.first_lazy_block or block >= len(self.physical_pages):
+                continue
+            self._install(block, "fault")
+        if self.complete:
+            self._finish_once()
+
+    def _stream_main(self) -> None:
+        try:
+            with safe_open(
+                str(self.entry.path), framework="pt", device="cpu"
+            ) as handle:
+                for block in self.stream_blocks:
+                    self._install(
+                        block,
+                        "stream",
+                        loader=lambda selected, source=handle: self._load_block(
+                            selected, source
+                        ),
+                    )
+        except BaseException:
+            # BlockPresence retains the failure for the request's next synchronous fault.
+            pass
+        finally:
+            self._finish_once()
+
+    def _install(
+        self,
+        block: int,
+        source: str,
+        *,
+        loader: Callable[[int], None] | None = None,
+    ) -> None:
+        installed = self.presence.install(block, loader or self._load_block)
+        if installed and source in ("fault", "stream") and self._on_block is not None:
+            self._on_block(source)
+
+    def _load_block(self, block: int, handle=None) -> None:
+        start = int(self.block_index[block])
+        end = int(self.block_index[block + 1])
+        physical = self.physical_pages[block]
+        locations = torch.arange(
+            physical * self.page_size,
+            physical * self.page_size + (end - start),
+            dtype=torch.int64,
+            device=self.kv_cache.device,
+        )
+        flat = self.kv_cache._kv_buffer.flatten(2, 3)
+        stream_context = (
+            torch.cuda.stream(self._copy_stream)
+            if self._copy_stream is not None
+            else nullcontext()
+        )
+        with stream_context:
+            if handle is None:
+                with safe_open(str(self.entry.path), framework="pt", device="cpu") as opened:
+                    self._copy_block(opened.get_slice("qsa_kv"), flat, locations, start, end)
+            else:
+                self._copy_block(handle.get_slice("qsa_kv"), flat, locations, start, end)
+        if self._copy_stream is not None:
+            # Presence is published only after the dedicated copy stream has installed every
+            # layer. A demand fault therefore returns before the engine stream launches gather.
+            self._copy_stream.synchronize()
+
+    def _copy_block(self, source, flat, locations, start: int, end: int) -> None:
+        for layer in range(flat.shape[1]):
+            page = source[:, layer, start:end]
+            scratch = page.to(device=self.kv_cache.device)
+            flat[:, layer].index_copy_(1, locations, scratch)
+
+    def _finish_once(self) -> None:
+        if not self.complete:
+            return
+        with self._callback_lock:
+            if self._completed_callback:
+                return
+            self._completed_callback = True
+        if self._on_complete is not None:
+            self._on_complete()
 
 
 def stage_tensors_for_write(
@@ -604,6 +996,11 @@ def stage_hybrid_prefix_for_write(
         for slab in range(flat.shape[0]):
             host_kv[slab, layer].copy_(scratch[slab], non_blocking=True)
     staged: dict[str, torch.Tensor] = {"qsa_kv": host_kv}
+    page_size = getattr(kv_cache, "_page_size", None)
+    if page_size is not None:
+        staged[BLOCK_INDEX_TENSOR] = make_block_index(
+            int(locations.numel()), int(page_size)
+        )
 
     cmp_buffer = getattr(kv_cache, "_cmp_k_buffer", None)
     if cmp_buffer is not None:
@@ -664,13 +1061,19 @@ def stage_hybrid_prefix_for_write(
 
 
 __all__ = [
+    "BLOCK_INDEX_TENSOR",
+    "BlockPresence",
     "DiskPrefixEntry",
     "DiskPrefixStore",
+    "LazyKVRestore",
     "capture_hybrid_prefix_tensors",
+    "make_block_index",
     "model_cache_identity",
+    "priority_streaming_plan",
     "restore_hybrid_prefix_tensors",
     "stage_hybrid_prefix_for_write",
     "stage_tensors_for_write",
     "tensor_nbytes",
     "token_chain_hash",
+    "validate_block_index",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -69,6 +70,10 @@ class CacheManager:
         self.page_table = page_table
         self.page_size = page_size
         self.cache_type = type
+        # Background lazy readers cannot mutate radix bookkeeping directly. They enqueue the
+        # temporary restore lock here, and the scheduler thread releases it at its next cache seam.
+        self._lazy_unlocks: queue.SimpleQueue[object] = queue.SimpleQueue()
+        self._lazy_restores_by_node: dict[object, object] = {}
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -99,6 +104,7 @@ class CacheManager:
         return create_prefix_cache(device=device, type=type, page_size=page_size)
 
     def match_req(self, req: PendingReq) -> MatchResult:
+        self._drain_lazy_unlocks()
         input_len = req.input_len
         assert input_len > 0, "Input length must be greater than 0."
         # Multimodal requests must not reuse a shared prefix: image-placeholder tokens
@@ -113,18 +119,25 @@ class CacheManager:
             from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
             m = self.prefix_cache.match_prefix(ids)
             qsa_pending = None
+            lazy_kv_restore = self._lazy_restore_for_node(m.node)
+            restore_started_at = None
             if self.disk_prefix_store is not None and ids.numel() > m.cached_len:
                 entry = self.disk_prefix_store.lookup_longest(
-                    ids, longer_than=m.cached_len, record=False
+                    ids,
+                    longer_than=m.cached_len,
+                    record=False,
+                    pin_lazy_path=True,
                 )
                 if entry is not None:
                     restored = self._restore_disk_prefix(ids, m, entry)
                     if restored is not None:
-                        m, qsa_pending = restored
+                        m, qsa_pending, lazy_kv_restore, restore_started_at = restored
             return MatchResult(
                 HybridCacheHandle(m.cached_len, m.node, m.kv_indices),
                 mamba_value=m.mamba_value,
                 qsa_pending=qsa_pending,
+                lazy_kv_restore=lazy_kv_restore,
+                restore_started_at=restore_started_at,
             )
         return self.prefix_cache.match_prefix(ids)
 
@@ -203,22 +216,29 @@ class CacheManager:
         """Allocate pool ownership, install a disk entry, then publish its radix node."""
         import time
 
-        from freetoken.kvcache.disk_prefix_cache import restore_hybrid_prefix_tensors
+        from freetoken.kvcache.disk_prefix_cache import (
+            LazyKVRestore,
+            restore_hybrid_prefix_tensors,
+        )
 
         started = time.perf_counter()
         length = entry.length
         if length % self.page_size or length <= old_match.cached_len:
+            self.disk_prefix_store.release_entry_pin(entry)
             self.disk_prefix_store.invalidate(entry.path)
             return None
-        old_handle = type("DiskRestoreHandle", (), {
-            "node": old_match.node,
-            "cached_len": old_match.cached_len,
-        })()
-        self.prefix_cache.inc_lock(old_handle.node)
+        kv_match = self.prefix_cache.match_kv_prefix(ids[:length])
+        # Keep the old resumable snapshot as a valid fallback if restore fails, and separately
+        # protect any deeper KV-only tombstone path whose pages the disk entry can reuse.
+        locked_nodes = [old_match.node]
+        if kv_match.node is not old_match.node:
+            locked_nodes.append(kv_match.node)
+        for node in locked_nodes:
+            self.prefix_cache.inc_lock(node)
         allocated = self.empty_indices()
         slot = None
         try:
-            needed = length - old_match.cached_len
+            needed = length - kv_match.cached_len
             if needed > self.available_size:
                 return None
             self.ensure_mamba_slots(1)
@@ -226,29 +246,60 @@ class CacheManager:
                 return None
             slot = self.linear_state_pool.alloc(1)[0]
             allocated = self._page_to_token(self._allocate(needed // self.page_size))
-            kv_indices = torch.cat((old_match.kv_indices, allocated))
+            kv_indices = torch.cat((kv_match.kv_indices, allocated))
+            lazy = entry.supports_lazy_restore and kv_match.cached_len < length
             qsa_pending = restore_hybrid_prefix_tensors(
                 self.kv_cache,
                 self.linear_state_pool,
                 entry.tensors,
                 kv_indices=kv_indices,
                 linear_slot=slot,
+                restore_kv=not lazy,
             )
+            tracker = None
+            if lazy:
+                tracker = LazyKVRestore(
+                    self.kv_cache,
+                    entry,
+                    kv_indices=kv_indices,
+                    already_resident_tokens=kv_match.cached_len,
+                    hot_blocks=self.disk_prefix_store.hot_blocks,
+                    on_block=lambda source: self.disk_prefix_store.note_lazy_blocks(
+                        faulted=int(source == "fault"),
+                        streamed=int(source == "stream"),
+                    ),
+                )
+                tracker.install_eager()
             prefix_len, mamba_exist = self.prefix_cache.insert(
                 ids[:length], kv_indices, slot, expert_profile=entry.expert_profile
             )
-            self._free(kv_indices[old_match.cached_len:prefix_len])
+            self._free(kv_indices[kv_match.cached_len:prefix_len])
             if mamba_exist:
                 self.linear_state_pool.free(slot)
-                slot = None
+                tracker = None
+            # From this point the radix tree owns the accepted slot and allocated KV pages.
+            # Clearing the local rollback handles prevents a later bookkeeping failure from
+            # freeing storage that a published node can already expose.
+            slot = None
+            allocated = self.empty_indices()
             match = self.prefix_cache.match_prefix(ids[:length])
+            if tracker is not None and not tracker.complete:
+                # This extra lock protects physical pages until the reader is finished. The
+                # request admission takes its ordinary handle lock independently.
+                self.prefix_cache.inc_lock(match.node)
+                self._lazy_restores_by_node[match.node] = tracker
+                self.disk_prefix_store.register_lazy_restore(tracker)
+                def finish_lazy_restore(node=match.node, restore=tracker):
+                    self._lazy_unlocks.put((node, restore))
+                tracker.set_on_complete(finish_lazy_restore)
+                tracker.start_background()
             self.disk_prefix_store.record_restore(
                 entry, length - old_match.cached_len
             )
-            self.disk_prefix_store.note_restore_install(
-                (time.perf_counter() - started) * 1000.0
-            )
-            return match, qsa_pending
+            install_ms = (time.perf_counter() - started) * 1000.0
+            self.disk_prefix_store.note_restore_install(install_ms)
+            self.disk_prefix_store.note_restore_eager(entry.restore_ms + install_ms)
+            return match, qsa_pending, tracker, entry.restore_started_at
         except Exception:
             self.disk_prefix_store.invalidate(entry.path)
             if slot is not None:
@@ -257,7 +308,9 @@ class CacheManager:
                 self._free(allocated)
             return None
         finally:
-            self.prefix_cache.dec_lock(old_handle.node)
+            for node in reversed(locked_nodes):
+                self.prefix_cache.dec_lock(node)
+            self.disk_prefix_store.release_entry_pin(entry)
 
     def empty_indices(self) -> torch.Tensor:
         return torch.empty(0, dtype=torch.int32, device=self.device)
@@ -468,6 +521,7 @@ class CacheManager:
             self.swa_pool.free_swa(indices)
 
     def allocate_paged(self, reqs: List[Req]) -> None:
+        self._drain_lazy_unlocks()
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
@@ -487,6 +541,28 @@ class CacheManager:
                     self.ensure_swa_slots(len(allocated))
                 self.swa_pool.alloc_swa(allocated)
             _write_page_table(self.page_table, allocated, allocation_info, self.page_size)
+
+    def _drain_lazy_unlocks(self) -> None:
+        if not self.is_hybrid:
+            return
+        while True:
+            try:
+                node, restore = self._lazy_unlocks.get_nowait()
+            except queue.Empty:
+                return
+            if self._lazy_restores_by_node.get(node) is restore:
+                self._lazy_restores_by_node.pop(node, None)
+            self.prefix_cache.dec_lock(node)
+            self.disk_prefix_store.finish_lazy_restore(restore)
+
+    def _lazy_restore_for_node(self, node):
+        """Find an incomplete restore on this radix path, including an ancestor entry."""
+        while not node.is_root():
+            restore = self._lazy_restores_by_node.get(node)
+            if restore is not None and not restore.complete:
+                return restore
+            node = node.parent
+        return None
 
     def rollback_paged_tail(self, req: Req, committed_len: int, allocated_len: int) -> None:
         """Return whole pages allocated only for rejected speculative positions.
@@ -805,6 +881,7 @@ class CacheManager:
         req.linear_slot_idx = None
 
     def check_integrity(self) -> None:
+        self._drain_lazy_unlocks()
         if self.is_hybrid:
             pc = self.prefix_cache
             pc.check_integrity()  # structural: every snapshot node owns a slot, refs >= 0
@@ -863,6 +940,19 @@ class CacheManager:
         # reclaim the whole LinearStatePool free-list (else those slots leak -> admission hangs).
         if self.is_hybrid:
             self.linear_state_pool.reclaim_all_slots()
+
+    def quiesce_lazy_restores(self) -> None:
+        """Wait for idle-time readers before the engine replaces their destination pool."""
+        restores = tuple(set(self._lazy_restores_by_node.values()))
+        for restore in restores:
+            restore.join()
+        self._drain_lazy_unlocks()
+        # A failed reader never publishes completion. It is safe to abandon here because the
+        # caller guarantees there are no live requests and is about to replace the whole pool.
+        for node, restore in tuple(self._lazy_restores_by_node.items()):
+            self._lazy_restores_by_node.pop(node, None)
+            self.prefix_cache.dec_lock(node)
+            self.disk_prefix_store.finish_lazy_restore(restore)
 
     @contextmanager
     def lazy_free_region(self):

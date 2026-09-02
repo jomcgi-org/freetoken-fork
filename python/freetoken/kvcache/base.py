@@ -197,6 +197,10 @@ class MatchResult(NamedTuple):
     # Disk-restored QSA carry state is table-local, unlike the donated GDN slot. Admission
     # installs it after assigning the new request's table row.
     qsa_pending: torch.Tensor | None = None
+    # Disk-restored QSA pages that are still streaming. Requests carrying this tracker use the
+    # eager QSA path until it completes, and synchronously install any selected missing block.
+    lazy_kv_restore: object | None = None
+    restore_started_at: float | None = None
     # TODO: support HiCache
 
 

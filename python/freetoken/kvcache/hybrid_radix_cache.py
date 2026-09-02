@@ -47,6 +47,14 @@ class HybridMatch(NamedTuple):
     node: RadixTreeNode           # the matched node (lock target)
 
 
+class HybridKVMatch(NamedTuple):
+    """Raw KV match that does not require a live GDN snapshot at its boundary."""
+
+    kv_indices: torch.Tensor
+    cached_len: int
+    node: RadixTreeNode
+
+
 class EvictResult(NamedTuple):
     kv_indices: torch.Tensor      # KV page indices to free
     mamba_slots: List[int]        # GDN state slots to free
@@ -87,6 +95,16 @@ class HybridRadixCache:
             end_len -= cur.length
             cur = cur.parent
         return HybridMatch(self.empty, 0, None, self.root)
+
+    def match_kv_prefix(self, input_ids: torch.Tensor) -> HybridKVMatch:
+        """Return the deepest physical KV match, including GDN tombstone paths.
+
+        Disk restore uses this before reinstalling the recurrent snapshot. Reusing these
+        pages avoids allocating a duplicate path and, for lazy restore, ensures the presence
+        tracker names the pages that the radix node will actually publish.
+        """
+        node, cached_len = self._walk(input_ids)
+        return HybridKVMatch(self._collect_kv(node), cached_len, node)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
                mamba_value: int, expert_profile=None) -> Tuple[int, bool]:
@@ -311,4 +329,10 @@ class HybridRadixCache:
         return node, prefix_len
 
 
-__all__ = ["HybridRadixCache", "HybridMatch", "EvictResult", "HybridCacheHandle"]
+__all__ = [
+    "HybridRadixCache",
+    "HybridMatch",
+    "HybridKVMatch",
+    "EvictResult",
+    "HybridCacheHandle",
+]
