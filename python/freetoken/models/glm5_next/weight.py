@@ -73,16 +73,6 @@ def _rename(raw_name: str, num_layers: int = 45) -> str | None:
         return None
     if _EXPERT_RE.search(raw_name):
         return None
-    # The current DSA backend reuses glm_moe_dsa's token-level indexer. The newer
-    # checkpoint's optional four-token k-pool compression is tracked as a hardware
-    # validation item and its two resident tensors must not leak into strict loading.
-    if raw_name.endswith(
-        (
-            ".indexer.index_kpool_compress_ape",
-            ".indexer.index_kpool_compress_gate",
-        )
-    ):
-        return None
     if raw_name.startswith("model.language_model."):
         name = "model." + raw_name[len("model.language_model.") :]
     elif raw_name.startswith("language_model."):

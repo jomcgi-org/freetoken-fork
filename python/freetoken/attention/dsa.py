@@ -22,6 +22,11 @@ regime:
   construction.
 * **DSA long prefill**: per-request causal top-k in query chunks, same kernel.
 
+GLM-5.3 selects learned ``index_kpool`` blocks instead of individual tokens. Its
+full indexer caches raw ``key | compression_gate`` token state, applies the learned
+per-channel pool softmax, expands selected blocks, and appends the open causal tail.
+The branch is enabled only for ``index_kpool > 1``; kpool 1 keeps the original calls.
+
 No flashinfer anywhere: no plan/wrapper/workspace, and the backend serves any arch
 Triton does (DSV4 is the precedent that one gathered-KV kernel serves all contexts
 in production). The model calls :meth:`mla_forward` directly (the ``q_nope``/``q_pe``
@@ -37,7 +42,11 @@ import torch
 from freetoken.core import Batch, get_global_ctx
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
-from .dsa_indexer import DSAIndexerMixin
+from .dsa_indexer import (
+    DSAIndexerMixin,
+    dsa_expand_block_positions,
+    dsa_pool_index_states,
+)
 
 if TYPE_CHECKING:
     from freetoken.models import ModelConfig
@@ -92,6 +101,20 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         )
         self.dsa_enabled = isinstance(self.kvcache, DSAKVCache)
         self.index_topk = args.index_topk
+        self.index_kpool = getattr(args, "index_kpool", 1)
+        self.index_kpool_always_select_tail = getattr(
+            args, "index_kpool_always_select_tail", True
+        )
+        self.pooled_index = self.index_kpool > 1
+        if self.pooled_index and self.index_topk % self.index_kpool:
+            raise ValueError(
+                f"index_topk ({self.index_topk}) must be divisible by "
+                f"index_kpool ({self.index_kpool})"
+            )
+        if self.dsa_enabled and self.kvcache.index_kpool != self.index_kpool:
+            raise ValueError(
+                f"DSA pool kpool {self.kvcache.index_kpool} != model kpool {self.index_kpool}"
+            )
         self.index_scale = args.index_head_dim**-0.5 if args.index_head_dim else 0.0
         # layer -> group leader (most recent "full" layer); leader -> pool slot.
         # Only built when DSA serves: the dense ablation never consults indexer_types,
@@ -134,7 +157,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         # active_table_idx (which the decode path's addressing requires) for
         # phase == "decode". The prefill path handles extend_len == 1 fine.
         is_decode = getattr(batch, "phase", None) == "decode"
-        qo_indptr = torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
+        qo_indptr = (
+            torch.tensor([0] + seqlens_q, **_CPU_PINNED).cumsum_(0).to(torch.int32)
+        )
         kv_len = torch.tensor(seqlens_k, **_CPU_PINNED)
         last = (qo_indptr[1:].to(torch.int32) - 1).to(self.device, non_blocking=True)
         md = DSAMetadata(
@@ -157,8 +182,12 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
 
         return glm_dsa_sparse_attn(
-            q_cat, self.kvcache.latent_rows(layer_id), sel, self.sm_scale,
-            counts=cnt, d_v=self.kv_lora_rank,
+            q_cat,
+            self.kvcache.latent_rows(layer_id),
+            sel,
+            self.sm_scale,
+            counts=cnt,
+            d_v=self.kv_lora_rank,
         )
 
     def mla_forward(
@@ -168,9 +197,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
         ``q_nope`` [T, H, kv_lora_rank] (kv_b-absorbed), ``q_pe`` [T, H, rope_dim],
         ``c_kv`` [T, kv_lora_rank] / ``k_rope`` [T, rope_dim]. The rope tensors are
-        None when rope_dim is zero. ``indexer_qkw`` = (q [T, Hi, Di], k [T, Di],
-        w [T, Hi]) on full-indexer layers, None on shared layers. Returns
-        [T, H, kv_lora_rank].
+        None when rope_dim is zero. On full-indexer layers, ``indexer_qkw`` is
+        ``(q, k, w)`` for kpool 1 and ``(q, cat(k, gate), w, ape)`` for pooled
+        GLM-5.3. Shared layers pass None. Returns ``[T, H, kv_lora_rank]``.
         """
         md = batch.attn_metadata
         assert isinstance(md, DSAMetadata)
@@ -185,15 +214,40 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             # + device-read live lengths, once per step at the first layer.
             md.rows = self._decode_rows(batch).to(torch.int32)
             md.kvlen = md.kv_len_cpu.to(self.device, non_blocking=True)
+        if (
+            self.pooled_index
+            and indexer_qkw is not None
+            and getattr(batch, "lazy_restore_pending", False)
+        ):
+            self._ensure_pooled_index_restored(batch)
         self.kvcache.store_kv(c_kv, k_rope, batch.out_loc, layer_id)
         if self.dsa_enabled and indexer_qkw is not None:
-            # Scatter index keys unconditionally: short prefills serve through the
-            # identity path TODAY, but their keys must exist once decode passes topk.
-            self.kvcache.store_index_k(indexer_qkw[1], batch.out_loc, self._idx_slot[layer_id])
+            # Scatter index state unconditionally: short prefills serve through the
+            # identity path today, but history must exist once decode passes topk.
+            self.kvcache.store_index_k(
+                indexer_qkw[1], batch.out_loc, self._idx_slot[layer_id]
+            )
 
         if md.is_decode:
             return self._decode(md, layer_id, q_nope, q_pe, indexer_qkw)
         return self._prefill(md, layer_id, q_nope, q_pe, batch, indexer_qkw)
+
+    @staticmethod
+    def _ensure_pooled_index_restored(batch: Batch) -> None:
+        """Finish a lazy disk restore before a pooled score reads every history page.
+
+        Pooled token state shares the lazy MLA page record. Unlike QSA, DSA must
+        score every complete block before it knows which latent pages attention
+        will gather, so its first full indexer layer faults all remaining pages.
+        """
+        reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
+        seen: set[int] = set()
+        for req in reqs:
+            tracker = getattr(req, "lazy_kv_restore", None)
+            if tracker is None or tracker.complete or id(tracker) in seen:
+                continue
+            seen.add(id(tracker))
+            tracker.ensure_blocks(range(len(tracker.physical_pages)))
 
     # ----- decode (CUDA-graph capturable, single code path) -----------------------------
     def _decode(self, md, layer_id, q_nope, q_pe, indexer_qkw) -> torch.Tensor:
@@ -205,28 +259,56 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             sel, cnt = rows.view(bs, 1, -1), kvlen.view(bs, 1)
         else:
             if indexer_qkw is not None:
-                q_idx, _, w = indexer_qkw
-                s = self.dsa_decode_scores(q_idx, w, self._idx_slot[layer_id], rows, kvlen)
-                k_sel = min(self.index_topk, s.shape[-1])
-                picks = self.indexer_select_decode(
-                    s.view(bs, 1, -1), valid=kvlen, topk=k_sel, offset=0
-                )[:, 0]  # [bs, K] positions, -1 sentinel
-                sel = self.dsa_map_rows(picks, rows).view(bs, 1, -1)
-                cnt = torch.clamp(kvlen, max=k_sel).to(torch.int32).view(bs, 1)
+                if self.pooled_index:
+                    q_idx, _, w, ape = indexer_qkw
+                    s = self.dsa_pooled_decode_scores(
+                        q_idx, w, ape, self._idx_slot[layer_id], rows, kvlen
+                    )
+                    block_topk = self.index_topk // self.index_kpool
+                    picks = self.indexer_select_decode(
+                        s.view(bs, 1, -1),
+                        valid=kvlen // self.index_kpool,
+                        topk=block_topk,
+                        offset=0,
+                    )[:, 0]
+                    logical = dsa_expand_block_positions(
+                        picks,
+                        kvlen,
+                        index_kpool=self.index_kpool,
+                        token_topk=self.index_topk,
+                        always_select_tail=self.index_kpool_always_select_tail,
+                    )
+                    sel = self.dsa_map_rows(logical, rows).view(bs, 1, -1)
+                    cnt = (logical >= 0).sum(-1, dtype=torch.int32).view(bs, 1)
+                else:
+                    q_idx, _, w = indexer_qkw
+                    s = self.dsa_decode_scores(
+                        q_idx, w, self._idx_slot[layer_id], rows, kvlen
+                    )
+                    k_sel = min(self.index_topk, s.shape[-1])
+                    picks = self.indexer_select_decode(
+                        s.view(bs, 1, -1), valid=kvlen, topk=k_sel, offset=0
+                    )[:, 0]  # [bs, K] positions, -1 sentinel
+                    sel = self.dsa_map_rows(picks, rows).view(bs, 1, -1)
+                    cnt = torch.clamp(kvlen, max=k_sel).to(torch.int32).view(bs, 1)
                 # Only the live group leader's selection is ever read again.
                 md.sel.clear()
                 md.sel[layer_id] = (sel, cnt)
             sel, cnt = md.sel[self._leader[layer_id]]
-        q_cat = (
-            q_nope if q_pe is None else torch.cat([q_nope, q_pe], dim=-1)
-        ).view(bs, 1, self.num_heads, self.latent_dim)
+        q_cat = (q_nope if q_pe is None else torch.cat([q_nope, q_pe], dim=-1)).view(
+            bs, 1, self.num_heads, self.latent_dim
+        )
         o = self._attend(q_cat, layer_id, sel, cnt)
         return o.view(bs, self.num_heads, self.kv_lora_rank)
 
     # ----- prefill / extend (eager) ------------------------------------------------------
     def _select_prefill(
-        self, slot: int, q_idx: torch.Tensor, w: torch.Tensor,
-        rows: torch.Tensor, positions: torch.Tensor,
+        self,
+        slot: int,
+        q_idx: torch.Tensor,
+        w: torch.Tensor,
+        rows: torch.Tensor,
+        positions: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-request causal top-k: ([1, m, K] physical rows, [1, m] counts)."""
         kv_len = rows.numel()
@@ -237,18 +319,82 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         start_pos = int(positions[0])
         # Bound the fp32 [chunk, kv_len] logits transient (worst case is capped by the
         # model's max_position: floor 16 x 1M x 4 B = 64 MB, see _PREFILL_SCORE_BYTES).
-        chunk = max(16, min(_PREFILL_SCORE_CHUNK, _PREFILL_SCORE_BYTES // max(kv_len * 4, 1)))
+        chunk = max(
+            16, min(_PREFILL_SCORE_CHUNK, _PREFILL_SCORE_BYTES // max(kv_len * 4, 1))
+        )
         for s0 in range(0, m, chunk):
             s1 = min(s0 + chunk, m)
             scores = self.dsa_prefill_logits(q_idx[s0:s1], k_all, w[s0:s1])
             # Shared selection semantics (dsv4_indexer): token-granular == ratio 1.
             picks = self.indexer_select_prefill(
-                scores.unsqueeze(0), start_pos=start_pos + s0, seqlen=s1 - s0,
-                ratio=1, topk=k_sel, offset=0,
+                scores.unsqueeze(0),
+                start_pos=start_pos + s0,
+                seqlen=s1 - s0,
+                ratio=1,
+                topk=k_sel,
+                offset=0,
             )[0]
             sel[s0:s1] = self.dsa_map_rows(picks, rows.view(1, -1).expand(s1 - s0, -1))
         cnt = torch.clamp(positions + 1, max=k_sel).to(torch.int32)
         return sel.view(1, m, k_sel), cnt.view(1, m)
+
+    def _select_pooled_prefill(
+        self,
+        slot: int,
+        q_idx: torch.Tensor,
+        w: torch.Tensor,
+        ape: torch.Tensor,
+        rows: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Reference-equivalent complete-pool top-k plus the causal open tail."""
+        packed = self.kvcache.index_k_cache(slot).index_select(0, rows.long())
+        pooled = dsa_pool_index_states(packed, ape, self.index_kpool)
+        block_topk = self.index_topk // self.index_kpool
+        m = q_idx.shape[0]
+        output_width = self.index_topk + (
+            self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
+        )
+        sel = torch.empty(m, output_width, dtype=torch.int32, device=self.device)
+        if pooled.shape[-2] == 0:
+            logical = dsa_expand_block_positions(
+                torch.empty(m, 0, dtype=torch.int64, device=self.device),
+                positions + 1,
+                index_kpool=self.index_kpool,
+                token_topk=self.index_topk,
+                always_select_tail=self.index_kpool_always_select_tail,
+            )
+            sel.copy_(self.dsa_map_rows(logical, rows.view(1, -1).expand(m, -1)))
+            cnt = (sel >= 0).sum(-1, dtype=torch.int32)
+            return sel.view(1, m, output_width), cnt.view(1, m)
+        start_pos = int(positions[0])
+        columns = max(pooled.shape[-2], 1)
+        chunk = max(
+            16,
+            min(_PREFILL_SCORE_CHUNK, _PREFILL_SCORE_BYTES // max(columns * 4, 1)),
+        )
+        rows_by_query = rows.view(1, -1).expand(min(chunk, m), -1)
+        for s0 in range(0, m, chunk):
+            s1 = min(s0 + chunk, m)
+            scores = self.dsa_prefill_logits(q_idx[s0:s1], pooled, w[s0:s1])
+            picks = self.indexer_select_prefill(
+                scores.unsqueeze(0),
+                start_pos=start_pos + s0,
+                seqlen=s1 - s0,
+                ratio=self.index_kpool,
+                topk=block_topk,
+                offset=0,
+            )[0]
+            logical = dsa_expand_block_positions(
+                picks,
+                positions[s0:s1] + 1,
+                index_kpool=self.index_kpool,
+                token_topk=self.index_topk,
+                always_select_tail=self.index_kpool_always_select_tail,
+            )
+            sel[s0:s1] = self.dsa_map_rows(logical, rows_by_query[: s1 - s0])
+        cnt = (sel >= 0).sum(-1, dtype=torch.int32)
+        return sel.view(1, m, output_width), cnt.view(1, m)
 
     def _prefill(self, md, layer_id, q_nope, q_pe, batch, indexer_qkw) -> torch.Tensor:
         t = q_nope.shape[0]
@@ -258,14 +404,29 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         qo = md.qo_indptr_cpu.tolist()
         sparse = self.dsa_enabled and int(md.kv_len_cpu.max()) > self.index_topk
         if sparse and indexer_qkw is not None:
-            q_idx, _, w = indexer_qkw
+            if self.pooled_index:
+                q_idx, _, w, ape = indexer_qkw
+            else:
+                q_idx, _, w = indexer_qkw
             md.sel.clear()  # one live group leader at a time
             md.sel[layer_id] = [
-                self._select_prefill(
-                    self._idx_slot[layer_id],
-                    q_idx[qo[i] : qo[i + 1]], w[qo[i] : qo[i + 1]],
-                    page_table[r.table_idx, : r.device_len],
-                    batch.positions[qo[i] : qo[i + 1]],
+                (
+                    self._select_pooled_prefill(
+                        self._idx_slot[layer_id],
+                        q_idx[qo[i] : qo[i + 1]],
+                        w[qo[i] : qo[i + 1]],
+                        ape,
+                        page_table[r.table_idx, : r.device_len],
+                        batch.positions[qo[i] : qo[i + 1]],
+                    )
+                    if self.pooled_index
+                    else self._select_prefill(
+                        self._idx_slot[layer_id],
+                        q_idx[qo[i] : qo[i + 1]],
+                        w[qo[i] : qo[i + 1]],
+                        page_table[r.table_idx, : r.device_len],
+                        batch.positions[qo[i] : qo[i + 1]],
+                    )
                 )
                 for i, r in enumerate(reqs)
             ]
@@ -281,11 +442,19 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 # token at kv <= index_topk, and the ablation attends everything).
                 # One shared row list broadcast across queries (stride 0), causality
                 # through per-query counts.
-                sel = page_table[r.table_idx, : r.device_len].view(1, 1, -1).to(torch.int32)
-                cnt = (batch.positions[qo[i] : qo[i + 1]] + 1).to(torch.int32).view(1, m)
+                sel = (
+                    page_table[r.table_idx, : r.device_len]
+                    .view(1, 1, -1)
+                    .to(torch.int32)
+                )
+                cnt = (
+                    (batch.positions[qo[i] : qo[i + 1]] + 1).to(torch.int32).view(1, m)
+                )
             o[qo[i] : qo[i + 1]] = self._attend(
                 q_cat[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.latent_dim),
-                layer_id, sel, cnt,
+                layer_id,
+                sel,
+                cnt,
             ).view(m, self.num_heads, self.kv_lora_rank)
         return o
 
@@ -295,20 +464,28 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         self.capture_bs = sorted(bs_list)
         max_bs = max(bs_list)
         width = get_global_ctx().page_table.shape[1]
-        self._rows_buf = torch.full((max_bs, width), -1, dtype=torch.int32, device=self.device)
+        self._rows_buf = torch.full(
+            (max_bs, width), -1, dtype=torch.int32, device=self.device
+        )
         self._kvlen_buf = torch.zeros(max_bs, dtype=torch.int32, device=self.device)
 
     def _decode_rows(self, batch: Batch) -> torch.Tensor:
         """This decode step's per-request page-table rows [bs, W], gathered off the
         scheduler-staged ``active_table_idx`` (a device tensor -- no host loop)."""
-        assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
-        return get_global_ctx().page_table.index_select(0, batch.active_table_idx.to(torch.int64))
+        assert batch.active_table_idx is not None, (
+            "decode batch is missing its page-table rows"
+        )
+        return get_global_ctx().page_table.index_select(
+            0, batch.active_table_idx.to(torch.int64)
+        )
 
     def _stage_decode(self, batch: Batch, bs: int, table_idx: torch.Tensor) -> None:
         """Copy this step's addressing into the static graph buffers and point the
         metadata at them (restage-per-replay, same shape as the generic backends)."""
         md = batch.attn_metadata
-        self._rows_buf[:bs].copy_(get_global_ctx().page_table.index_select(0, table_idx))
+        self._rows_buf[:bs].copy_(
+            get_global_ctx().page_table.index_select(0, table_idx)
+        )
         self._kvlen_buf[:bs].copy_(md.kv_len_cpu.to(self.device, non_blocking=True))
         md.rows = self._rows_buf[:bs]
         md.kvlen = self._kvlen_buf[:bs]
@@ -325,7 +502,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         self._stage_decode(batch, bs, dummy)
 
     def prepare_for_replay(self, batch: Batch) -> None:
-        assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"
+        assert batch.active_table_idx is not None, (
+            "decode batch is missing its page-table rows"
+        )
         self._stage_decode(
             batch, batch.padded_size, batch.active_table_idx.to(torch.int64)
         )

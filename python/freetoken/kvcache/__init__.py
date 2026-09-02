@@ -231,6 +231,7 @@ def create_kvcache_pool(
                 index_head_dim=spec.index_head_dim,
                 num_index_layers=spec.num_index_layers,
                 layer_ids=spec.layer_ids,
+                index_kpool=getattr(model_config.glm_dsa_args, "index_kpool", 1),
             )
         return MLAKVCache(
             latent_dim=spec.head_dim,

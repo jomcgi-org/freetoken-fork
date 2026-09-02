@@ -41,12 +41,12 @@ def test_weight_routing_skips_vision_mtp_experts_and_maps_text():
     assert _rename(
         "model.language_model.layers.4.mlp.gate.e_score_correction_bias"
     ) == ("model.layers.4.mlp.e_score_correction_bias")
-    assert (
-        _rename(
-            "model.language_model.layers.3.self_attn.indexer.index_kpool_compress_ape"
-        )
-        is None
-    )
+    assert _rename(
+        "model.language_model.layers.3.self_attn.indexer.index_kpool_compress_ape"
+    ) == ("model.layers.3.self_attn.indexer.index_kpool_compress_ape")
+    assert _rename(
+        "model.language_model.layers.3.self_attn.indexer.index_kpool_compress_gate"
+    ) == ("model.layers.3.self_attn.indexer.index_kpool_compress_gate")
 
 
 def test_compressed_tensors_nvfp4_source_alias_and_global_reciprocal():
