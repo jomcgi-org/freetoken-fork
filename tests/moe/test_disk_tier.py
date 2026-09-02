@@ -1000,6 +1000,77 @@ def test_prefill_hot_cold_route_partition_is_complementary():
     assert set(_group_prefill_routes(cpu_ids, weights, 4)) == {1, 3}
 
 
+def test_disk_hot_cold_split_weight_accounting():
+    """Symbolically verify split tensor bookkeeping without requiring CUDA.
+
+    This runs on Mac, where the CUDA kernels cannot run. It verifies the tensor
+    partition and route weights, not end-to-end GPU expert execution.
+    """
+    from freetoken.layers.moe import _split_hot_cold_routes
+
+    raw_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
+    slot_ids = torch.tensor([[5, -1], [-1, 5]], dtype=torch.int32)
+    topk_weights = torch.tensor(
+        [[1.0, 0.5], [0.5, 0.0]], dtype=torch.float32
+    )
+
+    on_gpu, cpu_ids, gpu_ids, gpu_weights = _split_hot_cold_routes(
+        raw_ids, slot_ids, topk_weights
+    )
+
+    assert on_gpu.tolist() == [[True, False], [False, True]]
+    assert cpu_ids.tolist() == [[-1, 1], [1, -1]]
+    assert gpu_ids.tolist() == [[5, 0], [0, 5]]
+    torch.testing.assert_close(
+        gpu_weights,
+        torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
+        rtol=0,
+        atol=0,
+    )
+
+    class MockExecutor:
+        def __init__(self):
+            self.weights = None
+
+        def route_contributions(self, weights, ids):
+            self.weights = weights.clone()
+            expert_outputs = torch.tensor([2.0, 4.0])
+            result = torch.zeros_like(weights)
+            valid = ids >= 0
+            result[valid] = weights[valid] * expert_outputs[ids[valid].long()]
+            return result
+
+    executor = MockExecutor()
+    cpu_contributions = executor.route_contributions(topk_weights, cpu_ids)
+    assert torch.equal(executor.weights, topk_weights)
+
+    # Slot 0 deliberately contains a nonzero value. Cold GPU routes still
+    # contribute zero because their GPU weights are zero.
+    slot_outputs = torch.full((6,), 99.0)
+    slot_outputs[5] = 2.0
+    gpu_contributions = gpu_weights * slot_outputs[gpu_ids.long()]
+    combined = gpu_contributions + cpu_contributions
+
+    torch.testing.assert_close(
+        gpu_contributions,
+        torch.tensor([[2.0, 0.0], [0.0, 0.0]]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        cpu_contributions,
+        torch.tensor([[0.0, 2.0], [2.0, 0.0]]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        combined,
+        torch.tensor([[2.0, 2.0], [2.0, 0.0]]),
+        rtol=0,
+        atol=0,
+    )
+
+
 def _prefill_hot_split_fixture(
     monkeypatch, *, hot_slots, split="on", oom=False, model_type="qwen4_exp"
 ):
@@ -1014,7 +1085,7 @@ def _prefill_hot_split_fixture(
 
     class Executor:
         def prefill(self, layer_id, hidden_states, topk_weights, topk_ids):
-            calls.append(("cpu", topk_ids.clone()))
+            calls.append(("cpu", topk_ids.clone(), hidden_states.clone()))
             return cpu_output
 
     def ensure_hot(layer_id, ids):
@@ -1070,7 +1141,10 @@ def _prefill_hot_split_fixture(
         )
         if oom:
             raise torch.OutOfMemoryError("synthetic CUDA out of memory")
-        return gpu_output
+        # Match fused_experts_impl's prefill contract: it overwrites and returns
+        # its hidden-state input. The split must protect the CPU input from this.
+        args[2].copy_(gpu_output)
+        return args[2]
 
     monkeypatch.setattr(OffloadMoELayer, "_expert_gemm", gpu_gemm)
     hidden = torch.zeros((3, 8), dtype=torch.bfloat16)
@@ -1099,6 +1173,8 @@ def test_prefill_hot_split_populates_and_batches_only_cold_routes(
     assert next(call[1] for call in calls if call[0] == "prepare") == {1, 3}
     cpu_ids = next(call[1] for call in calls if call[0] == "cpu")
     assert cpu_ids.tolist() == [[-1, 1], [-1, 3], [-1, 3]]
+    cpu_hidden = next(call[2] for call in calls if call[0] == "cpu")
+    assert not bool(cpu_hidden.any())
     gpu = next(call for call in calls if call[0] == "gpu")
     torch.testing.assert_close(
         gpu[1],
