@@ -18,10 +18,22 @@ class RMSNorm(BaseOP):
         self.weight = torch.empty(size)
         self.rmsnorm = rmsnorm
 
+    def _forward_reference(self, x: torch.Tensor) -> torch.Tensor:
+        """Pure torch fallback for CPU model and fake-backend callers."""
+        dtype = x.dtype
+        xf = x.float()
+        normalized = xf * torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + self.eps)
+        return (normalized * self.weight.float()).to(dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            return self._forward_reference(x)
         return self.rmsnorm(x, self.weight, self.eps)
 
     def forward_inplace(self, x: torch.Tensor) -> None:
+        if not x.is_cuda:
+            x.copy_(self._forward_reference(x))
+            return
         self.rmsnorm(x, self.weight, self.eps, out=x)
 
 

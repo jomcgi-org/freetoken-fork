@@ -104,6 +104,14 @@ def materialize_layer(cache, layer_id: int) -> None:
 
 
 def reset_cache(cache) -> None:
+    if not cache.slot_for_id.is_cuda:
+        cache.slot_for_id.fill_(-1)
+        cache.id_of_slot.fill_(-1)
+        cache.usage.zero_()
+        cache.step.zero_()
+        cache.active_mask.zero_()
+        cache.num_indices.zero_()
+        return
     _reset_cache_gpu(cache)
 
 
