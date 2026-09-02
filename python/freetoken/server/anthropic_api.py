@@ -32,7 +32,7 @@ from .anthropic_models import (
     AnthropicStreamEvent,
     AnthropicUsage,
 )
-from .disconnect import DisconnectAwareStreamingResponse
+from .disconnect import ClientDisconnectedResponse, DisconnectAwareStreamingResponse
 from .generation import (
     KEEPALIVE,
     ContentDelta,
@@ -131,7 +131,9 @@ async def handle_anthropic_messages(
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
-        return DisconnectAwareStreamingResponse(events, media_type="text/event-stream")
+        return DisconnectAwareStreamingResponse(
+            events, media_type="text/event-stream", request=request
+        )
 
     try:
         result = await await_with_disconnect(
@@ -146,6 +148,8 @@ async def handle_anthropic_messages(
             "api_error" if exc.status_code >= 500 else "invalid_request_error",
             str(exc),
         )
+    if isinstance(result, ClientDisconnectedResponse):
+        return result
     response = anthropic_full_response(result, req.model, uid, cache_report=cache_report)
     return JSONResponse(content=response.model_dump(exclude_none=True))
 

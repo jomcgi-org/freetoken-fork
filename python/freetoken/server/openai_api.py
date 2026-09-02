@@ -27,7 +27,7 @@ from .api_models import (
     ToolChoiceObject,
 )
 from .function_call_parser import ToolCallItem
-from .disconnect import DisconnectAwareStreamingResponse
+from .disconnect import ClientDisconnectedResponse, DisconnectAwareStreamingResponse
 from .generation import (
     ContentDelta,
     GenDone,
@@ -267,7 +267,9 @@ async def handle_chat_completion(
         chunks = stream_chat_completion_chunks(uid, req, state, spec)
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
-        return DisconnectAwareStreamingResponse(chunks, media_type="text/event-stream")
+        return DisconnectAwareStreamingResponse(
+            chunks, media_type="text/event-stream", request=request
+        )
 
     try:
         result = await await_with_disconnect(
@@ -283,6 +285,8 @@ async def handle_chat_completion(
             err_type="server_error" if exc.status_code >= 500 else "invalid_request_error",
             code=exc.code,
         )
+    if isinstance(result, ClientDisconnectedResponse):
+        return result
     message: dict[str, Any] = {"role": "assistant", "content": result.content}
     if result.reasoning:
         message["reasoning_content"] = result.reasoning
@@ -498,7 +502,9 @@ async def handle_completion(
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
-        return DisconnectAwareStreamingResponse(chunks, media_type="text/event-stream")
+        return DisconnectAwareStreamingResponse(
+            chunks, media_type="text/event-stream", request=request
+        )
 
     choices: list[dict[str, Any]] = []
     prompt_tokens = 0
@@ -543,7 +549,7 @@ async def handle_completion(
             )
 
         try:
-            text, finish_reason, pt, ct, cached = await await_with_disconnect(
+            collected = await await_with_disconnect(
                 _collect_completion(), request=request, state=state, uid=uid
             )
         except GenerationError as exc:
@@ -553,6 +559,9 @@ async def handle_completion(
                 err_type="server_error" if exc.status_code >= 500 else "invalid_request_error",
                 code=exc.code,
             )
+        if isinstance(collected, ClientDisconnectedResponse):
+            return collected
+        text, finish_reason, pt, ct, cached = collected
         prompt_tokens += pt
         completion_tokens += ct
         cached_tokens += cached
