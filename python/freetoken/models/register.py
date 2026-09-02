@@ -130,6 +130,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "freetoken.models.glm_moe_dsa",
         "GlmMoeDsaForCausalLM",
     ),
+    # GLM-5.3-Flash multimodal wrapper, served as its hybrid KDA + MLA/DSA
+    # text tower. Vision/video weights and the trailing MTP layer are excluded.
+    "Glm5NextForConditionalGeneration": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForCausalLM",
+    ),
 }
 
 

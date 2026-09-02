@@ -83,12 +83,16 @@ class GlmDsaIndexer(BaseOP):
         # indexer_rope_interleave=true -> interleaved, where DeepSeek-V3.2 defaults
         # half-split. transformers >= 5.13 is explicit about this difference; <= 5.12
         # applied half-split for GLM too, which selects the wrong top-k past 2048.
-        self._rope = get_rope(
-            head_dim=self.head_dim,
-            rotary_dim=args.qk_rope_head_dim,
-            max_position=args.max_position,
-            base=args.rope_theta,
-            is_neox=not args.indexer_rope_interleave,
+        self._rope = (
+            get_rope(
+                head_dim=self.head_dim,
+                rotary_dim=args.qk_rope_head_dim,
+                max_position=args.max_position,
+                base=args.rope_theta,
+                is_neox=not args.indexer_rope_interleave,
+            )
+            if args.qk_rope_head_dim
+            else None
         )
 
     def compute(
@@ -98,7 +102,8 @@ class GlmDsaIndexer(BaseOP):
         t = x.shape[0]
         q = self.wq_b.forward(q_resid).view(t, self.n_heads * self.head_dim)
         k = self.k_norm.forward(self.wk.forward(x)).view(t, self.head_dim)
-        q, k = self._rope.forward(positions, q, k)
+        if self._rope is not None:
+            q, k = self._rope.forward(positions, q, k)
         w = self.weights_proj.forward(x).float() * (self.n_heads**-0.5)
         return q.view(t, self.n_heads, self.head_dim), k, w
 
@@ -127,12 +132,16 @@ class GlmMoeDsaAttention(BaseOP):
         # cos/sin table from the model's max_position (1M -> ~256 MB, same
         # documented cost as DSV4's freqs table) and shares the one instance
         # across all layers via its cache.
-        self.rope = get_rope(
-            head_dim=args.qk_rope_head_dim,
-            rotary_dim=args.qk_rope_head_dim,
-            max_position=args.max_position,
-            base=args.rope_theta,
-            is_neox=not args.rope_interleave,  # GLM-5.2: interleaved (config-driven)
+        self.rope = (
+            get_rope(
+                head_dim=args.qk_rope_head_dim,
+                rotary_dim=args.qk_rope_head_dim,
+                max_position=args.max_position,
+                base=args.rope_theta,
+                is_neox=not args.rope_interleave,
+            )
+            if args.qk_rope_head_dim
+            else None
         )
 
         quant = config.attn_quant
@@ -204,7 +213,8 @@ class GlmMoeDsaAttention(BaseOP):
         rope_dim = self.qk_rope_head_dim
         q_rope = q_rope.reshape(t, self.num_heads * rope_dim)
         k_rope = k_rope.reshape(t, rope_dim)
-        q_rope, k_rope = self.rope.forward(ctx.batch.positions, q_rope, k_rope)
+        if self.rope is not None:
+            q_rope, k_rope = self.rope.forward(ctx.batch.positions, q_rope, k_rope)
         q_rope = q_rope.view(t, self.num_heads, rope_dim)
 
         # Absorb kv_b's k-part into the query: q_nope[H,T,nope] @ W_uk[H,nope,lora].

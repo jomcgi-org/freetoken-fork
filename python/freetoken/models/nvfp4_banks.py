@@ -49,6 +49,23 @@ class Nvfp4ExpertSourceSpec:
     proj_to_role: dict[str, str]
     layer_to_bank: LayerToBank
     desc: str
+    # Optional source-layout aliases to the native ModelOpt names used internally:
+    # weight, weight_scale, weight_scale_2.
+    kind_aliases: dict[str, str] | None = None
+    # compressed-tensors stores the quant-side global; dequant uses its reciprocal.
+    invert_global_scale: bool = False
+
+
+def _source_kind(spec: Nvfp4ExpertSourceSpec, match: re.Match[str]) -> str:
+    kind = match.group("kind")
+    return (spec.kind_aliases or {}).get(kind, kind)
+
+
+def _global_scale(spec: Nvfp4ExpertSourceSpec, tensor: torch.Tensor) -> torch.Tensor:
+    value = tensor.float()
+    if spec.invert_global_scale:
+        value = value.reciprocal()
+    return value.to(dtype=torch.float16, copy=True)
 
 
 def quantize_nvfp4_group16(
@@ -241,7 +258,7 @@ def _stream_nvfp4_expert_source_banks(
             path = os.path.join(folder, shard)
             with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
                 for name, match in shards[shard]:
-                    if match.group("kind") != "weight_scale_2":
+                    if _source_kind(spec, match) != "weight_scale_2":
                         continue
                     key = (
                         int(match.group("layer")),
@@ -250,9 +267,7 @@ def _stream_nvfp4_expert_source_banks(
                     )
                     if key in globals_map:
                         raise ValueError(f"{spec.desc}: duplicate global scale {name}")
-                    globals_map[key] = handle.get_tensor(name).to(
-                        dtype=torch.float16, copy=True
-                    )
+                    globals_map[key] = _global_scale(spec, handle.get_tensor(name))
             drop_page_cache(path)
 
         placed = 0
@@ -260,7 +275,7 @@ def _stream_nvfp4_expert_source_banks(
             path = os.path.join(folder, shard)
             with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
                 for name, match in shards[shard]:
-                    kind = match.group("kind")
+                    kind = _source_kind(spec, match)
                     if kind == "weight_scale_2":
                         continue
                     layer = int(match.group("layer"))
@@ -378,7 +393,7 @@ def load_nvfp4_expert_source_banks(
         proj = match.group("proj")
         if proj not in spec.proj_to_role:
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
-        kind = match.group("kind")
+        kind = _source_kind(spec, match)
         if kind == "weight_scale_2":
             global_shards[shard].append((name, match, bank_layer))
         elif kind in {"weight", "weight_scale"}:
@@ -396,7 +411,7 @@ def load_nvfp4_expert_source_banks(
                     int(match.group("expert")),
                     match.group("proj"),
                 )
-                globals_map[key] = f.get_tensor(name).to(torch.float16)
+                globals_map[key] = _global_scale(spec, f.get_tensor(name))
         drop_page_cache(path)
 
     _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
@@ -420,7 +435,7 @@ def load_nvfp4_expert_source_banks(
                     expert = int(match.group("expert"))
                     proj = match.group("proj")
                     role = spec.proj_to_role[proj]
-                    kind = match.group("kind")
+                    kind = _source_kind(spec, match)
                     tensor = f.get_tensor(name)
                     if kind == "weight":
                         if role == "gate":
@@ -514,7 +529,7 @@ def load_nvfp4_expert_source_banks_parallel(
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is None:
             continue
-        kind = match.group("kind")
+        kind = _source_kind(spec, match)
         if kind == "weight_scale_2":
             global_names_by_shard[shard].append(name)
         elif kind in {"weight", "weight_scale"}:
@@ -531,7 +546,7 @@ def load_nvfp4_expert_source_banks_parallel(
             for name in global_names_by_shard[shard]:
                 m = spec.key_pattern.match(name)
                 globals_map[(int(m.group("layer")), int(m.group("expert")), m.group("proj"))] = (
-                    f.get_tensor(name).to(torch.float16)
+                    _global_scale(spec, f.get_tensor(name))
                 )
         drop_page_cache(path)
 
@@ -557,7 +572,7 @@ def load_nvfp4_expert_source_banks_parallel(
             expert = int(match.group("expert"))
             proj = match.group("proj")
             role = spec.proj_to_role[proj]
-            kind = match.group("kind")
+            kind = _source_kind(spec, match)
             if kind == "weight":
                 if role == "gate":
                     gate_up_packed[bank_layer_id][expert, :I] = tensor

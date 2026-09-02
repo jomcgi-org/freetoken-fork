@@ -68,10 +68,16 @@ inline bf16_t f32_to_bf16(float f) {
 }
 
 // ACT_SWIGLUOAI is the clamped (up + 1) swiglu (gpt-oss "swigluoai" /
-// MiniMax-M3): gate/up are combined jointly with the runtime alpha/limit
-// scalars, so it is handled in the do_pass1 epilogue (act_apply never sees it;
-// the mxfp4 kernel additionally fuses its own copy of the same math).
-enum ActKind { ACT_SILU = 0, ACT_GELU = 1, ACT_GELU_TANH = 2, ACT_SWIGLUOAI = 3 };
+// MiniMax-M3 and clamped_silu for GLM-5.3): gate/up are combined jointly with
+// the runtime limit/alpha scalars, so do_pass1 handles them (act_apply never
+// sees either; the mxfp4 kernel additionally fuses its own swigluoai math).
+enum ActKind {
+  ACT_SILU = 0,
+  ACT_GELU = 1,
+  ACT_GELU_TANH = 2,
+  ACT_SWIGLUOAI = 3,
+  ACT_CLAMPED_SILU = 4,
+};
 
 inline float act_apply(int act, float x) {
   if (act == ACT_SILU) return x / (1.0f + std::exp(-x));
@@ -2130,6 +2136,7 @@ struct CpuMoeExecutor {
     const int i0 = static_cast<int>(ib) * IBLK;
     const int i1 = std::min(I, i0 + IBLK);
     const bool swigluoai = act == ACT_SWIGLUOAI;
+    const bool clamped_silu = act == ACT_CLAMPED_SILU;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
     for (int i = i0; i < i1; ++i) {
       // gate = row i, up = row I+i
@@ -2137,14 +2144,14 @@ struct CpuMoeExecutor {
           gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, i, x_row, xe, xo, xi8, xas) * w_in;
       float up = gemm1_dot(gate_up_l, gu_packed_l, gu_scale_l, gu_global_l, e, I + i, x_row,
                            xe, xo, xi8, xas) * w_in;
-      if (swigluoai) {
-        // clamp(gate, max=lim) * sigmoid(alpha * gate) * (clamp(up, +-lim) + 1)
-        // -- same math as the mxfp4 kernel's fused epilogue (lim == +inf: no clamp).
+      if (swigluoai || clamped_silu) {
+        // Both variants clamp gate/up. swigluoai uses sigmoid(alpha*gate)*(up+1),
+        // while clamped_silu uses sigmoid(gate)*up (lim == +inf means no clamp).
         if (gate > lim) gate = lim;
         if (up > lim) up = lim;
         else if (up < -lim) up = -lim;
-        const float glu = gate / (1.0f + std::exp(-gate * alpha));
-        g_row[i] = f32_to_bf16(glu * (up + 1.0f));
+        const float glu = gate / (1.0f + std::exp(-gate * (swigluoai ? alpha : 1.0f)));
+        g_row[i] = f32_to_bf16(glu * (swigluoai ? up + 1.0f : up));
       } else {
         g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
       }
@@ -2519,6 +2526,7 @@ struct CpuMoeExecutor {
     float* gate = prefill_gate_scratch.data() + static_cast<size_t>(begin) * kNvi8WeightRows;
     float* up = prefill_up_scratch.data() + static_cast<size_t>(begin) * kNvi8WeightRows;
     const bool swigluoai = act == ACT_SWIGLUOAI;
+    const bool clamped_silu = act == ACT_CLAMPED_SILU;
     for (int i0 = 0; i0 < I; i0 += kNvi8WeightRows) {
       const int rows = std::min(kNvi8WeightRows, I - i0);
       const size_t gr = static_cast<size_t>(e) * (2 * I) + i0;
@@ -2537,11 +2545,13 @@ struct CpuMoeExecutor {
           float gv = gate[static_cast<size_t>(r) * count + m] * w_in;
           float uv = up[static_cast<size_t>(r) * count + m] * w_in;
           float activated;
-          if (swigluoai) {
+          if (swigluoai || clamped_silu) {
             if (gv > swiglu_limit) gv = swiglu_limit;
             if (uv > swiglu_limit) uv = swiglu_limit;
             else if (uv < -swiglu_limit) uv = -swiglu_limit;
-            activated = gv / (1.0f + std::exp(-gv * swiglu_alpha)) * (uv + 1.0f);
+            const float alpha = swigluoai ? swiglu_alpha : 1.0f;
+            activated = gv / (1.0f + std::exp(-gv * alpha)) *
+                        (swigluoai ? uv + 1.0f : uv);
           } else {
             activated = act_apply(act, gv) * uv;
           }
@@ -3178,8 +3188,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // ABI capability marker: the highest ActKind this build implements in the
   // GENERIC epilogue. CpuMoeExecutor.__init__ probes it before requesting an act
   // id the epilogue must handle -- a prebuilt .so from before ACT_SWIGLUOAI
-  // accepts id 3 without error and silently computes the wrong activation
+  // accepts a newer id without error and silently computes the wrong activation
   // (act_apply falls through to gelu_tanh); the probe turns a stale extension
   // into a loud rebuild instruction instead of wrong model outputs.
-  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_SWIGLUOAI); });
+  m.def("max_generic_act_id", []() { return static_cast<int>(ACT_CLAMPED_SILU); });
 }
