@@ -53,6 +53,22 @@ def _is_oom_error(exc: BaseException) -> bool:
     )
 
 
+def _assert_route_ids_in_bank_bounds(
+    route_ids: torch.Tensor,
+    views: tuple[torch.Tensor, ...],
+) -> None:
+    """Fail before a routed kernel can index outside any expert bank."""
+    assert route_ids.numel(), "routed row ids must not be empty"
+    min_id, max_id = torch.aminmax(route_ids)
+    lo, hi = int(min_id.item()), int(max_id.item())
+    assert lo >= 0, f"routed row id {lo} is negative"
+    for bank in views:
+        table_row_count = bank.shape[0]
+        assert hi < table_row_count, (
+            f"routed row id {hi} exceeds bank row count {table_row_count}"
+        )
+
+
 class MoELayer(BaseOP):
     def __init__(
         self,
@@ -583,19 +599,24 @@ class OffloadMoELayer(MoELayer):
             )
 
         try:
-            # The bf16 prefill implementation uses ``hidden_states`` as its output
-            # buffer. Keep the original activations intact for the cold CPU partial
-            # and for the full-CPU OOM fallback.
+            # Keep the original activations intact for the cold CPU partial and
+            # for the full-CPU OOM fallback.
             gpu_hidden_states = hidden_states.clone()
+            views = cache.bank_views()
+            _assert_route_ids_in_bank_bounds(gpu_slots, views)
+            # HOT weights remain in arbitrary protected cache slots. Mapping these
+            # routes back to expert ids would make grouped prefill kernels read the
+            # unrelated rows at those expert-id positions, so use the established
+            # slot-indexed decode kernels for this partial.
             gpu_routed = self._expert_gemm(
                 cache,
                 gpu_hidden_states,
                 gpu_weights,
                 gpu_slots,
-                views=cache.bank_views(),
-                n=cache.cache_size,
+                views=views,
+                n=None,
                 alphas=cache.alphas_for_slots(self.layer_id),
-                is_prefill=True,
+                is_prefill=False,
             )
         except (MemoryError, RuntimeError) as exc:
             if not _is_oom_error(exc):
