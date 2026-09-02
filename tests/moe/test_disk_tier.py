@@ -163,6 +163,7 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     cache.stat_hot_pairs.fill_(7)
     cache.stat_hot_total_pairs.fill_(10)
     cache.hot_adapt_enabled = True
+    cache.hot_adapt_interval_steps = 17
     cache._hot_slot_owners = {0: [1]}
     cache.decayed_decode_freq[0] = torch.tensor([1.0, 3.0, 2.0, 4.0])
     cache.hot_adapt_ticks = 2
@@ -174,6 +175,7 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     assert stats["routed_pairs"] == 10
     assert stats["hot_swaps_per_interval"] == pytest.approx(1.5)
     assert stats["decayed_hot_pair_rate"] == pytest.approx(0.3)
+    assert stats["hot_adapt_interval"] == 17
     assert cache.stat_hot_pairs.item() == 0
     assert cache.stat_hot_total_pairs.item() == 0
 

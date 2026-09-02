@@ -240,6 +240,8 @@ class Scheduler(SchedulerIOMixin):
                     f"{disk.get('hot_swaps_per_interval', 0.0):.2f}, "
                     f"disk decayed_hot_pair_rate: "
                     f"{disk.get('decayed_hot_pair_rate', 0.0):.2%}, "
+                    f"hot_adapt_interval: "
+                    f"{disk.get('hot_adapt_interval', 0)}, "
                     f"disk lookahead_hit_rate: "
                     f"{disk['lookahead_hit_rate']:.4f}, "
                     f"disk delta_pages/step: "

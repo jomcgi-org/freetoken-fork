@@ -133,6 +133,22 @@ def parse_args(
             )
         return str(n)
 
+    def _hot_adapt_interval(value: str) -> str | int:
+        normalized = value.strip().lower()
+        if normalized == "auto":
+            return normalized
+        try:
+            interval = int(normalized)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "must be 'auto' or a non-negative integer"
+            ) from exc
+        if interval < 0:
+            raise argparse.ArgumentTypeError(
+                "must be 'auto' or a non-negative integer"
+            )
+        return interval
+
     def _nonnegative_float(value: str) -> float:
         try:
             n = float(value)
@@ -770,9 +786,13 @@ def parse_args(
 
     parser.add_argument(
         "--moe-hot-adapt-interval-steps",
-        type=int,
+        type=_hot_adapt_interval,
         default=ServerArgs.moe_hot_adapt_interval_steps,
-        help="Decode steps between HOT partition recomputes; 0 disables adaptation.",
+        help=(
+            "Decode steps between HOT partition recomputes. 'auto' derives fill and "
+            "steady cadences from the allocation (default); an integer is fixed, "
+            "and 0 disables adaptation."
+        ),
     )
 
     parser.add_argument(

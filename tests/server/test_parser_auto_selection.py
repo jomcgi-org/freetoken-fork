@@ -94,3 +94,22 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("auto", "auto"), ("37", 37), ("0", 0)],
+)
+def test_hot_adapt_interval_accepts_auto_or_an_explicit_integer(value, expected):
+    args, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-hot-adapt-interval-steps",
+            value,
+        ]
+    )
+
+    assert args.moe_hot_adapt_interval_steps == expected

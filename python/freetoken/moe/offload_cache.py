@@ -282,6 +282,7 @@ class OffloadMoeCache:
         # then published only after every staged row reaches its GPU slot.
         self.hot_adapt_enabled = False
         self.hot_adapt_interval_steps = 0
+        self._hot_adapt_interval_controller = None
         self.hot_adapt_max_swap_bytes = 0
         self.hot_adapt_expert_bytes = 0
         self.hot_adapt_decode_steps = 0
@@ -323,6 +324,12 @@ class OffloadMoeCache:
         self._hot_adapt_snapshot_host: torch.Tensor | None = None
         self._hot_adapt_snapshot_ready = None
         self._hot_adapt_copy_stream: torch.cuda.Stream | None = None
+        self._hot_adapt_next_step = 0
+        self._hot_adapt_last_tick_step = 0
+        self._hot_adapt_tick_interval_steps = 0
+        self._hot_adapt_tick_covered_seconds = 0.0
+        self._hot_adapt_window_started_at: float | None = None
+        self._hot_adapt_deferred_logged = False
         # per-layer host residency: direct GPU movement requires "pinned";
         # LOCKED/PAGEABLE decode on CPU, while DISK may use CPU or the staging ring
         # _unpinned_layers is the derived id set the hot paths test against
@@ -925,28 +932,39 @@ class OffloadMoeCache:
         self,
         *,
         half_life_steps: int,
-        interval_steps: int,
+        interval_steps: str | int,
         max_swap_bytes: int,
         expert_bytes: int,
     ) -> None:
         """Allocate bounded staging, load seeds, and arm online adaptation."""
         if not self.hot_expert_capacity:
             return
-        if half_life_steps <= 0 or interval_steps < 0:
-            raise ValueError("HOT adaptation steps must use a positive half-life and interval")
+        if half_life_steps <= 0:
+            raise ValueError("HOT adaptation half-life must be positive")
         if max_swap_bytes <= 0 or expert_bytes <= 0:
             raise ValueError("HOT adaptation byte geometry must be positive")
         from freetoken.moe.host_banks import alloc_pinned_row_staging
         from freetoken.moe.hot_adapt import (
+            HotAdaptIntervalController,
             decay_multiplier,
             hot_staging_budget_bytes,
             hot_staging_rows,
         )
 
-        self.hot_adapt_enabled = interval_steps > 0
-        self.hot_adapt_interval_steps = int(interval_steps)
         self.hot_adapt_max_swap_bytes = int(max_swap_bytes)
         self.hot_adapt_expert_bytes = int(expert_bytes)
+        hot_budget_bytes = (
+            sum(self.hot_expert_capacity.values()) * self.hot_adapt_expert_bytes
+        )
+        controller = HotAdaptIntervalController.create(
+            interval_steps,
+            hot_budget_bytes=hot_budget_bytes,
+            max_swap_bytes=self.hot_adapt_max_swap_bytes,
+        )
+        self._hot_adapt_interval_controller = controller
+        self.hot_adapt_interval_steps = controller.current_interval
+        self.hot_adapt_enabled = self.hot_adapt_interval_steps > 0
+        self._hot_adapt_next_step = self.hot_adapt_interval_steps
         self._hot_decay_factor = decay_multiplier(half_life_steps)
         self._hot_staging_rows = hot_staging_rows(max_swap_bytes, expert_bytes)
         self._hot_staging = alloc_pinned_row_staging(
@@ -970,6 +988,17 @@ class OffloadMoeCache:
             f"MoE HOT expert residency: {sum(self.hot_expert_capacity.values())} "
             f"protected GPU rows across {len(self.hot_expert_capacity)} DISK layers, "
             f"hot_staging_gib={self.hot_staging_bytes / 2**30:.2f}"
+        )
+        mode = "auto" if controller.auto else f"fixed({controller.current_interval})"
+        logger.info_rank0(
+            f"MoE HOT adaptation intervals: mode={mode}, "
+            f"hot_budget_gib={hot_budget_bytes / 2**30:.2f}, "
+            f"max_swap_gib={self.hot_adapt_max_swap_bytes / 2**30:.2f}, "
+            f"fill_ticks={controller.fill_ticks}, "
+            f"target_fill_tokens={controller.target_fill_tokens}, "
+            f"fill_interval={controller.fill_interval}, "
+            f"steady_interval={controller.steady_interval}, "
+            f"current_interval={controller.current_interval}"
         )
         if not self.hot_adapt_enabled:
             return
@@ -1005,6 +1034,7 @@ class OffloadMoeCache:
             ready.synchronize()
         if len(swaps) > self._hot_staging_rows:
             raise RuntimeError("HOT swap plan exceeds the allocated staging rows")
+        started_at = time.perf_counter()
         copied: set[tuple[int, int]] = set()
         with torch.inference_mode():
             for stage_row, swap in enumerate(swaps):
@@ -1014,7 +1044,7 @@ class OffloadMoeCache:
                         source[swap.incoming_expert]
                     )
                 copied.add((swap.layer_id, swap.row))
-        return copied
+        return copied, time.perf_counter() - started_at
 
     def _install_staged_hot_rows(self, swaps) -> None:
         """Copy staged rows into their fixed GPU slots on the publication stream."""
@@ -1039,7 +1069,7 @@ class OffloadMoeCache:
         ]
         for start in range(0, len(items), self._hot_staging_rows):
             batch = tuple(items[start:start + self._hot_staging_rows])
-            copied = self._stage_hot_rows(None, batch)
+            copied, _staging_seconds = self._stage_hot_rows(None, batch)
             self._install_staged_hot_rows(batch)
             # The next batch reuses the same pinned rows. Complete this H2D before
             # the CPU overwrites them; this path runs only at startup/rebuild.
@@ -1368,7 +1398,9 @@ class OffloadMoeCache:
             self._stage_hot_rows, ready, swaps
         )
 
-    def _finish_hot_adaptation_swaps(self, copied_rows) -> None:
+    def _finish_hot_adaptation_swaps(
+        self, copied_rows, staging_seconds: float = 0.0
+    ) -> None:
         from freetoken.moe.hot_adapt import finish_hot_swaps
 
         swaps = self._hot_adapt_swaps_pending
@@ -1394,6 +1426,46 @@ class OffloadMoeCache:
         self._hot_adapt_swaps_pending = ()
         self._hot_adapt_phase = None
         self._hot_adapt_future = None
+        self._complete_hot_adaptation_tick(staging_seconds=staging_seconds)
+
+    def _complete_hot_adaptation_tick(self, *, staging_seconds: float) -> None:
+        controller = self._hot_adapt_interval_controller
+        if controller is None:
+            return
+        partition_full = all(
+            owner is not None
+            for owners in self._hot_slot_owners.values()
+            for owner in owners
+        )
+        old_interval = controller.current_interval
+        switched, backed_off, backoff_interval = controller.complete_tick(
+            partition_full=partition_full,
+            tick_interval=self._hot_adapt_tick_interval_steps,
+            staging_seconds=staging_seconds,
+            covered_seconds=self._hot_adapt_tick_covered_seconds,
+        )
+        self.hot_adapt_interval_steps = controller.current_interval
+        self._hot_adapt_next_step = max(
+            self._hot_adapt_next_step,
+            self._hot_adapt_last_tick_step + self.hot_adapt_interval_steps,
+        )
+        if backed_off:
+            fraction = staging_seconds / self._hot_adapt_tick_covered_seconds
+            logger.info_rank0(
+                f"MoE HOT adaptation bandwidth back-off: staging_ms="
+                f"{staging_seconds * 1000:.1f}, covered_step_wall_ms="
+                f"{self._hot_adapt_tick_covered_seconds * 1000:.1f}, "
+                f"staging_fraction={fraction:.1%}, interval_floor="
+                f"{old_interval}->{backoff_interval}, next_interval="
+                f"{controller.current_interval}"
+            )
+        if switched:
+            logger.info_rank0(
+                f"MoE HOT adaptation fill complete: fill_interval="
+                f"{controller.fill_interval}, steady_interval="
+                f"{controller.steady_interval}, current_interval="
+                f"{controller.current_interval}"
+            )
 
     def _poll_hot_adaptation(self) -> None:
         future = self._hot_adapt_future
@@ -1405,8 +1477,11 @@ class OffloadMoeCache:
             self._hot_adapt_phase = None
             if swaps:
                 self._retire_hot_adaptation_swaps(swaps)
+            else:
+                self._complete_hot_adaptation_tick(staging_seconds=0.0)
         elif self._hot_adapt_phase == "copy":
-            self._finish_hot_adaptation_swaps(future.result())
+            copied_rows, staging_seconds = future.result()
+            self._finish_hot_adaptation_swaps(copied_rows, staging_seconds)
         else:
             raise RuntimeError("HOT adaptation future completed in an invalid phase")
 
@@ -1418,16 +1493,43 @@ class OffloadMoeCache:
         if not self.hot_adapt_enabled:
             return
         self.hot_adapt_decode_steps += 1
+        now = time.perf_counter()
+        if self._hot_adapt_window_started_at is None:
+            self._hot_adapt_window_started_at = now
         self._poll_hot_adaptation()
-        if self.hot_adapt_decode_steps % self.hot_adapt_interval_steps:
+        controller = self._hot_adapt_interval_controller
+        auto_interval = controller is not None and controller.auto
+        due = (
+            self.hot_adapt_decode_steps >= self._hot_adapt_next_step
+            if auto_interval
+            else self.hot_adapt_decode_steps % self.hot_adapt_interval_steps == 0
+        )
+        if not due:
             return
-        self.hot_adapt_ticks += 1
+        if not auto_interval:
+            # Preserve the fixed-N scheduler's existing modulo cadence and tick
+            # accounting, including a skipped tick while earlier work is active.
+            self.hot_adapt_ticks += 1
         if self._hot_adapt_future is not None:
-            logger.info_rank0(
-                f"MoE HOT adaptation tick step={self.hot_adapt_decode_steps}: "
-                f"copy_or_plan_in_progress, decayed_hot_pair_rate deferred"
-            )
+            if not auto_interval or not self._hot_adapt_deferred_logged:
+                logger.info_rank0(
+                    f"MoE HOT adaptation tick step={self.hot_adapt_decode_steps}: "
+                    f"copy_or_plan_in_progress, decayed_hot_pair_rate deferred"
+                )
+                self._hot_adapt_deferred_logged = True
             return
+        if auto_interval:
+            self.hot_adapt_ticks += 1
+        self._hot_adapt_deferred_logged = False
+        self._hot_adapt_last_tick_step = self.hot_adapt_decode_steps
+        self._hot_adapt_tick_interval_steps = self.hot_adapt_interval_steps
+        self._hot_adapt_tick_covered_seconds = max(
+            0.0, now - self._hot_adapt_window_started_at
+        )
+        self._hot_adapt_window_started_at = now
+        self._hot_adapt_next_step = (
+            self.hot_adapt_decode_steps + self.hot_adapt_interval_steps
+        )
         assert self._hot_adapt_snapshot_host is not None
         self._hot_adapt_snapshot_device.copy_(self.decayed_decode_freq)
         ready = None
@@ -1559,6 +1661,7 @@ class OffloadMoeCache:
         # them merely because this report window has no new tick.
         result["hot_swaps_per_interval"] = swaps / max(ticks, 1)
         result["decayed_hot_pair_rate"] = self.decayed_hot_pair_rate()
+        result["hot_adapt_interval"] = self.hot_adapt_interval_steps
         result.update(self.session_profile_stats(reset=reset))
         if reset:
             self.stat_hot_pairs.zero_()
