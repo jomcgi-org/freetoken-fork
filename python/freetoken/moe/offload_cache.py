@@ -166,6 +166,7 @@ class OffloadMoeCache:
     # pageable copy path.
     moe_disk_prefill: str = "cpu"
     moe_prefill_coalesce: str = "populate"
+    moe_prefill_hot_split: str = "on"
     # DISK-only decode policy. gpufetch keeps the mmap as the authoritative host
     # bank but fills LRU misses through a bounded pinned staging ring.
     moe_disk_decode: str = "cpu"
@@ -206,6 +207,7 @@ class OffloadMoeCache:
         assert self.moe_prefill_coalesce in (
             "populate", "on", "off"
         ), self.moe_prefill_coalesce
+        assert self.moe_prefill_hot_split in ("on", "off"), self.moe_prefill_hot_split
         assert self.moe_disk_decode in ("cpu", "gpufetch"), self.moe_disk_decode
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
@@ -360,6 +362,9 @@ class OffloadMoeCache:
         self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_hot_pairs = torch.zeros((), dtype=torch.int64, device=self.device)
         self.stat_hot_total_pairs = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._prefill_hot_pairs = 0
+        self._prefill_route_pairs = 0
+        self._prefill_cpu_experts = 0
         # Decode routing histogram (per layer, per expert) for cache-skew analysis and
         # v2 profiles. The device scatter is captured and replays with each step's raw
         # ids whenever collect_stats is enabled. collect_decode_freq remains a separate
@@ -857,6 +862,9 @@ class OffloadMoeCache:
         self.stat_steps_layer.zero_()
         self.stat_hot_pairs.zero_()
         self.stat_hot_total_pairs.zero_()
+        self._prefill_hot_pairs = 0
+        self._prefill_route_pairs = 0
+        self._prefill_cpu_experts = 0
         self.decode_freq.zero_()
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
@@ -1539,6 +1547,11 @@ class OffloadMoeCache:
         result["hot_pair_rate"] = hot_pairs / total_pairs if total_pairs else 0.0
         result["hot_pairs"] = hot_pairs
         result["routed_pairs"] = total_pairs
+        result["prefill_hot_route_frac"] = (
+            self._prefill_hot_pairs / self._prefill_route_pairs
+            if self._prefill_route_pairs else 0.0
+        )
+        result["prefill_cpu_experts"] = self._prefill_cpu_experts
         ticks = self.hot_adapt_ticks - self._hot_adapt_ticks_reported
         swaps = self.hot_adapt_swaps - self._hot_adapt_swaps_reported
         # A background copy may complete after the status window that contained
@@ -1550,9 +1563,23 @@ class OffloadMoeCache:
         if reset:
             self.stat_hot_pairs.zero_()
             self.stat_hot_total_pairs.zero_()
+            self._prefill_hot_pairs = 0
+            self._prefill_route_pairs = 0
+            self._prefill_cpu_experts = 0
             self._hot_adapt_ticks_reported = self.hot_adapt_ticks
             self._hot_adapt_swaps_reported = self.hot_adapt_swaps
         return result
+
+    def record_prefill_hot_split(
+        self, raw_ids: torch.Tensor, hot_mask: torch.Tensor
+    ) -> None:
+        """Account actual GPU-served pairs and distinct cold experts per chunk."""
+        hot_pairs = int(hot_mask.sum().item())
+        cold_ids = raw_ids.masked_select(~hot_mask)
+        cold_ids = cold_ids[cold_ids >= 0]
+        self._prefill_hot_pairs += hot_pairs
+        self._prefill_route_pairs += int(raw_ids.numel())
+        self._prefill_cpu_experts += int(torch.unique(cold_ids).numel())
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
@@ -1923,6 +1950,9 @@ class OffloadMoeCache:
         self.stat_steps_layer.zero_()
         self.stat_hot_pairs.zero_()
         self.stat_hot_total_pairs.zero_()
+        self._prefill_hot_pairs = 0
+        self._prefill_route_pairs = 0
+        self._prefill_cpu_experts = 0
         if self.cpu_executor is not None:
             self.cpu_executor.reset_disk_stats()
 

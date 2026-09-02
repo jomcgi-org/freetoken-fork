@@ -26,6 +26,33 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
 
 
+def _split_hot_cold_routes(
+    raw_ids: torch.Tensor,
+    slot_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the complementary GPU and CPU route views used by split MoE paths.
+
+    ``slot_ids`` contains protected GPU slot ids for resident routes and ``-1``
+    for cold routes. The GPU view clamps skipped ids to a valid row and zeros
+    their weights; the CPU view retains raw expert ids only for cold routes.
+    """
+    on_gpu = slot_ids >= 0
+    cpu_ids = torch.where(on_gpu, raw_ids.new_full((), -1), raw_ids).contiguous()
+    gpu_ids = slot_ids.clamp_min(0)
+    gpu_weights = torch.where(
+        on_gpu, topk_weights, topk_weights.new_zeros(())
+    ).contiguous()
+    return on_gpu, cpu_ids, gpu_ids, gpu_weights
+
+
+def _is_oom_error(exc: BaseException) -> bool:
+    """Recognize allocator OOMs across PyTorch versions and test doubles."""
+    return isinstance(exc, (MemoryError, torch.OutOfMemoryError)) or (
+        isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+    )
+
+
 class MoELayer(BaseOP):
     def __init__(
         self,
@@ -444,9 +471,9 @@ class OffloadMoELayer(MoELayer):
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
-        on_gpu = gpu_ids >= 0
-
-        cpu_ids = torch.where(on_gpu, raw_ids.new_full((), -1), raw_ids).contiguous()
+        on_gpu, cpu_ids, gpu_slots, gpu_w = _split_hot_cold_routes(
+            raw_ids, gpu_ids, topk_weights
+        )
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -456,8 +483,6 @@ class OffloadMoELayer(MoELayer):
         )
 
         cache.copy_missing()
-        gpu_slots = gpu_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
-        gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(
             cache,
             hidden_states,
@@ -490,29 +515,23 @@ class OffloadMoELayer(MoELayer):
         residency = getattr(cache, "layer_residency", ())
         if self.layer_id < len(residency) and residency[self.layer_id] == "disk":
             if cache.moe_disk_prefill == "cpu":
-                executor = cache.cpu_executor
-                assert executor is not None, "DISK layer requires the CPU MoE executor"
-                prepare = getattr(cache, "prepare_disk_prefill", None)
-                lease = prepare(self.layer_id, topk_ids) if prepare is not None else None
-                if lease is None:
-                    # No coalesce lease (flag off, seam missing, or degraded):
-                    # keep the pre-coalesce union WILLNEED sweep.
-                    cache.prefetch_disk_experts(self.layer_id, topk_ids)
-                self._prefetch_next_overlap_layer(cache)
-                try:
-                    out = executor.prefill(
-                        self.layer_id, hidden_states, topk_weights, topk_ids
+                hot_split = getattr(cache, "is_hot_split_layer", None)
+                if (
+                    getattr(cache, "moe_prefill_hot_split", "on") == "on"
+                    and hot_split is not None
+                    and hot_split(self.layer_id)
+                ):
+                    return self._prefill_hot_split(
+                        cache, hidden_states, topk_weights, topk_ids
                     )
-                finally:
-                    release = getattr(cache, "release_disk_prefill", None)
-                    if release is not None:
-                        release(lease)
-                schedule = getattr(
-                    cache, "schedule_next_chunk_disk_prefill", None
+                self._record_prefill_split(
+                    cache,
+                    topk_ids,
+                    torch.zeros_like(topk_ids, dtype=torch.bool),
                 )
-                if schedule is not None:
-                    schedule(self.layer_id, topk_ids)
-                return out
+                return self._prefill_cpu_routes(
+                    cache, hidden_states, topk_weights, topk_ids
+                )
             # Preserve the existing advisory sweep for the full-layer copy benchmark.
             cache.prefetch_disk_experts(self.layer_id, topk_ids)
         if cache.prefill_overlap and cache.prefill_overlap_for_layer(self.layer_id):
@@ -542,6 +561,97 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
         )
+
+    def _prefill_hot_split(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run resident DISK routes on protected slots and cold routes on CPU."""
+        raw_ids = topk_ids.clone()
+        cache.ensure_experts_hot(self.layer_id, topk_ids)
+        on_gpu, cpu_ids, gpu_slots, gpu_weights = _split_hot_cold_routes(
+            raw_ids, topk_ids, topk_weights
+        )
+        any_hot = bool(on_gpu.any().item())
+        if not any_hot:
+            self._record_prefill_split(cache, raw_ids, on_gpu)
+            return self._prefill_cpu_routes(
+                cache, hidden_states, topk_weights, raw_ids
+            )
+
+        try:
+            gpu_routed = self._expert_gemm(
+                cache,
+                hidden_states,
+                gpu_weights,
+                gpu_slots,
+                views=cache.bank_views(),
+                n=cache.cache_size,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=True,
+            )
+        except (MemoryError, RuntimeError) as exc:
+            if not _is_oom_error(exc):
+                raise
+            # The protected rows remain valid. Only this layer's GPU partial is
+            # abandoned, and the original route set is repopulated and run on CPU.
+            fallback_mask = torch.zeros_like(on_gpu, dtype=torch.bool)
+            self._record_prefill_split(cache, raw_ids, fallback_mask)
+            return self._prefill_cpu_routes(
+                cache, hidden_states, topk_weights, raw_ids
+            )
+
+        self._record_prefill_split(cache, raw_ids, on_gpu)
+        if bool(on_gpu.all().item()):
+            self._prefetch_next_overlap_layer(cache)
+            return gpu_routed
+        cpu_routed = self._prefill_cpu_routes(
+            cache, hidden_states, topk_weights, cpu_ids
+        )
+        return gpu_routed + cpu_routed
+
+    def _record_prefill_split(
+        self,
+        cache: OffloadMoeCache,
+        raw_ids: torch.Tensor,
+        hot_mask: torch.Tensor,
+    ) -> None:
+        record = getattr(cache, "record_prefill_hot_split", None)
+        if record is not None:
+            record(raw_ids, hot_mask)
+
+    def _prefill_cpu_routes(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        cpu_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run exactly the selected routes through the existing CPU prefill seam."""
+        executor = cache.cpu_executor
+        assert executor is not None, "DISK layer requires the CPU MoE executor"
+        prepare = getattr(cache, "prepare_disk_prefill", None)
+        lease = prepare(self.layer_id, cpu_ids) if prepare is not None else None
+        if lease is None:
+            # No coalesce lease (flag off, seam missing, or degraded): keep the
+            # pre-coalesce union WILLNEED sweep, now over cold routes only.
+            cache.prefetch_disk_experts(self.layer_id, cpu_ids)
+        self._prefetch_next_overlap_layer(cache)
+        try:
+            out = executor.prefill(
+                self.layer_id, hidden_states, topk_weights, cpu_ids
+            )
+        finally:
+            release = getattr(cache, "release_disk_prefill", None)
+            if release is not None:
+                release(lease)
+        schedule = getattr(cache, "schedule_next_chunk_disk_prefill", None)
+        if schedule is not None:
+            schedule(self.layer_id, cpu_ids)
+        return out
 
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the

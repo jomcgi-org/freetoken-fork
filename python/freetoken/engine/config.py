@@ -77,6 +77,8 @@ class EngineConfig:
     # "on" keeps advisory WILLNEED, and "off" preserves the original seam behavior.
     # The setting is inert for the DISK copy path.
     moe_prefill_coalesce: str = "populate"
+    # Split DISK prefill routes across protected HOT slots and the CPU executor.
+    moe_prefill_hot_split: str = "on"
     # Group CPU-prefill routes by expert and use the native row-batched NVFP4
     # W4A8 kernel. Unsupported formats or setup failures retain the serial path.
     moe_cpu_prefill_batch: str = "on"
@@ -205,6 +207,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-prefill-coalesce must be 'populate', 'on', or 'off', got "
                 f"{self.moe_prefill_coalesce!r}"
+            )
+        if self.moe_prefill_hot_split not in ("on", "off"):
+            raise ValueError(
+                "--moe-prefill-hot-split must be 'on' or 'off', got "
+                f"{self.moe_prefill_hot_split!r}"
             )
         if self.moe_cpu_prefill_batch not in ("on", "off"):
             raise ValueError(

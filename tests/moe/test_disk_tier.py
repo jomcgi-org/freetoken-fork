@@ -920,7 +920,9 @@ def test_cpu_prefill_populate_overlap_cancel_drains_mid_read():
     assert not overlap.thread.is_alive()
 
 
-@pytest.mark.parametrize("model_type", ["qwen4_exp", "glm4_moe"])
+@pytest.mark.parametrize(
+    "model_type", ["qwen4_exp", "glm4_moe", "glm_moe_dsa", "glm5_next"]
+)
 def test_cpu_prefill_coalesce_uses_shared_layer_seam_for_architectures(model_type):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer
@@ -971,6 +973,206 @@ def test_cpu_prefill_coalesce_uses_shared_layer_seam_for_architectures(model_typ
         ("release", model_type, lease),
         ("schedule", model_type, 0),
     ]
+
+
+def test_prefill_hot_cold_route_partition_is_complementary():
+    from freetoken.layers.moe import _split_hot_cold_routes
+    from freetoken.moe.cpu_executor import _group_prefill_routes
+
+    raw = torch.tensor([[0, 1], [2, 3], [0, 3]], dtype=torch.int32)
+    slots = torch.tensor([[7, -1], [9, -1], [7, -1]], dtype=torch.int32)
+    weights = torch.tensor(
+        [[0.7, 0.3], [0.25, 0.75], [0.6, 0.4]], dtype=torch.float32
+    )
+
+    hot, cpu_ids, gpu_ids, gpu_weights = _split_hot_cold_routes(
+        raw, slots, weights
+    )
+
+    assert hot.tolist() == [[True, False], [True, False], [True, False]]
+    assert cpu_ids.tolist() == [[-1, 1], [-1, 3], [-1, 3]]
+    assert gpu_ids.tolist() == [[7, 0], [9, 0], [7, 0]]
+    assert torch.equal(
+        gpu_weights,
+        torch.tensor([[0.7, 0.0], [0.25, 0.0], [0.6, 0.0]]),
+    )
+    assert set(_group_prefill_routes(cpu_ids, weights, 4)) == {1, 3}
+
+
+def _prefill_hot_split_fixture(
+    monkeypatch, *, hot_slots, split="on", oom=False, model_type="qwen4_exp"
+):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    calls = []
+    cpu_output = torch.full((3, 8), 2.0, dtype=torch.bfloat16)
+    gpu_output = torch.full((3, 8), 3.0, dtype=torch.bfloat16)
+
+    class Executor:
+        def prefill(self, layer_id, hidden_states, topk_weights, topk_ids):
+            calls.append(("cpu", topk_ids.clone()))
+            return cpu_output
+
+    def ensure_hot(layer_id, ids):
+        calls.append(("adapt", ids.clone()))
+        mapping = torch.tensor(hot_slots, dtype=ids.dtype)
+        ids.copy_(mapping[ids.long()])
+
+    def prepare(layer_id, ids):
+        cold = {int(i) for i in ids.reshape(-1).tolist() if int(i) >= 0}
+        calls.append(("prepare", cold))
+        return object()
+
+    cache = SimpleNamespace(
+        model_config=SimpleNamespace(model_type=model_type),
+        layer_residency=["disk"],
+        moe_disk_prefill="cpu",
+        moe_prefill_hot_split=split,
+        prefill_overlap=False,
+        cpu_executor=Executor(),
+        cache_size=12,
+        is_hot_split_layer=lambda layer_id: True,
+        ensure_experts_hot=ensure_hot,
+        prepare_disk_prefill=prepare,
+        release_disk_prefill=lambda lease: calls.append(("release",)),
+        schedule_next_chunk_disk_prefill=lambda layer_id, ids: calls.append(
+            ("schedule", ids.clone())
+        ),
+        prefetch_disk_experts=lambda layer_id, ids: calls.append(("prefetch",)),
+        bank_views=lambda: (),
+        alphas_for_slots=lambda layer_id: None,
+        record_prefill_hot_split=lambda raw, mask: calls.append(
+            ("stats", raw.clone(), mask.clone())
+        ),
+    )
+    layer = OffloadMoELayer(
+        layer_id=0,
+        num_experts=4,
+        top_k=2,
+        hidden_size=8,
+        intermediate_size=8,
+    )
+    layer.offload_cache = cache
+
+    def gpu_gemm(*args, **kwargs):
+        calls.append(
+            (
+                "gpu",
+                args[3].clone(),
+                args[4].clone(),
+                kwargs["n"],
+                kwargs["is_prefill"],
+            )
+        )
+        if oom:
+            raise torch.OutOfMemoryError("synthetic CUDA out of memory")
+        return gpu_output
+
+    monkeypatch.setattr(OffloadMoELayer, "_expert_gemm", gpu_gemm)
+    hidden = torch.zeros((3, 8), dtype=torch.bfloat16)
+    weights = torch.tensor(
+        [[0.7, 0.3], [0.25, 0.75], [0.6, 0.4]], dtype=torch.float32
+    )
+    ids = torch.tensor([[0, 1], [2, 3], [0, 3]], dtype=torch.int32)
+    return layer, hidden, weights, ids, calls, cpu_output, gpu_output
+
+
+@pytest.mark.parametrize(
+    "model_type", ["qwen4_exp", "glm4_moe", "glm_moe_dsa", "glm5_next"]
+)
+def test_prefill_hot_split_populates_and_batches_only_cold_routes(
+    monkeypatch, model_type
+):
+    layer, hidden, weights, ids, calls, cpu_out, gpu_out = (
+        _prefill_hot_split_fixture(
+            monkeypatch, hot_slots=[7, -1, 9, -1], model_type=model_type
+        )
+    )
+
+    out = layer._prefill_routed(hidden, weights, ids)
+
+    assert torch.equal(out, cpu_out + gpu_out)
+    assert next(call[1] for call in calls if call[0] == "prepare") == {1, 3}
+    cpu_ids = next(call[1] for call in calls if call[0] == "cpu")
+    assert cpu_ids.tolist() == [[-1, 1], [-1, 3], [-1, 3]]
+    gpu = next(call for call in calls if call[0] == "gpu")
+    torch.testing.assert_close(
+        gpu[1],
+        torch.tensor([[0.7, 0.0], [0.25, 0.0], [0.6, 0.0]]),
+        rtol=0,
+        atol=0,
+    )
+    assert gpu[2].tolist() == [[7, 0], [9, 0], [7, 0]]
+    assert gpu[3:] == (12, True)
+    adaptation = next(call[1] for call in calls if call[0] == "adapt")
+    assert adaptation.tolist() == [[0, 1], [2, 3], [0, 3]]
+    stats = next(call for call in calls if call[0] == "stats")
+    assert int(stats[2].sum()) == 3
+
+
+@pytest.mark.parametrize(
+    ("hot_slots", "oom"),
+    [([-1, -1, -1, -1], False), ([7, -1, 9, -1], True)],
+)
+def test_prefill_hot_split_degrades_to_full_cpu(monkeypatch, hot_slots, oom):
+    layer, hidden, weights, ids, calls, cpu_out, _gpu_out = (
+        _prefill_hot_split_fixture(monkeypatch, hot_slots=hot_slots, oom=oom)
+    )
+
+    out = layer._prefill_routed(hidden, weights, ids)
+
+    assert out is cpu_out
+    assert next(call[1] for call in calls if call[0] == "prepare") == {0, 1, 2, 3}
+    cpu_ids = next(call[1] for call in calls if call[0] == "cpu")
+    assert cpu_ids.tolist() == [[0, 1], [2, 3], [0, 3]]
+    stats = next(call for call in calls if call[0] == "stats")
+    assert not bool(stats[2].any())
+
+
+def test_prefill_hot_split_flag_off_preserves_full_cpu_path(monkeypatch):
+    layer, hidden, weights, ids, calls, cpu_out, _gpu_out = (
+        _prefill_hot_split_fixture(
+            monkeypatch, hot_slots=[7, -1, 9, -1], split="off"
+        )
+    )
+
+    out = layer._prefill_routed(hidden, weights, ids)
+
+    assert out is cpu_out
+    assert next(call[1] for call in calls if call[0] == "prepare") == {0, 1, 2, 3}
+    assert not any(call[0] in ("adapt", "gpu") for call in calls)
+    stats = next(call for call in calls if call[0] == "stats")
+    assert not bool(stats[2].any())
+
+
+def test_prefill_hot_split_stats_report_and_reset():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=4,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+    )
+    cache.cpu_executor = SimpleNamespace(
+        disk_prefetch_stats=lambda reset=False: {}
+    )
+    raw = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+    cache.record_prefill_hot_split(
+        raw, torch.tensor([[True, False], [True, False]])
+    )
+
+    stats = cache.disk_prefetch_stats(reset=True)
+
+    assert stats["prefill_hot_route_frac"] == pytest.approx(0.5)
+    assert stats["prefill_cpu_experts"] == 2
+    reset = cache.disk_prefetch_stats()
+    assert reset["prefill_hot_route_frac"] == 0.0
+    assert reset["prefill_cpu_experts"] == 0
 
 
 def test_disk_decode_route_dedup_stats_track_heavy_recurrence():
@@ -1592,6 +1794,108 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
     torch.testing.assert_close(split_out, cpu_out, rtol=2e-2, atol=2e-2)
     stats = cache.disk_prefetch_stats(reset=True)
     assert stats["hot_pair_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_disk_hot_cold_split_prefill_matches_pure_cpu_prefill(tmp_path):
+    from freetoken.checkpoint.ftw import load_ftw_banks
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.kernel import _cpu_moe
+    from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    native_executor = getattr(_cpu_moe, "CpuMoeExecutor", None)
+    if native_executor is None or getattr(native_executor, "run_task_sync", None) is None:
+        pytest.skip("CPU MoE extension needs rebuilding for DISK CPU prefill")
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    torch.manual_seed(47)
+    experts, hidden, inter, top_k, tokens = 4, 128, 128, 2, 8
+    gate_up = torch.randn(
+        experts, 2 * inter, hidden, dtype=torch.bfloat16,
+    ) * 0.1
+    down = torch.randn(
+        experts, hidden, inter, dtype=torch.bfloat16,
+    ) * 0.1
+    _write_bf16_ftw(tmp_path, [(gate_up, down)])
+    banks = load_ftw_banks(
+        str(tmp_path),
+        num_layers=1,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (0, 2)},
+    )
+    assert banks is not None
+
+    device = torch.device("cuda")
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=experts,
+        cache_size=experts,
+        device=device,
+        prefill_overlap=False,
+        decode_target="cpu",
+        moe_prefill_hot_split="on",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        banks.sources,
+        layer_residency=banks.layer_residency,
+        hot_sources=banks.hot_sources,
+        hot_expert_ids=banks.hot_expert_ids,
+    )
+    row_bytes = sum(
+        source[0][0].numel() * source[0].element_size()
+        for source in banks.sources.values()
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps=0,
+        max_swap_bytes=row_bytes,
+        expert_bytes=row_bytes,
+    )
+    executor = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=1,
+        max_tokens=tokens,
+        max_prefill_tokens=tokens,
+        device=device,
+    )
+    cache.set_cpu_executor(executor)
+    layer = OffloadMoELayer(
+        layer_id=0,
+        num_experts=experts,
+        top_k=top_k,
+        hidden_size=hidden,
+        intermediate_size=inter,
+    )
+    layer.offload_cache = cache
+
+    x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    ids = torch.tensor(
+        [[0, 1], [2, 3], [0, 3], [2, 1]] * 2,
+        device=device,
+        dtype=torch.int32,
+    )
+    weights = torch.tensor(
+        [[0.6, 0.4], [0.25, 0.75], [0.8, 0.2], [0.45, 0.55]] * 2,
+        device=device,
+        dtype=torch.float32,
+    )
+    cache.prefetch_disk_experts(0, ids)
+    cpu_out = executor.prefill(0, x, weights, ids).float()
+    split_out = layer._prefill_routed(x, weights, ids.clone()).float()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(split_out, cpu_out, rtol=2e-2, atol=2e-2)
+    stats = cache.disk_prefetch_stats(reset=True)
+    assert stats["prefill_hot_route_frac"] == pytest.approx(0.5)
+    assert stats["prefill_cpu_experts"] == 2
 
 
 @pytest.mark.cuda

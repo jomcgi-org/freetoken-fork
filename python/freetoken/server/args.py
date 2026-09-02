@@ -803,6 +803,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-prefill-hot-split",
+        choices=["on", "off"],
+        default=ServerArgs.moe_prefill_hot_split,
+        help=(
+            "Run protected HOT routes of DISK prefill layers on the GPU and only "
+            "the remaining cold routes on the CPU executor (default: on)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-prefill-batch",
         choices=["on", "off"],
         default=ServerArgs.moe_cpu_prefill_batch,
