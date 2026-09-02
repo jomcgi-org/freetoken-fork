@@ -646,20 +646,28 @@ def load_ftw_banks(
 
             def _read_alpha(e):
                 bank = alpha_hb[e["name"]]
-                reader.read_into(bank.memoryview(), e, workers=workers, chunk=chunk)
+                reader.read_into(
+                    bank._mapping_memoryview(), e, workers=workers, chunk=chunk
+                )
                 pins.submit(bank)
                 bar.update(e["nbytes"])
 
             def _read_row(job):
                 _name, bank, win_off, win_len, layer_bytes, layer_id = job
-                reader.read_into(bank.memoryview(), {"global_off": win_off, "nbytes": win_len},
-                                 workers=workers, chunk=chunk)
+                reader.read_into(
+                    bank._mapping_memoryview(),
+                    {"global_off": win_off, "nbytes": win_len},
+                    workers=workers,
+                    chunk=chunk,
+                )
                 pins.submit(bank, residency[layer_id])
                 bar.update(layer_bytes)
 
             def _read_layer(job):
                 _name, bank, entry, layer_id = job
-                reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
+                reader.read_into(
+                    bank._mapping_memoryview(), entry, workers=workers, chunk=chunk
+                )
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
 
