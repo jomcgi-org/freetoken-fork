@@ -485,6 +485,29 @@ def alloc_layer_banks(
     }
 
 
+def alloc_pinned_row_staging(
+    templates: list[torch.Tensor], rows: int, *, pinned: bool,
+) -> list[torch.Tensor]:
+    """Allocate one reusable row-staging tensor per bank schema entry.
+
+    ``templates`` only supplies row shape and dtype. The allocation has no layer
+    dimension, which is what keeps HOT adaptation proportional to the swap delta
+    instead of the resident partition.
+    """
+    if rows <= 0:
+        raise ValueError("row staging capacity must be positive")
+    if pinned:
+        from freetoken.kernel.pinned import alloc_pinned_tensor
+
+        allocate = alloc_pinned_tensor
+    else:
+        allocate = torch.empty
+    return [
+        allocate(rows, *template.shape[1:], dtype=template.dtype)
+        for template in templates
+    ]
+
+
 class _ResidencyPlan:
     """Per-layer ``HostResidency`` labels, ambiently visible to the bank settle points.
 
@@ -751,6 +774,7 @@ __all__ = [
     "PinPipeline",
     "alloc_banks",
     "alloc_layer_banks",
+    "alloc_pinned_row_staging",
     "born_pinned_default",
     "coalesced_page_ranges",
     "coalesced_row_ranges",

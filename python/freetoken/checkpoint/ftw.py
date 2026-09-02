@@ -685,14 +685,9 @@ def load_ftw_banks(
             views.append(raw.view(num_experts, *row_shape) if row_shape else raw.view(num_experts))
         sources[name] = views
 
-    # Profile-selected HOT rows get a compact anonymous bank. Only these bytes are
-    # copied from the file mapping and CUDA-pinned; COLD rows remain file-backed.
-    # The compact row order is stable and later becomes expert_id -> source-row in
-    # OffloadMoeCache's graph-safe copy plan.
-    hot_sources: dict[str, list[torch.Tensor | None]] = {
-        name: [None] * num_layers for name in sources
-    }
-    hot_bytes = 0
+    # HOT rows remain authoritative in the DISK banks. OffloadMoeCache streams
+    # seeds and later replacements through its bounded pinned staging area into
+    # protected GPU slots, so the loader must not create a full host mirror.
     for layer_id, capacity in sorted(hot_expert_capacity.items()):
         expert_ids = hot_expert_ids.get(layer_id, ())
         if len(expert_ids) > capacity:
@@ -711,20 +706,6 @@ def load_ftw_banks(
             raise ValueError(
                 f"HOT expert ids for layer {layer_id} must be in [0, {num_experts})"
             )
-        index = torch.tensor(expert_ids, dtype=torch.long)
-        for name, per_layer in sources.items():
-            source = per_layer[layer_id]
-            bank = HostBank((capacity, *source.shape[1:]), source.dtype)
-            if expert_ids:
-                torch.index_select(source, 0, index, out=bank.tensor[:len(expert_ids)])
-            bank.pin()
-            hot_sources[name][layer_id] = bank.tensor
-            hot_bytes += bank.nbytes
-    if hot_bytes:
-        logger.info(
-            f"MoE HOT expert residency: {hot_bytes / 2**30:.2f} GiB pinned compact "
-            f"rows across {len(hot_expert_capacity)} DISK layers"
-        )
 
     from freetoken.moe.expert_banks import ExpertBanks
 
@@ -776,9 +757,8 @@ def load_ftw_banks(
     return ExpertBanks(
         reader.meta("quant_format"), sources, **alpha_kw,
         layer_residency=applied,
-        hot_sources=hot_sources if hot_bytes else {},
-        hot_expert_ids=hot_expert_ids if hot_bytes else {},
-        hot_expert_capacity=hot_expert_capacity if hot_bytes else {},
+        hot_expert_ids=hot_expert_ids if hot_expert_capacity else {},
+        hot_expert_capacity=hot_expert_capacity,
     )
 
 

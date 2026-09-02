@@ -67,8 +67,8 @@ def ensure_experts_hot(
 ) -> None:
     """Current HOT/COLD split for a file-backed DISK layer.
 
-    HOT experts use normal LRU slots and compact pinned source rows. COLD routes are
-    rewritten to -1 for the CPU partial. The single fixed-shape launch is graph-safe.
+    HOT experts use protected GPU slots. COLD routes are rewritten to -1 for the
+    CPU partial. The single fixed-shape launch is graph-safe.
     """
     if not expert_ids.is_cuda:
         return _ensure_experts_hot_cpu(
@@ -621,9 +621,9 @@ def _ensure_experts_hot_kernel(
 ):
     """Timestamp-LRU restricted to the currently published HOT set.
 
-    ``hot_row_ptr`` maps original expert ids to compact pinned source rows, or -1
-    for COLD experts. Every HOT miss is installed. COLD pairs are rewritten to -1
-    and therefore run only in the CPU doorbell task.
+    ``hot_row_ptr`` marks published HOT expert ids, or -1 for COLD experts. HOT
+    rows are installed in protected slots before publication. COLD pairs are
+    rewritten to -1 and therefore run only in the CPU doorbell task.
     """
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)

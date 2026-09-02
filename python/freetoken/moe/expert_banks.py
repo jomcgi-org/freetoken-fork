@@ -77,10 +77,8 @@ class ExpertBanks:
     down_alpha: torch.Tensor | None = field(default=None)
     # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
     layer_residency: list[str] | None = field(default=None)
-    # Compact pinned copies of profile-selected rows from DISK layers. Each schema
-    # entry is a num_layers-long list; entries outside the HOT partition are None.
-    # hot_expert_ids[layer] seeds the leading compact rows; remaining capacity is
-    # initially unmapped and available to online adaptation.
+    # Legacy compatibility surface. HOT rows now stay authoritative in ``sources``
+    # and are streamed into protected GPU slots through bounded staging.
     hot_sources: dict[str, list[torch.Tensor | None]] = field(default_factory=dict)
     hot_expert_ids: dict[int, tuple[int, ...]] = field(default_factory=dict)
     # Fixed row capacity of each compact HOT layer. This may exceed the seeded

@@ -452,10 +452,6 @@ def load_indexed_banks(
     if invalid:
         raise ValueError(f"HOT expert rows require DISK layers, got {sorted(invalid)}")
 
-    hot_sources: dict[str, list[torch.Tensor | None]] = {
-        name: [None] * num_layers for name in sources
-    }
-    hot_bytes = 0
     for layer, capacity in sorted(capacities.items()):
         expert_ids = seeded.get(layer, ())
         if capacity <= 0 or capacity > index["num_experts"] or len(expert_ids) > capacity:
@@ -464,23 +460,13 @@ def load_indexed_banks(
             raise ValueError(f"HOT expert ids for layer {layer} contain duplicates")
         if any(expert < 0 or expert >= index["num_experts"] for expert in expert_ids):
             raise ValueError(f"HOT expert id outside layer {layer}'s expert range")
-        selected = torch.tensor(expert_ids, dtype=torch.long)
-        for name, per_layer in sources.items():
-            source = per_layer[layer]
-            hot = HostBank((capacity, *source.shape[1:]), source.dtype)
-            if expert_ids:
-                torch.index_select(source, 0, selected, out=hot.tensor[: len(expert_ids)])
-            hot.pin()
-            hot_sources[name][layer] = hot.tensor
-            hot_bytes += hot.nbytes
 
     return ExpertBanks(
         "bf16",
         {name: [tensor for tensor in layers if tensor is not None] for name, layers in sources.items()},
         layer_residency=applied,
-        hot_sources=hot_sources if hot_bytes else {},
-        hot_expert_ids=seeded if hot_bytes else {},
-        hot_expert_capacity=capacities if hot_bytes else {},
+        hot_expert_ids=seeded if capacities else {},
+        hot_expert_capacity=capacities,
     )
 
 
