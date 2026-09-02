@@ -1224,7 +1224,9 @@ def test_prefill_hot_split_populates_and_batches_only_cold_routes(
         rtol=0,
         atol=0,
     )
-    assert gpu[2].tolist() == [[7, 0], [9, 0], [7, 0]]
+    # Cold routes are clamped to a slot this chunk has resident (the first hot
+    # slot, 7), never to slot 0, which may be unwritten on a fresh cache.
+    assert gpu[2].tolist() == [[7, 7], [9, 7], [7, 7]]
     assert gpu[3:] == (None, False)
     adaptation = next(call[1] for call in calls if call[0] == "adapt")
     assert adaptation.tolist() == [[0, 1], [2, 3], [0, 3]]
