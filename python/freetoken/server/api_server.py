@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal
 
 import anyio
 import uvicorn
@@ -38,17 +38,23 @@ from freetoken.utils import (
 )
 from pydantic import BaseModel
 
-from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
-from .disconnect import DisconnectAwareStreamingResponse
+from .disconnect import (
+    ClientDisconnectedResponse,
+    DisconnectAwareStreamingResponse,
+    client_disconnected,
+)
 from .openai_api import register_openai_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
 from .request_logger import init as init_request_logging, log_request
 from .responses_api import register_responses_routes
 from .stats import StatsTracker
+
+if TYPE_CHECKING:
+    from .args import ServerArgs
 
 logger = init_logger(__name__, "FrontendAPI")
 
@@ -204,6 +210,15 @@ class FrontendManager:
     _frontend_warm_started: bool = False
     # Idempotence guard for disconnect and shutdown paths racing on the same request.
     _abort_sent: set[int] = field(default_factory=set)
+    # Completion tokens observed per live request, retained until its terminal reply so a
+    # disconnect log can report the exact generated count at abort dispatch time.
+    _generated_tokens: Dict[int, int] = field(default_factory=dict)
+    # Backend supervision is explicitly stopped and joined before its handle is released.
+    # Otherwise the supervisor frame retains the multiprocessing Queue and its SemLocks for
+    # the lifetime of the frontend process.
+    backend_handle: Any = None
+    backend_supervisor_stop: Any = None
+    backend_supervisor_thread: Any = None
 
     def __post_init__(self) -> None:
         if self.stats is None:
@@ -245,6 +260,7 @@ class FrontendManager:
         self.uid_counter += 1
         self.ack_map[uid] = []
         self.event_map[uid] = asyncio.Event()
+        self._generated_tokens[uid] = 0
         self.stats.on_new_user(uid)
         return uid
 
@@ -262,8 +278,13 @@ class FrontendManager:
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
                 # request remains gated below, but observation must happen first.
                 self.stats.observe(msg)
+                self._generated_tokens[msg.uid] = (
+                    self._generated_tokens.get(msg.uid, 0)
+                    + int(getattr(msg, "completion_tokens_delta", 0) or 0)
+                )
                 if msg.finished:
                     self._abort_sent.discard(msg.uid)
+                    self._generated_tokens.pop(msg.uid, None)
                 if msg.uid not in self.ack_map:
                     continue
                 self.ack_map[msg.uid].append(msg)
@@ -368,6 +389,7 @@ class FrontendManager:
         finally:
             self.ack_map.pop(uid, None)
             self.event_map.pop(uid, None)
+            self._generated_tokens.pop(uid, None)
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
@@ -385,21 +407,32 @@ class FrontendManager:
             async for chunk in generator:
                 yield chunk
             return
+        tokens_generated = self._generated_tokens.get(uid, 0)
         try:
             async for chunk in generator:
                 yield chunk
+                tokens_generated = self._generated_tokens.get(uid, tokens_generated)
         except asyncio.CancelledError:
+            if not client_disconnected(request):
+                raise
             # StreamingResponse has a dedicated ASGI receive task. It cancels this body
             # iterator as soon as it receives http.disconnect, including while the iterator
             # is blocked waiting for a long prefill to produce its first byte.
-            logger.info("Client disconnected for user %s", uid)
             # The response cancels this iterator through an AnyIO task group. Shield the
             # control send from that scope so cancellation cannot strand backend work.
             with anyio.CancelScope(shield=True):
                 await asyncio.shield(
-                    self.abort_user(uid, client_disconnected=True)
+                    self.abort_user(
+                        uid,
+                        client_disconnected=True,
+                        tokens_generated=tokens_generated,
+                    )
                 )
-            raise
+                close = getattr(generator, "aclose", None)
+                if close is not None:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await close()
+            return
 
     @staticmethod
     async def _wait_for_disconnect(request: Request) -> None:
@@ -424,7 +457,6 @@ class FrontendManager:
                 # If both complete in one loop turn, stop the HTTP handler so a multi-prompt
                 # completion cannot submit its next request after losing the peer. abort_user
                 # skips work whose terminal ack already removed its frontend maps.
-                logger.info("Client disconnected for user %s", uid)
                 try:
                     await self.abort_user(uid, client_disconnected=True)
                 finally:
@@ -432,26 +464,41 @@ class FrontendManager:
                         work.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await work
-                raise asyncio.CancelledError
+                return ClientDisconnectedResponse()
             return await work
         finally:
             disconnected.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await disconnected
 
-    async def abort_user(self, uid: int, *, client_disconnected: bool = False):
+    async def abort_user(
+        self,
+        uid: int,
+        *,
+        client_disconnected: bool = False,
+        tokens_generated: int | None = None,
+    ):
         if client_disconnected and getattr(self.config, "abort_on_disconnect", "on") == "off":
             return
         inflight = getattr(self.stats, "inflight_uids", None)
-        if client_disconnected and inflight is not None and uid not in inflight:
+        maps_present = uid in self.ack_map or uid in self.event_map
+        if client_disconnected:
+            # Streaming cancellation unwinds wait_for_ack before this wrapper receives the
+            # CancelledError, so its map cleanup can precede the abort. Stats remains inflight
+            # until the scheduler's terminal reply and is also what rejects a late socket close
+            # during response-body drain. Small test doubles without stats retain the map guard.
+            if (inflight is not None and uid not in inflight) or (
+                inflight is None and not maps_present
+            ):
+                return
+        elif not maps_present:
             return
-        # wait_for_ack removes both maps as soon as it consumes a terminal result. Skipping
-        # here prevents a late socket close during response-body drain from becoming an abort.
-        if uid in self._abort_sent or (uid not in self.ack_map and uid not in self.event_map):
+        if uid in self._abort_sent:
             return
         self._abort_sent.add(uid)
         self.stats.on_abort(uid)
-        logger.warning("Aborting request for user %s", uid)
+        if tokens_generated is None:
+            tokens_generated = self._generated_tokens.get(uid, 0)
         try:
             await self.send_one(
                 AbortMsg(uid=uid, client_disconnected=client_disconnected)
@@ -459,13 +506,43 @@ class FrontendManager:
         except BaseException:
             self._abort_sent.discard(uid)
             raise
+        if client_disconnected:
+            logger.info(
+                "Client disconnected: request_id=%s tokens_generated=%s "
+                "scheduler_abort=issued",
+                uid,
+                tokens_generated,
+            )
+        else:
+            logger.warning("Aborting request for user %s", uid)
 
     def shutdown(self):
-        self.send_tokenizer.stop()
-        self.recv_tokenizer.stop()
-        # Tear the workers down ourselves (best-effort). _SHUTTING_DOWN is already set by the
-        # time shutdown() runs, so the supervisor attributes the ensuing deaths to the stop.
-        _terminate_backend_workers(self.backend_processes)
+        stop = self.backend_supervisor_stop
+        if stop is not None:
+            stop.set()
+        thread = self.backend_supervisor_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self.backend_supervisor_stop = None
+        self.backend_supervisor_thread = None
+
+        try:
+            self.send_tokenizer.stop()
+            self.recv_tokenizer.stop()
+            # Tear the workers down ourselves (best-effort). _SHUTTING_DOWN is already set by
+            # the time shutdown() runs, so the supervisor attributes the deaths to the stop.
+            _terminate_backend_workers(self.backend_processes)
+        finally:
+            handle = self.backend_handle
+            self.backend_handle = None
+            queue = getattr(handle, "ack_queue", None)
+            if handle is not None:
+                handle.ack_queue = None
+            if queue is not None:
+                with contextlib.suppress(Exception):
+                    queue.close()
+                with contextlib.suppress(Exception):
+                    queue.join_thread()
 
 
 @asynccontextmanager
@@ -970,6 +1047,7 @@ async def generate(req: GenerateRequest, request: Request):
     return DisconnectAwareStreamingResponse(
         state.stream_with_cancellation(state.stream_generate(uid), request, uid),
         media_type="text/event-stream",
+        request=request,
     )
 
 
@@ -1107,6 +1185,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # Hold the worker handles so the orderly-shutdown path can tear them down itself (after
     # setting _SHUTTING_DOWN) rather than relying on OS signal-delivery order.
     _GLOBAL_STATE.backend_processes = list(getattr(handle, "processes", None) or [])
+    _GLOBAL_STATE.backend_handle = handle
 
     def _on_ready() -> None:
         # A stop requested while weights were loading has already sealed admission.  The backend
@@ -1147,7 +1226,8 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
     # immediately and /health can report loading progress. Shell mode wants exactly the same
     # thing -- its client waits on /health and renders that progress -- so both paths share
     # this supervisor; only who runs uvicorn differs.
-    threading.Thread(
+    supervisor_stop = threading.Event()
+    supervisor_thread = threading.Thread(
         target=run_backend_supervisor,
         args=(handle, _GLOBAL_STATE.load_progress, _on_ready),
         kwargs={
@@ -1156,10 +1236,14 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
             # uvicorn's lifespan shutdown sets this on SIGINT/SIGTERM, so the workers'
             # expected exit during stop is not reported as a crash.
             "is_shutting_down": _SHUTTING_DOWN.is_set,
+            "stop_event": supervisor_stop,
         },
         name="freetoken-backend-supervisor",
         daemon=True,
-    ).start()
+    )
+    _GLOBAL_STATE.backend_supervisor_stop = supervisor_stop
+    _GLOBAL_STATE.backend_supervisor_thread = supervisor_thread
+    supervisor_thread.start()
 
     if run_shell:
         _serve_and_run_shell(host, port)

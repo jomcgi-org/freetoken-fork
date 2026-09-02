@@ -102,6 +102,7 @@ def drain_ready(
     get: Callable[[float], Any] | None = None,
     poll: float = 1.0,
     on_meta: Callable[[dict], None] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
 ) -> None:
     """Block until ``expected_acks`` non-progress acks arrive, applying ("progress", …)
     tuples to ``progress``. Between acks, poll worker liveness; raise WorkerDied if a worker
@@ -116,6 +117,8 @@ def drain_ready(
 
     ready = 0
     while ready < handle.expected_acks:
+        if stop_requested is not None and stop_requested():
+            return
         try:
             msg = get(poll)
         except Empty:
@@ -147,6 +150,7 @@ def run_backend_supervisor(
     poll: float = 1.0,
     on_meta: Callable[[dict], None] | None = None,
     is_shutting_down: Callable[[], bool] | None = None,
+    stop_event: Any = None,
 ) -> None:
     """Drain to readiness (watching liveness), flip the gate via ``on_ready``, then watch
     forever: a worker that dies AFTER ready (a scheduler crash while the frontend keeps
@@ -164,17 +168,30 @@ def run_backend_supervisor(
     def _shutting_down() -> bool:
         return bool(is_shutting_down is not None and is_shutting_down())
 
+    def _stopping() -> bool:
+        return bool(stop_event is not None and stop_event.is_set())
+
     try:
-        drain_ready(handle, progress, poll=poll, on_meta=on_meta)
+        drain_ready(
+            handle,
+            progress,
+            poll=poll,
+            on_meta=on_meta,
+            stop_requested=_stopping,
+        )
     except WorkerDied as exc:
         # A worker dying mid-load during an orderly shutdown is expected, not a load failure.
         if not _shutting_down() and on_failure is not None:
             on_failure(exc.message)
         return
+    if _stopping():
+        return
 
     on_ready()
 
     while True:
+        if _stopping():
+            return
         dead = _first_dead(handle.processes)
         if dead is not None:
             if _shutting_down():
@@ -183,4 +200,7 @@ def run_backend_supervisor(
             if on_failure is not None:
                 on_failure(f"backend worker {getattr(dead, 'name', '?')} exited")
             return
-        time.sleep(poll)
+        if stop_event is None:
+            time.sleep(poll)
+        elif stop_event.wait(poll):
+            return

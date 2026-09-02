@@ -57,7 +57,7 @@ from openai.types.responses.response_usage import (
 )
 from pydantic import BaseModel, ConfigDict
 
-from .disconnect import DisconnectAwareStreamingResponse
+from .disconnect import ClientDisconnectedResponse, DisconnectAwareStreamingResponse
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     KEEPALIVE,
@@ -174,7 +174,9 @@ async def handle_responses(
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
-        return DisconnectAwareStreamingResponse(events, media_type="text/event-stream")
+        return DisconnectAwareStreamingResponse(
+            events, media_type="text/event-stream", request=request
+        )
 
     try:
         result = await await_with_disconnect(
@@ -185,6 +187,8 @@ async def handle_responses(
         )
     except GenerationError as exc:
         return _error_response(exc.status_code, str(exc), exc.code)
+    if isinstance(result, ClientDisconnectedResponse):
+        return result
     response = build_responses_response(result, req, response_id, created, cache_report=cache_report)
     return JSONResponse(content=response.model_dump(mode="json"))
 
