@@ -201,21 +201,25 @@ class GlmMoeDsaAttention(BaseOP):
         q_a_resid = self.q_a_layernorm.forward(self.q_a_proj.forward(x))
         q = self.q_b_proj.forward(q_a_resid)
         q = q.view(t, self.num_heads, self.qk_head_dim)
-        q_nope, q_rope = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         kv = self.kv_a_proj_with_mqa.forward(x)
-        c_kv, k_rope = kv.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        c_kv = self.kv_a_layernorm.forward(c_kv)
-
-        # The shared inplace kernel wants [T, heads*head_size] with head_size == the
-        # rotated width (64); q_rope is a non-contiguous split view, so reshape copies
-        # it into the buffer the kernel then mutates.
         rope_dim = self.qk_rope_head_dim
-        q_rope = q_rope.reshape(t, self.num_heads * rope_dim)
-        k_rope = k_rope.reshape(t, rope_dim)
-        if self.rope is not None:
+        if rope_dim:
+            q_nope, q_rope = q.split([self.qk_nope_head_dim, rope_dim], dim=-1)
+            c_kv, k_rope = kv.split([self.kv_lora_rank, rope_dim], dim=-1)
+            c_kv = self.kv_a_layernorm.forward(c_kv)
+            # The shared inplace kernel wants [T, heads*head_size] with head_size
+            # equal to the rotated width. q_rope is a non-contiguous split view, so
+            # reshape copies it into the buffer the kernel then mutates.
+            q_rope = q_rope.reshape(t, self.num_heads * rope_dim)
+            k_rope = k_rope.reshape(t, rope_dim)
             q_rope, k_rope = self.rope.forward(ctx.batch.positions, q_rope, k_rope)
-        q_rope = q_rope.view(t, self.num_heads, rope_dim)
+            q_rope = q_rope.view(t, self.num_heads, rope_dim)
+        else:
+            # GLM 5.3 Flash is nope-only. Do not create zero-width split views or
+            # rope buffers; the backend and cache use None as the zero-rope marker.
+            q_nope, q_rope = q, None
+            c_kv, k_rope = self.kv_a_layernorm.forward(kv), None
 
         # Absorb kv_b's k-part into the query: q_nope[H,T,nope] @ W_uk[H,nope,lora].
         q_absorbed = torch.bmm(q_nope.transpose(0, 1).contiguous(), w_uk).transpose(0, 1)
@@ -232,8 +236,11 @@ class GlmMoeDsaAttention(BaseOP):
         # The pool scatters the two latent halves (c_kv | k_rope) directly -- no
         # concatenated latent copy on the hot path.
         o_latent = ctx.attn_backend.mla_forward(
-            q_absorbed.contiguous(), q_rope.contiguous(), c_kv.contiguous(),
-            k_rope.contiguous(), self.layer_id, ctx.batch, indexer_qkw=indexer_qkw,
+            q_absorbed.contiguous(),
+            q_rope.contiguous() if q_rope is not None else None,
+            c_kv.contiguous(),
+            k_rope.contiguous() if k_rope is not None else None,
+            self.layer_id, ctx.batch, indexer_qkw=indexer_qkw,
         )  # [T, H, kv_lora_rank]
 
         # Absorb kv_b's v-part onto the output: o_latent[H,T,lora] @ W_uv_t[H,lora,v].

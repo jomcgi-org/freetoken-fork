@@ -76,7 +76,7 @@ def test_linear_reference_and_mla_fake_backend_shapes(monkeypatch):
 
         def mla_forward(self, q_nope, q_pe, c_kv, k_rope, layer_id, batch, **kwargs):
             assert layer_id == 3
-            assert q_pe.shape[-1] == k_rope.shape[-1] == 0
+            assert q_pe is None and k_rope is None
             return q_nope.new_zeros(q_nope.shape)
 
     ctx = Context(page_size=1)
@@ -84,6 +84,7 @@ def test_linear_reference_and_mla_fake_backend_shapes(monkeypatch):
     core._GLOBAL_CTX = ctx
     batch = SimpleNamespace(positions=torch.arange(5))
     attention = GlmMoeDsaAttention(cfg, 3)
+    assert attention.rope is None and attention.indexer._rope is None
     fill(attention, seed=2)
     try:
         with ctx.forward_batch(batch):
@@ -109,5 +110,5 @@ def test_compact_mla_pool_uses_global_layer_ids():
     )
     assert isinstance(pool, DSAKVCache)
     assert pool.num_layers == 1
-    pool.store_kv(torch.ones(1, 4), torch.empty(1, 0), torch.tensor([0]), layer_id=3)
+    pool.store_kv(torch.ones(1, 4), None, torch.tensor([0]), layer_id=3)
     assert torch.equal(pool.latent_rows(3)[0], torch.ones(4))

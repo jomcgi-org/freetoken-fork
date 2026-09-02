@@ -75,17 +75,22 @@ class MLAKVCache(BaseKVCachePool):
     def store_kv(
         self,
         c_kv: torch.Tensor,
-        k_rope: torch.Tensor,
+        k_rope: torch.Tensor | None,
         out_loc: torch.Tensor,
         layer_id: int,
     ) -> None:
         """Scatter this forward's latent rows: ``c_kv`` [T, kv_lora_rank] and
-        ``k_rope`` [T, qk_rope_head_dim] land in the row's two halves.
+        ``k_rope`` [T, qk_rope_head_dim] land in the row's two halves. ``k_rope``
+        is None for a nope-only model, whose latent row is entirely ``c_kv``.
 
         v0: two narrow ``index_put_`` scatters. TODO: generalize kernel/csrc
         store.cu to a two-width fused store and route this through it.
         """
         rows = self.latent_rows(layer_id)
+        if k_rope is None:
+            assert rows.shape[1] == c_kv.shape[-1], (rows.shape, c_kv.shape)
+            rows[out_loc] = c_kv
+            return
         split = rows.shape[1] - k_rope.shape[-1]
         rows[out_loc, :split] = c_kv
         rows[out_loc, split:] = k_rope

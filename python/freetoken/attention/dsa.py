@@ -167,12 +167,18 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
         """Store this forward's latent rows and attend over the paged latent history.
 
         ``q_nope`` [T, H, kv_lora_rank] (kv_b-absorbed), ``q_pe`` [T, H, rope_dim],
-        ``c_kv`` [T, kv_lora_rank] / ``k_rope`` [T, rope_dim] (the pool scatters the
-        two latent halves). ``indexer_qkw`` = (q [T, Hi, Di], k [T, Di], w [T, Hi])
-        on full-indexer layers, None on shared layers. Returns [T, H, kv_lora_rank].
+        ``c_kv`` [T, kv_lora_rank] / ``k_rope`` [T, rope_dim]. The rope tensors are
+        None when rope_dim is zero. ``indexer_qkw`` = (q [T, Hi, Di], k [T, Di],
+        w [T, Hi]) on full-indexer layers, None on shared layers. Returns
+        [T, H, kv_lora_rank].
         """
         md = batch.attn_metadata
         assert isinstance(md, DSAMetadata)
+        if self.qk_rope_head_dim:
+            assert q_pe is not None and q_pe.shape[-1] == self.qk_rope_head_dim
+            assert k_rope is not None and k_rope.shape[-1] == self.qk_rope_head_dim
+        else:
+            assert q_pe is None and k_rope is None
         if md.is_decode and md.rows is None:
             # Eager decode (not graph-staged): per-request padded row SNAPSHOT (the
             # live page_table row may mutate for the next batch while this one runs)
@@ -211,7 +217,9 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 md.sel.clear()
                 md.sel[layer_id] = (sel, cnt)
             sel, cnt = md.sel[self._leader[layer_id]]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1).view(bs, 1, self.num_heads, self.latent_dim)
+        q_cat = (
+            q_nope if q_pe is None else torch.cat([q_nope, q_pe], dim=-1)
+        ).view(bs, 1, self.num_heads, self.latent_dim)
         o = self._attend(q_cat, layer_id, sel, cnt)
         return o.view(bs, self.num_heads, self.kv_lora_rank)
 
@@ -244,7 +252,7 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
 
     def _prefill(self, md, layer_id, q_nope, q_pe, batch, indexer_qkw) -> torch.Tensor:
         t = q_nope.shape[0]
-        q_cat = torch.cat([q_nope, q_pe], dim=-1)  # [T, H, 576]
+        q_cat = q_nope if q_pe is None else torch.cat([q_nope, q_pe], dim=-1)
         reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
         page_table = get_global_ctx().page_table
         qo = md.qo_indptr_cpu.tolist()
