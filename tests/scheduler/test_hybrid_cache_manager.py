@@ -62,6 +62,24 @@ def test_hybrid_cache_manager_donate_then_hit():
     assert mrB.cuda_handle.get_matched_indices().tolist() == [100, 101, 102, 103]
 
 
+def test_hybrid_match_inherits_an_ancestor_lazy_restore_tracker():
+    pool = _pool()
+    page_table = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+    prefix = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    full = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.int32)
+    cm.prefix_cache.insert(prefix, torch.arange(100, 104, dtype=torch.int32), pool.alloc(1)[0])
+    ancestor = cm.prefix_cache.match_prefix(prefix).node
+    cm.prefix_cache.insert(full, torch.arange(100, 108, dtype=torch.int32), pool.alloc(1)[0])
+
+    tracker = SimpleNamespace(complete=False)
+    cm._lazy_restores_by_node[ancestor] = tracker
+    matched = cm.match_req(_pend([1, 2, 3, 4, 5, 6, 7, 8, 9]))
+
+    assert matched.cuda_handle.cached_len == 8
+    assert matched.lazy_kv_restore is tracker
+
+
 def test_hybrid_finish_donates_live_slot():
     pool = _pool()
     page_table = torch.zeros(4, 64, dtype=torch.int32)

@@ -43,12 +43,16 @@ def test_engine_config_disk_prefix_cache_defaults_off_and_requires_directory():
         dtype=torch.bfloat16,
     )
     assert EngineConfig(**base).kv_disk_cache_gib == 0
+    assert EngineConfig(**base).lazy_restore == "on"
     with pytest.raises(ValueError, match=r"--kv-disk-cache-dir.*required"):
         EngineConfig(**base, kv_disk_cache_gib=1.0)
     configured = EngineConfig(
         **base, kv_disk_cache_gib=8.0, kv_disk_cache_dir="/nvme/prefixes"
     )
     assert configured.kv_disk_cache_dir == "/nvme/prefixes"
+    assert EngineConfig(**base, lazy_restore="off").lazy_restore == "off"
+    with pytest.raises(ValueError, match=r"--lazy-restore.*on.*off"):
+        EngineConfig(**base, lazy_restore="maybe")
 
 
 def test_verify_state_snapshot_restore_round_trip_cpu():

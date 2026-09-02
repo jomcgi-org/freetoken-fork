@@ -142,6 +142,7 @@ def scenario_agent_resume(base_url: str, model: str, restart_cmd: str | None) ->
         resumed, resume_ttft, _ = _post(base_url, {
             "model": model, "messages": messages, "max_tokens": 160, "temperature": 0})
         result["post_restart_resume_ttft"] = resume_ttft
+        result["first_token_after_restore_ms"] = resume_ttft * 1000.0
         result["post_restart_first64_decode_rate"] = resumed["first64_decode_rate"]
         result["post_restart_steady_decode_rate"] = resumed["steady_decode_rate"]
     return result
@@ -216,6 +217,10 @@ def main() -> int:
                 f"warm follow-up ttft={a['warm_followup_ttft']:.2f}s")
         if "post_restart_resume_ttft" in a:
             line += f" | post-restart resume ttft={a['post_restart_resume_ttft']:.2f}s"
+            line += (
+                f" | first-token-after-restore="
+                f"{a['first_token_after_restore_ms']:.1f}ms"
+            )
             first64 = a.get("post_restart_first64_decode_rate")
             steady = a.get("post_restart_steady_decode_rate")
             line += (

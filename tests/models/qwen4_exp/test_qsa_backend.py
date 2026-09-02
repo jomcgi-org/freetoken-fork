@@ -105,6 +105,51 @@ def test_decode_is_dense_below_the_budget(monkeypatch):
 
 
 @requires_cuda
+def test_lazy_faulted_kv_is_bit_identical_to_eager_decode():
+    """Selected missing pages are fully installed before QSA's paged gather reads them."""
+    config = parsed_config()
+    fixture = Fixture(config, num_pages=64)
+    attn = fixture.layer(QSA_LAYER)
+    length = 256
+    history = _inputs(fixture, [length])[0]
+    reqs = [fixture.req(i, 0, length) for i in range(2)]
+    attn.forward(torch.cat([history, history]), fixture.batch(reqs, "prefill"))
+
+    flat = fixture.pool._kv_buffer.flatten(2, 3)
+    restored_locations = fixture.page_table[1, :length].to(torch.long)
+    source = flat.index_select(2, restored_locations).clone()
+    flat.index_fill_(2, restored_locations, 0)
+
+    class Tracker:
+        def __init__(self):
+            self.loaded = set()
+
+        @property
+        def complete(self):
+            return len(self.loaded) == length // fixture.page_size
+
+        def ensure_blocks(self, blocks):
+            for block in blocks:
+                if block in self.loaded or block >= length // fixture.page_size:
+                    continue
+                start = block * fixture.page_size
+                end = start + fixture.page_size
+                flat.index_copy_(
+                    2, restored_locations[start:end], source[:, :, start:end]
+                )
+                self.loaded.add(block)
+
+    reqs[1].lazy_kv_restore = Tracker()
+    for req in reqs:
+        fixture.step(req)
+    next_hidden = _inputs(fixture, [1], seed=29)[0]
+    batch = fixture.batch(reqs, "decode")
+    batch.lazy_restore_pending = True
+    got = attn.forward(torch.cat([next_hidden, next_hidden]), batch)
+    assert torch.equal(got[0], got[1])
+
+
+@requires_cuda
 def test_flashinfer_dense_matches_the_sparse_path():
     """The engine's dense FULL backend over the same pool, as an independent oracle."""
     pytest.importorskip("flashinfer")

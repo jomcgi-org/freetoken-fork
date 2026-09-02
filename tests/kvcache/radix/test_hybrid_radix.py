@@ -215,6 +215,7 @@ def test_insert_stores_whole_pages_only(P):
 # --------------------------------------------------------------------------- evict_mamba
 def test_evict_mamba_tombstones_an_internal_node_and_keeps_its_kv(hyb):
     chain, mx, my = two_node_tree(hyb)
+    before, _ = hyb.do_match(ids(1, 2))
 
     hyb.do_evict_second(1)                     # X is the LRU snapshot and is internal
     assert events(hyb)["evict_mamba.tombstone_in_place"] == 1
@@ -224,6 +225,9 @@ def test_evict_mamba_tombstones_an_internal_node_and_keeps_its_kv(hyb):
 
     m, _ = hyb.do_match(ids(1, 2))             # the tombstoned boundary is no longer resumable
     assert (m.cached_len, m.second) == (0, None)
+    raw = hyb.ad.cache.match_kv_prefix(torch.tensor(ids(1, 2), dtype=torch.int64))
+    assert raw.cached_len == 2 * PAGE
+    assert raw.kv_indices.tolist() == before.indices
     m, _ = hyb.do_match(chain)                 # the descendant snapshot is untouched
     assert (m.cached_len, m.second) == (4 * PAGE, my)
 

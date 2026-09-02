@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -87,16 +88,25 @@ class Scheduler(SchedulerIOMixin):
                 )
 
                 identity, checkpoint_fingerprint, config_hash = model_cache_identity(config)
+                qsa_args = config.model_config.qwen4_args
+                hot_blocks = (
+                    max(1, qsa_args.index_budget // config.page_size)
+                    if qsa_args is not None
+                    else 32
+                )
                 self.disk_prefix_store = DiskPrefixStore(
                     config.kv_disk_cache_dir,
                     int(config.kv_disk_cache_gib * (1 << 30)),
                     identity=identity,
                     checkpoint_fingerprint=checkpoint_fingerprint,
                     config_hash=config_hash,
+                    lazy_restore=config.lazy_restore == "on",
+                    hot_blocks=hot_blocks,
                 )
                 logger.info_rank0(
                     f"Disk prefix cache enabled at {config.kv_disk_cache_dir!r}, "
                     f"budget={config.kv_disk_cache_gib:.2f} GiB, "
+                    f"lazy_restore={config.lazy_restore}, hot_blocks={hot_blocks}, "
                     f"fingerprint={checkpoint_fingerprint}, config={config_hash[:12]}"
                 )
 
@@ -302,6 +312,7 @@ class Scheduler(SchedulerIOMixin):
         """
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
+        self.cache_manager.quiesce_lazy_restores()
         torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
@@ -489,6 +500,11 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
+                if req.restore_started_at is not None and self.disk_prefix_store is not None:
+                    self.disk_prefix_store.note_first_token_after_restore(
+                        (time.perf_counter() - req.restore_started_at) * 1000.0
+                    )
+                    req.restore_started_at = None
                 tokens = (
                     next_tokens_cpu
                     if getattr(batch, "mtp_verify", False)
@@ -1050,6 +1066,10 @@ class Scheduler(SchedulerIOMixin):
 
     def _build_forward_input(self, batch: Batch) -> ForwardInput:
         """Build device metadata for a batch whose request resources are already allocated."""
+        batch.lazy_restore_pending = batch.lazy_restore_pending or any(
+            req.lazy_kv_restore is not None and not req.lazy_kv_restore.complete
+            for req in batch.reqs
+        )
         if batch.is_prefill:
             self._gather_multimodal(batch)
             chunked_lens = {

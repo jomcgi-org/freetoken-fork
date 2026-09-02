@@ -314,6 +314,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
+        if getattr(batch, "lazy_restore_pending", False):
+            self._ensure_lazy_kv(indices, md, batch)
         return qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
@@ -323,6 +325,32 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.token_to_req,
             torch.empty_like(q),
         )
+
+    def _ensure_lazy_kv(
+        self, indices: torch.Tensor, md: QSASparseMetadata, batch: Batch
+    ) -> None:
+        """Install every selected restored page before the paged attention gather reads it."""
+        reqs = batch.padded_reqs if hasattr(batch, "padded_reqs") else batch.reqs
+        if not any(
+            getattr(req, "lazy_kv_restore", None) is not None
+            and not req.lazy_kv_restore.complete
+            for req in reqs
+        ):
+            return
+        selected = indices.detach().to(device="cpu", dtype=torch.int64)
+        token_to_req = md.token_to_req.detach().to(device="cpu", dtype=torch.int64)
+        per_tracker: dict[object, set[int]] = {}
+        for row, request_row in enumerate(token_to_req.tolist()):
+            tracker = getattr(reqs[request_row], "lazy_kv_restore", None)
+            if tracker is None or tracker.complete:
+                continue
+            valid = selected[row][selected[row] >= 0]
+            if valid.numel():
+                per_tracker.setdefault(tracker, set()).update(
+                    (valid // self.page_size).tolist()
+                )
+        for tracker, blocks in per_tracker.items():
+            tracker.ensure_blocks(sorted(blocks))
 
     def _qsa_forward_mtp_k1(
         self,
@@ -346,6 +374,7 @@ class QSASparseAttnBackend(BaseAttnBackend):
             one = SimpleNamespace(
                 padded_reqs=batch.padded_reqs,
                 reqs=batch.reqs,
+                lazy_restore_pending=getattr(batch, "lazy_restore_pending", False),
                 positions=batch.positions[step : step + 1],
                 out_loc=batch.out_loc[step : step + 1],
                 attn_metadata=md,
