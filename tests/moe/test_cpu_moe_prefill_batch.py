@@ -83,7 +83,7 @@ def test_buffer_bound_matches_native_geometry_formula():
     from freetoken.moe.cpu_executor import _prefill_batch_buffer_nbytes
 
     # qwen4_exp production geometry: H=2560, I=640, 2048 tokens, top_k=10.
-    assert _prefill_batch_buffer_nbytes(2048, 10, 2560, 640) == 265_748_480
+    assert _prefill_batch_buffer_nbytes(2048, 10, 2560, 640) == 270_827_520
 
 
 class _SetupExtension:
@@ -173,20 +173,54 @@ def test_native_dispatch_uses_vnni_when_isa_flags_expose_it():
     # that previously selected the scalar batch pointer despite serial using VNNI.
     assert (
         probe(has_avx512vnni=True, has_avxvnni=False)
-        == "batch_nvfp4_i8_avx512vnni"
+        == "batch_nvfp4_i8_avx512vnni_rows"
     )
     assert (
         probe(has_avx512vnni=True, has_avxvnni=True)
-        == "batch_nvfp4_i8_avx512vnni"
+        == "batch_nvfp4_i8_avx512vnni_rows"
     )
     assert (
         probe(has_avx512vnni=False, has_avxvnni=True)
-        == "batch_nvfp4_i8_vnni"
+        == "batch_nvfp4_i8_vnni_rows"
     )
     assert (
         probe(has_avx512vnni=False, has_avxvnni=False)
-        == "batch_nvfp4_i8_scalar"
+        == "batch_nvfp4_i8_scalar_rows"
     )
+
+
+def test_native_weight_rows_match_single_row_kernel_exactly():
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        pytest.skip("Linux CPU MoE extension is not built")
+
+    run = getattr(_cpu_moe, "run_prefill_batch_rows_parity", None)
+    if run is None:
+        pytest.skip("CPU MoE extension needs rebuilding for row-block parity")
+
+    torch.manual_seed(47)
+    rows, activation_rows, hidden = 7, 11, 64
+    codes = torch.randint(0, 16, (rows, hidden), dtype=torch.uint8)
+    packed = _pack_nvfp4(codes)
+    scales = torch.randint(0, 127, (rows, hidden // 16), dtype=torch.uint8)
+    globals_ = (0.02 + torch.rand(rows) * 0.01).to(torch.float16)
+    acts = torch.randint(
+        -127, 128, (activation_rows, hidden), dtype=torch.int8
+    )
+    act_scales = torch.rand(
+        activation_rows, hidden // 16, dtype=torch.float32
+    )
+    blocked = torch.empty(rows, activation_rows, dtype=torch.float32)
+    singles = torch.empty_like(blocked)
+
+    run(
+        blocked.data_ptr(), singles.data_ptr(), packed.data_ptr(),
+        scales.data_ptr(), globals_.data_ptr(), acts.data_ptr(),
+        act_scales.data_ptr(), rows, activation_rows, hidden,
+    )
+
+    torch.testing.assert_close(blocked, singles, rtol=0, atol=0)
 
 
 def test_batch_run_failure_disables_it_and_retries_serial():

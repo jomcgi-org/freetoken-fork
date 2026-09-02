@@ -209,6 +209,8 @@ class Scheduler(SchedulerIOMixin):
                     f"{disk.get('moe_prefill_populate_bytes', 0)}, "
                     f"moe_prefill_populate_ms: "
                     f"{disk.get('moe_prefill_populate_ms', 0.0):.1f}, "
+                    f"moe_prefill_populate_overlap_ms: "
+                    f"{disk.get('moe_prefill_populate_overlap_ms', 0.0):.1f}, "
                     f"moe_prefill_batch_rows: "
                     f"{disk.get('moe_prefill_batch_rows', 0)}, "
                     f"moe_prefill_batch_gemms: "

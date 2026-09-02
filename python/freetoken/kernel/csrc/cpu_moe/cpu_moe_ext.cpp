@@ -294,6 +294,16 @@ using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t
 using nvi8batch_fn = void (*)(float*, const uint8_t*, const uint8_t*, float,
                               const int8_t*, int, int, const float*, const float*);
 
+// Weight-row tile for expert prefill. At the measured H=2560, M=160 geometry,
+// the largest gate/up tile occupies 500 KiB of activation data + scales,
+// 45 KiB of packed weights + scales + globals, and 40 KiB for both fp32
+// projection tiles: 599,104 bytes (585 KiB), leaving headroom in Zen 4's
+// 1 MiB private L2.
+constexpr int kNvi8WeightRows = 32;
+using nvi8batch_rows_fn = void (*)(float*, const uint8_t*, const uint8_t*,
+                                   const uint16_t*, int, const int8_t*, int, int,
+                                   const float*, const float*);
+
 [[maybe_unused]] float dot_nvfp4_i8_scalar(const uint8_t* packed, const uint8_t* scale,
                           float global, const int8_t* asi8, int K, const float* e4m3,
                           const float* asb) {
@@ -332,6 +342,20 @@ void batch_nvfp4_i8_scalar(float* out, const uint8_t* packed, const uint8_t* sca
       for (int j = 0; j < 16; ++j) isum += (int)wb[j] * (int)a[j];
       out[m] += ws * act_scales[(size_t)m * nb + b] * (float)isum;
     }
+  }
+}
+
+void batch_nvfp4_i8_scalar_rows(float* out, const uint8_t* packed,
+                                const uint8_t* scale, const uint16_t* globals,
+                                int R, const int8_t* acts, int M, int K,
+                                const float* e4m3, const float* act_scales) {
+  const size_t packed_stride = static_cast<size_t>(K) / 2;
+  const size_t scale_stride = static_cast<size_t>(K) / 16;
+  for (int r = 0; r < R; ++r) {
+    batch_nvfp4_i8_scalar(
+        out + static_cast<size_t>(r) * M, packed + static_cast<size_t>(r) * packed_stride,
+        scale + static_cast<size_t>(r) * scale_stride, fp16_to_f32(globals[r]),
+        acts, M, K, e4m3, act_scales);
   }
 }
 
@@ -518,6 +542,67 @@ void batch_nvfp4_i8_vnni(float* out, const uint8_t* packed, const uint8_t* scale
   }
 }
 
+__attribute__((target("avx2,avxvnni,fma")))
+void batch_nvfp4_i8_vnni_rows(float* out, const uint8_t* packed,
+                              const uint8_t* scale, const uint16_t* globals,
+                              int R, const int8_t* acts, int M, int K,
+                              const float* e4m3, const float* act_scales) {
+  std::fill(out, out + static_cast<size_t>(R) * M, 0.0f);
+  const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2));
+  const int nb = K / 16;
+  const size_t packed_stride = static_cast<size_t>(K) / 2;
+  const size_t scale_stride = static_cast<size_t>(nb);
+  int b = 0;
+  for (; b + 2 <= nb; b += 2) {
+    for (int r = 0; r < R; ++r) {
+      const uint8_t* row_packed = packed + static_cast<size_t>(r) * packed_stride;
+      const uint8_t* row_scale = scale + static_cast<size_t>(r) * scale_stride;
+      const __m128i wb = nvfp4_decode_block_i8(
+          row_packed + static_cast<size_t>(b) * 8, lut);
+      const __m128i wb1 = nvfp4_decode_block_i8(
+          row_packed + static_cast<size_t>(b + 1) * 8, lut);
+      const __m256i w = _mm256_set_m128i(wb1, wb);
+      const __m256i aw = _mm256_sign_epi8(w, w);
+      const float row_global = 0.5f * fp16_to_f32(globals[r]);
+      const float ws0 = row_global * e4m3[row_scale[b]];
+      const float ws1 = row_global * e4m3[row_scale[b + 1]];
+      float* row_out = out + static_cast<size_t>(r) * M;
+      for (int m = 0; m < M; ++m) {
+        const int8_t* arow = acts + static_cast<size_t>(m) * K;
+        const __m256i a = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(arow + static_cast<size_t>(b) * 16));
+        const __m256i sa = _mm256_sign_epi8(a, w);
+        const __m256i di = _mm256_dpbusd_avx_epi32(
+            _mm256_setzero_si256(), aw, sa);
+        const float* as = act_scales + static_cast<size_t>(m) * nb;
+        const __m256 scv = _mm256_blend_ps(
+            _mm256_set1_ps(ws0 * as[b]),
+            _mm256_set1_ps(ws1 * as[b + 1]), 0xF0);
+        row_out[m] += hsum256(
+            _mm256_mul_ps(_mm256_cvtepi32_ps(di), scv));
+      }
+    }
+  }
+  for (; b < nb; ++b) {
+    for (int r = 0; r < R; ++r) {
+      const uint8_t* row_packed = packed + static_cast<size_t>(r) * packed_stride;
+      const uint8_t* row_scale = scale + static_cast<size_t>(r) * scale_stride;
+      const uint8_t* pk = row_packed + static_cast<size_t>(b) * 8;
+      const float ws = 0.5f * fp16_to_f32(globals[r]) * e4m3[row_scale[b]];
+      float* row_out = out + static_cast<size_t>(r) * M;
+      for (int m = 0; m < M; ++m) {
+        const int8_t* a = acts + static_cast<size_t>(m) * K + static_cast<size_t>(b) * 16;
+        int isum = 0;
+        for (int j = 0; j < 8; ++j) {
+          isum += (int)kE2M1x2[pk[j] & 0xF] * (int)a[j];
+          isum += (int)kE2M1x2[pk[j] >> 4] * (int)a[8 + j];
+        }
+        row_out[m] += ws * act_scales[static_cast<size_t>(m) * nb + b] * (float)isum;
+      }
+    }
+  }
+}
+
 #if (defined(__GNUC__) && __GNUC__ >= 10) || defined(__clang__)
 #define CPU_MOE_HAS_AVX512VNNI 1
 
@@ -692,6 +777,81 @@ void batch_nvfp4_i8_avx512vnni(float* out, const uint8_t* packed,
         isum += (int)kE2M1x2[pk[j] >> 4] * (int)a[8 + j];
       }
       out[m] += ws * act_scales[(size_t)m * nb + b] * (float)isum;
+    }
+  }
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+void batch_nvfp4_i8_avx512vnni_rows(
+    float* out, const uint8_t* packed, const uint8_t* scale,
+    const uint16_t* globals, int R, const int8_t* acts, int M, int K,
+    const float* e4m3, const float* act_scales) {
+  std::fill(out, out + static_cast<size_t>(R) * M, 0.0f);
+  const __m512i lut = _mm512_broadcast_i32x4(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2)));
+  const __m512i idx = _mm512_set_epi64(3, 3, 2, 2, 1, 1, 0, 0);
+  const __m512i mask0F = _mm512_set1_epi8(0x0F);
+  const __m512i idxsc = _mm512_set_epi32(
+      3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+  const __mmask64 hi_half = 0xFF00FF00FF00FF00ULL;
+  const int nb = K / 16;
+  const size_t packed_stride = static_cast<size_t>(K) / 2;
+  const size_t scale_stride = static_cast<size_t>(nb);
+  int b = 0;
+  for (; b + 4 <= nb; b += 4) {
+    for (int r = 0; r < R; ++r) {
+      const uint8_t* row_packed = packed + static_cast<size_t>(r) * packed_stride;
+      const uint8_t* row_scale = scale + static_cast<size_t>(r) * scale_stride;
+      const __m256i raw = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(row_packed + static_cast<size_t>(b) * 8));
+      const __m512i src = _mm512_permutexvar_epi64(
+          idx, _mm512_castsi256_si512(raw));
+      const __m512i lo = _mm512_and_si512(src, mask0F);
+      const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(src, 4), mask0F);
+      const __m512i w = _mm512_shuffle_epi8(
+          lut, _mm512_mask_blend_epi8(hi_half, lo, hi));
+      const __m512i aw = _mm512_abs_epi8(w);
+      const __mmask64 neg = _mm512_movepi8_mask(w);
+      int sc_raw;
+      memcpy(&sc_raw, row_scale + b, 4);
+      const __m128i sc4 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(sc_raw));
+      const __m128 ws4 = _mm_mul_ps(
+          _mm_i32gather_ps(e4m3, sc4, 4),
+          _mm_set1_ps(0.5f * fp16_to_f32(globals[r])));
+      float* row_out = out + static_cast<size_t>(r) * M;
+      for (int m = 0; m < M; ++m) {
+        const int8_t* arow = acts + static_cast<size_t>(m) * K;
+        const __m512i a = _mm512_loadu_si512(
+            reinterpret_cast<const __m512i*>(arow + static_cast<size_t>(b) * 16));
+        const __m512i sa = _mm512_mask_sub_epi8(
+            a, neg, _mm512_setzero_si512(), a);
+        const __m512i di = _mm512_dpbusd_epi32(
+            _mm512_setzero_si512(), aw, sa);
+        const __m128 as4 = _mm_loadu_ps(
+            act_scales + static_cast<size_t>(m) * nb + b);
+        const __m512 scv = _mm512_permutexvar_ps(
+            idxsc, _mm512_castps128_ps512(_mm_mul_ps(ws4, as4)));
+        row_out[m] += _mm512_reduce_add_ps(
+            _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv));
+      }
+    }
+  }
+  for (; b < nb; ++b) {
+    for (int r = 0; r < R; ++r) {
+      const uint8_t* row_packed = packed + static_cast<size_t>(r) * packed_stride;
+      const uint8_t* row_scale = scale + static_cast<size_t>(r) * scale_stride;
+      const uint8_t* pk = row_packed + static_cast<size_t>(b) * 8;
+      const float ws = 0.5f * fp16_to_f32(globals[r]) * e4m3[row_scale[b]];
+      float* row_out = out + static_cast<size_t>(r) * M;
+      for (int m = 0; m < M; ++m) {
+        const int8_t* a = acts + static_cast<size_t>(m) * K + static_cast<size_t>(b) * 16;
+        int isum = 0;
+        for (int j = 0; j < 8; ++j) {
+          isum += (int)kE2M1x2[pk[j] & 0xF] * (int)a[j];
+          isum += (int)kE2M1x2[pk[j] >> 4] * (int)a[8 + j];
+        }
+        row_out[m] += ws * act_scales[static_cast<size_t>(m) * nb + b] * (float)isum;
+      }
     }
   }
 }
@@ -913,19 +1073,23 @@ inline Nvi8Tier detect_nvi8_tier() {
 struct Nvi8Dispatch {
   nvi8dot_fn dot;
   nvi8batch_fn batch;
+  nvi8batch_rows_fn batch_rows;
   const char* batch_name;
 };
 
 Nvi8Dispatch select_nvi8_dispatch(Nvi8Tier tier) {
 #if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
   if (tier == NVI8_AVX512VNNI)
-    return {dot_nvfp4_i8_avx512vnni, batch_nvfp4_i8_avx512vnni, "vnni"};
+    return {dot_nvfp4_i8_avx512vnni, batch_nvfp4_i8_avx512vnni,
+            batch_nvfp4_i8_avx512vnni_rows, "vnni_rows32"};
 #endif
 #if CPU_MOE_X86
   if (tier == NVI8_AVXVNNI)
-    return {dot_nvfp4_i8_vnni, batch_nvfp4_i8_vnni, "vnni"};
+    return {dot_nvfp4_i8_vnni, batch_nvfp4_i8_vnni,
+            batch_nvfp4_i8_vnni_rows, "vnni_rows32"};
 #endif
-  return {nullptr, batch_nvfp4_i8_scalar, "scalar"};
+  return {nullptr, batch_nvfp4_i8_scalar, batch_nvfp4_i8_scalar_rows,
+          "scalar_rows32"};
 }
 
 // ----------------------- DeepSeek-V4 ds_fp4 (W4A8) ---------------------------
@@ -1442,7 +1606,7 @@ struct CpuMoeExecutor {
   dot_fn dot;
   nvdot_fn nvdot;
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
-  nvi8batch_fn nvi8batch = nullptr;  // expert-prefill M-row W4A8 kernel
+  nvi8batch_rows_fn nvi8batch_rows = nullptr;  // R_w weight rows x M activations
   const char* nvi8batch_name = "scalar";
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
@@ -1483,7 +1647,9 @@ struct CpuMoeExecutor {
   std::vector<bf16_t> prefill_y_scratch;  // [routes,H] per-route down result
   std::vector<float> prefill_x_scale_scratch;  // [routes,H/16]
   std::vector<float> prefill_g_scale_scratch;  // [routes,I/16]
-  std::vector<float> prefill_gate_scratch, prefill_up_scratch;  // [routes] projection temps
+  // [R_w,routes] projection tiles. Two buffers retain gate rows while the
+  // corresponding up rows are computed, then the down projection reuses gate.
+  std::vector<float> prefill_gate_scratch, prefill_up_scratch;
   std::vector<int> route_to_group;  // original token-major route -> grouped row
   std::vector<bf16_t> xq_scratch;  // [max_tokens * H] ds_fp4 fp8-roundtripped input
   // ds_fp4 activations pre-deinterleaved to fp32 (even/odd K) for the row-major dot.
@@ -1602,7 +1768,7 @@ struct CpuMoeExecutor {
     nvdot = select_nvdot();
     const Nvi8Tier nvi8_tier = detect_nvi8_tier();
     const Nvi8Dispatch nvi8_dispatch = select_nvi8_dispatch(nvi8_tier);
-    nvi8batch = nvi8_dispatch.batch;
+    nvi8batch_rows = nvi8_dispatch.batch_rows;
     nvi8batch_name = nvi8_dispatch.batch_name;
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
@@ -1731,7 +1897,7 @@ struct CpuMoeExecutor {
   }
 
   bool setup_prefill_batch(int max_prefill_tokens) {
-    if (fmt != WF_NVFP4 || nvi8batch == nullptr || max_prefill_tokens <= 0 ||
+    if (fmt != WF_NVFP4 || nvi8batch_rows == nullptr || max_prefill_tokens <= 0 ||
         H % 16 != 0 || I % 16 != 0) {
       return false;
     }
@@ -1745,8 +1911,8 @@ struct CpuMoeExecutor {
       std::vector<bf16_t> y(routes * H);
       std::vector<float> xs(routes * (H / 16));
       std::vector<float> gs(routes * (I / 16));
-      std::vector<float> gate(routes);
-      std::vector<float> up(routes);
+      std::vector<float> gate(routes * kNvi8WeightRows);
+      std::vector<float> up(routes * kNvi8WeightRows);
       std::vector<int> route_map(routes, -1);
       grouped_routes.reserve(routes);
       prefill_x_scratch.swap(x);
@@ -2348,35 +2514,40 @@ struct CpuMoeExecutor {
     const int8_t* expert_x = xi8 + static_cast<size_t>(begin) * H;
     const float* expert_xs =
         prefill_x_scale_scratch.data() + static_cast<size_t>(begin) * (H / 16);
-    float* gate = prefill_gate_scratch.data() + begin;
-    float* up = prefill_up_scratch.data() + begin;
+    // Each expert owns [begin*R_w, (begin+count)*R_w), so distinct-expert
+    // work stealing never aliases projection tiles.
+    float* gate = prefill_gate_scratch.data() + static_cast<size_t>(begin) * kNvi8WeightRows;
+    float* up = prefill_up_scratch.data() + static_cast<size_t>(begin) * kNvi8WeightRows;
     const bool swigluoai = act == ACT_SWIGLUOAI;
-    for (int i = 0; i < I; ++i) {
-      const size_t gr = static_cast<size_t>(e) * (2 * I) + i;
+    for (int i0 = 0; i0 < I; i0 += kNvi8WeightRows) {
+      const int rows = std::min(kNvi8WeightRows, I - i0);
+      const size_t gr = static_cast<size_t>(e) * (2 * I) + i0;
       const size_t ur = gr + I;
-      nvi8batch(gate, gu_packed_l + gr * (H / 2),
-                 gu_scale_l + gr * (H / 16), fp16_to_f32(gu_global_l[gr]),
-                 expert_x, count, H, e4m3_lut, expert_xs);
-      nvi8batch(up, gu_packed_l + ur * (H / 2),
-                 gu_scale_l + ur * (H / 16), fp16_to_f32(gu_global_l[ur]),
-                 expert_x, count, H, e4m3_lut, expert_xs);
-      for (int m = 0; m < count; ++m) {
-        const int pos = begin + m;
-        const int route = grouped_routes[pos];
-        const float w_in = apply_on_input ? t->w[route] : 1.0f;
-        float gv = gate[m] * w_in;
-        float uv = up[m] * w_in;
-        float activated;
-        if (swigluoai) {
-          if (gv > swiglu_limit) gv = swiglu_limit;
-          if (uv > swiglu_limit) uv = swiglu_limit;
-          else if (uv < -swiglu_limit) uv = -swiglu_limit;
-          activated = gv / (1.0f + std::exp(-gv * swiglu_alpha)) * (uv + 1.0f);
-        } else {
-          activated = act_apply(act, gv) * uv;
+      nvi8batch_rows(gate, gu_packed_l + gr * (H / 2),
+                     gu_scale_l + gr * (H / 16), gu_global_l + gr, rows,
+                     expert_x, count, H, e4m3_lut, expert_xs);
+      nvi8batch_rows(up, gu_packed_l + ur * (H / 2),
+                     gu_scale_l + ur * (H / 16), gu_global_l + ur, rows,
+                     expert_x, count, H, e4m3_lut, expert_xs);
+      for (int r = 0; r < rows; ++r) {
+        for (int m = 0; m < count; ++m) {
+          const int pos = begin + m;
+          const int route = grouped_routes[pos];
+          const float w_in = apply_on_input ? t->w[route] : 1.0f;
+          float gv = gate[static_cast<size_t>(r) * count + m] * w_in;
+          float uv = up[static_cast<size_t>(r) * count + m] * w_in;
+          float activated;
+          if (swigluoai) {
+            if (gv > swiglu_limit) gv = swiglu_limit;
+            if (uv > swiglu_limit) uv = swiglu_limit;
+            else if (uv < -swiglu_limit) uv = -swiglu_limit;
+            activated = gv / (1.0f + std::exp(-gv * swiglu_alpha)) * (uv + 1.0f);
+          } else {
+            activated = act_apply(act, gv) * uv;
+          }
+          prefill_g_scratch[static_cast<size_t>(pos) * I + i0 + r] =
+              f32_to_bf16(activated);
         }
-        prefill_g_scratch[static_cast<size_t>(pos) * I + i] =
-            f32_to_bf16(activated);
       }
     }
 
@@ -2392,14 +2563,17 @@ struct CpuMoeExecutor {
         prefill_gi8_scratch.data() + static_cast<size_t>(begin) * I;
     const float* expert_gs =
         prefill_g_scale_scratch.data() + static_cast<size_t>(begin) * (I / 16);
-    for (int h = 0; h < H; ++h) {
-      const size_t dr = static_cast<size_t>(e) * H + h;
-      nvi8batch(gate, dn_packed_l + dr * (I / 2),
-                 dn_scale_l + dr * (I / 16), fp16_to_f32(dn_global_l[dr]),
-                 expert_g, count, I, e4m3_lut, expert_gs);
-      for (int m = 0; m < count; ++m) {
-        prefill_y_scratch[(static_cast<size_t>(begin + m) * H) + h] =
-            f32_to_bf16(gate[m]);
+    for (int h0 = 0; h0 < H; h0 += kNvi8WeightRows) {
+      const int rows = std::min(kNvi8WeightRows, H - h0);
+      const size_t dr = static_cast<size_t>(e) * H + h0;
+      nvi8batch_rows(gate, dn_packed_l + dr * (I / 2),
+                     dn_scale_l + dr * (I / 16), dn_global_l + dr, rows,
+                     expert_g, count, I, e4m3_lut, expert_gs);
+      for (int r = 0; r < rows; ++r) {
+        for (int m = 0; m < count; ++m) {
+          prefill_y_scratch[(static_cast<size_t>(begin + m) * H) + h0 + r] =
+              f32_to_bf16(gate[static_cast<size_t>(r) * count + m]);
+        }
       }
     }
   }
@@ -2949,18 +3123,53 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           const Nvi8Dispatch d = select_nvi8_dispatch(
               nvi8_tier_from_flags(has_avx512vnni, has_avxvnni));
 #if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
-          if (d.batch == batch_nvfp4_i8_avx512vnni)
-            return std::string("batch_nvfp4_i8_avx512vnni");
+          if (d.batch_rows == batch_nvfp4_i8_avx512vnni_rows)
+            return std::string("batch_nvfp4_i8_avx512vnni_rows");
 #endif
 #if CPU_MOE_X86
-          if (d.batch == batch_nvfp4_i8_vnni)
-            return std::string("batch_nvfp4_i8_vnni");
+          if (d.batch_rows == batch_nvfp4_i8_vnni_rows)
+            return std::string("batch_nvfp4_i8_vnni_rows");
 #endif
-          if (d.batch == batch_nvfp4_i8_scalar)
-            return std::string("batch_nvfp4_i8_scalar");
+          if (d.batch_rows == batch_nvfp4_i8_scalar_rows)
+            return std::string("batch_nvfp4_i8_scalar_rows");
           return std::string("unknown");
         },
         py::arg("has_avx512vnni"), py::arg("has_avxvnni"));
+  // GPU-free numerical seam. The detected ISA is safe to execute on this host;
+  // both outputs traverse every K block in the same order and must match exactly.
+  m.def("run_prefill_batch_rows_parity",
+        [](uintptr_t rows_out_ptr, uintptr_t singles_out_ptr,
+           uintptr_t packed_ptr, uintptr_t scale_ptr, uintptr_t globals_ptr,
+           uintptr_t acts_ptr, uintptr_t act_scales_ptr, int R, int M, int K) {
+          if (R <= 0 || M <= 0 || K <= 0 || K % 16 != 0)
+            throw std::runtime_error(
+                "rows parity dimensions must be positive and K divisible by 16");
+          const Nvi8Dispatch d = select_nvi8_dispatch(detect_nvi8_tier());
+          float e4m3[256];
+          for (int i = 0; i < 256; ++i)
+            e4m3[i] = e4m3_decode(static_cast<uint8_t>(i));
+          float* rows_out = reinterpret_cast<float*>(rows_out_ptr);
+          float* singles_out = reinterpret_cast<float*>(singles_out_ptr);
+          const uint8_t* packed = reinterpret_cast<const uint8_t*>(packed_ptr);
+          const uint8_t* scale = reinterpret_cast<const uint8_t*>(scale_ptr);
+          const uint16_t* globals = reinterpret_cast<const uint16_t*>(globals_ptr);
+          const int8_t* acts = reinterpret_cast<const int8_t*>(acts_ptr);
+          const float* act_scales = reinterpret_cast<const float*>(act_scales_ptr);
+          d.batch_rows(rows_out, packed, scale, globals, R, acts, M, K,
+                       e4m3, act_scales);
+          for (int r = 0; r < R; ++r) {
+            d.batch(singles_out + static_cast<size_t>(r) * M,
+                    packed + static_cast<size_t>(r) * (K / 2),
+                    scale + static_cast<size_t>(r) * (K / 16),
+                    fp16_to_f32(globals[r]), acts, M, K, e4m3,
+                    act_scales);
+          }
+          return std::string(d.batch_name);
+        },
+        py::arg("rows_out_ptr"), py::arg("singles_out_ptr"),
+        py::arg("packed_ptr"), py::arg("scale_ptr"), py::arg("globals_ptr"),
+        py::arg("acts_ptr"), py::arg("act_scales_ptr"), py::arg("rows"),
+        py::arg("activation_rows"), py::arg("hidden_size"));
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));

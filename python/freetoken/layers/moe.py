@@ -500,13 +500,19 @@ class OffloadMoELayer(MoELayer):
                     cache.prefetch_disk_experts(self.layer_id, topk_ids)
                 self._prefetch_next_overlap_layer(cache)
                 try:
-                    return executor.prefill(
+                    out = executor.prefill(
                         self.layer_id, hidden_states, topk_weights, topk_ids
                     )
                 finally:
                     release = getattr(cache, "release_disk_prefill", None)
                     if release is not None:
                         release(lease)
+                schedule = getattr(
+                    cache, "schedule_next_chunk_disk_prefill", None
+                )
+                if schedule is not None:
+                    schedule(self.layer_id, topk_ids)
+                return out
             # Preserve the existing advisory sweep for the full-layer copy benchmark.
             cache.prefetch_disk_experts(self.layer_id, topk_ids)
         if cache.prefill_overlap and cache.prefill_overlap_for_layer(self.layer_id):

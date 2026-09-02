@@ -60,6 +60,7 @@ _FLAG_SLOTS_PER_LAYER = 16
 # MoeTask::num_tokens and CpuMoeExecutor::create_task use a signed C++ int.
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
 _PREFILL_POPULATE_SCRATCH_BYTES = 32 << 20
+_PREFILL_GEMM_WEIGHT_ROWS = 32
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,19 @@ class _StepTimingEvents:
 class _PrefillCoalesceLease:
     layer_id: int
     experts: tuple[int, ...]
+
+
+@dataclass
+class _PrefillPopulateOverlap:
+    """One predicted next-chunk populate owned by its executor."""
+
+    layer_id: int
+    experts: tuple[int, ...]
+    cancel: threading.Event
+    thread: threading.Thread | None = None
+    started_ns: int = 0
+    finished_ns: int = 0
+    joining: bool = False
 
 
 def _split_step_timing_layers(
@@ -184,7 +198,8 @@ def _prefill_batch_buffer_nbytes(
         + 3 * int(intermediate_size)
         + int(hidden_size) // 4
         + int(intermediate_size) // 4
-        + 16
+        + 8 * _PREFILL_GEMM_WEIGHT_ROWS
+        + 8
     )
 
 
@@ -387,7 +402,10 @@ class CpuMoeExecutor:
         self._prefill_coalesce_warned = False
         self._prefill_populate_bytes = 0
         self._prefill_populate_ns = 0
+        self._prefill_populate_overlap_ns = 0
         self._prefill_populate_scratch = None
+        self._prefill_populate_overlap: _PrefillPopulateOverlap | None = None
+        self._prefill_populate_overlap_lock = threading.Lock()
         if isinstance(prefill_batch, bool):
             prefill_batch = "on" if prefill_batch else "off"
         if prefill_batch not in ("on", "off"):
@@ -1110,6 +1128,154 @@ class CpuMoeExecutor:
         self._disk_delta_pages = getattr(self, "_disk_delta_pages", 0) + pages
         return pages
 
+    def _warm_prefill_selected(
+        self, layer_id: int, selected: list[int] | tuple[int, ...]
+    ) -> None:
+        """Apply the configured populate to WILLNEED to fault degrade chain."""
+        mode = getattr(self, "_prefill_coalesce_mode", "on")
+        if mode == "populate":
+            banks = self._disk_banks.get(int(layer_id), ())
+            has_file_banks = any(
+                getattr(bank, "_pager", None) is None for bank in banks
+            )
+            if not has_file_banks:
+                try:
+                    self._prefetch_selected(int(layer_id), selected)
+                except Exception as exc:
+                    self._record_prefill_degrade(
+                        "pager prefetch degraded to demand faults", exc
+                    )
+                return
+            populate_started = time.perf_counter_ns()
+            try:
+                self._populate_selected(int(layer_id), selected)
+            except Exception as exc:
+                self._record_prefill_degrade(
+                    "populate degraded to WILLNEED", exc
+                )
+                try:
+                    self._prefetch_selected(int(layer_id), selected)
+                except Exception as fallback_exc:
+                    self._record_prefill_degrade(
+                        "WILLNEED degraded to demand faults", fallback_exc
+                    )
+            finally:
+                self._prefill_populate_ns = getattr(
+                    self, "_prefill_populate_ns", 0
+                ) + time.perf_counter_ns() - populate_started
+            return
+        try:
+            self._prefetch_selected(int(layer_id), selected)
+        except Exception as exc:
+            self._record_prefill_degrade(
+                "WILLNEED degraded to demand faults", exc
+            )
+
+    def _prefill_overlap_lock(self) -> threading.Lock:
+        lock = getattr(self, "_prefill_populate_overlap_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._prefill_populate_overlap_lock = lock
+        return lock
+
+    def _finish_prefill_populate_overlap(
+        self, layer_id: int | None = None
+    ) -> tuple[int, ...]:
+        """Join a predicted populate and account the portion hidden by compute."""
+        lock = self._prefill_overlap_lock()
+        with lock:
+            overlap = getattr(self, "_prefill_populate_overlap", None)
+            if overlap is None or (
+                layer_id is not None and overlap.layer_id != int(layer_id)
+            ):
+                return ()
+            account = not overlap.joining
+            overlap.joining = True
+        wait_started = time.perf_counter_ns()
+        assert overlap.thread is not None
+        overlap.thread.join()
+        if not account:
+            return ()
+        wait_ns = time.perf_counter_ns() - wait_started
+        duration_ns = max(0, overlap.finished_ns - overlap.started_ns)
+        hidden_ns = max(0, duration_ns - wait_ns)
+        self._prefill_populate_overlap_ns = getattr(
+            self, "_prefill_populate_overlap_ns", 0
+        ) + hidden_ns
+        with lock:
+            if getattr(self, "_prefill_populate_overlap", None) is overlap:
+                self._prefill_populate_overlap = None
+        return () if overlap.cancel.is_set() else overlap.experts
+
+    def schedule_prefill_layer_overlap(self, layer_id: int, expert_ids):
+        """Predict next-chunk layer-0 rows on one background populate thread.
+
+        The current chunk's layer-0 union is the only route information available
+        while its tail layers compute. The next chunk joins this lease before its
+        actual layer-0 union is consumed, then synchronously warms only the delta.
+        """
+        if (
+            not getattr(self, "_prefill_coalesce_enabled", True)
+            or getattr(self, "_prefill_coalesce_mode", "on") != "populate"
+        ):
+            return None
+        self._finish_prefill_populate_overlap()
+        try:
+            selected, _route_pairs = _dedupe_decode_routes(
+                expert_ids, self.num_experts
+            )
+            limit = getattr(self, "_prefill_coalesce_limits", {}).get(
+                int(layer_id), self.num_experts
+            )
+            selected = selected[:limit]
+        except Exception as exc:
+            self._record_prefill_degrade(
+                "background sweep degraded to demand faults", exc
+            )
+            return None
+        if not selected:
+            return None
+        overlap = _PrefillPopulateOverlap(
+            int(layer_id), tuple(selected), threading.Event()
+        )
+
+        def populate() -> None:
+            overlap.started_ns = time.perf_counter_ns()
+            try:
+                if not overlap.cancel.is_set():
+                    self._warm_prefill_selected(overlap.layer_id, overlap.experts)
+            except BaseException as exc:
+                # No exception crosses the thread boundary. Even unusual failures
+                # degrade this prediction only; exact compute can still demand-fault.
+                try:
+                    self._record_prefill_degrade(
+                        "background sweep degraded to demand faults", exc
+                    )
+                except BaseException:
+                    pass
+            finally:
+                overlap.finished_ns = time.perf_counter_ns()
+
+        overlap.thread = threading.Thread(
+            target=populate,
+            name="freetoken-prefill-populate",
+            daemon=True,
+        )
+        with self._prefill_overlap_lock():
+            self._prefill_populate_overlap = overlap
+            overlap.thread.start()
+        return overlap
+
+    def cancel_prefill_populate_overlap(self, *, wait: bool = True) -> None:
+        """Cancel pending work; optionally drain the in-flight backing read."""
+        with self._prefill_overlap_lock():
+            overlap = getattr(self, "_prefill_populate_overlap", None)
+        if overlap is None:
+            return
+        overlap.cancel.set()
+        if wait:
+            self._finish_prefill_populate_overlap()
+
     def prepare_prefill_layer(self, layer_id: int, expert_ids):
         """Warm one bounded expert union and return its post-compute lease.
 
@@ -1123,6 +1289,7 @@ class CpuMoeExecutor:
         started = time.perf_counter_ns()
         selected: list[int] = []
         try:
+            predicted = set(self._finish_prefill_populate_overlap(int(layer_id)))
             selected, _route_pairs = _dedupe_decode_routes(
                 expert_ids, self.num_experts
             )
@@ -1138,44 +1305,9 @@ class CpuMoeExecutor:
                     _PrefillCoalesceLease(int(layer_id), ())
                     if had_selected else None
                 )
-            mode = getattr(self, "_prefill_coalesce_mode", "on")
-            if mode == "populate":
-                banks = self._disk_banks.get(int(layer_id), ())
-                has_file_banks = any(
-                    getattr(bank, "_pager", None) is None for bank in banks
-                )
-                if not has_file_banks:
-                    try:
-                        self._prefetch_selected(int(layer_id), selected)
-                    except Exception as exc:
-                        self._record_prefill_degrade(
-                            "pager prefetch degraded to demand faults", exc
-                        )
-                else:
-                    populate_started = time.perf_counter_ns()
-                    try:
-                        self._populate_selected(int(layer_id), selected)
-                    except Exception as exc:
-                        self._record_prefill_degrade(
-                            "populate degraded to WILLNEED", exc
-                        )
-                        try:
-                            self._prefetch_selected(int(layer_id), selected)
-                        except Exception as fallback_exc:
-                            self._record_prefill_degrade(
-                                "WILLNEED degraded to demand faults", fallback_exc
-                            )
-                    finally:
-                        self._prefill_populate_ns = getattr(
-                            self, "_prefill_populate_ns", 0
-                        ) + time.perf_counter_ns() - populate_started
-            else:
-                try:
-                    self._prefetch_selected(int(layer_id), selected)
-                except Exception as exc:
-                    self._record_prefill_degrade(
-                        "WILLNEED degraded to demand faults", exc
-                    )
+            delta = [expert for expert in selected if expert not in predicted]
+            if delta:
+                self._warm_prefill_selected(int(layer_id), delta)
         except Exception as exc:
             self._record_prefill_degrade("sweep degraded to demand faults", exc)
             # A non-None lease suppresses the layer seam's unguarded retry. Empty
@@ -1249,6 +1381,7 @@ class CpuMoeExecutor:
         self._prefill_coalesce_degrades = 0
         self._prefill_populate_bytes = 0
         self._prefill_populate_ns = 0
+        self._prefill_populate_overlap_ns = 0
         self._prefill_batch_rows = 0
         self._prefill_batch_gemms = 0
         self._prefill_batch_degrades = 0
@@ -1331,6 +1464,9 @@ class CpuMoeExecutor:
             "moe_prefill_populate_ms": getattr(
                 self, "_prefill_populate_ns", 0
             ) / 1_000_000,
+            "moe_prefill_populate_overlap_ms": getattr(
+                self, "_prefill_populate_overlap_ns", 0
+            ) / 1_000_000,
             "moe_prefill_batch_rows": getattr(
                 self, "_prefill_batch_rows", 0
             ),
@@ -1391,6 +1527,7 @@ class CpuMoeExecutor:
             self._prefill_coalesce_degrades = 0
             self._prefill_populate_bytes = 0
             self._prefill_populate_ns = 0
+            self._prefill_populate_overlap_ns = 0
             self._prefill_batch_rows = 0
             self._prefill_batch_gemms = 0
             self._prefill_batch_degrades = 0

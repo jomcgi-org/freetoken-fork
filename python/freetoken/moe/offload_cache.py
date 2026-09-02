@@ -1309,7 +1309,13 @@ class OffloadMoeCache:
         return hot / total if total else 0.0
 
     def shutdown_hot_adaptation(self) -> None:
-        """Drain and release the adaptation worker before bank teardown."""
+        """Drain background workers before bank teardown."""
+        if self.cpu_executor is not None:
+            cancel = getattr(
+                self.cpu_executor, "cancel_prefill_populate_overlap", None
+            )
+            if cancel is not None:
+                cancel(wait=True)
         executor = self._hot_adapt_executor
         if executor is not None:
             executor.shutdown(wait=True)
@@ -1360,6 +1366,21 @@ class OffloadMoeCache:
         if lease is not None:
             assert self.cpu_executor is not None
             self.cpu_executor.release_prefill_layer(lease)
+
+    def schedule_next_chunk_disk_prefill(self, layer_id: int, expert_ids):
+        """Use this chunk's layer-0 routes to predict the next chunk's warm set."""
+        if (
+            layer_id != 0
+            or self.layer_residency[layer_id] != "disk"
+            or self.moe_disk_prefill != "cpu"
+            or self.moe_prefill_coalesce != "populate"
+        ):
+            return None
+        assert self.cpu_executor is not None
+        schedule = getattr(
+            self.cpu_executor, "schedule_prefill_layer_overlap", None
+        )
+        return schedule(layer_id, expert_ids) if schedule is not None else None
 
     def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
         if self.cpu_executor is None:
