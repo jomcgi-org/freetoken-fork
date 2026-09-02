@@ -299,6 +299,8 @@ class ModelConfig:
     moe_weight_format: str | None = None
     swiglu_limit: float | None = None
     hidden_act_alpha: float = 1.702
+    # Routed-expert activation when it differs from the dense MLP activation.
+    moe_activation: str | None = None
     # Full DeepseekV4Args payload for the DSV4-specific machinery (MLA sparse attention,
     # CSA/HCA compressors, Lightning Indexer, manifold-constrained Hyper-Connections,
     # hash routing). Opaque to model-agnostic engine code; None for non-DSV4 models.
@@ -307,6 +309,12 @@ class ModelConfig:
     # DSA indexer geometry the model module needs. Opaque to model-agnostic engine code;
     # None for every other model.
     glm_dsa_args: Any | None = None
+    # GLM-5.3-Flash (glm5_next) hybrid KDA + MLA/DSA payload. The generic cache
+    # machinery continues to read attention_groups; this carries only model math.
+    glm5_next_args: Any | None = None
+    # Optional explicit dense/sparse MLP type for each decoder layer. Empty keeps
+    # the historical contiguous first_k_dense_replace convention.
+    mlp_layer_types: Tuple[str, ...] = ()
     # MiniMax-M3 (minimax_m3) payload (MiniMaxM3Args): the block-sparse indexer geometry
     # (index heads/dim, top-k blocks, init/local blocks, sparse layer set) plus the
     # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
@@ -334,6 +342,8 @@ class ModelConfig:
         Models with leading dense layers (``first_k_dense_replace`` > 0, e.g. GLM-4)
         only store experts for the trailing layers; everything else has all layers MoE.
         """
+        if self.mlp_layer_types:
+            return sum(t == "sparse" for t in self.mlp_layer_types[: self.num_layers])
         return self.num_layers - self.first_k_dense_replace
 
     @property

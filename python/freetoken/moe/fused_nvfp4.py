@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -45,6 +46,10 @@ def _run_act(
     ignore them."""
     if activation == "swigluoai":
         swigluoai_and_mul(gate_up, out, alpha=act_alpha, limit=act_limit)
+        return
+    if activation == "clamped_silu":
+        gate, up = gate_up.chunk(2, dim=-1)
+        out.copy_(F.silu(gate.clamp(max=act_limit)) * up.clamp(-act_limit, act_limit))
         return
     _ACT[activation](gate_up, out)
 

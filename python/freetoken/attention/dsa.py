@@ -102,7 +102,13 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             lead = None
             # Capped to the SERVED layer count (dev num_layers overrides must not
             # index slots past the pool the factory sized from the same cap).
+            mla_specs = [spec for spec in config.kv_cache_group_specs() if spec.mla]
+            if len(mla_specs) != 1:
+                raise ValueError(f"DSA needs one MLA cache group, got {len(mla_specs)}")
+            mla_layers = set(mla_specs[0].layer_ids)
             for lid, kind in enumerate(args.indexer_types[: config.num_layers]):
+                if lid not in mla_layers:
+                    continue
                 if kind == "full":
                     lead = lid
                     self._idx_slot[lid] = len(self._idx_slot)

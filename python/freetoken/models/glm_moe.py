@@ -26,20 +26,37 @@ def derive_glm_moe_geometry(config) -> GlmMoeGeometry:
     properties.
     """
     first_moe_layer = int(getattr(config, "first_k_dense_replace", 0))
+    mlp_types = tuple(getattr(config, "mlp_layer_types", ()) or ())
+    if mlp_types and len(mlp_types) < int(config.num_layers):
+        raise ValueError(
+            f"GLM mlp_layer_types has {len(mlp_types)} entries for {config.num_layers} layers"
+        )
     num_layers = getattr(config, "num_moe_layers", None)
     if num_layers is None:
-        num_layers = int(config.num_layers) - first_moe_layer
+        num_layers = (
+            sum(t == "sparse" for t in mlp_types[: int(config.num_layers)])
+            if mlp_types
+            else int(config.num_layers) - first_moe_layer
+        )
+    num_experts = getattr(config, "num_experts", None)
+    if not num_experts:
+        num_experts = getattr(config, "n_routed_experts", None)
+    if not num_experts:
+        raise ValueError("GLM config needs num_experts or n_routed_experts")
     geometry = GlmMoeGeometry(
-        num_experts=int(config.num_experts),
+        num_experts=int(num_experts),
         hidden_size=int(config.hidden_size),
         intermediate_size=int(config.moe_intermediate_size),
         num_layers=int(num_layers),
         top_k=int(config.num_experts_per_tok),
     )
-    if geometry.num_layers != int(config.num_layers) - first_moe_layer:
-        raise ValueError(
-            "GLM num_moe_layers must equal num_layers - first_k_dense_replace"
-        )
+    expected_layers = (
+        sum(t == "sparse" for t in mlp_types[: int(config.num_layers)])
+        if mlp_types
+        else int(config.num_layers) - first_moe_layer
+    )
+    if geometry.num_layers != expected_layers:
+        raise ValueError(f"GLM num_moe_layers must equal sparse layer count {expected_layers}")
     if min(
         geometry.num_experts,
         geometry.hidden_size,
@@ -53,6 +70,19 @@ def derive_glm_moe_geometry(config) -> GlmMoeGeometry:
             f"GLM top_k {geometry.top_k} exceeds routed experts {geometry.num_experts}"
         )
     return geometry
+
+
+def glm_moe_bank_layer(config, layer_id: int) -> int:
+    """Packed expert-bank row for a decoder layer, including non-contiguous MLP types."""
+    mlp_types = tuple(getattr(config, "mlp_layer_types", ()) or ())
+    if mlp_types:
+        if layer_id >= len(mlp_types) or mlp_types[layer_id] != "sparse":
+            raise ValueError(f"GLM decoder layer {layer_id} is not sparse")
+        return sum(t == "sparse" for t in mlp_types[:layer_id])
+    first = int(getattr(config, "first_k_dense_replace", 0))
+    if layer_id < first:
+        raise ValueError(f"GLM decoder layer {layer_id} is dense")
+    return layer_id - first
 
 
 def glm_shared_expert_count(config) -> int:
@@ -127,6 +157,7 @@ __all__ = [
     "GlmMoeGeometry",
     "derive_glm_moe_geometry",
     "glm_shared_expert_count",
+    "glm_moe_bank_layer",
     "iter_glm_offload_moe_layers",
     "validate_glm_nvfp4_bank_geometry",
 ]

@@ -15,7 +15,11 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 import torch.nn.functional as F
 from freetoken.layers import BaseOP, LinearReplicated, make_moe_layer
-from freetoken.models.glm_moe import derive_glm_moe_geometry, glm_shared_expert_count
+from freetoken.models.glm_moe import (
+    derive_glm_moe_geometry,
+    glm_moe_bank_layer,
+    glm_shared_expert_count,
+)
 
 from .mlp import GlmDsaGatedMLP
 
@@ -46,12 +50,13 @@ class GlmMoeDsaSparseBlock(BaseOP):
         # first_k_dense_replace), matching how the loader packs the expert banks.
         self.experts = make_moe_layer(
             config,
-            layer_id=layer_id - config.first_k_dense_replace,
+            layer_id=glm_moe_bank_layer(config, layer_id),
             renormalize=config.norm_topk_prob,
             num_experts=geometry.num_experts,
             top_k=geometry.top_k,
             hidden_size=geometry.hidden_size,
             intermediate_size=geometry.intermediate_size,
+            extra_attrs={"swiglu_limit": getattr(config, "swiglu_limit", None)},
         )
         shared_count = glm_shared_expert_count(config)
         self.shared_experts = GlmDsaGatedMLP(
