@@ -612,14 +612,16 @@ class Engine:
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
         num_moe_layers = config.model_config.num_moe_layers
-        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+        from freetoken.moe.expert_banks import resolve_bank_source
 
-        ftw_checkpoint = bool(config.model_path and is_ftw_checkpoint(config.model_path))
+        resolved_bank_source = resolve_bank_source(
+            config.model_path, getattr(config, "bank_source", "auto")
+        )
+        disk_bank_checkpoint = resolved_bank_source in ("ftw", "index")
         disk_layer_ids = _resolve_disk_layers(config, num_moe_layers)
-        if disk_layer_ids and not ftw_checkpoint:
+        if disk_layer_ids and not disk_bank_checkpoint:
             raise ValueError(
-                "--moe-disk-layers requires an FTW checkpoint; convert this model with "
-                "`ft checkpoint` first"
+                "--moe-disk-layers requires FTW or a supported safetensors bank index"
             )
         cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers)
         if config.moe_disk_decode == "cpu":
@@ -638,7 +640,7 @@ class Engine:
             cpu_layer_ids = _auto_cpu_layers(
                 config, num_moe_layers, reserved=self._host_tables_bytes
             )
-            if ftw_checkpoint:
+            if disk_bank_checkpoint:
                 disk_layer_ids = cpu_layer_ids
                 if config.moe_disk_decode == "gpufetch":
                     cpu_layer_ids = frozenset()
@@ -728,6 +730,7 @@ class Engine:
                 disk_pager=disk_pager,
                 hot_expert_ids=hot_expert_ids,
                 hot_expert_capacity=hot_expert_capacity,
+                bank_source=getattr(config, "bank_source", "auto"),
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -1808,14 +1811,18 @@ def _resolve_hot_expert_setup(
         bank_bytes_per_expert,
         ftw_bank_byte_breakdown,
     )
+    from freetoken.checkpoint.safetensors_bank_index import indexed_bank_byte_breakdown
 
-    breakdown = ftw_bank_byte_breakdown(config.model_path)
+    breakdown = (
+        ftw_bank_byte_breakdown(config.model_path)
+        or indexed_bank_byte_breakdown(config.model_path)
+    )
     if breakdown is not None:
         row_total, fixed_bytes = breakdown
         divisor = num_moe_layers * num_experts
         if row_total % divisor:
             raise ValueError(
-                f"FTW expert row bytes {row_total} are not divisible by {divisor}"
+                f"expert row bytes {row_total} are not divisible by {divisor}"
             )
         expert_bytes = row_total // divisor
     else:
@@ -1890,12 +1897,15 @@ def _resolve_hot_expert_sets(
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
     """Pick CPU MoE layers automatically when banks exceed the pin budget.
 
-    FTW checkpoints use the lowest-traffic layers from a complete profile, or the
+    Disk-mappable checkpoints use the lowest-traffic layers from a complete profile, or the
     U-shaped head-and-tail default. Other checkpoints use the same head-and-tail
     selection for LOCKED residency.
     """
-    from freetoken.checkpoint.ftw import is_ftw_checkpoint
-    from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
+    from freetoken.moe.expert_banks import (
+        bank_bytes_estimate,
+        ftw_bank_bytes,
+        resolve_bank_source,
+    )
 
     bank_bytes = ftw_bank_bytes(config.model_path) or bank_bytes_estimate(config.model_config)
     if not bank_bytes:
@@ -1914,7 +1924,13 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
         )
         return frozenset()
     n = min(num_moe_layers, math.ceil(num_moe_layers * (1 - budget / bank_bytes)))
-    if config.model_path and is_ftw_checkpoint(config.model_path):
+    disk_mappable = (
+        config.model_path
+        and resolve_bank_source(
+            config.model_path, getattr(config, "bank_source", "auto")
+        ) in ("ftw", "index")
+    )
+    if disk_mappable:
         profile_path = getattr(config, "moe_disk_layer_profile", None)
         scores = (
             _load_disk_layer_profile(profile_path, num_moe_layers)
@@ -1926,13 +1942,13 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 
             )
             score_log = {layer_id: scores[layer_id] for layer_id in sorted(ids)}
             action = (
-                f"mapping {n} lowest-traffic MoE layers from FTW on DISK; "
+                f"mapping {n} lowest-traffic MoE layers from the checkpoint on DISK; "
                 f"layer scores {score_log}"
             )
         else:
             ids = _head_tail_layers(num_moe_layers, n)
             action = (
-                f"mapping {n} head+tail MoE layers from FTW on DISK; "
+                f"mapping {n} head+tail MoE layers from the checkpoint on DISK; "
                 "layer scores unavailable"
             )
     else:
@@ -1973,6 +1989,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_hit_d2d": False,
     "moe_collect_stats": False,
     "expert_load": "auto",
+    "bank_source": "auto",
 }
 
 
@@ -2327,12 +2344,17 @@ def _adjust_config(config: EngineConfig):
                 "--moe-disk-layers requires --moe-backend offload, hybrid, or cpu "
                 f"(got {config.moe_backend!r})"
             )
-        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+        from freetoken.moe.expert_banks import resolve_bank_source
 
-        if not config.model_path or not is_ftw_checkpoint(config.model_path):
+        if (
+            not config.model_path
+            or resolve_bank_source(
+                config.model_path, getattr(config, "bank_source", "auto")
+            )
+            not in ("ftw", "index")
+        ):
             raise ValueError(
-                "--moe-disk-layers requires an FTW checkpoint; convert this model with "
-                "`ft checkpoint` first"
+                "--moe-disk-layers requires FTW or a supported safetensors bank index"
             )
 
     if is_moe and getattr(config, "moe_hot_expert_budget_gib", 0.0) > 0:
@@ -2353,11 +2375,17 @@ def _adjust_config(config: EngineConfig):
                 "static --moe-hot-expert-budget-gib requires "
                 "--moe-disk-layer-profile"
             )
-        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+        from freetoken.moe.expert_banks import resolve_bank_source
 
-        if not config.model_path or not is_ftw_checkpoint(config.model_path):
+        if (
+            not config.model_path
+            or resolve_bank_source(
+                config.model_path, getattr(config, "bank_source", "auto")
+            )
+            not in ("ftw", "index")
+        ):
             raise ValueError(
-                "--moe-hot-expert-budget-gib requires an FTW checkpoint"
+                "--moe-hot-expert-budget-gib requires FTW or a supported bank index"
             )
 
     if is_moe:

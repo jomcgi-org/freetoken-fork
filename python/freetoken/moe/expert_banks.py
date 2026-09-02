@@ -32,6 +32,38 @@ logger = init_logger(__name__)
 _PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
 
 
+def resolve_bank_source(model_path: str | None, requested: str = "auto") -> str:
+    """Resolve to ``ftw``, ``index``, or the legacy materializing ``source`` path."""
+    if requested not in ("auto", "ftw", "index"):
+        raise ValueError(f"unknown bank source {requested!r}")
+    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+    ftw = bool(model_path and is_ftw_checkpoint(model_path))
+    if ftw:
+        if requested == "index":
+            raise ValueError("--bank-source index requires a safetensors checkpoint")
+        return "ftw"
+    if requested == "ftw":
+        raise ValueError("--bank-source ftw requires an FTW checkpoint")
+    if not model_path:
+        if requested == "index":
+            raise ValueError("--bank-source index requires a checkpoint path")
+        return "source"
+
+    from freetoken.checkpoint.safetensors_bank_index import (
+        UnsupportedSafetensorsBankIndex,
+        ensure_safetensors_bank_index,
+    )
+
+    try:
+        ensure_safetensors_bank_index(model_path)
+    except (FileNotFoundError, UnsupportedSafetensorsBankIndex):
+        if requested == "index":
+            raise
+        return "source"
+    return "index"
+
+
 @dataclass(frozen=True)
 class ExpertBanks:
     """Loaded expert banks, normalized for ``OffloadMoeCache`` wiring."""
@@ -466,12 +498,15 @@ def load_expert_banks(
     disk_pager=None,
     hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
     hot_expert_capacity: dict[int, int] | None = None,
+    bank_source: str = "auto",
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
 
-    * **Fast path (FTW)**: if ``model_path`` is a converted FTW checkpoint, read its
+    * **FTW path**: if ``model_path`` is a converted FTW checkpoint, read its
       repacked banks directly (contiguous chunked O_DIRECT). No auto-conversion.
+    * **Indexed path**: for a byte-identical packed safetensors layout, map DISK layers
+      directly from their source shards and copy resident layers from the same ranges.
     * **Slow path** (the original checkpoint): auto-pick **parallel** (the common parallel chunked
       O_DIRECT reader) when experts are stored as many small tensors -- the serial read is
       slow there -- else the **serial baseline** (packed experts: serial already saturates,
@@ -487,25 +522,30 @@ def load_expert_banks(
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
 
-    ``disk_pager`` selects anonymous UFFD regions for FTW DISK layers. ``None`` keeps
-    the portable file-mapping backend.
+    ``disk_pager`` selects anonymous UFFD regions for FTW or indexed DISK layers.
+    ``None`` keeps the portable file-mapping backend.
     """
-    from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
+    from freetoken.checkpoint.ftw import load_ftw_banks
+    from freetoken.checkpoint.safetensors_bank_index import load_indexed_banks
     from freetoken.moe.host_banks import HostResidency
+
+    resolved_source = "source" if dummy else resolve_bank_source(model_path, bank_source)
+    ftw = resolved_source == "ftw"
+    indexed = resolved_source == "index"
 
     wants_disk = bool(
         layer_residency
         and HostResidency.DISK.value in layer_residency
     )
     if (wants_disk or hot_expert_ids or hot_expert_capacity) and (
-        not model_path or not is_ftw_checkpoint(model_path)
+        not model_path or not (ftw or indexed)
     ):
         raise ValueError(
-            "DISK and HOT expert-bank residency require an FTW checkpoint; convert the model "
-            "with `ft checkpoint` first"
+            "DISK and HOT expert-bank residency require FTW or a byte-identical "
+            "safetensors bank index; convert repacked layouts with `ft checkpoint`"
         )
 
-    if model_path and is_ftw_checkpoint(model_path) and not dummy:
+    if ftw and not dummy:
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency, disk_pager=disk_pager,
@@ -515,6 +555,21 @@ def load_expert_banks(
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
             return banks
+
+    if indexed and not dummy:
+        banks = load_indexed_banks(
+            model_path,
+            num_layers=model_config.num_moe_layers,
+            dtype=dtype,
+            layer_residency=layer_residency,
+            disk_pager=disk_pager,
+            hot_expert_ids=hot_expert_ids,
+            hot_expert_capacity=hot_expert_capacity,
+        )
+        logger.info_rank0(
+            f"expert banks: safetensors indexed path (checkpoint {model_path})"
+        )
+        return banks
 
     if parallel and not _PARALLEL_READER_SUPPORTED:
         logger.warning_rank0(

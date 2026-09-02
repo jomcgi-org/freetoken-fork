@@ -29,6 +29,8 @@ class EngineConfig:
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
+    # Expert bank source: FTW, a byte-identical safetensors index, or automatic detection.
+    bank_source: str = "auto"
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
@@ -49,10 +51,10 @@ class EngineConfig:
     # fraction ("0.5"). None/"" = all layers on GPU (plain offload). --moe-backend cpu
     # already means all layers on CPU and ignores this.
     moe_cpu_layers: str | None = None
-    # File-backed FTW bank layers. Uses the same grammar as moe_cpu_layers. Decode
-    # uses the CPU executor by default or the GPU slot cache under moe_disk_decode.
+    # File-backed FTW or indexed safetensors bank layers. Uses the same grammar as
+    # moe_cpu_layers. Decode uses the CPU executor by default or the GPU slot cache.
     moe_disk_layers: str | None = None
-    # Optional per-MoE-layer traffic scores used only by automatic FTW DISK spill
+    # Optional per-MoE-layer traffic scores used only by automatic DISK spill
     # selection. Explicit moe_disk_layers remains authoritative.
     moe_disk_layer_profile: str | None = None
     # Compact pinned HOT row capacity for DISK layers. A profile seeds the rows;
@@ -157,6 +159,11 @@ class EngineConfig:
 
         validate_speculative_mtp(self.speculative_mtp)
         validate_mtp_draft_tokens(self.mtp_draft_tokens)
+        if self.bank_source not in ("auto", "ftw", "index"):
+            raise ValueError(
+                "--bank-source must be 'auto', 'ftw', or 'index', got "
+                f"{self.bank_source!r}"
+            )
         if (
             not math.isfinite(float(self.kv_disk_cache_gib))
             or self.kv_disk_cache_gib < 0

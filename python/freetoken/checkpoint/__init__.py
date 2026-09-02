@@ -12,8 +12,15 @@ from .ftw import (
     load_ftw_banks,
 )
 from .convert import convert_checkpoint
+from .safetensors_bank_index import (
+    build_safetensors_bank_index,
+    ensure_safetensors_bank_index,
+    load_indexed_banks,
+)
 
 __all__ = [
     "FTWReader", "FTWWriter", "is_ftw_checkpoint",
     "iter_ftw_weights", "load_ftw_banks", "convert_checkpoint",
+    "build_safetensors_bank_index", "ensure_safetensors_bank_index",
+    "load_indexed_banks",
 ]
