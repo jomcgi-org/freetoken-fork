@@ -23,7 +23,8 @@ def decay_multiplier(half_life_steps: int, elapsed_steps: int = 1) -> float:
         raise ValueError("decay half-life must be positive")
     if elapsed_steps < 0:
         raise ValueError("elapsed decay steps must be non-negative")
-    return math.exp2(-float(elapsed_steps) / float(half_life_steps))
+    # math.exp2 is Python 3.11+; serving images still run 3.10
+    return 2.0 ** (-float(elapsed_steps) / float(half_life_steps))
 
 
 def update_decayed_counts(
