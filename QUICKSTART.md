@@ -53,7 +53,7 @@ between two interfaces on one subnet dropped one download from 107 to 21 MB/s.
 ## 4. Convert to FTW
 
 ```bash
-ft checkpoint --model models/flash-raw --out models/flash-e2m1.ftw
+ft checkpoint --model models/flash-raw --out models/flash.ftw
 ```
 
 The converter streams one expert layer at a time. On the reference box it
@@ -61,15 +61,21 @@ took 94 seconds. It has run out of memory on 64 GB cloud boxes with less
 headroom; if it does, add a swapfile on the NVMe for the conversion, or convert
 once on any machine with 96 GB or more.
 
-Then assemble the serving directory: the FTW shards and `freetoken_weight.json`
-from the converter, the model's `config.json` and tokenizer files from the raw
-checkpoint, and symlinks to the quantized table shards. Do not copy a
-`safetensors` index file into the directory; its absence is what makes the
-loader discover the table shards beside the weights.
+`models/flash.ftw` now holds the FTW shards, `freetoken_weight.json`, the
+model's config and tokenizer files, and still the raw safetensors with their
+index. Serving from it as is would use the unquantized fp8 table. The serving
+directory is a second directory of symlinks that leaves out the raw shards and
+the index and adds the quantized table shards. With no index file present the
+loader discovers the table shards beside the weights.
 
 ```bash
-cd models/flash-e2m1.ftw
-cp ../flash-raw/config.json ../flash-raw/tokenizer* ../flash-raw/generation_config.json .
+mkdir models/flash-e2m1.ftw && cd models/flash-e2m1.ftw
+for f in ../flash.ftw/*; do
+  case "$(basename "$f")" in
+    model-*.safetensors|model.safetensors.index.json) ;;
+    *) ln -s "$f" . ;;
+  esac
+done
 ln -s ../ple-quant/ples_nvfp4/*.safetensors .
 cd -
 ```
