@@ -143,7 +143,44 @@ def test_cache_stages_hot_sources_into_protected_gpu_rows():
     assert ids[0, 1].item() == -1
     assert ids[0, 0].item() >= 0
     assert ids[1, 0].item() >= 0
+    gpu_slots = ids[ids >= 0].long()
+    assert int(gpu_slots.max().item()) > cache.num_experts
+    expert_ids = cache.id_of_slot[gpu_slots] % cache.num_experts
+    assert sorted(expert_ids.tolist()) == [1, 4, 4]
     assert cache.num_indices.item() == 0
+
+
+def test_real_hot_split_geometry_uses_slots_beyond_expert_domain():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    layers, experts, hot_rows, cache_size = 28, 512, 55, 2564
+    cache = OffloadMoeCache(
+        num_layers=layers,
+        num_experts=experts,
+        cache_size=cache_size,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset(range(layers))
+    empty_bank = torch.empty((experts, 0, 0), dtype=torch.bfloat16)
+    cache.set_bank_sources(
+        {
+            "gate_up": [empty_bank] * layers,
+            "down": [empty_bank] * layers,
+        },
+        layer_residency=[HostResidency.DISK.value] * layers,
+        hot_expert_ids={layer_id: tuple(range(hot_rows)) for layer_id in range(layers)},
+    )
+    cache._restore_hot_slot_metadata()
+
+    first_slot = cache._hot_slot_for_row[0][0]
+    last_slot = cache._hot_slot_for_row[layers - 1][-1]
+    assert (first_slot, last_slot) == (1024, 2563)
+    assert last_slot > experts
+    assert cache.id_of_slot[last_slot].item() == ((layers - 1) * experts + hot_rows - 1)
+    assert cache.id_of_slot[last_slot].item() % experts == hot_rows - 1
 
 
 def test_disk_stats_report_hot_pair_rate_and_reset():
@@ -1116,7 +1153,10 @@ def _prefill_hot_split_fixture(
             ("schedule", ids.clone())
         ),
         prefetch_disk_experts=lambda layer_id, ids: calls.append(("prefetch",)),
-        bank_views=lambda: (),
+        bank_views=lambda: (
+            torch.empty((12, 0), dtype=torch.bfloat16),
+            torch.empty((12, 0), dtype=torch.bfloat16),
+        ),
         alphas_for_slots=lambda layer_id: None,
         record_prefill_hot_split=lambda raw, mask: calls.append(
             ("stats", raw.clone(), mask.clone())
@@ -1185,7 +1225,7 @@ def test_prefill_hot_split_populates_and_batches_only_cold_routes(
         atol=0,
     )
     assert gpu[2].tolist() == [[7, 0], [9, 0], [7, 0]]
-    assert gpu[3:] == (12, True)
+    assert gpu[3:] == (None, False)
     adaptation = next(call[1] for call in calls if call[0] == "adapt")
     assert adaptation.tolist() == [[0, 1], [2, 3], [0, 3]]
     stats = next(call for call in calls if call[0] == "stats")
@@ -1209,6 +1249,19 @@ def test_prefill_hot_split_degrades_to_full_cpu(monkeypatch, hot_slots, oom):
     assert cpu_ids.tolist() == [[0, 1], [2, 3], [0, 3]]
     stats = next(call for call in calls if call[0] == "stats")
     assert not bool(stats[2].any())
+
+
+def test_prefill_hot_split_rejects_slot_outside_bank_before_gemm(monkeypatch):
+    layer, hidden, weights, ids, calls, _cpu_out, _gpu_out = _prefill_hot_split_fixture(
+        monkeypatch, hot_slots=[12, -1, 9, -1]
+    )
+
+    with pytest.raises(
+        AssertionError, match=r"routed row id 12 exceeds bank row count 12"
+    ):
+        layer._prefill_routed(hidden, weights, ids)
+
+    assert not any(call[0] == "gpu" for call in calls)
 
 
 def test_prefill_hot_split_flag_off_preserves_full_cpu_path(monkeypatch):
@@ -1912,7 +1965,7 @@ def test_disk_hot_cold_split_prefill_matches_pure_cpu_prefill(tmp_path):
     cache = OffloadMoeCache(
         num_layers=1,
         num_experts=experts,
-        cache_size=experts,
+        cache_size=experts + 2,
         device=device,
         prefill_overlap=False,
         decode_target="cpu",
@@ -1925,6 +1978,7 @@ def test_disk_hot_cold_split_prefill_matches_pure_cpu_prefill(tmp_path):
         hot_sources=banks.hot_sources,
         hot_expert_ids=banks.hot_expert_ids,
     )
+    assert max(cache._hot_slot_for_row[0]) > experts
     row_bytes = sum(
         source[0][0].numel() * source[0].element_size()
         for source in banks.sources.values()
