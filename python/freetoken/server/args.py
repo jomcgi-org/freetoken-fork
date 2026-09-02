@@ -594,6 +594,16 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--bank-source",
+        default=ServerArgs.bank_source,
+        choices=["auto", "ftw", "index"],
+        help=(
+            "Expert bank source. 'auto' prefers FTW, then a supported byte-identical "
+            "safetensors index; 'ftw' and 'index' force one path."
+        ),
+    )
+
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(
         "--moe-cache-size",
@@ -672,10 +682,10 @@ def parse_args(
         type=str,
         default=ServerArgs.moe_disk_layers,
         help=(
-            "Which MoE layers keep expert banks as read-only file-backed FTW mappings "
+            "Which MoE layers keep expert banks as read-only file-backed mappings "
             "and use the selected DISK decode mode. Explicit id list ('3,7,11'), a count "
-            "('8' = 8 layers evenly strided), or a fraction ('0.5'). Requires a "
-            "checkpoint converted by `ft checkpoint`."
+            "('8' = 8 layers evenly strided), or a fraction ('0.5'). Requires FTW or "
+            "a supported byte-identical safetensors bank index."
         ),
     )
 
