@@ -78,6 +78,7 @@ def test_server_cli_exposes_uffd_pager_flags():
         EngineConfig.__dataclass_fields__["moe_prefill_coalesce"].default
         == "populate"
     )
+    assert EngineConfig.__dataclass_fields__["moe_prefill_hot_split"].default == "on"
 
     args, _ = parse_args([
         "--model", "/tmp/nonexistent-model",
@@ -85,6 +86,7 @@ def test_server_cli_exposes_uffd_pager_flags():
         "--moe-disk-pager", "uffd",
         "--moe-disk-lookahead", "off",
         "--moe-prefill-coalesce", "off",
+        "--moe-prefill-hot-split", "off",
         "--moe-step-timing",
         "--host-cache-reserve-gib", "9.5",
         "--moe-pager-budget-gib", "12.5",
@@ -92,6 +94,7 @@ def test_server_cli_exposes_uffd_pager_flags():
     assert args.moe_disk_pager == "uffd"
     assert args.moe_disk_lookahead == "off"
     assert args.moe_prefill_coalesce == "off"
+    assert args.moe_prefill_hot_split == "off"
     assert args.moe_step_timing is True
     assert args.host_cache_reserve_gib == 9.5
     assert args.moe_pager_budget_gib == 12.5
@@ -107,6 +110,18 @@ def test_server_cli_accepts_all_prefill_coalesce_values(value):
         "--moe-prefill-coalesce", value,
     ])
     assert args.moe_prefill_coalesce == value
+
+
+@pytest.mark.parametrize("value", ["on", "off"])
+def test_server_cli_accepts_all_prefill_hot_split_values(value):
+    from freetoken.server.args import parse_args
+
+    args, _ = parse_args([
+        "--model", "/tmp/nonexistent-model",
+        "--dtype", "bfloat16",
+        "--moe-prefill-hot-split", value,
+    ])
+    assert args.moe_prefill_hot_split == value
 
 
 def test_probe_reports_sysctl_requirement(monkeypatch):
