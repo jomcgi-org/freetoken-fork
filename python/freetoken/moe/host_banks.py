@@ -353,8 +353,15 @@ class HostBank:
         huge_enabled = hugepages_enabled(_requested_hugepage_mode)
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
-        allocation_alignment = _HUGEPAGE if huge_enabled and backing != "cuda" else (
-            mmap.PAGESIZE if backing == "uffd" else _BLK
+        # UFFD owns exact 4 KiB fault-addressable pages: its occupancy bitmap, LRU,
+        # and spanning-row accounting all use those units, and registration permits
+        # at most one partial page of mapping padding. Excluding UFFD from THP costs
+        # those banks 2 MiB page coverage, but preserves the pager's mapping invariant.
+        huge_eligible = huge_enabled and backing not in ("cuda", "uffd")
+        allocation_alignment = (
+            _HUGEPAGE
+            if huge_eligible
+            else (mmap.PAGESIZE if backing == "uffd" else _BLK)
         )
         asize = _round_up(self.nbytes, allocation_alignment)
         self._disk = backing in ("file", "uffd")
@@ -433,7 +440,7 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            if huge_enabled:
+            if huge_eligible:
                 self._mapping, self._buf, self.addr = _aligned_anonymous_mapping(asize)
             elif self._uffd:
                 self._mapping = self._buf = mmap.mmap(
@@ -491,6 +498,9 @@ class HostBank:
         self._locked = False
 
     def _apply_hugepage_advice(self) -> None:
+        if self._uffd:
+            self._hugepage_status["reason"] = "excluded: UFFD uses 4 KiB pager pages"
+            return
         if not hugepages_enabled(_requested_hugepage_mode):
             return
         status = self._hugepage_status
@@ -518,7 +528,16 @@ class HostBank:
         return HostResidency.PAGEABLE
 
     def memoryview(self) -> memoryview:
-        return memoryview(self._buf)
+        # Allocation alignment padding belongs to the bank mapping, not to callers.
+        # Expose only the logical tensor range so byte-range reads validate against
+        # the destination capacity rather than the padded mapping capacity.
+        return memoryview(self._buf).cast("B")[
+            self._view_offset : self._view_offset + self.nbytes
+        ]
+
+    def _mapping_memoryview(self) -> memoryview:
+        """Expose the padded allocation to the owning aligned bulk loader only."""
+        return memoryview(self._buf).cast("B")
 
     def pin(self) -> None:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
@@ -1185,8 +1204,12 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
     Byte-range counterpart of :func:`read_file_into`, for one tensor inside a shard. O_DIRECT needs the file offset AND the destination address block-aligned at the same time, which only holds when the two share their offset mod 4096 -- a safetensors data offset practically never lines up with the tensor's slot in the bank. Chunks that do line up DMA straight into ``buf``; the rest DMA into a page-aligned bounce (source window rounded out to whole blocks) and are copied into place, which also covers the unaligned head and tail.
     """
     mv = (buf if isinstance(buf, memoryview) else memoryview(buf)).cast("B")
-    if dest_offset + nbytes > len(mv):
-        raise ValueError(f"destination holds {len(mv)} bytes, need {dest_offset + nbytes}")
+    destination_len = len(mv)
+    required_len = dest_offset + nbytes
+    if destination_len < required_len:
+        raise ValueError(
+            f"destination holds {destination_len} bytes, need {required_len}"
+        )
     base = ctypes.addressof(ctypes.c_char.from_buffer(mv))
     if drop_cache:
         try:
