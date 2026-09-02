@@ -114,6 +114,22 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _gpu_prefill_layers(value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized in ("auto", "off"):
+            return normalized
+        try:
+            n = int(normalized)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "must be 'auto', 'off', or a positive integer"
+            ) from exc
+        if n < 1:
+            raise argparse.ArgumentTypeError(
+                "must be 'auto', 'off', or a positive integer"
+            )
+        return str(n)
+
     def _nonnegative_float(value: str) -> float:
         try:
             n = float(value)
@@ -883,7 +899,21 @@ def parse_args(
         ),
     )
 
-    parser.add_argument(
+    prefill_residency_group = parser.add_mutually_exclusive_group()
+    prefill_residency_group.add_argument(
+        "--moe-gpu-prefill-layers",
+        type=_gpu_prefill_layers,
+        metavar="{auto,N,off}",
+        default=ServerArgs.moe_gpu_prefill_layers,
+        help=(
+            "Pinned MoE layers reserved first for GPU prefill overlap during automatic "
+            "host-residency planning: 'auto' fits as many as the pin budget permits, "
+            "a positive integer forces exactly that many, and 'off' sends every "
+            "automatically planned layer through the CPU prefill path."
+        ),
+    )
+
+    prefill_residency_group.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",

@@ -181,7 +181,7 @@ def test_auto_budget_uses_lowest_profile_scores_with_stable_ties(tmp_path, monke
     monkeypatch.setattr("freetoken.engine.engine.logger.info_rank0", logs.append)
 
     assert auto_layers(_auto_config(tmp_path, profile), 6) == frozenset({1, 5})
-    assert "layer scores {1: 1.0, 5: 0.0}" in logs[-1]
+    assert "reserved GPU prefill layers [0, 4, 3, 2] first" in logs[-1]
     assert "([1, 5])" in logs[-1]
 
 
@@ -199,6 +199,18 @@ def test_auto_budget_accepts_versioned_layer_profile(tmp_path, monkeypatch):
     )
 
     assert auto_layers(_auto_config(tmp_path, profile), 4) == frozenset({1, 3})
+
+
+def test_gpu_prefill_off_sends_all_auto_layers_to_disk(tmp_path, monkeypatch):
+    _write_ftw_index(tmp_path, 4)
+    monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(401 / 2**30))
+    monkeypatch.setattr(
+        "freetoken.engine.engine._cpu_moe_executor_viable", lambda model_config: True,
+    )
+    config = _auto_config(tmp_path)
+    config.moe_gpu_prefill_layers = "off"
+
+    assert auto_layers(config, 4) == frozenset(range(4))
 
 
 def test_hot_partition_uses_equal_top_n_per_disk_layer_and_stable_ties():
@@ -321,7 +333,7 @@ def test_bad_profile_warns_and_falls_back(tmp_path, monkeypatch, caplog, content
     assert "falling back to head+tail DISK selection" in caplog.text
 
 
-def test_ple_disk_zero_reservation_expands_expert_pin_budget(tmp_path, monkeypatch):
+def test_external_reservation_refuses_zero_gpu_prefill_layers(tmp_path, monkeypatch):
     _write_ftw_index(tmp_path, 4)
     monkeypatch.setenv("FREETOKEN_PIN_BUDGET_GB", str(201 / 2**30))
     monkeypatch.setattr(
@@ -330,7 +342,8 @@ def test_ple_disk_zero_reservation_expands_expert_pin_budget(tmp_path, monkeypat
     config = _auto_config(tmp_path)
 
     assert auto_layers(config, 4, reserved=0) == frozenset({0, 3})
-    assert auto_layers(config, 4, reserved=200) == frozenset(range(4))
+    with pytest.raises(ValueError, match="cannot fit one MoE layer"):
+        auto_layers(config, 4, reserved=200)
 
 
 @pytest.mark.parametrize("mode", ["cpu", "copy"])
@@ -378,6 +391,7 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     )
     assert config.moe_disk_prefill == "cpu"
     assert config.moe_disk_decode == "cpu"
+    assert config.moe_gpu_prefill_layers == "auto"
     assert config.moe_hot_expert_budget_gib == 0
     assert config.moe_hot_adapt_halflife_steps == 2000
     assert config.moe_hot_adapt_interval_steps == 1000

@@ -37,6 +37,11 @@ class EngineConfig:
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
+    # Automatic host residency reserves these pinned layers for the GPU prefill
+    # overlap path before assigning the remaining layers to CPU or DISK.
+    # "auto" fits as many as the pin budget permits, "off" reserves none, and a
+    # positive integer string forces that exact count.
+    moe_gpu_prefill_layers: str = "auto"
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
