@@ -32,6 +32,20 @@ from freetoken.utils import init_logger
 logger = init_logger(__name__)
 
 
+def hot_dynamic_slot_reserve(
+    cache_size: int, num_experts: int, prefill_overlap: bool,
+) -> int:
+    """Headroom protected HOT rows must leave for ordinary cache traffic.
+
+    The normal one-layer or two-layer prefill floor is appropriate for a full-sized
+    cache, but applying it literally to a small cache can reserve every slot. Keep
+    at most half of the configured cache for this floor so HOT rows and dynamic
+    traffic can coexist in synthetic and deliberately small configurations.
+    """
+    floor = (2 if prefill_overlap else 1) * int(num_experts)
+    return min(floor, int(cache_size) // 2)
+
+
 def disk_gpufetch_capacity(
     *, max_tokens: int, top_k: int, num_experts: int, cache_size: int,
 ) -> int:
@@ -538,11 +552,14 @@ class OffloadMoeCache:
                             f"shape/dtype {hot.shape}/{hot.dtype}"
                         )
         total_hot_rows = sum(hot_expert_capacity.values())
-        dynamic_floor = 2 * self.num_experts if self.prefill_overlap else self.num_experts
-        if total_hot_rows + dynamic_floor > self.cache_size:
+        dynamic_reserve = hot_dynamic_slot_reserve(
+            self.cache_size, self.num_experts, self.prefill_overlap
+        )
+        if total_hot_rows and total_hot_rows + dynamic_reserve > self.cache_size:
             raise ValueError(
                 f"HOT residency needs {total_hot_rows} protected slots plus "
-                f"{dynamic_floor} dynamic/prefill slots, but moe_cache_size={self.cache_size}"
+                f"{dynamic_reserve} dynamic/prefill slots, but "
+                f"moe_cache_size={self.cache_size}"
             )
         first_hot_slot = self.cache_size - total_hot_rows
         next_hot_slot = first_hot_slot
@@ -770,11 +787,13 @@ class OffloadMoeCache:
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         self.validate_rebuild(cache_size)
         total_hot_rows = sum(self.hot_expert_capacity.values())
-        dynamic_floor = 2 * self.num_experts if self.prefill_overlap else self.num_experts
-        if total_hot_rows + dynamic_floor > cache_size:
+        dynamic_reserve = hot_dynamic_slot_reserve(
+            cache_size, self.num_experts, self.prefill_overlap
+        )
+        if total_hot_rows and total_hot_rows + dynamic_reserve > cache_size:
             raise ValueError(
                 f"HOT residency needs {total_hot_rows} protected slots plus "
-                f"{dynamic_floor} dynamic/prefill slots, but moe_cache_size={cache_size}"
+                f"{dynamic_reserve} dynamic/prefill slots, but moe_cache_size={cache_size}"
             )
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []

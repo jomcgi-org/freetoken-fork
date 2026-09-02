@@ -565,14 +565,14 @@ def glm_dsa_sparse_attn(
     q = q.contiguous()
     pool_2d = pool.reshape(-1, d)
     assert pool_2d.stride(-1) == 1
-    idx = topk_idxs.contiguous().to(torch.int32)
+    idx = topk_idxs.contiguous().to(device=q.device, dtype=torch.int32)
     broadcast_m = idx.shape[1] == 1 and m > 1
     assert broadcast_m or idx.shape[1] == m, (idx.shape, m)
     o = q.new_empty(b, m, h, d_v)
 
     has_counts = counts is not None
     if has_counts:
-        cnt = counts.contiguous().to(torch.int32).view(b, m)
+        cnt = counts.contiguous().to(device=q.device, dtype=torch.int32).view(b, m)
         stride_nb, stride_nm = cnt.stride()
     else:
         cnt, stride_nb, stride_nm = idx, 0, 0

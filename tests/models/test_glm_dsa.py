@@ -248,7 +248,14 @@ def _make_backend(dsa: bool, latent=80, dv=64, idx_dim=32, idx_heads=16, topk=64
         index_topk=topk, index_head_dim=idx_dim,
         indexer_types=("full", "shared"),
     )
-    cfg = SimpleNamespace(glm_dsa_args=args, num_qo_heads=8, attn_sm_scale=None, num_layers=2)
+    mla_spec = SimpleNamespace(mla=True, layer_ids=(0, 1))
+    cfg = SimpleNamespace(
+        glm_dsa_args=args,
+        num_qo_heads=8,
+        attn_sm_scale=None,
+        num_layers=2,
+        kv_cache_group_specs=lambda: (mla_spec,),
+    )
     return DSAAttnBackend(cfg), ctx
 
 

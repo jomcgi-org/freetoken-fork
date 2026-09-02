@@ -379,6 +379,10 @@ def test_hot_plan_refuses_when_slot_bound_leaves_zero_rows(tmp_path):
         moe_disk_layer_profile=str(profile),
     )
 
+    config.moe_hot_expert_budget_gib = 50 / 2**30
+    assert resolve_hot(config, frozenset({0, 3}), num_layers) == {}
+    config.moe_hot_expert_budget_gib = 1.0
+
     with pytest.raises(
         ValueError,
         match=(

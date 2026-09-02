@@ -515,8 +515,10 @@ def test_disk_prefetch_deduplicates_route_union_across_batch():
     assert executor._disk_decode_steps == 0
 
 
-def test_cpu_prefill_coalesce_dedupes_and_releases_after_layer():
+def test_cpu_prefill_coalesce_dedupes_and_releases_after_layer(monkeypatch):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    monkeypatch.setenv("FREETOKEN_PREFILL_EAGER_RELEASE", "1")
 
     class Bank:
         def __init__(self):

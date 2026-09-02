@@ -125,10 +125,18 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
             lead = None
             # Capped to the SERVED layer count (dev num_layers overrides must not
             # index slots past the pool the factory sized from the same cap).
-            mla_specs = [spec for spec in config.kv_cache_group_specs() if spec.mla]
-            if len(mla_specs) != 1:
-                raise ValueError(f"DSA needs one MLA cache group, got {len(mla_specs)}")
-            mla_layers = set(mla_specs[0].layer_ids)
+            specs_fn = getattr(config, "kv_cache_group_specs", None)
+            if specs_fn is None:
+                # Compatibility for focused backend doubles written before the
+                # attention-group seam. Such doubles model an all-MLA stack.
+                mla_layers = set(range(config.num_layers))
+            else:
+                mla_specs = [spec for spec in specs_fn() if spec.mla]
+                if len(mla_specs) != 1:
+                    raise ValueError(
+                        f"DSA needs one MLA cache group, got {len(mla_specs)}"
+                    )
+                mla_layers = set(mla_specs[0].layer_ids)
             for lid, kind in enumerate(args.indexer_types[: config.num_layers]):
                 if lid not in mla_layers:
                     continue
@@ -445,10 +453,12 @@ class DSAAttnBackend(DSAIndexerMixin, BaseAttnBackend):
                 sel = (
                     page_table[r.table_idx, : r.device_len]
                     .view(1, 1, -1)
-                    .to(torch.int32)
+                    .to(device=self.device, dtype=torch.int32)
                 )
                 cnt = (
-                    (batch.positions[qo[i] : qo[i + 1]] + 1).to(torch.int32).view(1, m)
+                    (batch.positions[qo[i] : qo[i + 1]] + 1)
+                    .to(device=self.device, dtype=torch.int32)
+                    .view(1, m)
                 )
             o[qo[i] : qo[i + 1]] = self._attend(
                 q_cat[qo[i] : qo[i + 1]].view(1, m, self.num_heads, self.latent_dim),
