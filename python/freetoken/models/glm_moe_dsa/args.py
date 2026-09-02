@@ -35,6 +35,10 @@ class GlmMoeDsaArgs:
     index_head_dim: int
     index_topk: int
     indexer_types: Tuple[str, ...]
+    # GLM-5.3 pools index keys in complete groups and always attends the open tail.
+    # GLM-5.2 omits these fields, so it resolves to the existing token path.
+    index_kpool: int
+    index_kpool_always_select_tail: bool
 
     @property
     def qk_head_dim(self) -> int:
@@ -50,7 +54,9 @@ class GlmMoeDsaArgs:
 
 def load_args(hf_config: Any) -> GlmMoeDsaArgs:
     rope = getattr(hf_config, "rope_parameters", None) or {}
-    rope_theta = float(rope.get("rope_theta", getattr(hf_config, "rope_theta", 10000.0)))
+    rope_theta = float(
+        rope.get("rope_theta", getattr(hf_config, "rope_theta", 10000.0))
+    )
     return GlmMoeDsaArgs(
         hidden_size=hf_config.hidden_size,
         num_heads=hf_config.num_attention_heads,
@@ -65,12 +71,18 @@ def load_args(hf_config: Any) -> GlmMoeDsaArgs:
         # sglang convention: is_neox_style = not indexer_rope_interleave. DSV3.2
         # defaults half-split (False); GLM-5.2 sets True (interleaved indexer rope --
         # transformers >= 5.13 is explicit that this DIFFERS from DeepSeek-V3.2).
-        indexer_rope_interleave=bool(getattr(hf_config, "indexer_rope_interleave", False)),
+        indexer_rope_interleave=bool(
+            getattr(hf_config, "indexer_rope_interleave", False)
+        ),
         max_position=hf_config.max_position_embeddings,
         index_n_heads=int(getattr(hf_config, "index_n_heads", 0)),
         index_head_dim=int(getattr(hf_config, "index_head_dim", 0)),
         index_topk=int(getattr(hf_config, "index_topk", 0)),
         indexer_types=tuple(getattr(hf_config, "indexer_types", ()) or ()),
+        index_kpool=max(1, int(getattr(hf_config, "index_kpool", 1) or 1)),
+        index_kpool_always_select_tail=bool(
+            getattr(hf_config, "index_kpool_always_select_tail", True)
+        ),
     )
 
 

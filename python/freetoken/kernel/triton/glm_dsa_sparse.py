@@ -196,6 +196,208 @@ def glm_dsa_decode_logits(
 
 
 @triton.jit
+def _glm_dsa_pooled_decode_logits_kernel(
+    q_ptr,
+    w_ptr,
+    state_ptr,
+    ape_ptr,
+    rows_ptr,
+    valid_ptr,
+    out_ptr,
+    N_TOKENS,
+    stride_qb,
+    stride_qh,
+    stride_qd,
+    stride_wb,
+    stride_wh,
+    stride_sr,
+    stride_sd,
+    stride_ak,
+    stride_ad,
+    stride_rb,
+    stride_rw,
+    stride_ob,
+    stride_op,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KPOOL: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    """Decode scores over complete GLM-5.3 learned k-pools.
+
+    The token state row is ``key[D] | compression_gate[D]``. Softmax is
+    evaluated over KPOOL independently for every channel, then the bf16 pooled
+    key is scored by the usual head-reduced DSA formula.
+    """
+    pid_b = tl.program_id(0)
+    pid_p = tl.program_id(1)
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    n_stage = tl.cdiv(N_TOKENS, KPOOL)
+    store_mask = offs_p < n_stage
+    n_valid = tl.load(valid_ptr + pid_b)
+    n_complete = n_valid // KPOOL
+    pool_valid = offs_p < n_complete
+
+    offs_d = tl.arange(0, D)
+    max_logits = tl.full((BLOCK_P, D), -float("inf"), tl.float32)
+    for member in range(0, KPOOL):
+        token = offs_p * KPOOL + member
+        token_valid = store_mask & (token < N_TOKENS) & (token < n_valid)
+        physical = tl.load(
+            rows_ptr + pid_b * stride_rb + token * stride_rw,
+            mask=token_valid,
+            other=0,
+        )
+        gate = tl.load(
+            state_ptr
+            + physical[:, None] * stride_sr
+            + (D + offs_d[None, :]) * stride_sd,
+            mask=token_valid[:, None],
+            other=-float("inf"),
+        ).to(tl.float32)
+        ape = tl.load(ape_ptr + member * stride_ak + offs_d * stride_ad).to(tl.float32)
+        max_logits = tl.maximum(max_logits, gate + ape[None, :])
+
+    denominator = tl.zeros((BLOCK_P, D), tl.float32)
+    for member in range(0, KPOOL):
+        token = offs_p * KPOOL + member
+        token_valid = store_mask & (token < N_TOKENS) & (token < n_valid)
+        physical = tl.load(
+            rows_ptr + pid_b * stride_rb + token * stride_rw,
+            mask=token_valid,
+            other=0,
+        )
+        gate = tl.load(
+            state_ptr
+            + physical[:, None] * stride_sr
+            + (D + offs_d[None, :]) * stride_sd,
+            mask=token_valid[:, None],
+            other=-float("inf"),
+        ).to(tl.float32)
+        ape = tl.load(ape_ptr + member * stride_ak + offs_d * stride_ad).to(tl.float32)
+        numerator = tl.exp(gate + ape[None, :] - max_logits)
+        numerator = tl.where(token_valid[:, None], numerator, 0.0)
+        denominator += numerator
+
+    pooled = tl.zeros((BLOCK_P, D), tl.float32)
+    for member in range(0, KPOOL):
+        token = offs_p * KPOOL + member
+        token_valid = store_mask & (token < N_TOKENS) & (token < n_valid)
+        physical = tl.load(
+            rows_ptr + pid_b * stride_rb + token * stride_rw,
+            mask=token_valid,
+            other=0,
+        )
+        key = tl.load(
+            state_ptr + physical[:, None] * stride_sr + offs_d[None, :] * stride_sd,
+            mask=token_valid[:, None],
+            other=0.0,
+        )
+        gate = tl.load(
+            state_ptr
+            + physical[:, None] * stride_sr
+            + (D + offs_d[None, :]) * stride_sd,
+            mask=token_valid[:, None],
+            other=-float("inf"),
+        ).to(tl.float32)
+        ape = tl.load(ape_ptr + member * stride_ak + offs_d * stride_ad).to(tl.float32)
+        probability = (tl.exp(gate + ape[None, :] - max_logits) / denominator).to(
+            tl.bfloat16
+        )
+        pooled += (probability * key).to(tl.float32)
+    pooled = pooled.to(tl.bfloat16)
+
+    offs_h = tl.arange(0, BLOCK_H)
+    h_mask = offs_h < H
+    q = tl.load(
+        q_ptr
+        + pid_b * stride_qb
+        + offs_h[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd,
+        mask=h_mask[:, None],
+        other=0.0,
+    )
+    weights = tl.load(
+        w_ptr + pid_b * stride_wb + offs_h * stride_wh,
+        mask=h_mask,
+        other=0.0,
+    ).to(tl.float32)
+    score = tl.dot(q, tl.trans(pooled))
+    logits = tl.sum(tl.maximum(score, 0.0) * weights[:, None], axis=0)
+    tl.store(
+        out_ptr + pid_b * stride_ob + offs_p * stride_op,
+        tl.where(pool_valid, logits, float("-inf")),
+        mask=store_mask,
+    )
+
+
+def glm_dsa_pooled_decode_logits(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    token_states: torch.Tensor,
+    ape: torch.Tensor,
+    rows: torch.Tensor,
+    valid: torch.Tensor,
+    index_kpool: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Head-reduced logits over complete learned k-pools for decode."""
+    b, h, d = q.shape
+    if index_kpool <= 1:
+        raise ValueError("pooled decode logits need index_kpool > 1")
+    if token_states.shape[-1] != 2 * d:
+        raise ValueError(
+            f"pooled token state width must be {2 * d}, got {token_states.shape[-1]}"
+        )
+    if ape.shape != (index_kpool, d):
+        raise ValueError(
+            f"pooled APE must be {(index_kpool, d)}, got {tuple(ape.shape)}"
+        )
+    if d != triton.next_power_of_2(d):
+        raise ValueError(f"index_head_dim must be pow2, got {d}")
+    if h < 16:
+        raise ValueError(f"tl.dot needs at least 16 index heads, got {h}")
+    n_tokens = rows.shape[1]
+    n_pools = triton.cdiv(n_tokens, index_kpool)
+    weights = weights.to(torch.float32).contiguous()
+    if out is None:
+        out = torch.empty(b, n_pools, dtype=torch.float32, device=q.device)
+    block_p = 16
+    _glm_dsa_pooled_decode_logits_kernel[(b, triton.cdiv(n_pools, block_p))](
+        q,
+        weights,
+        token_states,
+        ape,
+        rows,
+        valid,
+        out,
+        n_tokens,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        weights.stride(0),
+        weights.stride(1),
+        token_states.stride(0),
+        token_states.stride(1),
+        ape.stride(0),
+        ape.stride(1),
+        rows.stride(0),
+        rows.stride(1),
+        out.stride(0),
+        out.stride(1),
+        H=h,
+        D=d,
+        KPOOL=index_kpool,
+        BLOCK_H=triton.next_power_of_2(h),
+        BLOCK_P=block_p,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out
+
+
+@triton.jit
 def _glm_dsa_splitk_kernel(
     q_ptr, pool_ptr, mid_o_ptr, mid_lse_ptr, idx_ptr, cnt_ptr,
     scale,
@@ -424,4 +626,8 @@ def glm_dsa_sparse_attn(
     return o
 
 
-__all__ = ["glm_dsa_sparse_attn", "glm_dsa_decode_logits"]
+__all__ = [
+    "glm_dsa_decode_logits",
+    "glm_dsa_pooled_decode_logits",
+    "glm_dsa_sparse_attn",
+]

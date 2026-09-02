@@ -72,11 +72,23 @@ class GlmDsaIndexer(BaseOP):
         args = config.glm_dsa_args
         self.n_heads = args.index_n_heads
         self.head_dim = args.index_head_dim
+        self.index_kpool = getattr(args, "index_kpool", 1)
         self.softmax_scale = args.index_head_dim**-0.5
-        self.wq_b = LinearReplicated(args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False)
+        self.wq_b = LinearReplicated(
+            args.q_lora_rank, self.n_heads * self.head_dim, has_bias=False
+        )
         self.wk = LinearReplicated(args.hidden_size, self.head_dim, has_bias=False)
         self.k_norm = _IdxLayerNorm(self.head_dim, eps=1e-6)
-        self.weights_proj = LinearReplicated(args.hidden_size, self.n_heads, has_bias=False)
+        self.weights_proj = LinearReplicated(
+            args.hidden_size, self.n_heads, has_bias=False
+        )
+        if self.index_kpool > 1:
+            # Checkpoint names intentionally have no trailing ``.weight``. BaseOP
+            # registers raw tensors, matching the Transformers module exactly.
+            self.index_kpool_compress_ape = torch.empty(self.index_kpool, self.head_dim)
+            self.index_kpool_compress_gate = torch.empty(
+                self.head_dim, args.hidden_size
+            )
         # Partial rope on the first qk_rope_head_dim dims of the 128-dim index heads,
         # same frequency table as the main rope. The convention is CONFIG-DRIVEN
         # (sglang: is_neox_style = not indexer_rope_interleave): GLM-5.2 sets
@@ -97,15 +109,26 @@ class GlmDsaIndexer(BaseOP):
 
     def compute(
         self, x: torch.Tensor, q_resid: torch.Tensor, positions: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per-token indexer projections: (q [T, H, D], k [T, D], weights [T, H] fp32)."""
+    ) -> tuple[torch.Tensor, ...]:
+        """Indexer projections.
+
+        The token path returns ``(q, k, weights)`` unchanged. The pooled path
+        returns ``(q, cat(k, gate), weights, ape)`` so the cache keeps the two
+        token states Transformers needs to rebuild complete pooled candidates.
+        """
+        import torch.nn.functional as F
+
         t = x.shape[0]
         q = self.wq_b.forward(q_resid).view(t, self.n_heads * self.head_dim)
         k = self.k_norm.forward(self.wk.forward(x)).view(t, self.head_dim)
         if self._rope is not None:
             q, k = self._rope.forward(positions, q, k)
         w = self.weights_proj.forward(x).float() * (self.n_heads**-0.5)
-        return q.view(t, self.n_heads, self.head_dim), k, w
+        q = q.view(t, self.n_heads, self.head_dim)
+        if self.index_kpool == 1:
+            return q, k, w
+        gate = F.linear(x, self.index_kpool_compress_gate)
+        return q, torch.cat([k, gate], dim=-1), w, self.index_kpool_compress_ape
 
 
 class GlmMoeDsaAttention(BaseOP):
@@ -147,7 +170,9 @@ class GlmMoeDsaAttention(BaseOP):
         quant = config.attn_quant
         self.q_a_proj = _make_proj(quant, args.hidden_size, args.q_lora_rank)
         self.q_a_layernorm = RMSNorm(args.q_lora_rank, eps=args.norm_eps)
-        self.q_b_proj = _make_proj(quant, args.q_lora_rank, self.num_heads * self.qk_head_dim)
+        self.q_b_proj = _make_proj(
+            quant, args.q_lora_rank, self.num_heads * self.qk_head_dim
+        )
         self.kv_a_proj_with_mqa = _make_proj(
             quant, args.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim
         )
@@ -159,7 +184,9 @@ class GlmMoeDsaAttention(BaseOP):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             has_bias=False,
         )
-        self.o_proj = _make_proj(quant, self.num_heads * self.v_head_dim, args.hidden_size)
+        self.o_proj = _make_proj(
+            quant, self.num_heads * self.v_head_dim, args.hidden_size
+        )
         # Contiguous per-head kv_b split, cached on first forward (see _kv_b). Absorbing
         # kv_b into Q/O runs as a per-head bf16 bmm on these instead of re-slicing +
         # re-upcasting the bf16 weight per token (bf16 einsum with tensor-core fp32
@@ -182,7 +209,9 @@ class GlmMoeDsaAttention(BaseOP):
         """
         if self._w_uk is None:
             w = self.kv_b_proj.weight.view(
-                self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+                self.kv_lora_rank,
             )
             self._w_uk = w[:, : self.qk_nope_head_dim, :].contiguous()
             self._w_uv = w[:, self.qk_nope_head_dim :, :].transpose(1, 2).contiguous()
@@ -222,14 +251,17 @@ class GlmMoeDsaAttention(BaseOP):
             c_kv, k_rope = self.kv_a_layernorm.forward(kv), None
 
         # Absorb kv_b's k-part into the query: q_nope[H,T,nope] @ W_uk[H,nope,lora].
-        q_absorbed = torch.bmm(q_nope.transpose(0, 1).contiguous(), w_uk).transpose(0, 1)
+        q_absorbed = torch.bmm(q_nope.transpose(0, 1).contiguous(), w_uk).transpose(
+            0, 1
+        )
 
         # DSA: full layers hand the backend this token's indexer projections (the
         # backend caches the keys, scores the history, and selects top-k); shared
         # layers pass None and reuse their group leader's selection.
         indexer_qkw = (
             self.indexer.compute(x, q_a_resid, ctx.batch.positions)
-            if self.indexer is not None and getattr(ctx.attn_backend, "dsa_enabled", False)
+            if self.indexer is not None
+            and getattr(ctx.attn_backend, "dsa_enabled", False)
             else None
         )
 
@@ -240,7 +272,9 @@ class GlmMoeDsaAttention(BaseOP):
             q_rope.contiguous() if q_rope is not None else None,
             c_kv.contiguous(),
             k_rope.contiguous() if k_rope is not None else None,
-            self.layer_id, ctx.batch, indexer_qkw=indexer_qkw,
+            self.layer_id,
+            ctx.batch,
+            indexer_qkw=indexer_qkw,
         )  # [T, H, kv_lora_rank]
 
         # Absorb kv_b's v-part onto the output: o_latent[H,T,lora] @ W_uv_t[H,lora,v].
