@@ -55,6 +55,20 @@ class GenerationError(Exception):
         self.status_code = status_code
 
 
+async def await_with_disconnect(
+    awaitable, *, request: Any | None, state: Any, uid: int
+):
+    """Use the production frontend's ASGI disconnect race when one is available.
+
+    Protocol tests and offline callers intentionally use small state/request doubles. They
+    have no ASGI receive channel and continue to await generation directly.
+    """
+    runner = getattr(state, "run_with_cancellation", None)
+    if request is None or runner is None or not hasattr(request, "receive"):
+        return await awaitable
+    return await runner(awaitable, request, uid)
+
+
 # --------------------------------------------------------------------------- #
 # Protocol-neutral generation events.
 #

@@ -12,9 +12,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal
 
+import anyio
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from freetoken import __version__
 from freetoken.core import SamplingParams
 from freetoken.message import (
@@ -41,6 +42,7 @@ from .args import ServerArgs
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
+from .disconnect import DisconnectAwareStreamingResponse
 from .openai_api import register_openai_routes
 from . import request_ring
 from .access_log_filter import install_polling_access_log_filter
@@ -200,6 +202,8 @@ class FrontendManager:
     _frontend_tokenizer_lock: Any = field(default_factory=threading.Lock)
     # One-shot guard for warm_frontend_tokenizer(); benign if two polls race it.
     _frontend_warm_started: bool = False
+    # Idempotence guard for disconnect and shutdown paths racing on the same request.
+    _abort_sent: set[int] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if self.stats is None:
@@ -258,6 +262,8 @@ class FrontendManager:
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
                 # request remains gated below, but observation must happen first.
                 self.stats.observe(msg)
+                if msg.finished:
+                    self._abort_sent.discard(msg.uid)
                 if msg.uid not in self.ack_map:
                     continue
                 self.ack_map[msg.uid].append(msg)
@@ -375,26 +381,84 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_with_cancellation(self, generator, request: Request, uid: int):
+        if getattr(self.config, "abort_on_disconnect", "on") == "off":
+            async for chunk in generator:
+                yield chunk
+            return
         try:
             async for chunk in generator:
-                # detect if the client has disconnected
-                if await request.is_disconnected():
-                    logger.info("Client disconnected for user %s", uid)
-                    raise asyncio.CancelledError
                 yield chunk
         except asyncio.CancelledError:
-            asyncio.create_task(self.abort_user(uid))
+            # StreamingResponse has a dedicated ASGI receive task. It cancels this body
+            # iterator as soon as it receives http.disconnect, including while the iterator
+            # is blocked waiting for a long prefill to produce its first byte.
+            logger.info("Client disconnected for user %s", uid)
+            # The response cancels this iterator through an AnyIO task group. Shield the
+            # control send from that scope so cancellation cannot strand backend work.
+            with anyio.CancelScope(shield=True):
+                await asyncio.shield(
+                    self.abort_user(uid, client_disconnected=True)
+                )
             raise
 
-    async def abort_user(self, uid: int):
-        await asyncio.sleep(0.1)
-        if uid in self.ack_map:
-            del self.ack_map[uid]
-        if uid in self.event_map:
-            del self.event_map[uid]
+    @staticmethod
+    async def _wait_for_disconnect(request: Request) -> None:
+        """Wait directly on the post-body ASGI receive channel for peer disconnect."""
+        while True:
+            message = await request.receive()
+            if message["type"] == "http.disconnect":
+                return
+
+    async def run_with_cancellation(self, awaitable, request: Request, uid: int):
+        """Race a non-streaming generation against its request's ASGI disconnect event."""
+        if getattr(self.config, "abort_on_disconnect", "on") == "off":
+            return await awaitable
+
+        work = asyncio.ensure_future(awaitable)
+        disconnected = asyncio.create_task(self._wait_for_disconnect(request))
+        try:
+            done, _ = await asyncio.wait(
+                (work, disconnected), return_when=asyncio.FIRST_COMPLETED
+            )
+            if disconnected in done:
+                # If both complete in one loop turn, stop the HTTP handler so a multi-prompt
+                # completion cannot submit its next request after losing the peer. abort_user
+                # skips work whose terminal ack already removed its frontend maps.
+                logger.info("Client disconnected for user %s", uid)
+                try:
+                    await self.abort_user(uid, client_disconnected=True)
+                finally:
+                    if not work.done():
+                        work.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await work
+                raise asyncio.CancelledError
+            return await work
+        finally:
+            disconnected.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await disconnected
+
+    async def abort_user(self, uid: int, *, client_disconnected: bool = False):
+        if client_disconnected and getattr(self.config, "abort_on_disconnect", "on") == "off":
+            return
+        inflight = getattr(self.stats, "inflight_uids", None)
+        if client_disconnected and inflight is not None and uid not in inflight:
+            return
+        # wait_for_ack removes both maps as soon as it consumes a terminal result. Skipping
+        # here prevents a late socket close during response-body drain from becoming an abort.
+        if uid in self._abort_sent or (uid not in self.ack_map and uid not in self.event_map):
+            return
+        self._abort_sent.add(uid)
         self.stats.on_abort(uid)
         logger.warning("Aborting request for user %s", uid)
-        await self.send_one(AbortMsg(uid=uid))
+        try:
+            await self.send_one(
+                AbortMsg(uid=uid, client_disconnected=client_disconnected)
+            )
+        except BaseException:
+            self._abort_sent.discard(uid)
+            raise
 
     def shutdown(self):
         self.send_tokenizer.stop()
@@ -903,7 +967,7 @@ async def generate(req: GenerateRequest, request: Request):
         )
     )
 
-    return StreamingResponse(
+    return DisconnectAwareStreamingResponse(
         state.stream_with_cancellation(state.stream_generate(uid), request, uid),
         media_type="text/event-stream",
     )

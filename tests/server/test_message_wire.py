@@ -10,6 +10,8 @@ from __future__ import annotations
 import torch
 
 from freetoken.message import (
+    AbortBackendMsg,
+    AbortMsg,
     BaseBackendMsg,
     DetokenizeMsg,
     BaseFrontendMsg,
@@ -28,6 +30,16 @@ from freetoken.message import (
     UserReply,
 )
 from freetoken.core import SamplingParams
+
+
+def test_client_abort_messages_roundtrip():
+    frontend = AbortMsg(uid=41, client_disconnected=True)
+    decoded_frontend = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(frontend))
+    assert decoded_frontend == frontend
+
+    backend = AbortBackendMsg(uid=41, client_disconnected=True)
+    decoded_backend = BaseBackendMsg.decoder(backend.encoder())
+    assert decoded_backend == backend
 
 
 def test_cache_rebuild_msg_roundtrip():

@@ -6,13 +6,14 @@ No Engine is initialized and no CUDA device is required.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 import freetoken.scheduler.scheduler as scheduler_module
-from freetoken.message import ErrorReplyMsg
+from freetoken.message import AbortBackendMsg, ErrorReplyMsg
 from freetoken.scheduler.cache import CacheManager
 from freetoken.scheduler.scheduler import ForwardInput, Scheduler
 
@@ -30,8 +31,13 @@ def _forward_input(batch: SimpleNamespace) -> ForwardInput:
     return ForwardInput(batch=batch, sample_args=None, input_tuple=None, write_tuple=None)
 
 
-def _req(uid: int, admission_order: int) -> SimpleNamespace:
-    return SimpleNamespace(uid=uid, admission_order=admission_order, table_idx=uid)
+def _req(uid: int, admission_order: int, cached_len: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(
+        uid=uid,
+        admission_order=admission_order,
+        table_idx=uid,
+        cached_len=cached_len,
+    )
 
 
 def _scheduler(monkeypatch):
@@ -60,14 +66,24 @@ def _scheduler(monkeypatch):
 
     sched.cache_manager = SimpleNamespace(cache_req=cache_req)
     sched.table_manager = SimpleNamespace(free=free_table)
-    sched.prefill_manager = SimpleNamespace(runnable=True, abort_req=abort_prefill)
-    sched.decode_manager = SimpleNamespace(runnable=False, remove_req=remove_decode)
-    sched.status_reporter = SimpleNamespace(oom_aborts=0)
+    sched.prefill_manager = SimpleNamespace(
+        runnable=True, pending_list=[], abort_req=abort_prefill
+    )
+    sched.decode_manager = SimpleNamespace(
+        runnable=False,
+        running_reqs=[],
+        remove_req=remove_decode,
+        abort_req=lambda uid: None,
+    )
+    sched.status_reporter = SimpleNamespace(oom_aborts=0, client_aborts=0)
     sched.engine = SimpleNamespace(stream=SimpleNamespace(synchronize=synchronize))
     sched.device = torch.device("cuda")
     sched.finished_reqs = set()
     sched._pending_oom_errors = {}
     sched._pending_abort_acks = set()
+    sched._abort_tombstones = {}
+    sched._completed_uids = {}
+    sched._last_data = None
     sched._pending_rebuild = None
     sent: list[ErrorReplyMsg] = []
     sched.send_result = lambda replies: sent.extend(replies)
@@ -249,3 +265,128 @@ def test_failed_cache_cleanup_discards_all_pools_without_prefix_commit():
     assert calls.swa == [[102, 103, 104]]
     assert calls.gdn == [60]
     assert calls.profiles == [60]
+
+
+def test_client_abort_drops_queued_request_before_admission(monkeypatch):
+    sched, calls, _sent = _scheduler(monkeypatch)
+    pending = SimpleNamespace(uid=70, chunked_req=None)
+    sched.prefill_manager.pending_list = [pending]
+    logs = []
+    monkeypatch.setattr(
+        scheduler_module,
+        "logger",
+        SimpleNamespace(
+            warning_rank0=lambda message, *args: logs.append(message % args),
+            debug_rank0=lambda *_args: None,
+        ),
+    )
+
+    def abort_prefill(uid):
+        calls.prefill_aborts.append(uid)
+        sched.prefill_manager.pending_list = [
+            req for req in sched.prefill_manager.pending_list if req.uid != uid
+        ]
+        return None
+
+    sched.prefill_manager.abort_req = abort_prefill
+
+    Scheduler._process_one_msg(
+        sched, AbortBackendMsg(uid=70, client_disconnected=True)
+    )
+
+    assert sched.prefill_manager.pending_list == []
+    assert calls.prefill_aborts == [70]
+    assert calls.cache == [] and calls.tables == []
+    assert sched.status_reporter.client_aborts == 1
+    assert 70 in sched._pending_abort_acks
+    assert logs == [
+        "Client abort request_id=70, phase=queued, tokens_processed=0"
+    ]
+
+
+def test_client_abort_of_inflight_request_releases_owned_slots(monkeypatch):
+    sched, calls, _sent = _scheduler(monkeypatch)
+    req = type("ReqDouble", (), {})()
+    req.uid = 71
+    req.admission_order = 11
+    req.table_idx = 71
+    req.cached_len = 123
+    req.device_len = 124
+    req.aborted = False
+    sched.decode_manager.running_reqs = [req]
+    logs = []
+    monkeypatch.setattr(
+        scheduler_module,
+        "logger",
+        SimpleNamespace(
+            warning_rank0=lambda message, *args: logs.append(message % args),
+            debug_rank0=lambda *_args: None,
+        ),
+    )
+
+    def abort_decode(uid):
+        for running in list(sched.decode_manager.running_reqs):
+            if running.uid == uid:
+                sched.decode_manager.running_reqs.remove(running)
+                return running
+        return None
+
+    sched.decode_manager.abort_req = abort_decode
+    batch = _batch("prefill", [req])
+    copy_done = SimpleNamespace(synchronize=lambda: None)
+    sched._last_data = (
+        SimpleNamespace(batch=batch),
+        (None, torch.tensor([], dtype=torch.int32), copy_done),
+    )
+    sched.cache_manager.lazy_free_region = nullcontext
+    sched._kv_usage_pages = lambda: (0, 0)
+    sched._mamba_slot_usage = lambda: None
+    sched._swa_token_usage = lambda: None
+    sched._gpu_mem_bytes = lambda: 0
+    sched.prefill_manager.queue_stats = lambda: ({}, 0.0)
+    sched.status_reporter.report_batch = lambda *args, **kwargs: None
+    sched.config = SimpleNamespace(page_size=1)
+
+    Scheduler._process_one_msg(
+        sched, AbortBackendMsg(uid=71, client_disconnected=True)
+    )
+
+    assert req.aborted
+    assert req.table_idx == 71
+    assert calls.cache == [] and calls.tables == []
+
+    Scheduler._process_last_data(sched, sched._last_data)
+
+    # failed=True selects the OOM guard's discard path: release every request-owned
+    # KV/GDN allocation without inserting a prefix or parking a session profile.
+    assert calls.cache == [(71, True, True)]
+    assert calls.tables == [71]
+    assert req.table_idx == -1
+    assert req.device_len == 123
+    assert sched.decode_manager.running_reqs == []
+    assert sched.status_reporter.client_aborts == 1
+    assert logs == [
+        "Client abort request_id=71, phase=prefill, tokens_processed=123"
+    ]
+
+
+def test_client_abort_does_not_abort_completed_request_during_output_drain(monkeypatch):
+    sched, calls, _sent = _scheduler(monkeypatch)
+    req = _req(72, 12, cached_len=128)
+    req.table_idx = -1
+    sched.finished_reqs = [req]
+
+    def unexpected_abort(_uid):
+        raise AssertionError("completed request must not reach manager abort paths")
+
+    sched.prefill_manager.abort_req = unexpected_abort
+    sched.decode_manager.abort_req = unexpected_abort
+
+    Scheduler._process_one_msg(
+        sched, AbortBackendMsg(uid=72, client_disconnected=True)
+    )
+
+    assert calls.cache == [] and calls.tables == []
+    assert sched.status_reporter.client_aborts == 0
+    assert 72 not in sched._abort_tombstones
+    assert 72 not in sched._pending_abort_acks

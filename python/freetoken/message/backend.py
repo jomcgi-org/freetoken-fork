@@ -45,6 +45,7 @@ class UserMsg(BaseBackendMsg):
 @dataclass
 class AbortBackendMsg(BaseBackendMsg):
     uid: int
+    client_disconnected: bool = False
 
 
 @dataclass

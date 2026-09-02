@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from freetoken.core import SamplingParams
 from freetoken.guided import (
     GuidedDecodingUnavailable,
@@ -27,6 +27,7 @@ from .api_models import (
     ToolChoiceObject,
 )
 from .function_call_parser import ToolCallItem
+from .disconnect import DisconnectAwareStreamingResponse
 from .generation import (
     ContentDelta,
     GenDone,
@@ -36,6 +37,7 @@ from .generation import (
     ToolCallArgsDelta,
     ToolCallsDelta,
     ToolCallStart,
+    await_with_disconnect,
     generate_events,
     generate_full,
     prerender_error,
@@ -265,10 +267,15 @@ async def handle_chat_completion(
         chunks = stream_chat_completion_chunks(uid, req, state, spec)
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
-        return StreamingResponse(chunks, media_type="text/event-stream")
+        return DisconnectAwareStreamingResponse(chunks, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
+        result = await await_with_disconnect(
+            generate_full(uid, spec, state, source="/v1/chat/completions"),
+            request=request,
+            state=state,
+            uid=uid,
+        )
     except GenerationError as exc:
         return create_error_response(
             str(exc),
@@ -491,7 +498,7 @@ async def handle_completion(
         chunks = stream_completion_chunks(uid, req, state)
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
-        return StreamingResponse(chunks, media_type="text/event-stream")
+        return DisconnectAwareStreamingResponse(chunks, media_type="text/event-stream")
 
     choices: list[dict[str, Any]] = []
     prompt_tokens = 0
@@ -507,27 +514,48 @@ async def handle_completion(
                 priority=priority,
             )
         )
-        text = ""
-        finish_reason = "stop"
-        async for ack in state.wait_for_ack(uid):
-            if getattr(ack, "error", None):
-                return create_error_response(
-                    ack.error,
-                    status_code=getattr(ack, "error_status_code", 400),
-                    err_type=(
-                        "server_error"
-                        if getattr(ack, "error_status_code", 400) >= 500
-                        else "invalid_request_error"
-                    ),
-                    code=getattr(ack, "error_code", None),
-                )
-            prompt_tokens += ack.prompt_tokens_delta
-            completion_tokens += ack.completion_tokens_delta
-            cached_tokens += ack.cached_tokens
-            text += ack.incremental_output
-            if ack.finished:
-                finish_reason = getattr(ack, "finish_reason", None) or "stop"
-                break
+        async def _collect_completion():
+            text = ""
+            finish_reason = "stop"
+            one_prompt_tokens = 0
+            one_completion_tokens = 0
+            one_cached_tokens = 0
+            async for ack in state.wait_for_ack(uid):
+                if getattr(ack, "error", None):
+                    raise GenerationError(
+                        ack.error,
+                        getattr(ack, "error_code", None),
+                        getattr(ack, "error_status_code", 400),
+                    )
+                one_prompt_tokens += ack.prompt_tokens_delta
+                one_completion_tokens += ack.completion_tokens_delta
+                one_cached_tokens += ack.cached_tokens
+                text += ack.incremental_output
+                if ack.finished:
+                    finish_reason = getattr(ack, "finish_reason", None) or "stop"
+                    break
+            return (
+                text,
+                finish_reason,
+                one_prompt_tokens,
+                one_completion_tokens,
+                one_cached_tokens,
+            )
+
+        try:
+            text, finish_reason, pt, ct, cached = await await_with_disconnect(
+                _collect_completion(), request=request, state=state, uid=uid
+            )
+        except GenerationError as exc:
+            return create_error_response(
+                str(exc),
+                status_code=exc.status_code,
+                err_type="server_error" if exc.status_code >= 500 else "invalid_request_error",
+                code=exc.code,
+            )
+        prompt_tokens += pt
+        completion_tokens += ct
+        cached_tokens += cached
         choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
 
     return {

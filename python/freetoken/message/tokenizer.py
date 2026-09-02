@@ -82,6 +82,9 @@ class TokenizeMsg(BaseTokenizerMsg):
 @dataclass
 class AbortMsg(BaseTokenizerMsg):
     uid: int
+    # Distinguish transport loss from administrative aborts such as prepare-stop. The
+    # scheduler uses this to report client_aborts and apply the disconnect cache policy.
+    client_disconnected: bool = False
 
 
 @dataclass
