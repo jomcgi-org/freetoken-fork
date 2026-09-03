@@ -141,3 +141,36 @@ def test_hot_adapt_boundary_cap_flag_reaches_server_config():
     )
 
     assert args.moe_hot_adapt_boundary_cap_frac == 0.25
+
+
+def test_hot_adapt_idle_flags_reach_server_config():
+    args, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-hot-adapt-idle-ms",
+            "750",
+            "--moe-hot-adapt-idle-min-interval-ms",
+            "2500",
+        ]
+    )
+
+    assert args.moe_hot_adapt_idle_ms == 750
+    assert args.moe_hot_adapt_idle_min_interval_ms == 2500
+
+
+def test_hot_adapt_idle_zero_is_the_cli_kill_switch():
+    args, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-hot-adapt-idle-ms",
+            "0",
+        ]
+    )
+
+    assert args.moe_hot_adapt_idle_ms == 0

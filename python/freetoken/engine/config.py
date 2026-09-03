@@ -87,6 +87,9 @@ class EngineConfig:
     moe_hot_plan_persist: str = "auto"
     moe_hot_plan_dir: str | None = None
     moe_hot_plan_interval_minutes: float = 10.0
+    # Zero disables scheduler-idle ticks without disabling token-boundary adaptation.
+    moe_hot_adapt_idle_ms: int = 500
+    moe_hot_adapt_idle_min_interval_ms: int = 2000
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"
@@ -310,6 +313,22 @@ class EngineConfig:
         ):
             raise ValueError(
                 "--moe-hot-plan-interval-minutes must be a finite positive number"
+            )
+        if (
+            isinstance(self.moe_hot_adapt_idle_ms, bool)
+            or not isinstance(self.moe_hot_adapt_idle_ms, int)
+            or self.moe_hot_adapt_idle_ms < 0
+        ):
+            raise ValueError(
+                "--moe-hot-adapt-idle-ms must be a non-negative integer"
+            )
+        if (
+            isinstance(self.moe_hot_adapt_idle_min_interval_ms, bool)
+            or not isinstance(self.moe_hot_adapt_idle_min_interval_ms, int)
+            or self.moe_hot_adapt_idle_min_interval_ms < 0
+        ):
+            raise ValueError(
+                "--moe-hot-adapt-idle-min-interval-ms must be a non-negative integer"
             )
         if self.moe_disk_pager not in ("madvise", "uffd"):
             raise ValueError(

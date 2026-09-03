@@ -622,6 +622,8 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_hot_plan_persist == "auto"
     assert config.moe_hot_plan_dir is None
     assert config.moe_hot_plan_interval_minutes == 10.0
+    assert config.moe_hot_adapt_idle_ms == 500
+    assert config.moe_hot_adapt_idle_min_interval_ms == 2000
 
 
 @pytest.mark.parametrize("budget", [-1, float("inf"), float("nan")])
@@ -735,6 +737,40 @@ def test_engine_config_rejects_invalid_hot_plan_interval(minutes):
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_hot_plan_interval_minutes=minutes,
+        )
+
+
+@pytest.mark.parametrize("idle_ms", [-1, 1.5, True])
+def test_engine_config_rejects_invalid_hot_adapt_idle_delay(idle_ms):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-idle-ms"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_idle_ms=idle_ms,
+        )
+
+
+@pytest.mark.parametrize("interval_ms", [-1, 1.5, True])
+def test_engine_config_rejects_invalid_hot_adapt_idle_min_interval(interval_ms):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(
+        ValueError, match="--moe-hot-adapt-idle-min-interval-ms"
+    ):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_idle_min_interval_ms=interval_ms,
         )
 
 

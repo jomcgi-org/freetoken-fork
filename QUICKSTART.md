@@ -128,6 +128,12 @@ What each line does:
   profile capture step: start cold and it warms itself. If you want a static
   budget instead of auto-adapting, set the adaptation interval to zero and
   supply a captured profile with `--moe-disk-layer-profile <json>`.
+- `--moe-hot-adapt-idle-ms N`: starts an adaptation tick after the scheduler
+  has been idle for `N` milliseconds. The default is 500; zero disables idle
+  adaptation without disabling token-boundary adaptation. Idle adaptation is
+  supported only when TP == 1 and is inert under tensor parallelism.
+- `--moe-hot-adapt-idle-min-interval-ms N`: sets the minimum time between
+  repeated idle adaptation ticks. The default is 2000 milliseconds.
 - `--moe-hot-plan-persist {auto,on,off}`: controls HOT plan loading and
   snapshots. The default is `auto`, which enables writes when the plan
   directory is writable. `on` requests persistence explicitly, and `off`

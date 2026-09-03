@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Callable, Dict, Generic, TypeVar
 
 import msgpack
@@ -76,6 +77,11 @@ class ZmqPullQueue(Generic[T]):
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0
 
+    def wait_for_item(self, timeout_seconds: float) -> bool:
+        """Wait up to ``timeout_seconds`` for an item without receiving it."""
+        timeout_ms = math.ceil(max(0.0, timeout_seconds) * 1000.0)
+        return self.socket.poll(timeout=timeout_ms) != 0
+
     def stop(self):
         self.socket.close()
         self.context.term()
@@ -145,6 +151,11 @@ class ZmqSubQueue(Generic[T]):
 
     def empty(self) -> bool:
         return self.socket.poll(timeout=0) == 0
+
+    def wait_for_item(self, timeout_seconds: float) -> bool:
+        """Wait up to ``timeout_seconds`` for an item without receiving it."""
+        timeout_ms = math.ceil(max(0.0, timeout_seconds) * 1000.0)
+        return self.socket.poll(timeout=timeout_ms) != 0
 
     def stop(self):
         self.socket.close()
