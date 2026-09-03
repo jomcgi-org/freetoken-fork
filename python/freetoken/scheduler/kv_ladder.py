@@ -14,6 +14,29 @@ class KVLadderCapacityError(ValueError):
     """The requested KV rung cannot fit with the minimum MoE cache."""
 
 
+class KVLadderProtectedCapacityError(KVLadderCapacityError):
+    """The requested KV rung would consume protected HOT capacity."""
+
+    def __init__(
+        self,
+        *,
+        target_tokens: int,
+        protected: int,
+        available_non_protected: int,
+        required: int,
+    ) -> None:
+        self.target_tokens = int(target_tokens)
+        self.protected = int(protected)
+        self.available_non_protected = int(available_non_protected)
+        self.required = int(required)
+        super().__init__(
+            f"KV ladder rung {self.target_tokens} tokens would evict protected HOT "
+            f"rows: protected={self.protected}, "
+            f"available_non_protected={self.available_non_protected}, "
+            f"required={self.required}"
+        )
+
+
 @dataclass(frozen=True)
 class KVLadderEligibility:
     enabled: bool
@@ -66,34 +89,6 @@ def kv_ladder_requested(config) -> bool:
     return kv_ladder_eligibility(config).enabled
 
 
-def _trim_protected_rows(
-    rows_by_layer: tuple[tuple[int, int], ...], max_rows: int
-) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
-    """Keep protected rows balanced across layers and report per-layer losses."""
-    remaining = max(0, int(max_rows))
-    kept = {layer_id: 0 for layer_id, _ in rows_by_layer}
-    capacities = dict(rows_by_layer)
-    while remaining:
-        progressed = False
-        for layer_id, _ in rows_by_layer:
-            if kept[layer_id] >= capacities[layer_id]:
-                continue
-            kept[layer_id] += 1
-            remaining -= 1
-            progressed = True
-            if remaining == 0:
-                break
-        if not progressed:
-            break
-    after = tuple((layer_id, kept[layer_id]) for layer_id, _ in rows_by_layer)
-    lost = tuple(
-        (layer_id, before - kept[layer_id])
-        for layer_id, before in rows_by_layer
-        if kept[layer_id] < before
-    )
-    return after, lost
-
-
 @dataclass(frozen=True)
 class KVLadderPlan:
     required_tokens: int
@@ -102,8 +97,6 @@ class KVLadderPlan:
     target_pages: int
     current_moe_slots: int
     target_moe_slots: int
-    protected_rows_after: tuple[tuple[int, int], ...]
-    lost_protected_rows: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -191,19 +184,27 @@ class KVLadderPolicy:
             )
 
         overlap = self.prefill_overlap if prefill_overlap is None else prefill_overlap
-        dynamic_floor = min(
+        fetch_reserve = min(
             (2 if overlap else 1) * self.min_moe_slots,
             target_moe_slots // 2,
         )
-        protected_room = max(0, target_moe_slots - dynamic_floor)
-        protected_after, lost = _trim_protected_rows(
-            (
-                self.protected_rows_by_layer
-                if protected_rows_by_layer is None
-                else protected_rows_by_layer
-            ),
-            protected_room,
+        protected_rows = (
+            self.protected_rows_by_layer
+            if protected_rows_by_layer is None
+            else protected_rows_by_layer
         )
+        protected = sum(rows for _layer_id, rows in protected_rows)
+        available_non_protected = max(
+            0, current_moe_slots - protected - fetch_reserve
+        )
+        required = max(0, current_moe_slots - target_moe_slots)
+        if protected and required > available_non_protected:
+            raise KVLadderProtectedCapacityError(
+                target_tokens=target_tokens,
+                protected=protected,
+                available_non_protected=available_non_protected,
+                required=required,
+            )
         return KVLadderPlan(
             required_tokens=required_tokens,
             current_tokens=current_tokens,
@@ -211,6 +212,4 @@ class KVLadderPolicy:
             target_pages=target_pages,
             current_moe_slots=current_moe_slots,
             target_moe_slots=target_moe_slots,
-            protected_rows_after=protected_after,
-            lost_protected_rows=lost,
         )

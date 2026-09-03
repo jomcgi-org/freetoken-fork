@@ -1216,45 +1216,13 @@ class Engine:
         )
         return target_moe, per_expert_bytes
 
-    def _validate_hot_slot_owners(
-        self,
-        owners: dict[int, tuple[int | None, ...]],
-        target_moe: int,
-    ) -> None:
-        """Validate a ladder-requested reduction of permanent HOT rows."""
-        cache = self.moe_offload_cache
-        if cache is None:
-            raise CacheRebuildRejected("HOT slot ownership requested without an MoE cache")
-        from freetoken.moe.offload_cache import hot_dynamic_slot_reserve
-
-        for layer_id, layer_owners in owners.items():
-            if not 0 <= layer_id < cache.num_layers:
-                raise CacheRebuildRejected(f"HOT layer id {layer_id} is out of range")
-            if len(layer_owners) > cache.num_experts:
-                raise CacheRebuildRejected(
-                    f"HOT layer {layer_id} has {len(layer_owners)} rows, maximum is "
-                    f"{cache.num_experts}"
-                )
-            experts = [expert for expert in layer_owners if expert is not None]
-            if len(experts) != len(set(experts)) or any(
-                expert < 0 or expert >= cache.num_experts for expert in experts
-            ):
-                raise CacheRebuildRejected(
-                    f"HOT layer {layer_id} has duplicate or out-of-range expert owners"
-                )
-        protected = sum(len(layer_owners) for layer_owners in owners.values())
-        dynamic = hot_dynamic_slot_reserve(
-            target_moe, cache.num_experts, cache.prefill_overlap
-        )
-        if protected + dynamic > target_moe:
-            raise CacheRebuildRejected(
-                f"HOT residency needs {protected} protected slots plus {dynamic} "
-                f"dynamic/prefill slots, but moe_cache_size={target_moe}"
-            )
-
     @staticmethod
     def _drain_hot_adaptation_for_rebuild(cache) -> None:
         """Resolve in-flight HOT work before changing its protected row geometry."""
+        drain = getattr(cache, "drain_hot_adaptation_for_rebuild", None)
+        if drain is not None:
+            drain()
+            return
         future = getattr(cache, "_hot_adapt_future", None)
         if future is None:
             return
@@ -1264,29 +1232,6 @@ class Engine:
         cache._hot_adapt_phase = None
         cache._hot_adapt_swaps_pending = ()
         cache._hot_adapt_worker_installs = False
-
-    @staticmethod
-    def _apply_hot_slot_owners(cache, owners: dict[int, tuple[int | None, ...]]) -> None:
-        """Install a validated HOT row geometry immediately before cache allocation."""
-        cache.hot_expert_capacity = {
-            layer_id: len(layer_owners)
-            for layer_id, layer_owners in owners.items()
-            if layer_owners
-        }
-        cache._hot_slot_owners = {
-            layer_id: list(layer_owners)
-            for layer_id, layer_owners in owners.items()
-            if layer_owners
-        }
-        cache._hot_slot_for_row = {}
-        cache.hot_expert_ids = {
-            layer_id: tuple(sorted(expert for expert in layer_owners if expert is not None))
-            for layer_id, layer_owners in cache._hot_slot_owners.items()
-        }
-        if getattr(cache, "hot_adapt_expert_bytes", 0):
-            cache.hot_adapt_hot_budget_bytes = (
-                sum(cache.hot_expert_capacity.values()) * cache.hot_adapt_expert_bytes
-            )
 
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
         # IN-PLACE, identity-preserving: the CacheManager's swa_pool reference, ctx.kv_cache and
@@ -1323,7 +1268,7 @@ class Engine:
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
-        hot_slot_owners: dict[int, tuple[int | None, ...]] | None = None,
+        preserve_hot_state: bool = False,
     ) -> None:
         """Idle-only in-place resize of the MoE slot cache, KV page pool, GDN (mamba) state pool,
         and/or the window pool (num_swa_pages: an absolute pinned window), followed by CUDA-graph
@@ -1332,7 +1277,7 @@ class Engine:
         """
         config = self.config
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
-                and num_swa_pages is None and hot_slot_owners is None):
+                and num_swa_pages is None):
             return
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
@@ -1349,12 +1294,21 @@ class Engine:
                 self.moe_offload_cache.validate_rebuild(moe_cache_size)
             except ValueError as e:
                 raise CacheRebuildRejected(str(e)) from e
-        if hot_slot_owners is not None:
-            if moe_cache_size is None:
+        if preserve_hot_state:
+            if moe_cache_size is None or self.moe_offload_cache is None:
                 raise CacheRebuildRejected(
-                    "HOT slot ownership can change only with moe_cache_size"
+                    "preserving HOT state requires an MoE cache resize"
                 )
-            self._validate_hot_slot_owners(hot_slot_owners, moe_cache_size)
+            protected = sum(self.moe_offload_cache.hot_expert_capacity.values())
+            if not protected:
+                raise CacheRebuildRejected(
+                    "preserving HOT state requires protected HOT rows"
+                )
+            if not self.moe_offload_cache._hot_staging:
+                raise CacheRebuildRejected(
+                    "protected HOT rows cannot survive rebuild without their "
+                    "pinned staging bank"
+                )
         if num_pages is not None and num_pages <= 0:
             raise CacheRebuildRejected(f"num_pages must be positive, got {num_pages}")
         if num_mamba_slots is not None:
@@ -1410,8 +1364,11 @@ class Engine:
             ),
         )
 
-        if hot_slot_owners is not None:
-            assert self.moe_offload_cache is not None
+        if (
+            moe_cache_size is not None
+            and self.moe_offload_cache is not None
+            and self.moe_offload_cache.hot_expert_capacity
+        ):
             self._drain_hot_adaptation_for_rebuild(self.moe_offload_cache)
 
         torch.cuda.synchronize(self.device)
@@ -1437,9 +1394,12 @@ class Engine:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
-            if hot_slot_owners is not None:
-                self._apply_hot_slot_owners(self.moe_offload_cache, hot_slot_owners)
-            self.moe_offload_cache.rebuild(moe_cache_size)
+            if preserve_hot_state:
+                self.moe_offload_cache.rebuild(
+                    moe_cache_size, preserve_hot_state=True
+                )
+            else:
+                self.moe_offload_cache.rebuild(moe_cache_size)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
@@ -1473,7 +1433,6 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
-
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         if self.cpu_moe_executor is not None:

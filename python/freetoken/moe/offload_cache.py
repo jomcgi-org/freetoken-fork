@@ -875,14 +875,78 @@ class OffloadMoeCache:
                 "1024); reduce moe_cache_size or force --nvfp4-backend triton"
             )
 
-    def rebuild(self, cache_size: int) -> None:
+    def drain_hot_adaptation_for_rebuild(self) -> None:
+        """Stop at a row boundary and publish copied rows before a rebuild."""
+        future = self._hot_adapt_future
+        if future is None:
+            return
+        self._hot_adapt_stop_event.set()
+        phase = self._hot_adapt_phase
+        started_at = time.monotonic()
+        computed_budget = max(0.0, self._hot_adapt_stop_wait_seconds())
+        wait_budget = min(computed_budget, _HOT_ADAPT_STOP_WAIT_MAX_SECONDS)
+        if wait_budget < computed_budget:
+            logger.warning_rank0(
+                "MoE HOT rebuild drain wait clamped from "
+                f"{computed_budget:g} to {wait_budget:g} s"
+            )
+        cancelled = future.cancel()
+        try:
+            result = None if cancelled else future.result(timeout=wait_budget)
+        except TimeoutError as exc:
+            if future.done():
+                raise
+            elapsed = time.monotonic() - started_at
+            logger.warning_rank0(
+                f"MoE HOT rebuild drain timed out: phase={phase}, "
+                f"elapsed={elapsed:.3f}s, budget={wait_budget:.3f}s"
+            )
+            raise TimeoutError(
+                f"MoE HOT rebuild drain exceeded its {wait_budget:.3f}s wait budget"
+            ) from exc
+
+        if phase == "copy":
+            copied_rows, staging_seconds = (
+                result if result is not None else (set(), 0.0)
+            )
+            self._finish_hot_adaptation_swaps(copied_rows, staging_seconds)
+        elif phase == "plan":
+            # A completed plan is intentionally discarded. Polling it here would
+            # submit a copy phase whose result the rebuild immediately replaces.
+            self._hot_adapt_future = None
+            self._hot_adapt_phase = None
+            self._hot_adapt_tick_executed_swaps = 0
+            if getattr(self, "_hot_adapt_tick_boundary", None) == "idle":
+                self.hot_adapt_ticks -= 1
+                self.hot_adapt_ticks_idle -= 1
+        else:
+            raise RuntimeError("HOT adaptation future has an invalid rebuild phase")
+        self._hot_adapt_stop_event.clear()
+        elapsed = time.monotonic() - started_at
+        outcome = (
+            "cancelled"
+            if cancelled
+            else ("discarded" if phase == "plan" else "published")
+        )
+        logger.info_rank0(
+            f"MoE HOT rebuild drain: phase={phase}, elapsed={elapsed:.3f}s, "
+            f"budget={wait_budget:.3f}s, "
+            f"outcome={outcome}"
+        )
+
+    def rebuild(self, cache_size: int, *, preserve_hot_state: bool = False) -> None:
         """Resize the GPU slot cache + bookkeeping to ``cache_size`` IN PLACE.
 
         Keeps the CPU/pinned ``bank_sources`` and the GPU-resident alphas; never
         reloads banks. Tears down prefill-overlap buffers first (their views alias
         the old ``bank_caches``), frees the old GPU tensors, then reallocates. Slots
-        cold-start after rebuild. Object identity is preserved so attached layers and
-        ``ctx.moe_offload_cache`` stay valid.
+        cold-start after rebuild. Protected HOT rows are reloaded into their new fixed
+        slots. Every rebuild with protected rows first stops adaptation at a row
+        boundary and publishes completed copies; rebuilds without protected rows do
+        not pay that drain cost. Object identity is preserved so attached layers and
+        ``ctx.moe_offload_cache`` stay valid. ``preserve_hot_state`` additionally keeps
+        the current realized-hit window, adaptation controller, decayed counters,
+        published owner plan, and plan persistence state used by ladder growth.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         self.validate_rebuild(cache_size)
@@ -895,18 +959,12 @@ class OffloadMoeCache:
                 f"HOT residency needs {total_hot_rows} protected slots plus "
                 f"{dynamic_reserve} dynamic/prefill slots, but moe_cache_size={cache_size}"
             )
-        # Catch-up copies can install rows from their worker thread. Resolve or
-        # cancel that work while the old slot tensors and row map are still valid,
-        # then discard its publication state. The final _reload_hot_slots call
-        # restores every authoritative owner into the newly allocated cache.
-        future = self._hot_adapt_future
-        if future is not None:
-            if not future.cancel():
-                future.result()
-            self._hot_adapt_future = None
-            self._hot_adapt_phase = None
-            self._hot_adapt_swaps_pending = ()
-            self._hot_adapt_worker_installs = False
+        # Catch-up copies can install rows from their worker thread. Finish their
+        # normal publication path while the old slot tensors and row map are still
+        # valid. Clearing a completed future directly would retain its retired None
+        # owners and silently drop those protected rows at the rebuild boundary.
+        if total_hot_rows:
+            self.drain_hot_adaptation_for_rebuild()
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
         self.prefill_copy_stream = None
@@ -967,13 +1025,14 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
-        self.stat_hot_pairs.zero_()
-        self.stat_hot_total_pairs.zero_()
-        self._prefill_hot_pairs = 0
-        self._prefill_route_pairs = 0
-        self._prefill_cpu_experts = 0
-        self.decode_freq.zero_()
-        self._protected_route_baseline = None
+        if not preserve_hot_state:
+            self.stat_hot_pairs.zero_()
+            self.stat_hot_total_pairs.zero_()
+            self._prefill_hot_pairs = 0
+            self._prefill_route_pairs = 0
+            self._prefill_cpu_experts = 0
+            self.decode_freq.zero_()
+            self._protected_route_baseline = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
