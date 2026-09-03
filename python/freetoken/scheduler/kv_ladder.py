@@ -97,8 +97,6 @@ class KVLadderPlan:
     target_pages: int
     current_moe_slots: int
     target_moe_slots: int
-    protected_rows_after: tuple[tuple[int, int], ...]
-    lost_protected_rows: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -214,6 +212,4 @@ class KVLadderPolicy:
             target_pages=target_pages,
             current_moe_slots=current_moe_slots,
             target_moe_slots=target_moe_slots,
-            protected_rows_after=protected_rows,
-            lost_protected_rows=(),
         )

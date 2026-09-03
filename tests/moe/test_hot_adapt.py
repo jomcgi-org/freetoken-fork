@@ -7,7 +7,7 @@ import importlib.util
 import sys
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -1143,8 +1143,9 @@ def test_rebuild_drains_hot_adaptation_before_replacing_bank_caches(monkeypatch)
         def done(self):
             return True
 
-        def result(self):
+        def result(self, timeout=None):
             drain_started.set()
+            assert cache._hot_adapt_stop_event.is_set()
             assert release.wait(timeout=5)
             assert cache.bank_caches is old_bank_caches
             for bank_id, name in enumerate(cache.bank_schema):
@@ -1178,6 +1179,122 @@ def test_rebuild_drains_hot_adaptation_before_replacing_bank_caches(monkeypatch)
     finally:
         release.set()
         cache.shutdown_hot_adaptation()
+
+
+@pytest.mark.parametrize("already_completed", [False, True])
+def test_rebuild_drain_discards_plan_without_starting_copy(
+    monkeypatch, already_completed
+):
+    from concurrent.futures import Future
+    from threading import Event
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    future = Future()
+    if already_completed:
+        future.set_result(((object(),), 0.5, 1))
+    cache._hot_adapt_future = future
+    cache._hot_adapt_phase = "plan"
+    cache._hot_adapt_stop_event = Event()
+    cache._hot_adapt_tick_executed_swaps = -1
+    cache._hot_adapt_stop_wait_seconds = lambda: 1.0
+    submitted_copies = []
+    cache._retire_hot_adaptation_swaps = submitted_copies.append
+
+    cache.drain_hot_adaptation_for_rebuild()
+
+    assert future.cancelled() is not already_completed
+    assert submitted_copies == []
+    assert cache._hot_adapt_future is None
+    assert cache._hot_adapt_phase is None
+    assert cache._hot_adapt_tick_executed_swaps == 0
+    assert not cache._hot_adapt_stop_event.is_set()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("triton") is None, reason="needs Triton import"
+)
+def test_engine_rebuild_preserves_hot_state_through_prevalidation(monkeypatch):
+    import torch
+
+    from freetoken.engine import engine as engine_module
+    from freetoken.engine.engine import Engine
+    from freetoken.kvcache.base import CacheRebuildRejected
+
+    events = []
+    cache = SimpleNamespace(
+        hot_expert_capacity={0: 2},
+        _hot_staging=[],
+        validate_rebuild=lambda size: events.append(("validate_moe", size)),
+        drain_hot_adaptation_for_rebuild=lambda: events.append("drain_hot"),
+        rebuild=lambda size, **kwargs: events.append(("rebuild_moe", size, kwargs)),
+    )
+    kv_cache = SimpleNamespace(
+        needs_rebind_on_rebuild=False,
+        validate_rebuild=lambda *_args, **_kwargs: events.append("validate_kv"),
+        attach_page_table=lambda _table: events.append("attach_page_table"),
+    )
+    config = SimpleNamespace(
+        page_size=1,
+        max_seq_len=32,
+        max_running_req=1,
+        cuda_graph_max_bs=1,
+        model_config=SimpleNamespace(vocab_size=16),
+    )
+    engine = Engine.__new__(Engine)
+    engine.config = config
+    engine.moe_offload_cache = cache
+    engine.kv_cache = kv_cache
+    engine.linear_state_pool = None
+    engine._baseline_free = 1_000
+    engine._weights_bytes = 0
+    engine._target_moe_and_expert_bytes = lambda _size: (6, 1)
+    engine.device = torch.device("cpu")
+    engine.num_pages = 32
+    engine.page_table = torch.zeros((2, 32), dtype=torch.int32)
+    engine.ctx = SimpleNamespace(page_table=engine.page_table)
+    engine.dummy_req = SimpleNamespace(table_idx=0)
+    engine.graph_runner = SimpleNamespace(
+        graph_bs_list=[1],
+        destroy_cuda_graphs=lambda: events.append("destroy_graphs"),
+    )
+    engine.attn_backend = SimpleNamespace(
+        reset_capture=lambda: events.append("reset_capture")
+    )
+    engine.stream = None
+    engine.model = SimpleNamespace()
+    engine._sync_get_memory = lambda: (500, 500)
+    engine.rebuild_teardown_started = False
+
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda _device=None: events.append("synchronize")
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "GraphRunner",
+        lambda **kwargs: SimpleNamespace(graph_bs_list=kwargs["cuda_graph_bs"]),
+    )
+
+    with pytest.raises(CacheRebuildRejected, match="pinned staging bank"):
+        engine.rebuild_runtime_cache(moe_cache_size=6, preserve_hot_state=True)
+    assert not engine.rebuild_teardown_started
+    assert events == [("validate_moe", 6)]
+
+    events.clear()
+    cache._hot_staging = [object()]
+    engine.rebuild_runtime_cache(moe_cache_size=6, preserve_hot_state=True)
+
+    assert engine.rebuild_teardown_started
+    assert events == [
+        ("validate_moe", 6),
+        "validate_kv",
+        "drain_hot",
+        "synchronize",
+        "reset_capture",
+        "destroy_graphs",
+        ("rebuild_moe", 6, {"preserve_hot_state": True}),
+        "attach_page_table",
+    ]
 
 
 def test_ladder_rebuild_preserves_hot_mapping_counters_and_plan(monkeypatch):

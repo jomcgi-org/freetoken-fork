@@ -209,7 +209,6 @@ class Scheduler(SchedulerIOMixin):
         self.config = config
         self._kv_ladder_waiting: list[UserMsg] = []
         self._kv_ladder_starvation_uid: int | None = None
-        self._kv_ladder_parked_reason: tuple[int, str] | None = None
         self._kv_ladder = self._make_kv_ladder_policy()
 
         def _status_log(message: str) -> None:
@@ -444,7 +443,9 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     "KV ladder cap cannot be reached without protected HOT eviction: "
                     "slots=%d, protected=%d, fetch_reserve=%d, needed=%d, "
-                    "reclaimable=%d",
+                    "reclaimable=%d; the first request that needs this capacity "
+                    "will use the current KV pool and be clamped, or receive "
+                    "context_length_exceeded when its prompt alone does not fit",
                     moe.cache_size,
                     protected_count,
                     fetch_reserve,
@@ -491,7 +492,6 @@ class Scheduler(SchedulerIOMixin):
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
-        hot_slot_owners: dict[int, tuple[int | None, ...]] | None = None,
         preserve_hot_state: bool = False,
     ) -> None:
         """Idle-only runtime cache rebuild: resize the MoE slot cache, KV pages, GDN (mamba) state
@@ -512,7 +512,7 @@ class Scheduler(SchedulerIOMixin):
             self.sync_all_ranks()
         engine_rebuild = dict(
             moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
-            num_swa_pages=num_swa_pages, hot_slot_owners=hot_slot_owners,
+            num_swa_pages=num_swa_pages,
         )
         if preserve_hot_state:
             engine_rebuild["preserve_hot_state"] = True
@@ -915,10 +915,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _queue_for_kv_ladder(self, msg: UserMsg) -> bool:
         """Hold a request until an idle safe point can grow KV before admission."""
-        from .kv_ladder import (
-            KVLadderCapacityError,
-            KVLadderProtectedCapacityError,
-        )
+        from .kv_ladder import KVLadderCapacityError
 
         waiting = getattr(self, "_kv_ladder_waiting", None)
         if waiting is None:
@@ -944,15 +941,6 @@ class Scheduler(SchedulerIOMixin):
             return True
         try:
             plan = self._kv_ladder_plan(msg)
-        except KVLadderProtectedCapacityError as exc:
-            waiting.append(msg)
-            waiting[:] = order_pending_requests(
-                waiting,
-                now=now,
-                aging_seconds=aging_seconds,
-            )
-            self._log_kv_ladder_parked(msg, exc)
-            return True
         except KVLadderCapacityError as exc:
             logger.warning_rank0("KV ladder cannot grow for request %d: %s", msg.uid, exc)
             return False
@@ -964,7 +952,6 @@ class Scheduler(SchedulerIOMixin):
             now=now,
             aging_seconds=aging_seconds,
         )
-        self._kv_ladder_parked_reason = None
         logger.info_rank0(
             "KV ladder queued request %d before admission: required=%d tokens, "
             "current=%d tokens, target=%d tokens",
@@ -976,22 +963,8 @@ class Scheduler(SchedulerIOMixin):
         return True
 
     def _kv_ladder_has_drainable_waiter(self) -> bool:
-        """Avoid spinning the idle loop while every known rung is HOT-blocked."""
-        return bool(getattr(self, "_kv_ladder_waiting", None)) and not getattr(
-            self, "_kv_ladder_parked_reason", None
-        )
-
-    def _log_kv_ladder_parked(self, msg: UserMsg, reason: Exception) -> None:
-        """Log a protected-capacity park once while its arithmetic is unchanged."""
-        marker = (msg.uid, str(reason))
-        if getattr(self, "_kv_ladder_parked_reason", None) == marker:
-            return
-        self._kv_ladder_parked_reason = marker
-        logger.warning_rank0(
-            "KV ladder parked request %d to preserve protected HOT rows: %s",
-            msg.uid,
-            reason,
-        )
+        """Return whether an idle drain has a waiter to resolve."""
+        return bool(getattr(self, "_kv_ladder_waiting", None))
 
     def _kv_ladder_starved_waiter(
         self, *, now: float | None = None
@@ -1006,9 +979,19 @@ class Scheduler(SchedulerIOMixin):
             return None
         if now is None:
             now = getattr(self.prefill_manager, "clock", time.monotonic)()
-        starved = [
-            req for req in waiting if now - req.arrival_time >= aging_seconds
-        ]
+        from .kv_ladder import KVLadderCapacityError
+
+        starved = []
+        for req in waiting:
+            if now - req.arrival_time < aging_seconds:
+                continue
+            try:
+                self._kv_ladder_plan(req)
+            except KVLadderCapacityError:
+                # A request that cannot grow will be clamped or rejected when
+                # drained. It must not hold otherwise admissible requests behind it.
+                continue
+            starved.append(req)
         if not starved:
             self._kv_ladder_starvation_uid = None
             return None
@@ -1042,16 +1025,10 @@ class Scheduler(SchedulerIOMixin):
         else:
             msg = starved
 
-        from .kv_ladder import (
-            KVLadderCapacityError,
-            KVLadderProtectedCapacityError,
-        )
+        from .kv_ladder import KVLadderCapacityError
 
         try:
             plan = self._kv_ladder_plan(msg)
-        except KVLadderProtectedCapacityError as exc:
-            self._log_kv_ladder_parked(msg, exc)
-            return
         except KVLadderCapacityError as exc:
             logger.warning_rank0("KV ladder cannot grow for request %d: %s", msg.uid, exc)
             plan = None
@@ -1080,7 +1057,6 @@ class Scheduler(SchedulerIOMixin):
                 )
             else:
                 status = self._execute_pending_rebuild(
-                    hot_slot_owners=None,
                     send_reply=False,
                 )
             rebuild_ms = (time.perf_counter() - started_at) * 1000.0
@@ -1098,17 +1074,22 @@ class Scheduler(SchedulerIOMixin):
                         if hasattr(model, "ple_disk_stats") else {}
                     )
                     ple_faults = ple.get("ple_major_faults")
+                    hot_rate = (
+                        "n/a"
+                        if self.engine.moe_offload_cache.cpu_executor is None
+                        else f"{float(disk.get('hot_pair_rate', 0.0)) * 100.0:.2f}%"
+                    )
                     logger.info_rank0(
                         "KV ladder growth: tokens %d -> %d, expert slots %d -> %d, "
                         "rebuild_ms=%.1f, protected_rows=%d, "
-                        "realized_hot_rate=%.2f%%, ple_major_faults=%s",
+                        "realized_hot_rate=%s, ple_major_faults=%s",
                         plan.current_tokens,
                         plan.target_tokens,
                         plan.current_moe_slots,
                         plan.target_moe_slots,
                         rebuild_ms,
                         protected_count,
-                        float(disk.get("hot_pair_rate", 0.0)) * 100.0,
+                        hot_rate,
                         "n/a" if ple_faults is None else str(ple_faults),
                     )
                 else:
@@ -1131,9 +1112,6 @@ class Scheduler(SchedulerIOMixin):
         self._admit_user_msg(msg)
         if getattr(self, "_kv_ladder_starvation_uid", None) == msg.uid:
             self._kv_ladder_starvation_uid = None
-        parked_reason = getattr(self, "_kv_ladder_parked_reason", None)
-        if parked_reason is not None and parked_reason[0] == msg.uid:
-            self._kv_ladder_parked_reason = None
 
     def _queue_stats(self) -> tuple[int, dict[str, int], float]:
         """Report prefill and ladder waiters as one scheduler queue."""
@@ -1241,9 +1219,6 @@ class Scheduler(SchedulerIOMixin):
             waiting = getattr(self, "_kv_ladder_waiting", None)
             if waiting:
                 waiting[:] = [req for req in waiting if req.uid != msg.uid]
-            parked_reason = getattr(self, "_kv_ladder_parked_reason", None)
-            if parked_reason is not None and parked_reason[0] == msg.uid:
-                self._kv_ladder_parked_reason = None
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
             if req_to_free is not None:
@@ -1471,7 +1446,6 @@ class Scheduler(SchedulerIOMixin):
     def _execute_pending_rebuild(
         self,
         *,
-        hot_slot_owners: dict[int, tuple[int | None, ...]] | None = None,
         preserve_hot_state: bool = False,
         send_reply: bool = True,
     ) -> str:
@@ -1486,8 +1460,6 @@ class Scheduler(SchedulerIOMixin):
             "num_mamba_slots": msg.num_mamba_slots,
             "num_swa_pages": msg.num_swa_pages,
         }
-        if hot_slot_owners is not None:
-            requested["hot_slot_owners"] = hot_slot_owners
         if preserve_hot_state:
             requested["preserve_hot_state"] = True
         # Rollback target: the CURRENT (serving) sizes of ONLY the pools this request touches.
@@ -1499,13 +1471,6 @@ class Scheduler(SchedulerIOMixin):
             for k, v in requested.items()
             if v is not None and k in snapshot
         }
-        if hot_slot_owners is not None:
-            cache = self.engine.moe_offload_cache
-            assert cache is not None
-            prior["hot_slot_owners"] = {
-                layer_id: tuple(owners)
-                for layer_id, owners in cache._hot_slot_owners.items()
-            }
         if preserve_hot_state:
             prior["preserve_hot_state"] = True
 

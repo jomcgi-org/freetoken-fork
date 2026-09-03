@@ -121,8 +121,7 @@ def test_protected_rows_are_preserved_when_the_target_has_room():
     )
     assert plan is not None
     assert plan.target_moe_slots == 13
-    assert plan.protected_rows_after == ((3, 4), (7, 4))
-    assert plan.lost_protected_rows == ()
+    assert plan.target_moe_slots >= 8 + 4
 
 
 def test_protected_rows_refuse_growth_when_fetch_reserve_would_be_consumed():
@@ -143,7 +142,7 @@ def test_protected_rows_refuse_growth_when_fetch_reserve_would_be_consumed():
     assert raised.value.required == 10
 
 
-def test_scheduler_parks_growth_instead_of_evicting_fake_protected_layout(
+def test_protected_capacity_drain_is_terminal_and_does_not_block_following_request(
     monkeypatch,
 ):
     from freetoken.scheduler import scheduler as scheduler_module
@@ -151,11 +150,24 @@ def test_scheduler_parks_growth_instead_of_evicting_fake_protected_layout(
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._kv_ladder = _policy(kv_bytes_per_page=10, budget=1_650)
-    scheduler._kv_ladder_waiting = []
+    blocked = UserMsg(
+        uid=17,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=17),
+        arrival_time=0.0,
+    )
+    following = UserMsg(
+        uid=18,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=16),
+        arrival_time=31.0,
+    )
+    scheduler._kv_ladder_waiting = [blocked]
     scheduler._kv_ladder_starvation_uid = None
-    scheduler._kv_ladder_parked_reason = None
+    scheduler._abort_tombstones = {}
     scheduler.engine = SimpleNamespace(
         num_pages=32,
+        max_seq_len=32,
         moe_offload_cache=SimpleNamespace(
             cache_size=20,
             hot_expert_capacity={3: 4, 7: 4},
@@ -163,15 +175,15 @@ def test_scheduler_parks_growth_instead_of_evicting_fake_protected_layout(
         )
     )
     scheduler.prefill_manager = SimpleNamespace(
-        clock=lambda: 10.0,
+        runnable=False,
+        pending_list=[],
+        add_one_req=lambda request: admitted.append(request.uid),
+        clock=lambda: 31.0,
         priority_aging_seconds=30.0,
     )
-    msg = UserMsg(
-        uid=17,
-        input_ids=torch.arange(16, dtype=torch.int32),
-        sampling_params=SamplingParams(max_tokens=17),
-        arrival_time=10.0,
-    )
+    scheduler.decode_manager = SimpleNamespace(runnable=False)
+    scheduler.cache_manager = SimpleNamespace(supports_runtime_rebuild=True)
+    admitted = []
     logs = []
     monkeypatch.setattr(
         scheduler_module.logger,
@@ -179,14 +191,20 @@ def test_scheduler_parks_growth_instead_of_evicting_fake_protected_layout(
         lambda message, *args: logs.append(message % args),
     )
 
-    assert Scheduler._queue_for_kv_ladder(scheduler, msg)
-    assert scheduler._kv_ladder_waiting == [msg]
-    assert not Scheduler._kv_ladder_has_drainable_waiter(scheduler)
-    assert logs == [
-        "KV ladder parked request 17 to preserve protected HOT rows: "
+    Scheduler._process_one_msg(scheduler, following)
+    assert admitted == [18]
+    assert scheduler._kv_ladder_waiting == [blocked]
+
+    Scheduler._drain_kv_ladder_waiting(scheduler)
+
+    assert admitted == [18, 17]
+    assert blocked.sampling_params.max_tokens == 16
+    assert scheduler._kv_ladder_waiting == []
+    assert logs[-2] == (
+        "KV ladder cannot grow for request 17: "
         "KV ladder rung 64 tokens would evict protected HOT rows: protected=8, "
         "available_non_protected=8, required=10"
-    ]
+    )
 
 
 def test_flag_and_auto_sizing_gate_the_policy():
@@ -780,7 +798,10 @@ def test_ladder_startup_warns_when_hot_budget_blocks_the_cap(monkeypatch):
 
     assert logs == [
         "KV ladder cap cannot be reached without protected HOT eviction: "
-        "slots=90, protected=72, fetch_reserve=4, needed=16, reclaimable=14"
+        "slots=90, protected=72, fetch_reserve=4, needed=16, reclaimable=14; "
+        "the first request that needs this capacity will use the current KV pool "
+        "and be clamped, or receive context_length_exceeded when its prompt alone "
+        "does not fit"
     ]
 
 
@@ -830,7 +851,13 @@ def test_idle_drain_rebuilds_before_admitting_the_request():
     assert scheduler._kv_ladder_waiting == []
 
 
-def test_growth_status_line_exposes_preserved_hot_rate_and_ple_faults(monkeypatch):
+@pytest.mark.parametrize(
+    ("cpu_executor", "expected_hot_rate"),
+    [(object(), "94.00%"), (None, "n/a")],
+)
+def test_growth_status_line_exposes_preserved_hot_rate_and_ple_faults(
+    monkeypatch, cpu_executor, expected_hot_rate
+):
     from freetoken.scheduler import scheduler as scheduler_module
     from freetoken.scheduler.scheduler import Scheduler
 
@@ -843,11 +870,11 @@ def test_growth_status_line_exposes_preserved_hot_rate_and_ple_faults(monkeypatc
     )
     scheduler._kv_ladder_waiting = [msg]
     scheduler._kv_ladder_starvation_uid = None
-    scheduler._kv_ladder_parked_reason = None
     moe = SimpleNamespace(
         cache_size=20,
         hot_expert_capacity={3: 4, 7: 4},
         prefill_overlap=False,
+        cpu_executor=cpu_executor,
         disk_prefetch_stats=lambda **_kwargs: {"hot_pair_rate": 0.94},
     )
     scheduler.engine = SimpleNamespace(
@@ -889,7 +916,7 @@ def test_growth_status_line_exposes_preserved_hot_rate_and_ple_faults(monkeypatc
         ("admit", 18),
     ]
     assert "protected_rows=8" in logs[-1]
-    assert "realized_hot_rate=94.00%" in logs[-1]
+    assert f"realized_hot_rate={expected_hot_rate}" in logs[-1]
     assert "ple_major_faults=400000" in logs[-1]
 
 
@@ -964,41 +991,48 @@ def test_cuda_ladder_rebuild_preserves_protected_hot_rows_and_realized_hits():
         max_swap_bytes=row_bytes,
         expert_bytes=row_bytes,
     )
-    cache.stat_hot_pairs.fill_(94)
-    cache.stat_hot_total_pairs.fill_(100)
-    cache.decayed_decode_freq.copy_(
-        torch.tensor([[1.0, 7.0, 2.0, 9.0]], device="cuda")
-    )
-    cache.decode_freq.copy_(
-        torch.tensor([[1, 7, 2, 9]], dtype=torch.int64, device="cuda")
-    )
-    cache._protected_route_baseline = [[0, 3, 0, 4]]
-    owners_before = {
-        layer_id: tuple(owners)
-        for layer_id, owners in cache._hot_slot_owners.items()
-    }
-    plan_before = dict(cache._hot_plan_last_published_owners)
-    decayed_before = cache.decayed_decode_freq.clone()
-    decode_before = cache.decode_freq.clone()
+    try:
+        cache.stat_hot_pairs.fill_(94)
+        cache.stat_hot_total_pairs.fill_(100)
+        cache.decayed_decode_freq.copy_(
+            torch.tensor([[1.0, 7.0, 2.0, 9.0]], device="cuda")
+        )
+        cache.decode_freq.copy_(
+            torch.tensor([[1, 7, 2, 9]], dtype=torch.int64, device="cuda")
+        )
+        cache._protected_route_baseline = [[0, 3, 0, 4]]
+        owners_before = {
+            layer_id: tuple(owners)
+            for layer_id, owners in cache._hot_slot_owners.items()
+        }
+        plan_before = dict(cache._hot_plan_last_published_owners)
+        decayed_before = cache.decayed_decode_freq.clone()
+        decode_before = cache.decode_freq.clone()
 
-    cache.rebuild(6, preserve_hot_state=True)
+        cache.rebuild(6, preserve_hot_state=True)
 
-    assert {
-        layer_id: tuple(owners)
-        for layer_id, owners in cache._hot_slot_owners.items()
-    } == owners_before
-    for expert in (1, 3):
-        slot = int(cache.slot_for_id[0, expert].item())
-        assert slot >= 0
-        for name in cache.bank_schema:
-            assert torch.equal(
-                cache.bank_caches[name][slot].cpu(),
-                sources[name][0][expert],
-            )
-    assert int(cache.stat_hot_pairs.item()) == 94
-    assert int(cache.stat_hot_total_pairs.item()) == 100
-    assert int(cache.stat_hot_pairs.item()) / int(cache.stat_hot_total_pairs.item()) == 0.94
-    assert torch.equal(cache.decayed_decode_freq, decayed_before)
-    assert torch.equal(cache.decode_freq, decode_before)
-    assert cache._protected_route_baseline == [[0, 3, 0, 4]]
-    assert cache._hot_plan_last_published_owners == plan_before
+        assert {
+            layer_id: tuple(owners)
+            for layer_id, owners in cache._hot_slot_owners.items()
+        } == owners_before
+        for expert in (1, 3):
+            slot = int(cache.slot_for_id[0, expert].item())
+            assert slot >= 0
+            for name in cache.bank_schema:
+                assert torch.equal(
+                    cache.bank_caches[name][slot].cpu(),
+                    sources[name][0][expert],
+                )
+        assert int(cache.stat_hot_pairs.item()) == 94
+        assert int(cache.stat_hot_total_pairs.item()) == 100
+        assert (
+            int(cache.stat_hot_pairs.item())
+            / int(cache.stat_hot_total_pairs.item())
+            == 0.94
+        )
+        assert torch.equal(cache.decayed_decode_freq, decayed_before)
+        assert torch.equal(cache.decode_freq, decode_before)
+        assert cache._protected_route_baseline == [[0, 3, 0, 4]]
+        assert cache._hot_plan_last_published_owners == plan_before
+    finally:
+        cache.shutdown_hot_adaptation()
