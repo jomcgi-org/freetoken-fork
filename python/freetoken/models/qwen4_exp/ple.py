@@ -14,9 +14,9 @@ HF reference: ``Qwen4ExpTextNGramEmbedding`` (modeling_qwen4_exp.py:1018) and
 The table is the 47.7 GiB FP8 n-gram store. ``PinnedUVATable`` gathers from a fully pinned host
 bank, ``CachedTable`` keeps a bounded pinned hot-row bank, ``HMMMappedTable`` gathers directly
 from read-only file mappings, and ``DiskStagedTable`` copies requested mapped rows through a
-small pinned bank. ``PrefillGatherTable`` bulk-stages deduplicated prefill rows in front of the
-direct HMM decode path. ``GpuResidentTable`` is the small-table oracle the host backends are
-diffed against.
+small pinned bank. ``UringTable`` streams requested rows into a similar bank without mapping the
+table. ``PrefillGatherTable`` bulk-stages deduplicated prefill rows in front of the direct HMM
+decode path. ``GpuResidentTable`` is the small-table oracle the host backends are diffed against.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Protocol, Sequence, Tuple
+from typing import TYPE_CHECKING, List, Literal, Protocol, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -108,8 +108,8 @@ class PLETableBackend(Protocol):
     """Row store for one PLE layer's 40M-row by 160-wide n-gram embedding table.
 
     Frozen contract. ``GpuResidentTable`` is the small-table oracle;
-    ``PinnedUVATable``, ``CachedTable``, ``HMMMappedTable``, and ``DiskStagedTable`` serve the real
-    host table. Rows are addressed by the GLOBAL hashed id, i.e. the
+    ``PinnedUVATable``, ``CachedTable``, ``HMMMappedTable``, ``DiskStagedTable``, and
+    ``UringTable`` serve the real host table. Rows are addressed by the GLOBAL hashed id, i.e. the
     per-head vocab offset is already added by ``NGramEmbedding``.
 
     ``lookup`` gets ``row_ids [T, num_ngram_heads]`` (int64, device) and returns
@@ -118,7 +118,8 @@ class PLETableBackend(Protocol):
     decode reuses a fixed buffer).
 
     ``prefetch`` may start the gather early on a side stream (the model issues it before layer 0 and
-    joins it in ``lookup``); a backend with no async path makes it a no-op.
+    joins it in ``lookup``); a backend with no async path makes it a no-op. ``phase`` is the active
+    batch's forward mode, independent of whether that forward uses a captured graph.
     """
 
     num_rows: int
@@ -127,7 +128,12 @@ class PLETableBackend(Protocol):
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor: ...
 
-    def prefetch(self, row_ids: torch.Tensor) -> None: ...
+    def prefetch(
+        self,
+        row_ids: torch.Tensor,
+        *,
+        phase: Literal["prefill", "decode"] = "prefill",
+    ) -> None: ...
 
 
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -200,7 +206,9 @@ class GpuResidentTable:
         out.copy_(rows)
         return out
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(
+        self, row_ids: torch.Tensor, *, phase: str = "prefill"
+    ) -> None:
         return None
 
 
@@ -221,7 +229,9 @@ class ZeroTable:
             device=row_ids.device,
         )
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(
+        self, row_ids: torch.Tensor, *, phase: str = "prefill"
+    ) -> None:
         return None
 
 
@@ -322,7 +332,9 @@ class PinnedUVATable:
             scale_ptr=self._scale_ptr,
         )
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(
+        self, row_ids: torch.Tensor, *, phase: str = "prefill"
+    ) -> None:
         if self._stream is None or row_ids.numel() == 0:
             return
         dst = self._stage(row_ids.numel())
@@ -1281,7 +1293,9 @@ class DiskStagedTable:
                 self._replay_done = torch.cuda.Event()
             self._replay_done.record(torch.cuda.current_stream(self._device))
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(
+        self, row_ids: torch.Tensor, *, phase: str = "prefill"
+    ) -> None:
         if self._decode_shape is not None:
             # The graph's lookup launches the fixed-address gather. All host work is complete.
             return
@@ -1613,12 +1627,14 @@ class PrefillGatherTable:
         out.copy_(rows)
         return out
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(
+        self, row_ids: torch.Tensor, *, phase: str = "prefill"
+    ) -> None:
         pending = self._pending
         if pending is not None and row_ids.shape == pending[0] and pending[2] is None:
             self._pending = (pending[0], pending[1], row_ids)
             return
-        self.fallback.prefetch(row_ids)
+        self.fallback.prefetch(row_ids, phase=phase)
 
     def lookup(
         self, row_ids: torch.Tensor, out: torch.Tensor | None = None
@@ -2168,7 +2184,9 @@ class CachedTable:
                 self._replay_done = torch.cuda.Event()
             self._replay_done.record(torch.cuda.current_stream(self._device))
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(
+        self, row_ids: torch.Tensor, *, phase: str = "prefill"
+    ) -> None:
         if self._decode_shape is not None:
             return
         mode, slots = self._prepare_eager(row_ids)
@@ -2975,7 +2993,7 @@ class PLELayer(BaseOP):
             meta = build_ple_metadata(batch, self.args, batch.input_ids.device)
         row_ids = self.ple_embedding.row_ids(meta)
         self._pending = (meta, row_ids)
-        self.ple_embedding.table.prefetch(row_ids)
+        self.ple_embedding.table.prefetch(row_ids, phase=batch.phase)
 
     def forward(
         self,

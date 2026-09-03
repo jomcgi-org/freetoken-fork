@@ -2512,6 +2512,8 @@ _PLE_SETTINGS = {
     "ple_cache_gib": 8.0,
     "ple_cache_warm": None,
     "ple_cache_profile_out": None,
+    "ple_uring_staging_mib": 64,
+    "ple_uring_queue_depth": 64,
 }
 
 
@@ -2634,7 +2636,7 @@ def _adjust_config(config: EngineConfig):
             override("cuda_graph_max_bs", 1)
 
     ple_backend = getattr(config, "ple_backend", "pinned")
-    if has_ple and ple_backend in ("cached", "disk"):
+    if has_ple and ple_backend in ("cached", "disk", "uring"):
         no_graphs = os.getenv("FREETOKEN_PLE_DISK_NO_GRAPHS", "").strip().lower()
         if no_graphs in ("1", "true", "yes", "on"):
             override("cuda_graph_bs", [])

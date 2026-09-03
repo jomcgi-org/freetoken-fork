@@ -370,12 +370,13 @@ def parse_args(
 
     parser.add_argument(
         "--ple-backend",
-        choices=["pinned", "cached", "disk", "hmm"],
+        choices=["pinned", "cached", "disk", "uring", "hmm"],
         default=ServerArgs.ple_backend,
         help=(
             "Qwen3.8 Flash-Next PLE table backend: 'pinned' keeps the full table in "
             "pinned host RAM; 'cached' pins a bounded hot-row bank; 'disk' stages rows "
-            "from read-only mappings; 'hmm' lets the GPU read those mappings directly."
+            "from read-only mappings; 'uring' streams rows from the checkpoint with "
+            "Linux io_uring; 'hmm' lets the GPU read those mappings directly."
         ),
     )
 
@@ -426,6 +427,24 @@ def parse_args(
         type=str,
         default=ServerArgs.ple_cache_profile_out,
         help="Write cumulative cached-PLE row frequencies to this JSON file.",
+    )
+
+    parser.add_argument(
+        "--ple-uring-staging-mib",
+        type=_positive_int,
+        default=ServerArgs.ple_uring_staging_mib,
+        help=(
+            "Per-PLE-layer resident staging budget in MiB for --ple-backend "
+            "uring, including data, scale conversion, local IDs, and io_uring "
+            "bounce buffers (default: 64)."
+        ),
+    )
+
+    parser.add_argument(
+        "--ple-uring-queue-depth",
+        type=_positive_int,
+        default=ServerArgs.ple_uring_queue_depth,
+        help="io_uring submission queue depth for --ple-backend uring (default: 64).",
     )
 
     parser.add_argument(

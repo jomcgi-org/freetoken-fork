@@ -132,7 +132,8 @@ class EngineConfig:
     moe_hybrid_max_fetch: int = -1
     # Qwen3.8 Flash-Next PLE table storage. "pinned" is the original full-bank UVA
     # path; "cached" keeps hot mapped rows in a bounded pinned bank; "disk" stages
-    # mapped rows; "hmm" gathers from mapped shards directly.
+    # mapped rows; "uring" streams rows with Linux io_uring; "hmm" gathers from
+    # mapped shards directly.
     ple_backend: str = "pinned"
     # Bulk-stage a prefill chunk's deduplicated PLE rows when HMM is selected.
     # Decode remains on the direct HMM path regardless of this setting.
@@ -140,6 +141,8 @@ class EngineConfig:
     ple_cache_gib: float = 8.0
     ple_cache_warm: str | None = None
     ple_cache_profile_out: str | None = None
+    ple_uring_staging_mib: int = 64
+    ple_uring_queue_depth: int = 64
     # Qwen3.8-Flash-Next native multi-token prediction head. Kept as an explicit
     # on/off choice instead of a boolean so the CLI and serialized daemon config
     # have one stable spelling.
@@ -221,9 +224,9 @@ class EngineConfig:
             raise ValueError(
                 f"--lazy-restore must be 'on' or 'off', got {self.lazy_restore!r}"
             )
-        if self.ple_backend not in ("pinned", "cached", "disk", "hmm"):
+        if self.ple_backend not in ("pinned", "cached", "disk", "uring", "hmm"):
             raise ValueError(
-                "--ple-backend must be 'pinned', 'cached', 'disk', or 'hmm', got "
+                "--ple-backend must be 'pinned', 'cached', 'disk', 'uring', or 'hmm', got "
                 f"{self.ple_backend!r}"
             )
         if self.ple_prefill_gather not in ("on", "off"):
@@ -233,6 +236,12 @@ class EngineConfig:
             )
         if not math.isfinite(float(self.ple_cache_gib)) or self.ple_cache_gib <= 0:
             raise ValueError("--ple-cache-gib must be a finite positive number")
+        if self.ple_uring_staging_mib < 1:
+            raise ValueError("--ple-uring-staging-mib must be a positive integer")
+        if not 1 <= self.ple_uring_queue_depth <= 4096:
+            raise ValueError(
+                "--ple-uring-queue-depth must be an integer in [1, 4096]"
+            )
         if self.moe_disk_prefill not in ("cpu", "copy"):
             raise ValueError(
                 "--moe-disk-prefill must be 'cpu' or 'copy', got "
