@@ -957,6 +957,15 @@ class Engine:
                 boundary_cap_frac=getattr(
                     config, "moe_hot_adapt_boundary_cap_frac", 0.5
                 ),
+                prefill_weight=getattr(
+                    config, "moe_hot_adapt_prefill_weight", 1.0
+                ),
+                prefill_run_cap_frac=getattr(
+                    config, "moe_hot_adapt_prefill_run_cap_frac", 0.0
+                ),
+                post_prefill_tick=getattr(
+                    config, "moe_hot_adapt_post_prefill_tick", False
+                ),
                 persisted_counter_seed=(
                     hot_plan_seed.counters if hot_plan_seed is not None else None
                 ),
@@ -2611,6 +2620,9 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
     "moe_hot_adapt_boundary_cap_frac": 0.5,
+    "moe_hot_adapt_prefill_weight": 1.0,
+    "moe_hot_adapt_prefill_run_cap_frac": 0.0,
+    "moe_hot_adapt_post_prefill_tick": False,
     "moe_hot_plan_persist": "auto",
     "moe_hot_plan_dir": None,
     "moe_hot_plan_interval_minutes": 10.0,

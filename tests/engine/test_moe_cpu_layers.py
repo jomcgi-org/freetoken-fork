@@ -649,6 +649,9 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_hot_adapt_interval_steps == "auto"
     assert config.moe_hot_adapt_max_swap_gib == 0.5
     assert config.moe_hot_adapt_boundary_cap_frac == 0.5
+    assert config.moe_hot_adapt_prefill_weight == 1.0
+    assert config.moe_hot_adapt_prefill_run_cap_frac == 0.0
+    assert config.moe_hot_adapt_post_prefill_tick is False
     assert config.moe_hot_plan_persist == "auto"
     assert config.moe_hot_plan_dir is None
     assert config.moe_hot_plan_interval_minutes == 10.0
@@ -735,6 +738,55 @@ def test_engine_config_rejects_invalid_hot_adapt_boundary_cap(boundary_cap):
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_hot_adapt_boundary_cap_frac=boundary_cap,
+        )
+
+
+@pytest.mark.parametrize("weight", [-0.1, 1.5, float("inf"), float("nan"), True])
+def test_engine_config_rejects_invalid_hot_adapt_prefill_weight(weight):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-prefill-weight"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_prefill_weight=weight,
+        )
+
+
+@pytest.mark.parametrize(
+    "run_cap", [-0.1, 1.5, float("inf"), float("nan"), True]
+)
+def test_engine_config_rejects_invalid_hot_adapt_prefill_run_cap(run_cap):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-prefill-run-cap-frac"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_prefill_run_cap_frac=run_cap,
+        )
+
+
+def test_engine_config_rejects_non_bool_hot_adapt_post_prefill_tick():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-post-prefill-tick"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_post_prefill_tick="on",
         )
 
 

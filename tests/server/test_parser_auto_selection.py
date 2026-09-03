@@ -163,6 +163,27 @@ def test_hot_adapt_boundary_cap_flag_reaches_server_config():
     assert args.moe_hot_adapt_boundary_cap_frac == 0.25
 
 
+def test_hot_adapt_prefill_flags_reach_server_config():
+    args, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-hot-adapt-prefill-weight",
+            "0.25",
+            "--moe-hot-adapt-prefill-run-cap-frac",
+            "0.4",
+            "--moe-hot-adapt-post-prefill-tick",
+            "on",
+        ]
+    )
+
+    assert args.moe_hot_adapt_prefill_weight == 0.25
+    assert args.moe_hot_adapt_prefill_run_cap_frac == 0.4
+    assert args.moe_hot_adapt_post_prefill_tick is True
+
+
 def test_hot_adapt_idle_flags_reach_server_config():
     args, _ = parse_args(
         [

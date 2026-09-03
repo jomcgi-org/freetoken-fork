@@ -271,6 +271,8 @@ class Scheduler(SchedulerIOMixin):
                     f"{disk.get('hot_adapt_interval', 0)}, "
                     f"hot_adapt_ticks_prefill: "
                     f"{disk.get('hot_adapt_ticks_prefill', 0)}, "
+                    f"hot_adapt_prefill_run_swaps: "
+                    f"{disk.get('hot_adapt_prefill_run_swaps', 0)}, "
                     f"hot_adapt_ticks_decode: "
                     f"{disk.get('hot_adapt_ticks_decode', 0)}, "
                     f"hot_adapt_ticks_idle: "

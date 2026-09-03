@@ -155,6 +155,12 @@ def parse_args(
             )
         return interval
 
+    def _on_off_bool(value: str) -> bool:
+        normalized = value.strip().lower()
+        if normalized not in ("on", "off"):
+            raise argparse.ArgumentTypeError("must be 'on' or 'off'")
+        return normalized == "on"
+
     def _nonnegative_float(value: str) -> float:
         try:
             n = float(value)
@@ -915,6 +921,37 @@ def parse_args(
         help=(
             "Maximum fraction of the HOT budget staged at one request boundary "
             "(default: 0.5)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-prefill-weight",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_prefill_weight,
+        help=(
+            "Weight applied to prefill route counts during HOT adaptation "
+            "(default: 1.0)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-prefill-run-cap-frac",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_prefill_run_cap_frac,
+        help=(
+            "Maximum fraction of the HOT budget staged across one prefill run; "
+            "0 disables the run cap (default: 0)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-post-prefill-tick",
+        type=_on_off_bool,
+        metavar="{on,off}",
+        default=ServerArgs.moe_hot_adapt_post_prefill_tick,
+        help=(
+            "Run one immediate HOT adaptation tick at the first decode boundary "
+            "after prefill (default: off)."
         ),
     )
 
