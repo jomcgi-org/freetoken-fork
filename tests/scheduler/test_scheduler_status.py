@@ -319,3 +319,36 @@ def test_usage_ratio_guard():
     assert _usage_ratio(0, 0) == 0.0
     assert _usage_ratio(5, 0) == 0.0
     assert _usage_ratio(5, 10) == 0.5
+
+
+def test_disk_status_includes_harness_anchor_counters():
+    stats = {
+        "hits": 0,
+        "misses": 0,
+        "bytes_restored": 0,
+        "restore_ms": 0.0,
+        "restore_eager_ms": 0.0,
+        "blocks_faulted": 0,
+        "blocks_streamed": 0,
+        "first_token_after_restore_ms": 0.0,
+        "prefill_ms_saved": 0.0,
+        "write_drops": 0,
+        "stale_format": 0,
+        "corrupt_entries": 0,
+        "fingerprint_mismatches": 0,
+        "harness_anchor_persisted": 3,
+        "harness_anchor_skipped_final_chunk": 4,
+        "harness_anchor_skipped_no_store": 5,
+        "harness_anchor_skipped_unaligned": 6,
+    }
+    reporter = SchedulerStatusReporter(
+        log=lambda _line: None,
+        disk_prefix_store=SimpleNamespace(stats=lambda: stats),
+    )
+
+    line = reporter._disk_prefix_msg()
+
+    assert "harness_anchor_persisted: 3" in line
+    assert "harness_anchor_skipped_final_chunk: 4" in line
+    assert "harness_anchor_skipped_no_store: 5" in line
+    assert "harness_anchor_skipped_unaligned: 6" in line

@@ -53,9 +53,10 @@ def test_successful_tokenization_does_not_account_prompt_before_admission():
         def tokenize(self, messages):
             return [torch.tensor([10, 11, 12], dtype=torch.int32)]
 
-    ok, tensors, errors = _tokenize_requests(Tokenizer(), [_tokenize_msg(1)], _Logger())
+    ok, results, errors = _tokenize_requests(Tokenizer(), [_tokenize_msg(1)], _Logger())
     assert [msg.uid for msg in ok] == [1]
-    assert tensors[0].tolist() == [10, 11, 12]
+    assert results[0][0].tolist() == [10, 11, 12]
+    assert results[0][1:] == (None, None)
     assert errors == []  # in particular, no early prompt_tokens_delta UserReply
 
 

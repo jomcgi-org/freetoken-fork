@@ -22,6 +22,8 @@ class PendingReq:
     priority: int = 0
     arrival_time: float = field(default_factory=time.monotonic)
     expert_profile: Any | None = None
+    cache_anchor_len: int | None = None
+    cache_anchor_kind: str | None = None
 
     @property
     def input_len(self) -> int:

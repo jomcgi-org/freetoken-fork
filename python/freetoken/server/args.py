@@ -117,6 +117,12 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _harness_prefix(value: str) -> str:
+        kind, separator, prefix = value.partition("=")
+        if not separator or not kind.strip() or not prefix.strip():
+            raise argparse.ArgumentTypeError("must use non-empty kind=prefix syntax")
+        return f"{kind.strip()}={prefix}"
+
     def _gpu_prefill_layers(value: str) -> str:
         normalized = value.strip().lower()
         if normalized in ("auto", "off"):
@@ -559,6 +565,18 @@ def parse_args(
         type=float,
         default=ServerArgs.kv_disk_cache_gib,
         help="Disk prefix-cache byte budget in GiB (default: 0, disabled).",
+    )
+
+    parser.add_argument(
+        "--kv-harness-prefixes",
+        action="append",
+        type=_harness_prefix,
+        default=None,
+        metavar="KIND=PREFIX",
+        help=(
+            "Coding-harness system-prefix signature. Repeat for multiple signatures. "
+            "Supplying any entries replaces the built-in OpenCode and Pi signatures."
+        ),
     )
 
     parser.add_argument(
@@ -1187,6 +1205,10 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    if kwargs["kv_harness_prefixes"] is None:
+        kwargs["kv_harness_prefixes"] = ServerArgs.kv_harness_prefixes
+    else:
+        kwargs["kv_harness_prefixes"] = tuple(kwargs["kv_harness_prefixes"])
     kwargs["kv_ladder_explicit"] = kwargs["kv_ladder"] is not kv_ladder_unspecified
     if not kwargs["kv_ladder_explicit"]:
         kwargs["kv_ladder"] = ServerArgs.kv_ladder

@@ -88,6 +88,10 @@ def test_store_round_trip_with_synthetic_hybrid_state(tmp_path):
     stats = store.stats()
     assert stats["hits"] == 1
     assert stats["bytes_restored"] == entry.file_bytes
+    assert stats["harness_anchor_persisted"] == 0
+    assert stats["harness_anchor_skipped_final_chunk"] == 0
+    assert stats["harness_anchor_skipped_no_store"] == 0
+    assert stats["harness_anchor_skipped_unaligned"] == 0
     store.close()
 
 

@@ -177,6 +177,12 @@ class EngineConfig:
     # the lane fully disabled. Version 2 adds a page index to whole-prefix entries.
     kv_disk_cache_dir: str | None = None
     kv_disk_cache_gib: float = 0.0
+    # Repeated kind=prefix signatures recognized at the start of leading system or
+    # developer content. The CLI replaces these defaults when any entries are supplied.
+    kv_harness_prefixes: tuple[str, ...] = (
+        "opencode=You are OpenCode,",
+        "pi=You are a focused coding agent.",
+    )
     # Demand-load page-indexed disk QSA KV. Older entries without an index fall back to eager.
     lazy_restore: str = "on"
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
@@ -261,6 +267,18 @@ class EngineConfig:
             raise ValueError(
                 "--kv-disk-cache-dir is required when --kv-disk-cache-gib is positive"
             )
+        for entry in self.kv_harness_prefixes:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    "--kv-harness-prefixes entries must be strings using kind=prefix syntax, "
+                    f"got {entry!r}"
+                )
+            kind, separator, prefix = entry.partition("=")
+            if not separator or not kind.strip() or not prefix.strip():
+                raise ValueError(
+                    "--kv-harness-prefixes entries must use non-empty kind=prefix syntax, "
+                    f"got {entry!r}"
+                )
         if self.lazy_restore not in ("on", "off"):
             raise ValueError(
                 f"--lazy-restore must be 'on' or 'off', got {self.lazy_restore!r}"

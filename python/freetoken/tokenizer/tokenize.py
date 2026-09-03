@@ -4,8 +4,9 @@ import importlib.util
 import json
 import os
 import threading
+from collections import OrderedDict
 from types import ModuleType
-from typing import Any, List
+from typing import Any, List, Sequence
 
 import torch
 from freetoken.message import TokenizeMsg
@@ -21,6 +22,13 @@ from .effort import (
 )
 
 logger = init_logger(__name__)
+
+
+_DEFAULT_HARNESS_PREFIXES = (
+    "opencode=You are OpenCode,",
+    "pi=You are a focused coding agent.",
+)
+_PREAMBLE_CACHE_SIZE = 64
 
 
 def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
@@ -47,8 +55,17 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        harness_prefixes: Sequence[str] | None = None,
+    ) -> None:
         self.tokenizer = tokenizer
+        self._harness_prefixes = _parse_harness_prefixes(
+            _DEFAULT_HARNESS_PREFIXES if harness_prefixes is None else harness_prefixes
+        )
+        self._preamble_cache: OrderedDict[str, tuple[str, torch.Tensor]] = OrderedDict()
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
@@ -56,23 +73,80 @@ class TokenizeManager:
         self._logged_effort_maps: set[tuple[Any, str | None]] = set()
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
         # TODO: batch tokenization
-        for msg in msgs:
-            prompt = self.render_prompt(msg)
-            # A jinja chat template owns every special token (HF's apply_chat_template
-            # tokenizes with add_special_tokens=False for the same reason): tokenizers
-            # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --
-            # the template already rendered one. Raw-string prompts and the dsv4
-            # encoder path keep the default.
-            templated = isinstance(msg.text, list) and self._dsv4_encoder is None
-            input_ids: torch.Tensor = (  # type: ignore
-                self.tokenizer.encode(
-                    prompt, return_tensors="pt", add_special_tokens=not templated
-                )
+        return [
+            self._encode_prompt(
+                self.render_prompt(msg), templated=isinstance(msg.text, list)
             )
-            results.append(input_ids.view(-1).to(torch.int32))
-        return results
+            for msg in msgs
+        ]
+
+    def tokenize_with_cache_anchor(
+        self, msg: TokenizeMsg
+    ) -> tuple[torch.Tensor, int | None, str | None]:
+        """Tokenize one request and find a reusable coding-harness preamble.
+
+        Configured coding harnesses put stable instructions and tool schemas before
+        the first conversational message. Rendering that leading system run by itself,
+        then taking its token-level common prefix with the real prompt, finds the
+        exact template-safe boundary without assuming how a model spells role markers.
+        Any generation suffix emitted by the standalone template stops contributing
+        at the first token where it differs from the full conversation render.
+        """
+        prompt = self.render_prompt(msg)
+        input_ids = self._encode_prompt(prompt, templated=isinstance(msg.text, list))
+        kind, preamble = _known_harness_preamble(msg.text, self._harness_prefixes)
+        if kind is None or not preamble:
+            return input_ids, None, None
+        try:
+            _, preamble_ids = self._cached_preamble(
+                preamble,
+                msg.tools,
+                self._sanitize_effort(msg.chat_template_kwargs or {}),
+            )
+        except Exception:  # a template may reject a system-only conversation
+            return input_ids, None, None
+        anchor = _common_prefix_len(input_ids, preamble_ids)
+        if anchor <= 0 or anchor >= input_ids.numel():
+            return input_ids, None, None
+        return input_ids, anchor, kind
+
+    def _cached_preamble(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        chat_template_kwargs: dict[str, Any],
+    ) -> tuple[str, torch.Tensor]:
+        key = json.dumps(
+            (messages, tools, chat_template_kwargs),
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=repr,
+        )
+        cached = self._preamble_cache.get(key)
+        if cached is not None:
+            self._preamble_cache.move_to_end(key)
+            return cached
+        rendered_preamble = self._render(messages, tools, chat_template_kwargs)
+        encoded = self._encode_prompt(rendered_preamble, templated=True)
+        cached = (rendered_preamble, encoded)
+        self._preamble_cache[key] = cached
+        self._preamble_cache.move_to_end(key)
+        if len(self._preamble_cache) > _PREAMBLE_CACHE_SIZE:
+            self._preamble_cache.popitem(last=False)
+        return cached
+
+    def _encode_prompt(self, prompt: str, *, templated: bool) -> torch.Tensor:
+        # A jinja chat template owns every special token (HF's apply_chat_template
+        # tokenizes with add_special_tokens=False for the same reason): tokenizers
+        # that auto-add bos (muse-glimmer's, llama's) would otherwise double it.
+        # Raw-string prompts and the dsv4 encoder path keep the default.
+        rendered_by_jinja = templated and self._dsv4_encoder is None
+        input_ids: torch.Tensor = self.tokenizer.encode(  # type: ignore
+            prompt, return_tensors="pt", add_special_tokens=not rendered_by_jinja
+        )
+        return input_ids.view(-1).to(torch.int32)
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
         """The template/encoder half of ``tokenize``, exposed so the frontend can
@@ -186,6 +260,70 @@ def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleTy
     if not hasattr(module, "encode_messages"):
         return None
     return module
+
+
+def _known_harness_preamble(
+    text: str | list[dict[str, Any]],
+    prefixes: tuple[tuple[str, str], ...] | None = None,
+) -> tuple[str | None, list[dict[str, Any]]]:
+    if not isinstance(text, list):
+        return None, []
+    preamble: list[dict[str, Any]] = []
+    for message in text:
+        if message.get("role") not in ("system", "developer"):
+            break
+        preamble.append(message)
+    if not preamble:
+        return None, []
+    configured = (
+        _parse_harness_prefixes(_DEFAULT_HARNESS_PREFIXES)
+        if prefixes is None
+        else prefixes
+    )
+    for message in preamble:
+        system_text = _content_text(message.get("content")).lstrip().casefold()
+        for kind, prefix in configured:
+            if system_text.startswith(prefix):
+                return kind, preamble
+    return None, []
+
+
+def _parse_harness_prefixes(entries: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    parsed = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            raise ValueError(
+                "harness prefixes must be strings using kind=prefix syntax, "
+                f"got {entry!r}"
+            )
+        kind, separator, prefix = entry.partition("=")
+        if not separator or not kind.strip() or not prefix.strip():
+            raise ValueError(
+                "harness prefixes must use non-empty kind=prefix syntax, "
+                f"got {entry!r}"
+            )
+        parsed.append((kind.strip(), prefix.lstrip().casefold()))
+    return tuple(parsed)
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def _common_prefix_len(left: torch.Tensor, right: torch.Tensor) -> int:
+    limit = min(int(left.numel()), int(right.numel()))
+    if limit == 0:
+        return 0
+    different = torch.nonzero(left[:limit] != right[:limit], as_tuple=False)
+    return limit if different.numel() == 0 else int(different[0].item())
 
 
 def _apply_dsv4_chat_encoder(

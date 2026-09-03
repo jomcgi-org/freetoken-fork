@@ -27,6 +27,21 @@ class FakeTokenizer:
         return torch.tensor([[1, 2, 3]], dtype=torch.long)
 
 
+class HarnessTokenizer:
+    """Character tokenizer whose template makes the role boundary observable."""
+
+    def apply_chat_template(self, messages, **kwargs):
+        tools = json.dumps(kwargs.get("tools") or [], sort_keys=True)
+        turns = "".join(
+            f"<{message['role']}>{message.get('content') or ''}</{message['role']}>"
+            for message in messages
+        )
+        return f"<tools>{tools}</tools>{turns}<assistant>"
+
+    def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+        return torch.tensor([[ord(char) for char in prompt]], dtype=torch.long)
+
+
 def test_tokenize_manager_passes_chat_template_kwargs():
     tokenizer = FakeTokenizer()
     manager = TokenizeManager(tokenizer)
@@ -72,6 +87,205 @@ def test_tokenize_manager_passes_tools_to_chat_template():
         "tools": tools,
     }
     assert input_ids.tolist() == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("system", "kind"),
+    [
+        ("You are OpenCode, the best coding agent on the planet. " + "x" * 100, "opencode"),
+        ("You are a focused coding agent. " + "x" * 100, "pi"),
+    ],
+)
+def test_known_harness_gets_exact_system_and_tool_anchor(system, kind):
+    manager = TokenizeManager(HarnessTokenizer())
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    msg = TokenizeMsg(
+        uid=1,
+        text=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": "session-specific task"},
+        ],
+        sampling_params=SamplingParams(),
+        tools=tools,
+    )
+
+    full, anchor, detected = manager.tokenize_with_cache_anchor(msg)
+    preamble = TokenizeMsg(
+        uid=2,
+        text=[msg.text[0]],
+        sampling_params=SamplingParams(),
+        tools=tools,
+    )
+    preamble_ids = manager.tokenize([preamble])[0]
+    expected_common = 0
+    for left, right in zip(full.tolist(), preamble_ids.tolist(), strict=False):
+        if left != right:
+            break
+        expected_common += 1
+
+    assert detected == kind
+    assert anchor == expected_common
+    assert 0 < anchor < full.numel()
+
+
+def test_unknown_client_does_not_get_a_harness_anchor():
+    manager = TokenizeManager(HarnessTokenizer())
+    msg = TokenizeMsg(
+        uid=1,
+        text=[
+            {"role": "system", "content": "You are an ordinary assistant. " + "x" * 100},
+            {"role": "user", "content": "hello"},
+        ],
+        sampling_params=SamplingParams(),
+    )
+
+    _, anchor, kind = manager.tokenize_with_cache_anchor(msg)
+
+    assert anchor is None
+    assert kind is None
+
+
+def test_empty_harness_configuration_disables_detection():
+    manager = TokenizeManager(HarnessTokenizer(), harness_prefixes=())
+    msg = TokenizeMsg(
+        uid=8,
+        text=[
+            {"role": "system", "content": "You are OpenCode, ready"},
+            {"role": "user", "content": "hello"},
+        ],
+        sampling_params=SamplingParams(),
+    )
+
+    assert manager.tokenize_with_cache_anchor(msg)[1:] == (None, None)
+
+
+def test_harness_detection_supports_content_parts_case_and_leading_space():
+    manager = TokenizeManager(HarnessTokenizer())
+    msg = TokenizeMsg(
+        uid=2,
+        text=[
+            {
+                "role": "system",
+                "content": [
+                    {"type": "text", "text": "  you are "},
+                    {"type": "text", "text": "OPENCODE, configured here"},
+                ],
+            },
+            {"role": "user", "content": "hello"},
+        ],
+        sampling_params=SamplingParams(),
+    )
+
+    _, anchor, kind = manager.tokenize_with_cache_anchor(msg)
+
+    assert anchor is not None
+    assert kind == "opencode"
+
+
+def test_configured_harness_prefixes_replace_builtins():
+    manager = TokenizeManager(
+        HarnessTokenizer(), harness_prefixes=("custom=You are Custom Agent,",)
+    )
+    custom = TokenizeMsg(
+        uid=3,
+        text=[
+            {"role": "system", "content": "you are custom agent, ready"},
+            {"role": "user", "content": "hello"},
+        ],
+        sampling_params=SamplingParams(),
+    )
+    builtin = TokenizeMsg(
+        uid=4,
+        text=[
+            {"role": "system", "content": "You are OpenCode, ready"},
+            {"role": "user", "content": "hello"},
+        ],
+        sampling_params=SamplingParams(),
+    )
+
+    assert manager.tokenize_with_cache_anchor(custom)[2] == "custom"
+    assert manager.tokenize_with_cache_anchor(builtin)[1:] == (None, None)
+
+
+def test_batch_tokenize_does_not_render_or_encode_anchor():
+    class CountingTokenizer(HarnessTokenizer):
+        def __init__(self):
+            self.renders = 0
+            self.encodes = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.renders += 1
+            return super().apply_chat_template(messages, **kwargs)
+
+        def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+            self.encodes += 1
+            return super().encode(prompt, return_tensors, add_special_tokens)
+
+    tokenizer = CountingTokenizer()
+    manager = TokenizeManager(tokenizer)
+    msg = TokenizeMsg(
+        uid=5,
+        text=[
+            {"role": "system", "content": "You are OpenCode, ready"},
+            {"role": "user", "content": "hello"},
+        ],
+        sampling_params=SamplingParams(),
+    )
+
+    manager.tokenize([msg])
+
+    assert tokenizer.renders == 1
+    assert tokenizer.encodes == 1
+
+
+def test_rendered_preamble_tokenization_uses_bounded_lru():
+    class CountingTokenizer(HarnessTokenizer):
+        def __init__(self):
+            self.encoded_prompts = []
+            self.renders = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.renders += 1
+            return super().apply_chat_template(messages, **kwargs)
+
+        def encode(self, prompt, return_tensors=None, add_special_tokens=True):
+            self.encoded_prompts.append(prompt)
+            return super().encode(prompt, return_tensors, add_special_tokens)
+
+    tokenizer = CountingTokenizer()
+    manager = TokenizeManager(tokenizer)
+
+    def request(uid, user):
+        return TokenizeMsg(
+            uid=uid,
+            text=[
+                {"role": "system", "content": "You are OpenCode, ready"},
+                {"role": "user", "content": user},
+            ],
+            sampling_params=SamplingParams(),
+        )
+
+    manager.tokenize_with_cache_anchor(request(6, "first"))
+    manager.tokenize_with_cache_anchor(request(7, "second"))
+
+    preamble_prompt = HarnessTokenizer().apply_chat_template(
+        [{"role": "system", "content": "You are OpenCode, ready"}]
+    )
+    assert tokenizer.encoded_prompts.count(preamble_prompt) == 1
+    assert tokenizer.renders == 3
+    assert len(manager._preamble_cache) == 1
+
+
+def test_rendered_preamble_lru_is_capped_at_64_entries():
+    manager = TokenizeManager(HarnessTokenizer())
+    for index in range(65):
+        manager._cached_preamble(
+            [{"role": "system", "content": f"You are OpenCode, variant {index}"}],
+            None,
+            {},
+        )
+
+    assert len(manager._preamble_cache) == 64
 
 
 class FakeDsv4Tokenizer:

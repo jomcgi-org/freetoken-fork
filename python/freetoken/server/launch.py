@@ -196,6 +196,15 @@ def launch_server(
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue = mp.Queue()
         processes: list[mp.Process] = []
+        harness_prefixes = (
+            server_args.kv_harness_prefixes
+            if (
+                server_args.kv_disk_cache_gib > 0
+                and server_args.cache_type != "naive"
+                and server_args.model_config.has_linear_attention
+            )
+            else ()
+        )
 
         for i in range(world_size):
             new_args = replace(server_args, tp_info=DistributedInfo(i, world_size))
@@ -220,6 +229,7 @@ def launch_server(
                 "local_bs": 1,
                 "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": num_tokenizers,
+                "harness_prefixes": harness_prefixes,
                 "ack_queue": ack_queue,
             },
             daemon=False,
@@ -239,6 +249,7 @@ def launch_server(
                     "local_bs": 1,
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
+                    "harness_prefixes": harness_prefixes,
                     "ack_queue": ack_queue,
                 },
                 daemon=False,

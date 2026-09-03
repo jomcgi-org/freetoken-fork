@@ -53,6 +53,8 @@ def test_engine_config_disk_prefix_cache_defaults_off_and_requires_directory():
     assert EngineConfig(**base, lazy_restore="off").lazy_restore == "off"
     with pytest.raises(ValueError, match=r"--lazy-restore.*on.*off"):
         EngineConfig(**base, lazy_restore="maybe")
+    with pytest.raises(ValueError, match=r"--kv-harness-prefixes.*kind=prefix"):
+        EngineConfig(**base, kv_harness_prefixes=("missing-separator",))
 
 
 def test_verify_state_snapshot_restore_round_trip_cpu():
