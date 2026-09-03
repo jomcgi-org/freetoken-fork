@@ -671,9 +671,12 @@ def test_grouped_hot_partial_real_slot_geometry_matches_decode_and_cpu():
     )
     torch.cuda.synchronize()
 
-    _assert_close(grouped, cpu_ref.to(device))
-    _assert_close(decoded, cpu_ref.to(device))
-    _assert_close(grouped, decoded)
+    # The CPU reference is float32 and both GPU partials are bfloat16;
+    # compare values, not storage dtypes.
+    cpu_ref32 = cpu_ref.to(device=device, dtype=torch.float32)
+    _assert_close(grouped.float(), cpu_ref32)
+    _assert_close(decoded.float(), cpu_ref32)
+    _assert_close(grouped.float(), decoded.float())
     _sorted, expert_slots, ntpp = _align_active_slots(ids, 32)
     valid_blocks = int(ntpp.item()) // 32
     assert set(expert_slots[:valid_blocks].cpu().tolist()) == set(active_slots.tolist())
