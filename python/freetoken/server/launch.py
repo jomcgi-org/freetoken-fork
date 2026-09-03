@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+import signal
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -53,6 +56,37 @@ def _run_tokenize_worker(detach: bool, **kwargs) -> None:
     from freetoken.tokenizer import tokenize_worker
 
     tokenize_worker(**kwargs)
+
+
+def _scheduler_sigterm_handler(scheduler):
+    """Build the worker-local SIGTERM bridge into the graceful shutdown path."""
+    quiet_abort = threading.Event()
+
+    def handle_sigterm(_signum, _frame) -> None:
+        if quiet_abort.is_set():
+            return
+        quiet_abort.set()
+        cache = getattr(getattr(scheduler, "engine", None), "moe_offload_cache", None)
+        if cache is not None:
+            stop = getattr(cache, "request_hot_plan_stop", None)
+            if stop is not None:
+                stop()
+        raise KeyboardInterrupt
+
+    handle_sigterm.stop_event = quiet_abort
+    return handle_sigterm
+
+
+@contextmanager
+def _scheduler_sigterm_handler_installed(scheduler):
+    """Install the scheduler SIGTERM bridge and restore the prior handler."""
+    previous_sigterm = signal.signal(
+        signal.SIGTERM, _scheduler_sigterm_handler(scheduler)
+    )
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
@@ -112,14 +146,15 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
         if args.silent_output:
             logging.disable(logging.INFO)
 
-        try:
-            scheduler.run_forever()
-        except KeyboardInterrupt:
-            logger = init_logger(__name__)
-            if args.tp_info.is_primary():
-                print()  # for a clean newline after ^C
-                logger.info("Scheduler exiting gracefully...")
-            scheduler.shutdown()
+        with _scheduler_sigterm_handler_installed(scheduler):
+            try:
+                scheduler.run_forever()
+            except KeyboardInterrupt:
+                logger = init_logger(__name__)
+                if args.tp_info.is_primary():
+                    print()  # for a clean newline after ^C
+                    logger.info("Scheduler exiting gracefully...")
+                scheduler.shutdown()
 
 
 def launch_server(

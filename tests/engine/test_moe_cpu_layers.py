@@ -19,6 +19,7 @@ from freetoken.engine.engine import _load_hot_expert_profile as load_hot_profile
 from freetoken.engine.engine import _plan_hot_experts as plan_hot
 from freetoken.engine.engine import _profiled_hot_pair_rate as profiled_hot_rate
 from freetoken.engine.engine import _resolve_hot_expert_sets as resolve_hot
+from freetoken.engine.engine import _resolve_persisted_hot_plan as resolve_hot_plan
 from freetoken.engine.engine import _validate_disk_prefill_task_size as validate_chunk
 from freetoken.moe.cpu_executor import (
     CpuMoeExecutor,
@@ -394,6 +395,107 @@ def test_hot_plan_refuses_when_slot_bound_leaves_zero_rows(tmp_path):
         resolve_hot(config, frozenset({0, 3}), num_layers)
 
 
+def test_hot_plan_resolves_hub_id_and_logs_saved_and_current_budgets(
+    tmp_path, monkeypatch
+):
+    import freetoken.moe.hot_adapt as hot_adapt
+
+    plan_path = tmp_path / hot_adapt.HOT_PLAN_FILENAME
+    plan_path.write_text("{}")
+    identity = {"kind": "ftw", "path": str(tmp_path), "shards": []}
+    seed = SimpleNamespace(
+        expert_ids={0: (1, 2)},
+        counters={0: (1.0, 2.0, 3.0)},
+        seeded_layers=frozenset({0}),
+        age_seconds=12.0,
+        saved_hot_budget_bytes=200,
+        tier_commit="tier-test",
+        tier_mismatch=False,
+    )
+    observed = {}
+    monkeypatch.setattr(
+        "freetoken.utils.hf.download_hf_weight", lambda model_path: str(tmp_path)
+    )
+    monkeypatch.setattr(hot_adapt, "resolve_tier_commit", lambda: "tier-test")
+
+    def checkpoint_identity(model_path):
+        observed["identity_path"] = model_path
+        return identity
+
+    monkeypatch.setattr(hot_adapt, "checkpoint_identity", checkpoint_identity)
+    monkeypatch.setattr(
+        hot_adapt,
+        "hot_plan_directory_writable",
+        lambda _path: False,
+    )
+
+    def load(path, **kwargs):
+        observed["load_path"] = path
+        observed["current_budget"] = kwargs["current_hot_budget_bytes"]
+        return seed
+
+    monkeypatch.setattr(hot_adapt, "load_hot_plan", load)
+    logs = []
+    monkeypatch.setattr("freetoken.engine.engine.logger.info_rank0", logs.append)
+    config = SimpleNamespace(
+        model_path="meta-llama/Llama-2-7b-hf",
+        moe_hot_plan_persist="auto",
+        moe_hot_plan_dir=None,
+        moe_hot_plan_interval_minutes=10.0,
+        tp_info=SimpleNamespace(is_primary=lambda: True),
+        model_config=SimpleNamespace(num_experts=3),
+    )
+
+    selected, loaded_seed, runtime = resolve_hot_plan(
+        config, frozenset({0}), 1, {0: (0, 1)}, {0: 2}, 150
+    )
+
+    assert selected == seed.expert_ids
+    assert loaded_seed is seed
+    assert runtime["path"] == str(plan_path)
+    assert observed == {
+        "identity_path": str(tmp_path),
+        "load_path": str(plan_path),
+        "current_budget": 300,
+    }
+    assert any(f"resolved_model_path={str(tmp_path)!r}" in message for message in logs)
+    assert any(
+        "plan was saved at 200 byte budget, current is 300" in message
+        for message in logs
+    )
+
+
+def test_hot_plan_resolution_failure_logs_once_and_disables_persistence(monkeypatch):
+    import freetoken.moe.hot_adapt as hot_adapt
+
+    def fail_resolution(model_path):
+        raise ValueError(f"cannot resolve {model_path}")
+
+    monkeypatch.setattr("freetoken.utils.hf.download_hf_weight", fail_resolution)
+    monkeypatch.setattr(hot_adapt, "resolve_tier_commit", lambda: "tier-test")
+    warnings = []
+    monkeypatch.setattr("freetoken.engine.engine.logger.warning_rank0", warnings.append)
+    config = SimpleNamespace(
+        model_path="org/missing-model",
+        moe_hot_plan_persist="auto",
+        moe_hot_plan_dir=None,
+        moe_hot_plan_interval_minutes=10.0,
+        tp_info=SimpleNamespace(is_primary=lambda: True),
+        model_config=SimpleNamespace(num_experts=3),
+    )
+
+    selected, seed, runtime = resolve_hot_plan(
+        config, frozenset({0}), 1, {0: (0, 1)}, {0: 2}, 150
+    )
+
+    assert selected == {0: (0, 1)}
+    assert seed is None
+    assert runtime["identity"] is None
+    assert not runtime["write_enabled"]
+    assert len(warnings) == 1
+    assert "checkpoint path resolution or identity failed" in warnings[0]
+
+
 def test_hot_budget_without_profile_starts_all_cold_when_adaptation_is_on(
     tmp_path, monkeypatch,
 ):
@@ -517,6 +619,9 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_hot_adapt_interval_steps == "auto"
     assert config.moe_hot_adapt_max_swap_gib == 0.5
     assert config.moe_hot_adapt_boundary_cap_frac == 0.5
+    assert config.moe_hot_plan_persist == "auto"
+    assert config.moe_hot_plan_dir is None
+    assert config.moe_hot_plan_interval_minutes == 10.0
 
 
 @pytest.mark.parametrize("budget", [-1, float("inf"), float("nan")])
@@ -598,6 +703,38 @@ def test_engine_config_rejects_invalid_hot_adapt_boundary_cap(boundary_cap):
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_hot_adapt_boundary_cap_frac=boundary_cap,
+        )
+
+
+@pytest.mark.parametrize("mode", ["yes", "", None])
+def test_engine_config_rejects_invalid_hot_plan_persist(mode):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-plan-persist"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_plan_persist=mode,
+        )
+
+
+@pytest.mark.parametrize("minutes", [0, -1, float("inf"), float("nan"), True])
+def test_engine_config_rejects_invalid_hot_plan_interval(minutes):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-plan-interval-minutes"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_plan_interval_minutes=minutes,
         )
 
 

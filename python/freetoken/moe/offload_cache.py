@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 import math
 import os
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Iterator, Mapping
 
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
+from freetoken.exit_safe_executor import ExitSafeThreadPoolExecutor
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
@@ -30,6 +33,49 @@ _SMALL_BANK_FEAT_BYTES = 256 * 1024
 from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
+
+# Shutdown allows one conservative 512 MiB/s transfer window plus fixed setup
+# headroom after asking a catch-up staging loop to stop at its next row boundary.
+_HOT_ADAPT_SHUTDOWN_BYTES_PER_SECOND = 512 << 20
+_HOT_ADAPT_SHUTDOWN_FIXED_SECONDS = 2.0
+# Leave enough supervisor grace for the drain, final write, and executor join.
+_HOT_ADAPT_STOP_WAIT_MAX_SECONDS = 20.0
+_HOT_PLAN_FINAL_WRITE_SECONDS = 1.0
+_HOT_PLAN_FENCE_CANCEL_SECONDS = 0.5
+_HOT_ADAPT_EXECUTOR_JOIN_SECONDS = 1.0
+
+
+class _HotPlanWriteFence:
+    """Serialize cancellation with the final atomic plan rename."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._cancelled = False
+
+    def cancel(self, timeout_seconds: float | None = None) -> bool:
+        """Fence publication, or abandon confirmation when the lock stays busy."""
+        if timeout_seconds is None:
+            timeout_seconds = _HOT_PLAN_FENCE_CANCEL_SECONDS
+        acquired = self._lock.acquire(timeout=max(0.0, timeout_seconds))
+        if not acquired:
+            self._cancelled = True
+            logger.warning_rank0(
+                "MoE HOT plan fence lock acquire timed out; abandoning write "
+                "without confirmation"
+            )
+            return False
+        try:
+            self._cancelled = True
+        finally:
+            self._lock.release()
+        return True
+
+    def publish(self, source: str, target: str) -> bool:
+        with self._lock:
+            if self._cancelled:
+                return False
+            os.replace(source, target)
+            return True
 
 
 def hot_dynamic_slot_reserve(
@@ -330,6 +376,7 @@ class OffloadMoeCache:
         self.hot_staging_bytes = 0
         self._hot_adapt_executor: ThreadPoolExecutor | None = None
         self._hot_adapt_future: Future | None = None
+        self._hot_adapt_stop_event = threading.Event()
         self._hot_adapt_phase: str | None = None
         self._hot_adapt_swaps_pending = ()
         self._hot_adapt_worker_installs = False
@@ -341,6 +388,21 @@ class OffloadMoeCache:
         self._hot_adapt_tick_covered_seconds = 0.0
         self._hot_adapt_window_started_at: float | None = None
         self._hot_adapt_deferred_logged = False
+        # Persisted HOT plan state. The adaptation and persistence executors are
+        # separate so JSON encoding and fsync never occupy the rerank worker.
+        self._hot_plan_counter_seed: dict[int, tuple[float, ...]] = {}
+        self._hot_plan_path: str | None = None
+        self._hot_plan_identity = None
+        self._hot_plan_tier_commit = ""
+        self._hot_plan_write_enabled = False
+        self._hot_plan_interval_seconds = 600.0
+        self._hot_plan_last_snapshot = 0.0
+        self._hot_plan_executor: ThreadPoolExecutor | None = None
+        self._hot_plan_future: Future | None = None
+        self._hot_plan_write_fence: _HotPlanWriteFence | None = None
+        self._hot_plan_stop_event = threading.Event()
+        self._hot_plan_zero_logged = False
+        self._hot_plan_last_published_owners: dict[int, tuple[int | None, ...]] = {}
         # per-layer host residency: direct GPU movement requires "pinned";
         # LOCKED/PAGEABLE decode on CPU, while DISK may use CPU or the staging ring
         # _unpinned_layers is the derived id set the hot paths test against
@@ -983,6 +1045,13 @@ class OffloadMoeCache:
         max_swap_bytes: int,
         expert_bytes: int,
         boundary_cap_frac: float = 0.5,
+        persisted_counter_seed: Mapping[int, tuple[float, ...]] | None = None,
+        persisted_seeded_layers: frozenset[int] = frozenset(),
+        hot_plan_path: str | None = None,
+        hot_plan_identity=None,
+        hot_plan_tier_commit: str = "",
+        hot_plan_write_enabled: bool = False,
+        hot_plan_interval_seconds: float = 600.0,
     ) -> None:
         """Allocate bounded staging, load seeds, and arm online adaptation."""
         if not self.hot_expert_capacity:
@@ -1017,6 +1086,29 @@ class OffloadMoeCache:
             hot_budget_bytes=self.hot_adapt_hot_budget_bytes,
             max_swap_bytes=self.hot_adapt_max_swap_bytes,
         )
+        seed = {
+            int(layer_id): tuple(float(value) for value in row)
+            for layer_id, row in (persisted_counter_seed or {}).items()
+        }
+        for layer_id, row in seed.items():
+            if layer_id not in self.hot_expert_capacity or len(row) != self.num_experts:
+                raise ValueError(f"persisted HOT counter layer {layer_id} has invalid geometry")
+        self._hot_plan_counter_seed = seed
+        self._apply_hot_plan_counter_seed()
+        fully_seeded = (
+            bool(self.hot_expert_capacity)
+            and persisted_seeded_layers == frozenset(self.hot_expert_capacity)
+            and all(
+                len(self.hot_expert_ids[layer_id]) == capacity
+                for layer_id, capacity in self.hot_expert_capacity.items()
+            )
+        )
+        if fully_seeded:
+            controller.fill_complete = True
+            if controller.auto:
+                controller.current_interval = max(
+                    controller.current_interval, controller.steady_interval
+                )
         self._hot_adapt_interval_controller = controller
         self.hot_adapt_interval_steps = controller.current_interval
         self._hot_adapt_tick_interval_tokens = self.hot_adapt_interval_steps
@@ -1040,10 +1132,28 @@ class OffloadMoeCache:
                 f"max_swap plus fixed headroom ({budget_bytes} bytes)"
             )
         self.hot_staging_bytes = budget_bytes
-        self._hot_adapt_executor = ThreadPoolExecutor(
+        # These pools use daemon workers omitted from concurrent.futures' atexit
+        # join registry. Explicit shutdown still cleans up responsive workers,
+        # while process exit may abandon a wedged copy, fsync, or temporary file.
+        self._hot_adapt_executor = ExitSafeThreadPoolExecutor(
             max_workers=1, thread_name_prefix="freetoken-hot-adapt"
         )
+        self._hot_adapt_stop_event.clear()
+        self._hot_plan_path = hot_plan_path
+        self._hot_plan_identity = hot_plan_identity
+        self._hot_plan_tier_commit = hot_plan_tier_commit
+        self._hot_plan_write_enabled = bool(
+            hot_plan_write_enabled and hot_plan_path and hot_plan_identity
+        )
+        self._hot_plan_interval_seconds = float(hot_plan_interval_seconds)
+        self._hot_plan_last_snapshot = time.monotonic()
+        self._hot_plan_stop_event.clear()
+        if self._hot_plan_write_enabled:
+            self._hot_plan_executor = ExitSafeThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="freetoken-hot-plan"
+            )
         self._reload_hot_slots()
+        self._checkpoint_published_hot_slot_owners()
         logger.info_rank0(
             f"MoE HOT expert residency: {sum(self.hot_expert_capacity.values())} "
             f"protected GPU rows across {len(self.hot_expert_capacity)} DISK layers, "
@@ -1074,6 +1184,13 @@ class OffloadMoeCache:
             self._hot_adapt_copy_stream = torch.cuda.Stream(device=self.device)
             self._hot_adapt_snapshot_ready = torch.cuda.Event()
 
+    def _apply_hot_plan_counter_seed(self) -> None:
+        """Restore the startup seed after graph capture and prefill warmup resets."""
+        for layer_id, row in self._hot_plan_counter_seed.items():
+            self.decayed_decode_freq[layer_id].copy_(
+                torch.tensor(row, dtype=torch.float32, device=self.device)
+            )
+
     def _protect_hot_slots(self) -> None:
         """Keep permanent HOT rows outside every ordinary LRU victim set."""
         slots = self._hot_slots_device
@@ -1091,7 +1208,7 @@ class OffloadMoeCache:
                 self.slot_for_id[layer_id, expert] = slot
                 self.id_of_slot[slot] = layer_id * self.num_experts + expert
 
-    def _stage_hot_rows(self, ready, swaps):
+    def _stage_hot_rows(self, ready, swaps, stop_event=None):
         if ready is not None:
             ready.synchronize()
         if len(swaps) > self._hot_staging_rows:
@@ -1100,6 +1217,8 @@ class OffloadMoeCache:
         copied: set[tuple[int, int]] = set()
         with torch.inference_mode():
             for stage_row, swap in enumerate(swaps):
+                if stop_event is not None and stop_event.is_set():
+                    break
                 for bank_id, name in enumerate(self.bank_schema):
                     source = self.bank_sources[name][swap.layer_id]
                     self._hot_staging[bank_id][stage_row].copy_(
@@ -1122,15 +1241,22 @@ class OffloadMoeCache:
                         non_blocking=self.device.type == "cuda",
                     )
 
-    def _stage_hot_rows_batched(self, ready, swaps):
+    def _stage_hot_rows_batched(self, ready, swaps, stop_event=None):
         """Stream catch-up ticks through the one-tick staging allocation."""
         if ready is not None:
             ready.synchronize()
+        if stop_event is None:
+            stop_event = self._hot_adapt_stop_event
         started_at = time.perf_counter()
         copied: set[tuple[int, int]] = set()
         for start in range(0, len(swaps), self._hot_staging_rows):
             batch = tuple(swaps[start:start + self._hot_staging_rows])
-            batch_copied, _ = self._stage_hot_rows(None, batch)
+            batch_copied, _ = self._stage_hot_rows(
+                None, batch, stop_event
+            )
+            batch = batch[:len(batch_copied)]
+            if not batch:
+                break
             if self.device.type == "cuda":
                 assert self._hot_adapt_copy_stream is not None
                 with torch.cuda.stream(self._hot_adapt_copy_stream):
@@ -1139,7 +1265,15 @@ class OffloadMoeCache:
             else:
                 self._install_staged_hot_rows(batch)
             copied.update(batch_copied)
+            if stop_event.is_set():
+                break
         return copied, time.perf_counter() - started_at
+
+    def _checkpoint_published_hot_slot_owners(self) -> None:
+        self._hot_plan_last_published_owners = {
+            layer_id: tuple(owners)
+            for layer_id, owners in self._hot_slot_owners.items()
+        }
 
     def _reload_hot_slots(self) -> None:
         """Stream every published/seeded HOT row through the bounded stage."""
@@ -1511,7 +1645,9 @@ class OffloadMoeCache:
             self._stage_hot_rows_batched
             if self._hot_adapt_worker_installs else self._stage_hot_rows
         )
-        self._hot_adapt_future = self._hot_adapt_executor.submit(stage, ready, swaps)
+        self._hot_adapt_future = self._hot_adapt_executor.submit(
+            stage, ready, swaps, self._hot_adapt_stop_event
+        )
 
     def _finish_hot_adaptation_swaps(
         self, copied_rows, staging_seconds: float = 0.0
@@ -1539,6 +1675,7 @@ class OffloadMoeCache:
             layer_id: tuple(sorted(owner for owner in owners if owner is not None))
             for layer_id, owners in self._hot_slot_owners.items()
         }
+        self._checkpoint_published_hot_slot_owners()
         self.hot_adapt_swaps += len(swaps)
         self._hot_adapt_swaps_pending = ()
         self._hot_adapt_worker_installs = False
@@ -1603,6 +1740,87 @@ class OffloadMoeCache:
         else:
             raise RuntimeError("HOT adaptation future completed in an invalid phase")
 
+    def _write_hot_plan_snapshot(
+        self,
+        owners,
+        counters: torch.Tensor,
+        fence: _HotPlanWriteFence,
+    ) -> bool:
+        from freetoken.moe.hot_adapt import atomic_write_hot_plan, make_hot_plan_document
+
+        document = make_hot_plan_document(
+            identity=self._hot_plan_identity,
+            disk_layer_ids=tuple(sorted(self.hot_expert_capacity)),
+            num_layers=self.num_layers,
+            num_experts=self.num_experts,
+            hot_budget_bytes=self.hot_adapt_hot_budget_bytes,
+            tier_commit=self._hot_plan_tier_commit,
+            protected_slots=owners,
+            decayed_counters={
+                layer_id: counters[layer_id].tolist()
+                for layer_id in sorted(self.hot_expert_capacity)
+            },
+        )
+        if document is None:
+            if not self._hot_plan_zero_logged:
+                logger.info_rank0("MoE HOT plan write skipped: decayed counters are all zero")
+                self._hot_plan_zero_logged = True
+            return False
+        return atomic_write_hot_plan(
+            self._hot_plan_path,
+            document,
+            publish=fence.publish,
+        )
+
+    def _collect_finished_hot_plan_write(self) -> None:
+        future = self._hot_plan_future
+        if future is None or not future.done():
+            return
+        self._hot_plan_future = None
+        self._hot_plan_write_fence = None
+        try:
+            wrote = future.result()
+        except Exception as exc:  # noqa: BLE001 - persistence must not stop serving
+            logger.warning_rank0(f"MoE HOT plan write failed: {exc!r}")
+        else:
+            if wrote:
+                logger.info_rank0(f"MoE HOT plan wrote {self._hot_plan_path!r}")
+
+    def snapshot_hot_plan(
+        self,
+        *,
+        force: bool = False,
+        snapshot_at: Mapping[int, tuple[int | None, ...]] | None = None,
+    ) -> Future | None:
+        """Take the small D2H state snapshot and queue encoding plus fsync."""
+        if (
+            not getattr(self, "_hot_plan_write_enabled", False)
+            or getattr(self, "_hot_plan_executor", None) is None
+        ):
+            return None
+        self._collect_finished_hot_plan_write()
+        if self._hot_plan_future is not None:
+            return self._hot_plan_future
+        now = time.monotonic()
+        if not force and (
+            self._hot_plan_stop_event.is_set()
+            or now - self._hot_plan_last_snapshot < self._hot_plan_interval_seconds
+            or self._hot_adapt_future is not None
+        ):
+            return None
+        # The mapping owners are host bookkeeping. Copy counters to host here so
+        # the background task never calls CUDA or touches mutable serving state.
+        owner_source = self._hot_slot_owners if snapshot_at is None else snapshot_at
+        owners = {layer_id: tuple(rows) for layer_id, rows in owner_source.items()}
+        counters = self.decayed_decode_freq.detach().to("cpu", copy=True)
+        self._hot_plan_last_snapshot = now
+        fence = _HotPlanWriteFence()
+        self._hot_plan_write_fence = fence
+        self._hot_plan_future = self._hot_plan_executor.submit(
+            self._write_hot_plan_snapshot, owners, counters, fence
+        )
+        return self._hot_plan_future
+
     def _hot_adapt_token_boundary(self, routed_tokens: int, boundary: str) -> None:
         """Advance the shared routed-token clock without waiting on staging work.
 
@@ -1618,6 +1836,7 @@ class OffloadMoeCache:
         # This runs after model work, keeping protection maintenance outside capture.
         self._protect_hot_slots()
         self._boost_protected_slots()
+        self.snapshot_hot_plan()
         if not self.hot_adapt_enabled:
             return
         clock = self._hot_adapt_token_clock
@@ -1711,18 +1930,296 @@ class OffloadMoeCache:
         )
         return hot / total if total else 0.0
 
-    def shutdown_hot_adaptation(self) -> None:
-        """Drain background workers before bank teardown."""
+    def request_hot_plan_stop(self) -> None:
+        """Quiet periodic snapshots before the scheduler enters its drain path."""
+        self._hot_plan_stop_event.set()
+
+    def _drain_hot_adaptation(self, deadline: float) -> bool:
+        """Publish completed rerank and copy work until empty or the deadline."""
+        while self._hot_adapt_future is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            future = self._hot_adapt_future
+            try:
+                future.result(timeout=remaining)
+            except Exception:  # noqa: BLE001 - shutdown must keep progressing
+                if not future.done():
+                    return False
+                try:
+                    future.result()
+                except Exception as completed_exc:  # noqa: BLE001
+                    logger.warning_rank0(
+                        f"MoE HOT adaptation drain failed: {completed_exc!r}"
+                    )
+                    self._hot_adapt_future = None
+                    self._hot_adapt_phase = None
+                    return False
+            try:
+                self._poll_hot_adaptation()
+            except Exception as exc:  # noqa: BLE001 - shutdown must keep progressing
+                logger.warning_rank0(f"MoE HOT adaptation drain failed: {exc!r}")
+                self._hot_adapt_future = None
+                self._hot_adapt_phase = None
+                return False
+        return True
+
+    def _hot_adapt_stop_wait_seconds(self) -> float:
+        boundary_bytes = int(
+            self.hot_adapt_boundary_cap_frac * self.hot_adapt_hot_budget_bytes
+        )
+        return (
+            boundary_bytes / _HOT_ADAPT_SHUTDOWN_BYTES_PER_SECOND
+            + _HOT_ADAPT_SHUTDOWN_FIXED_SECONDS
+        )
+
+    def _wait_for_hot_adaptation_worker(self, timeout_seconds: float) -> bool:
+        future = self._hot_adapt_future
+        if future is None:
+            return True
+        try:
+            future.result(timeout=max(0.0, timeout_seconds))
+        except Exception:  # noqa: BLE001 - shutdown must keep progressing
+            if not future.done():
+                return False
+            try:
+                future.result()
+            except Exception as completed_exc:  # noqa: BLE001
+                logger.warning_rank0(
+                    "MoE HOT adaptation worker stopped with an error: "
+                    f"{completed_exc!r}"
+                )
+            return True
+        return True
+
+    def _shutdown_hot_adaptation_executor(
+        self, executor: ThreadPoolExecutor, timeout_seconds: float
+    ) -> bool:
+        """Join the executor without letting a stuck staging worker block shutdown."""
+        joined = threading.Event()
+
+        def join_executor() -> None:
+            try:
+                executor.shutdown(wait=True, cancel_futures=False)
+            finally:
+                joined.set()
+
+        join_thread = threading.Thread(
+            target=join_executor,
+            name="freetoken-hot-adapt-shutdown",
+            daemon=True,
+        )
+        join_thread.start()
+        return joined.wait(max(0.0, timeout_seconds))
+
+    def _abandon_hot_plan_write(self, future: Future) -> None:
+        """Cancel a queued write and fence a running write before its rename."""
+        fence = getattr(self, "_hot_plan_write_fence", None)
+        if fence is not None:
+            fence.cancel()
+        future.cancel()
+        if getattr(self, "_hot_plan_future", None) is future:
+            self._hot_plan_future = None
+            self._hot_plan_write_fence = None
+
+    @staticmethod
+    def _hot_plan_owner_counts(
+        owners: Mapping[int, tuple[int | None, ...]],
+    ) -> tuple[int, int]:
+        return (
+            sum(owner is not None for rows in owners.values() for owner in rows),
+            sum(any(owner is not None for owner in rows) for rows in owners.values()),
+        )
+
+    @staticmethod
+    def _log_hot_shutdown_step(
+        step: str,
+        started_at: float,
+        budget_seconds: float,
+        outcome: str,
+    ) -> None:
+        elapsed = time.monotonic() - started_at
+        logger.info_rank0(
+            f"MoE HOT shutdown {step}: elapsed={elapsed:.3f}s, "
+            f"budget={budget_seconds:.3f}s, outcome={outcome}"
+        )
+
+    def _persisted_hot_plan_counts(self) -> tuple[int, int] | None:
+        """Read the plan file and report the protected expert and layer counts."""
+        path = getattr(self, "_hot_plan_path", None)
+        if not path:
+            return None
+        try:
+            with open(path, encoding="utf-8") as handle:
+                protected = json.load(handle).get("protected_slots")
+        except (OSError, AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(protected, dict) or any(
+            not isinstance(owners, list) for owners in protected.values()
+        ):
+            return None
+        return (
+            sum(len(owners) for owners in protected.values()),
+            sum(bool(owners) for owners in protected.values()),
+        )
+
+    def shutdown_hot_adaptation(self, timeout_seconds: float = 3.0) -> None:
+        """Bound adaptation drain, persist one final snapshot, then stop workers."""
+        self.request_hot_plan_stop()
+        drain_budget = max(0.0, float(timeout_seconds))
+        drain_started = time.monotonic()
+        drain_deadline = drain_started + drain_budget
         if self.cpu_executor is not None:
             cancel = getattr(
                 self.cpu_executor, "cancel_prefill_populate_overlap", None
             )
             if cancel is not None:
-                cancel(wait=True)
+                cancel(wait=False)
+        drained = self._drain_hot_adaptation(drain_deadline)
+        self._log_hot_shutdown_step(
+            "drain",
+            drain_started,
+            drain_budget,
+            "completed" if drained else "timed_out_or_failed",
+        )
+        timed_out_owners = None
+        worker_timed_out = False
+        stop_wait_budget = 0.0
+        stop_wait_started = time.monotonic()
+        stopped = True
+        if not drained:
+            timed_out_owners = dict(self._hot_plan_last_published_owners)
+            worker_timed_out = self._hot_adapt_future is not None
+            if worker_timed_out:
+                self._hot_adapt_stop_event.set()
+                computed_stop_wait = max(
+                    0.0, self._hot_adapt_stop_wait_seconds()
+                )
+                stop_wait_budget = min(
+                    computed_stop_wait, _HOT_ADAPT_STOP_WAIT_MAX_SECONDS
+                )
+                if stop_wait_budget < computed_stop_wait:
+                    logger.warning_rank0(
+                        "MoE HOT adaptation stop wait clamped from "
+                        f"{computed_stop_wait:g} to {stop_wait_budget:g} s"
+                    )
+                stopped = self._wait_for_hot_adaptation_worker(stop_wait_budget)
+                if not stopped:
+                    logger.warning_rank0(
+                        "MoE HOT adaptation worker exceeded its bounded stop wait; "
+                        "attempting a bounded executor join"
+                    )
+        self._log_hot_shutdown_step(
+            "stop_wait",
+            stop_wait_started,
+            stop_wait_budget,
+            "completed" if stopped else "timed_out",
+        )
+        final_write_started = time.monotonic()
+        final_write_deadline = final_write_started + _HOT_PLAN_FINAL_WRITE_SECONDS
+        existing_write = self._hot_plan_future
+        if existing_write is not None:
+            if existing_write.done():
+                self._collect_finished_hot_plan_write()
+            else:
+                self._abandon_hot_plan_write(existing_write)
+                logger.warning_rank0(
+                    "MoE HOT periodic plan write was abandoned before final snapshot"
+                )
+        try:
+            final_write = self.snapshot_hot_plan(
+                force=True, snapshot_at=timed_out_owners
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence must not stop shutdown
+            logger.warning_rank0(f"MoE HOT final plan snapshot failed: {exc!r}")
+            final_write = None
+        final_wrote = False
+        final_write_confirmed = final_write is None
+        if final_write is not None:
+            try:
+                final_wrote = bool(
+                    final_write.result(
+                        timeout=max(0.0, final_write_deadline - time.monotonic())
+                    )
+                )
+                final_write_confirmed = True
+            except Exception:  # noqa: BLE001 - persistence must not stop shutdown
+                if final_write.done():
+                    final_write_confirmed = True
+                else:
+                    self._abandon_hot_plan_write(final_write)
+                    logger.warning_rank0(
+                        "MoE HOT final plan write did not finish before shutdown"
+                    )
+            self._collect_finished_hot_plan_write()
+        self._log_hot_shutdown_step(
+            "final_write",
+            final_write_started,
+            _HOT_PLAN_FINAL_WRITE_SECONDS,
+            (
+                "written"
+                if final_wrote
+                else ("completed_without_write" if final_write_confirmed else "timed_out")
+            ),
+        )
+        if timed_out_owners is not None:
+            drain_outcome = "timed out" if worker_timed_out else "failed"
+            attempted_experts, attempted_layers = self._hot_plan_owner_counts(
+                timed_out_owners
+            )
+            if final_wrote:
+                persisted_counts = self._persisted_hot_plan_counts()
+                if persisted_counts is not None:
+                    seeded_experts, seeded_layers = persisted_counts
+                    logger.warning_rank0(
+                        f"MoE HOT adaptation drain {drain_outcome}; wrote the last "
+                        f"published slot set containing {seeded_experts} seeded experts "
+                        f"from {seeded_layers} layers"
+                    )
+                else:
+                    logger.warning_rank0(
+                        f"MoE HOT adaptation drain {drain_outcome}; plan written and "
+                        "fsynced; readback failed; the file on disk is the new plan"
+                    )
+            elif final_write is not None and not final_write_confirmed:
+                logger.warning_rank0(
+                    f"MoE HOT adaptation drain {drain_outcome}; attempted "
+                    f"{attempted_experts} experts across {attempted_layers} layers; "
+                    f"write did not confirm within {_HOT_PLAN_FINAL_WRITE_SECONDS:g} s"
+                )
+            else:
+                logger.warning_rank0(
+                    f"MoE HOT adaptation drain {drain_outcome}; attempted "
+                    f"{attempted_experts} experts across {attempted_layers} layers; "
+                    "no plan was published"
+                )
         executor = self._hot_adapt_executor
+        join_started = time.monotonic()
+        joined = True
         if executor is not None:
-            executor.shutdown(wait=True)
-            self._hot_adapt_executor = None
+            joined = self._shutdown_hot_adaptation_executor(
+                executor, _HOT_ADAPT_EXECUTOR_JOIN_SECONDS
+            )
+            if joined:
+                self._hot_adapt_executor = None
+                if hasattr(self, "_hot_adapt_copy_stream"):
+                    self._hot_adapt_copy_stream = None
+            else:
+                logger.warning_rank0(
+                    "MoE HOT adaptation executor join exceeded its "
+                    f"{_HOT_ADAPT_EXECUTOR_JOIN_SECONDS:g} second reserve; "
+                    "leaving the copy stream intact"
+                )
+        self._log_hot_shutdown_step(
+            "executor_join",
+            join_started,
+            _HOT_ADAPT_EXECUTOR_JOIN_SECONDS,
+            "completed" if joined else "timed_out",
+        )
+        plan_executor = self._hot_plan_executor
+        if plan_executor is not None:
+            plan_executor.shutdown(wait=False, cancel_futures=True)
+            self._hot_plan_executor = None
 
     def is_gpufetch_layer(self, layer_id: int) -> bool:
         """Whether this file-backed layer decodes through the GPU slot cache."""
@@ -2283,6 +2780,7 @@ class OffloadMoeCache:
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
         self.decayed_decode_freq.zero_()
+        self._apply_hot_plan_counter_seed()
         if self.session_profile_ids is not None:
             self.session_profile_ids.fill_(-1)
             self.session_profile_counts.zero_()

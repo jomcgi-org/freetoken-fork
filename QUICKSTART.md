@@ -95,6 +95,9 @@ ft serve \
   --ple-backend hmm \
   --moe-hot-expert-budget-gib 6 \
   --moe-hot-adapt-interval-steps auto \
+  --moe-hot-plan-persist auto \
+  --moe-hot-plan-dir models/flash-e2m1.ftw \
+  --moe-hot-plan-interval-minutes 10 \
   --moe-collect-stats \
   --max-running-requests 1 --linear-state-cache-ratio 4.0 \
   --num-pages 1568 --max-seq-len-override 100352 --kv-reserve-tokens 163840 --max-extend-length 2048 \
@@ -121,12 +124,24 @@ What each line does:
   by counted HOT-split prefill chunks and decode batches. The automatic default
   derives its fill and steady cadences from the HOT allocation. At most 0.5 GiB
   of rows swap per due interval, while the default boundary cap stages no more
-  than half of the HOT budget at one request boundary. A 2,000-token prompt is
-  one chunk and one boundary, so it cannot fill an all-cold partition by
-  construction; the initial fill normally lands at about the second request.
-  This also means no profile capture step: start cold and it warms itself.
-  `--moe-disk-layer-profile <json>` seeds it from a captured profile if you
-  have one.
+  than half of the HOT budget at one request boundary. This also means no
+  profile capture step: start cold and it warms itself. If you want a static
+  budget instead of auto-adapting, set the adaptation interval to zero and
+  supply a captured profile with `--moe-disk-layer-profile <json>`.
+- `--moe-hot-plan-persist {auto,on,off}`: controls HOT plan loading and
+  snapshots. The default is `auto`, which enables writes when the plan
+  directory is writable. `on` requests persistence explicitly, and `off`
+  disables both loading and writing.
+- `--moe-hot-plan-dir <path>`: overrides the default plan location beside the
+  model.
+- `--moe-hot-plan-interval-minutes N`: sets how often periodic HOT plan
+  snapshots are written. The default is 10 minutes.
+
+After a clean shutdown, the hot set is seeded from the persisted plan and the
+first request runs at the previous session's coverage (measurement pending on
+node-4). Without a persisted plan, the initial fill lands at about the second
+request.
+
 - The KV block: 100,352 tokens of context on a single lane. KV is 64 KB a
   token on this model, so this is close to the 24 GB ceiling; for throughput
   instead of context, drop the four KV flags and set

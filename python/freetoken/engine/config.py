@@ -82,6 +82,11 @@ class EngineConfig:
     moe_hot_adapt_interval_steps: str | int = "auto"
     moe_hot_adapt_max_swap_gib: float = 0.5
     moe_hot_adapt_boundary_cap_frac: float = 0.5
+    # Persist the adapted protected-slot assignment and its decayed routing counts.
+    # auto reads an existing plan and writes only when its directory is writable.
+    moe_hot_plan_persist: str = "auto"
+    moe_hot_plan_dir: str | None = None
+    moe_hot_plan_interval_minutes: float = 10.0
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"
@@ -292,6 +297,19 @@ class EngineConfig:
         ):
             raise ValueError(
                 "--moe-hot-adapt-boundary-cap-frac must be finite and in (0, 1]"
+            )
+        if self.moe_hot_plan_persist not in ("auto", "on", "off"):
+            raise ValueError(
+                "--moe-hot-plan-persist must be 'auto', 'on', or 'off', got "
+                f"{self.moe_hot_plan_persist!r}"
+            )
+        if (
+            isinstance(self.moe_hot_plan_interval_minutes, bool)
+            or not math.isfinite(float(self.moe_hot_plan_interval_minutes))
+            or self.moe_hot_plan_interval_minutes <= 0
+        ):
+            raise ValueError(
+                "--moe-hot-plan-interval-minutes must be a finite positive number"
             )
         if self.moe_disk_pager not in ("madvise", "uffd"):
             raise ValueError(
