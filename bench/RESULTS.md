@@ -880,3 +880,85 @@ lacks fails to fetch (push the branch, `git fetch origin`); systemd-run scripts
 need /snap/bin on PATH for gcloud; `--moe-hot-expert-budget-gib` requires
 `--moe-disk-decode cpu`; the io_uring extension needs `<linux/time_types.h>`
 on 22.04 headers (aa818cb).
+
+## Decode program, night of 2026-09-03 (node-4, fork issues #2 to #15)
+
+Harness: `tools/n4-decode-ab.sh` on the Mac side (a second worktree on node-4
+with its own extension build, sharing the serving venv), each arm run as a
+detached systemd unit with a 15-minute watchdog, the production unit stopped
+for the arm and restored after it, and from 20:00 the hot plan file backed
+up before and restored after every arm. Metric: three 300-token essays
+(thinking off) after three warm-up essays, plus the decode stats line.
+Production profile throughout (hot 6 GiB, uring PLE, single lane, 100k cap).
+
+### The number that matters first: a warm control
+
+The first control of the evening measured 13.5 tok/s mean with 1,000 to
+1,400 major faults per step; every later arm ran at 130 to 500. Re-measured
+warm at the end, the same merged tier gave 23.7 / 22.9 / 17.9 tok/s (mean
+21.5, steady batches 24 to 30). Every "gain" quoted against the cold control
+evaporated against the warm one. Rule adopted: the control runs last (or
+twice), and arms are compared only when major faults per step are in the
+same band.
+
+### Arms (essay means; warm control 21.5)
+
+| arm | branch | mean tok/s | batches | verdict |
+|---|---|---:|---|---|
+| timers on (#3) | 04149da | 16.2 (cold cache) | 17 to 22 | diagnostic, merged 0215585 |
+| cold fetch N = 4 (#6) | 8147037 | 12.0 | 7 to 17 | negative |
+| cold fetch N = 12, twice | 8147037 | 14.8, 13.6 | 8 to 25 | neutral |
+| N = 12 plus hot 7 GiB | 8147037 | 15.3 | 10 to 23 | the budget, not the fetch |
+| hot 7 GiB alone | 8147037 | 21.5 | 23 to 29 | equals the warm control |
+| spin executor, first cut (#4) | a625863 | 2.6 | 2 to 3 | 14 spinners on 8 cores starved the GPU thread |
+| spin, bounded and placed, 3 ms idle | 60055ff | 20.9 | 22 to 30 | neutral; wake 378 to 273 us only |
+| spin plus hot 7 | 60055ff | 20.1 | 24 to 29 | neutral |
+
+### What the timers say (per DISK layer per step, 28 layers)
+
+wake 270 to 380 us, compute 400 to 450 us for one to three experts, signal
+about 5 us; the CPU windows around the executor task (cpu_head plus cpu_tail,
+36 to 40 ms per step) hold another ~0.6 ms per layer of handoff (D2H,
+doorbell, H2D, GPU-side wait). That handoff is now the largest line item
+(issue #13). The cold-fetch policy reuses the same flag-handshake task for
+its staging copy, which is why it cannot remove a round trip (its payload
+changed, not its latency). Batched speculative verify (#9) remains the only
+lever that moves the ~40 ms step by more than a fraction.
+
+### The long-prompt scare, and what it actually was
+
+A 72k-token `ft probe-prefill` prompt (seeded random word salad) left decode
+at 0.14 to 0.25 tok/s with the hot-pair rate at 10 to 14 percent against an
+oracle of 94 to 100 and PLE major faults in the hundreds of thousands per
+step. It reproduced with the KV ladder on, off (fixed 100k pool), on the
+ladder-fix branch, and with hot 6, 6.5 and 7. With adaptation disabled the
+realised hot rate was 14 percent for the whole prefill and prefill fell from
+450 to 80 tok/s: random words route to experts no hot set tuned on real text
+holds, adaptation re-tunes the set to them during prefill, and random n-gram
+rows defeat the page cache (5,000 to 14,000 disk major faults per step). The
+instrument, not the ladder.
+
+The real-text version (a 76,570-token document of fork docs and sources):
+prefill 551 s (139 tok/s average, chunks 170 to 335, 59 percent of prefill
+routes hot), then three essays at 9.1 to 12.3 tok/s (batches about 14.5)
+with the realised hot rate at 13 percent against a 93 percent oracle and
+disk major faults at 14 per step. So a long document does re-tune the hot
+set to itself and the following conversation runs at roughly two thirds of
+the warm rate until adaptation catches up (issue #16); it does not collapse.
+
+Two things that were real: with a 7 GiB budget the ladder's growth rebuild
+evicted protected rows (it handed the rebuild the trimmed plan owners and
+discarded a completed adaptation future unpublished); fix on
+`fix/ladder-growth-hot-set`, whose first cut the review blocked because its
+refusal path parked requests forever (correction in progress, issue #15).
+And every A/B arm persisted its hot plan on shutdown, so the production unit
+was reseeded with a document-tuned or salad-tuned set after each long-probe
+arm until the runner learned to back the plan up.
+
+### Production
+
+Unchanged: hot 6 GiB, ladder on. Hot 7 is neutral against a warm control
+and leaves the ladder 41 reclaimable slots against the ~163 it needs to
+reach the cap. Serving box downtime from the arms: one 13-minute strand at
+18:10 UTC when a spin arm hung and the driver died with the ssh session
+(the runner is detached and watchdogged since), plus about 100 s per arm.
