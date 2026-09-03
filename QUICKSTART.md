@@ -94,7 +94,7 @@ ft serve \
   --moe-disk-prefill cpu \
   --ple-backend hmm \
   --moe-hot-expert-budget-gib 6 \
-  --moe-hot-adapt-interval-steps 1000 \
+  --moe-hot-adapt-interval-steps auto \
   --moe-collect-stats \
   --max-running-requests 1 --linear-state-cache-ratio 4.0 \
   --num-pages 1568 --max-seq-len-override 100352 --kv-reserve-tokens 163840 --max-extend-length 2048 \
@@ -116,9 +116,14 @@ What each line does:
   the disk layers are pinned and go through the GPU slot cache; the cold tail
   stays on CPU decode. 6 GiB was the optimum in a two-dimensional sweep with a
   40 GB pin budget; 44/4 and 36/8 both lose.
-- `--moe-hot-adapt-interval-steps 1000` with `--moe-collect-stats`: the hot
-  set follows the traffic. Every 1,000 decode steps the decayed per-expert
-  counters are re-ranked and at most 0.5 GiB of rows swap in the background.
+- `--moe-hot-adapt-interval-steps auto` with `--moe-collect-stats`: the hot
+  set follows the traffic. The interval is measured in routed tokens, shared
+  by counted HOT-split prefill chunks and decode batches. The automatic default
+  derives its fill and steady cadences from the HOT allocation. At most 0.5 GiB
+  of rows swap per due interval, while the default boundary cap stages no more
+  than half of the HOT budget at one request boundary. A 2,000-token prompt is
+  one chunk and one boundary, so it cannot fill an all-cold partition by
+  construction; the initial fill normally lands at about the second request.
   This also means no profile capture step: start cold and it warms itself.
   `--moe-disk-layer-profile <json>` seeds it from a captured profile if you
   have one.

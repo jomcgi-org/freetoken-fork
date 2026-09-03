@@ -126,3 +126,18 @@ def test_kv_cache_dtype_cli_choices(value):
 def test_kv_cache_dtype_cli_default_is_auto():
     args, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
     assert args.kv_cache_dtype == "auto"
+
+
+def test_hot_adapt_boundary_cap_flag_reaches_server_config():
+    args, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-hot-adapt-boundary-cap-frac",
+            "0.25",
+        ]
+    )
+
+    assert args.moe_hot_adapt_boundary_cap_frac == 0.25

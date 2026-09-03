@@ -803,7 +803,10 @@ def parse_args(
         "--moe-hot-adapt-halflife-steps",
         type=int,
         default=ServerArgs.moe_hot_adapt_halflife_steps,
-        help="Decode-step half-life for online per-expert route counts (default: 2000).",
+        help=(
+            "Routing-update-call half-life for online per-expert route counts "
+            "(default: 2000)."
+        ),
     )
 
     parser.add_argument(
@@ -811,9 +814,10 @@ def parse_args(
         type=_hot_adapt_interval,
         default=ServerArgs.moe_hot_adapt_interval_steps,
         help=(
-            "Decode steps between HOT partition recomputes. 'auto' derives fill and "
-            "steady cadences from the allocation (default); an integer is fixed, "
-            "and 0 disables adaptation."
+            "Routed tokens between HOT partition recomputes. 'auto' derives fill and "
+            "steady cadences from the allocation (default); an integer is fixed. "
+            "Due fixed-interval ticks accumulate while work is active, and 0 disables "
+            "adaptation."
         ),
     )
 
@@ -821,7 +825,22 @@ def parse_args(
         "--moe-hot-adapt-max-swap-gib",
         type=float,
         default=ServerArgs.moe_hot_adapt_max_swap_gib,
-        help="Maximum HOT row bytes copied by one adaptation interval (default: 0.5 GiB).",
+        help=(
+            "Maximum HOT row bytes copied per adaptation tick (default: 0.5 GiB). "
+            "A request boundary may consume several accumulated ticks, up to "
+            "--moe-hot-adapt-boundary-cap-frac of the HOT budget (node-4 example: "
+            "0.5 x 3.98 GiB per boundary)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-boundary-cap-frac",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_boundary_cap_frac,
+        help=(
+            "Maximum fraction of the HOT budget staged at one request boundary "
+            "(default: 0.5)."
+        ),
     )
 
     parser.add_argument(

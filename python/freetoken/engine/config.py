@@ -81,6 +81,7 @@ class EngineConfig:
     moe_hot_adapt_halflife_steps: int = 2000
     moe_hot_adapt_interval_steps: str | int = "auto"
     moe_hot_adapt_max_swap_gib: float = 0.5
+    moe_hot_adapt_boundary_cap_frac: float = 0.5
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
     # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
     moe_disk_prefill: str = "cpu"
@@ -284,6 +285,14 @@ class EngineConfig:
             or self.moe_hot_adapt_max_swap_gib <= 0
         ):
             raise ValueError("--moe-hot-adapt-max-swap-gib must be a finite positive number")
+        if (
+            isinstance(self.moe_hot_adapt_boundary_cap_frac, bool)
+            or not math.isfinite(float(self.moe_hot_adapt_boundary_cap_frac))
+            or not 0 < self.moe_hot_adapt_boundary_cap_frac <= 1
+        ):
+            raise ValueError(
+                "--moe-hot-adapt-boundary-cap-frac must be finite and in (0, 1]"
+            )
         if self.moe_disk_pager not in ("madvise", "uffd"):
             raise ValueError(
                 "--moe-disk-pager must be 'madvise' or 'uffd', got "

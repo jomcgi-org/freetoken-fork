@@ -516,6 +516,7 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_hot_adapt_halflife_steps == 2000
     assert config.moe_hot_adapt_interval_steps == "auto"
     assert config.moe_hot_adapt_max_swap_gib == 0.5
+    assert config.moe_hot_adapt_boundary_cap_frac == 0.5
 
 
 @pytest.mark.parametrize("budget", [-1, float("inf"), float("nan")])
@@ -579,6 +580,24 @@ def test_engine_config_rejects_invalid_hot_adapt_swap_bound(max_swap):
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_hot_adapt_max_swap_gib=max_swap,
+        )
+
+
+@pytest.mark.parametrize(
+    "boundary_cap", [0, -1, 1.01, float("inf"), float("nan"), True]
+)
+def test_engine_config_rejects_invalid_hot_adapt_boundary_cap(boundary_cap):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-boundary-cap-frac"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_boundary_cap_frac=boundary_cap,
         )
 
 

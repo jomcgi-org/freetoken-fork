@@ -68,7 +68,11 @@ def ensure_experts_hot(
     """Current HOT/COLD split for a file-backed DISK layer.
 
     HOT experts use protected GPU slots. COLD routes are rewritten to -1 for the
-    CPU partial. The single fixed-shape launch is graph-safe.
+    CPU partial. The single fixed-shape launch is graph-safe. Decay is
+    intentionally invocation-based: one 2,048-token prefill chunk and one
+    1-token decode step each age prior counts by one half-life step. New route
+    counts remain unnormalized, so large prefill observations retain their
+    proportional traffic weight.
     """
     if not expert_ids.is_cuda:
         return _ensure_experts_hot_cpu(
@@ -319,7 +323,12 @@ def _ensure_experts_hybrid_cpu(
 def _ensure_experts_hot_cpu(
     cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
 ) -> None:
-    """CPU reference for the current HOT/COLD split kernel."""
+    """CPU reference for the invocation-based HOT/COLD decay and routing rule.
+
+    Decay runs once per call, regardless of routed-token count. A 2,048-token
+    prefill chunk and a 1-token decode step therefore each advance decay by one
+    half-life step, matching the production Triton kernel below.
+    """
     raw = [int(expert) for expert in expert_ids.view(-1).tolist()]
     hot_row = cache.hot_row_for_expert[layer_id].tolist()
     seen_hot = []
@@ -632,6 +641,10 @@ def _ensure_experts_hot_kernel(
     ``hot_row_ptr`` marks published HOT expert ids, or -1 for COLD experts. HOT
     rows are installed in protected slots before publication. COLD pairs are
     rewritten to -1 and therefore run only in the CPU doorbell task.
+
+    The decayed counter update runs once per kernel invocation, not once per
+    routed token. Thus a 2,048-token prefill chunk and a 1-token decode step each
+    advance decay by one half-life step; this is the intentional production rule.
     """
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
