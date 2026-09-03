@@ -6,8 +6,8 @@ group of 16 reduction values, and scalar ``weight_global_scale`` is the quant-si
 global. The native FreeToken bank is byte-for-byte for packed/block-scale data and
 stores ``1 / weight_global_scale`` expanded per output row. Triton serves that
 layout directly; optional GPU backends repack it through the existing bank layer.
-Activation ``input_global_scale`` tensors are W4A4 calibration data and are not
-banked because FreeToken's expert kernels consume BF16 activations.
+Activation ``input_global_scale`` tensors are carried as small sidecars for the
+SM120 W4A4 expert path.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ _LAYER_RE = re.compile(r"^model\.language_model\.layers\.(?P<layer>\d+)\.")
 _NVFP4_KEY_RE = re.compile(
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\."
     r"(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\."
-    r"(?P<kind>weight_packed|weight_scale|weight_global_scale)$"
+    r"(?P<kind>weight_packed|weight_scale|weight_global_scale|input_global_scale)$"
 )
 
 
@@ -59,8 +59,10 @@ _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
         "weight_packed": "weight",
         "weight_scale": "weight_scale",
         "weight_global_scale": "weight_scale_2",
+        "input_global_scale": "input_scale",
     },
     invert_global_scale=True,
+    invert_input_scale=True,
 )
 
 

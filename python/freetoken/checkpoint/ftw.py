@@ -54,7 +54,10 @@ DEFAULT_SHARD_LIMIT = 8 << 30  # 8 GiB; must be a multiple of ALIGN
 _SHARD_FMT = "freetoken-{:05d}.ftw"
 _DEFAULT_CHUNK = 8 << 20
 _BANK_CONCURRENCY = 4
-_ALPHA_NAMES = ("gate_up_alpha", "down_alpha")
+_SIDECAR_NAMES = (
+    "gate_up_alpha", "down_alpha",
+    "gate_up_input_scale", "down_input_scale",
+)
 # Per-layer expert-bank entry name (converter streaming path, see checkpoint/convert.py):
 # each layer of a bank is its own FTW tensor instead of one flat [num_layers*E, ...] region.
 _LAYER_ENTRY_RE = re.compile(r"^(?P<base>.+)#L(?P<layer>\d{5})$")
@@ -487,9 +490,8 @@ def load_ftw_banks(
       written by its own ``add_tensor`` call, so its start is already ALIGN-aligned --
       no windowing/head-pad needed, read straight into a HostBank shaped like the entry.
 
-    Alphas (``gate_up_alpha``/``down_alpha``) stay flat ``[num_layers*num_experts]``
-    vectors, unaffected by the row split (fixed GPU residency; see
-    ``cache_budget.expert_bytes_per_slot``).
+    Alphas and activation input scales stay flat ``[num_layers*num_experts]`` vectors,
+    unaffected by the row split and appended as fixed-residency sidecars.
     """
     from freetoken.moe.host_banks import (
         HostBank, HostResidency, PinPipeline, alloc_banks, born_pinned_default,
@@ -519,8 +521,8 @@ def load_ftw_banks(
         reader.close()
         return None
 
-    alpha_entries = [e for e in bank_entries if e["name"] in _ALPHA_NAMES]
-    row_entries = [e for e in bank_entries if e["name"] not in _ALPHA_NAMES]
+    alpha_entries = [e for e in bank_entries if e["name"] in _SIDECAR_NAMES]
+    row_entries = [e for e in bank_entries if e["name"] not in _SIDECAR_NAMES]
 
     meta_layers = reader.meta("expert_bank_num_layers")
     if meta_layers is not None and meta_layers != num_layers:
@@ -759,11 +761,13 @@ def load_ftw_banks(
             f"{pageable_part}"
         )
 
-    # alphas are the small per-expert scale vectors, distinguished by their reserved names
-    # (not a separate kind); everything else under experts_bank is a weight source.
+    # Small per-expert scale sidecars are distinguished by reserved names, not a separate
+    # kind. Everything else under experts_bank is a weight source.
     alpha_kw = {n: alpha_hb[n].tensor for n in alpha_hb}
     return ExpertBanks(
         reader.meta("quant_format"), sources, **alpha_kw,
+        activation_dtype=reader.meta("moe_activation_dtype"),
+        activation_dtype_reason=reader.meta("moe_activation_dtype_reason"),
         layer_residency=applied,
         hot_expert_ids=hot_expert_ids if hot_expert_capacity else {},
         hot_expert_capacity=hot_expert_capacity,

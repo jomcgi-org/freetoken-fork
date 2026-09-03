@@ -247,7 +247,9 @@ class ModelConfig:
     # weight_scale_inv per block), also applied to the dense projections.
     expert_quant: str = "none"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend); injected from EngineConfig.
-    nvfp4_backend: str = "triton"
+    nvfp4_backend: str | None = None
+    # Routed-expert activation dtype (--moe-activation-dtype); injected from EngineConfig.
+    moe_activation_dtype: str = "auto"
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).
     weight_block_size: tuple[int, int] | None = None
     # Weight quantization of the *dense* attention / GatedDeltaNet projections (separate

@@ -8,8 +8,8 @@ no per-model conversion code is needed.
 * optional Qwen3.8 MTP weights = the separately gated head reader output ->
   ``kind="mtp"``; default conversions omit it.
 * offload experts = exactly what ``load_expert_banks(parallel=True)`` produces (post
-  backend-repack pinned banks + alpha scale vectors) -> ``kind="experts_bank"`` (alphas are
-  told apart at load by their reserved names, so they need no separate kind).
+  backend-repack pinned banks plus scale sidecars) -> ``kind="experts_bank"`` (sidecars
+  are told apart at load by reserved names, so they need no separate kind).
 
 The output directory is a self-contained checkpoint (config + tokenizer copied), so you can
 point ``--model`` straight at it; the load path auto-detects the FTW and reads it (FTW).
@@ -50,6 +50,9 @@ def _source_fingerprint(
     it's clear what an FTW was built from. Cheap (stat only)."""
     h = hashlib.sha256()
     h.update(f"quant={getattr(model_config, 'expert_quant', None)}|".encode())
+    h.update(
+        f"moe_activation_dtype={getattr(model_config, 'moe_activation_dtype', None)}|".encode()
+    )
     h.update(f"mtp_quant={mtp_quant}|".encode())
     h.update(f"arch={getattr(model_config, 'architectures', None)}|".encode())
     try:  # nvfp4 marlin/b12x layout depends on compute capability
@@ -231,6 +234,7 @@ def convert_checkpoint(
     include_mtp: bool = False,
     mtp_quant: str = "bf16",
     nvfp4_backend: str | None = None,
+    moe_activation_dtype: str = "auto",
 ) -> dict:
     """Write ``model_path`` as an FTW checkpoint at ``out_dir``. Returns the index dict.
 
@@ -266,7 +270,8 @@ def convert_checkpoint(
         torch.zeros(1, device=dev)
 
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_backend=moe_backend)
+                       dtype=dtype, moe_backend=moe_backend,
+                       moe_activation_dtype=moe_activation_dtype)
     mc = cfg.model_config
     if getattr(mc, "expert_quant", None) == "nvfp4":
         # A CPU conversion keeps the checkpoint-native six-bank layout, which is portable
@@ -274,6 +279,7 @@ def convert_checkpoint(
         # repackers only rearrange/fold source NVFP4 buffers and never dequantize weights.
         backend = nvfp4_backend or ("auto" if dev.type == "cuda" else "triton")
         object.__setattr__(mc, "nvfp4_backend", backend)
+        object.__setattr__(mc, "moe_activation_dtype", moe_activation_dtype)
     offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
     include_moe_experts = not offload
 
@@ -351,11 +357,12 @@ def convert_checkpoint(
                 "provider reported streamed=True but the sink never fired -- the FTW "
                 "would silently have no expert banks"
             )
-            # Formats that fold their global scales (nvfp4 marlin/b12x) stream the weight
-            # banks per layer but keep the alphas as flat [L*E] GPU vectors; write those as
-            # flat reserved-name entries (same kind + names the materialize branch uses, so
-            # the reader's reserved-name path reconstructs them identically).
-            for an in ("gate_up_alpha", "down_alpha"):
+            # Stream weight banks per layer, but keep small per-expert scales as flat
+            # [L*E] sidecars. Reserved names let the reader reconstruct them identically.
+            for an in (
+                "gate_up_alpha", "down_alpha",
+                "gate_up_input_scale", "down_input_scale",
+            ):
                 alpha = getattr(banks, an, None)
                 if alpha is not None:
                     writer.add_tensor(an, alpha, kind="experts_bank")
@@ -371,14 +378,18 @@ def convert_checkpoint(
                 else:
                     assert len(per_layer) == num_layers, (name, len(per_layer), num_layers)
                 items.append((name, torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0]))
-            for an in ("gate_up_alpha", "down_alpha"):
+            sidecar_names = (
+                "gate_up_alpha", "down_alpha",
+                "gate_up_input_scale", "down_input_scale",
+            )
+            for an in sidecar_names:
                 if getattr(banks, an, None) is not None:
                     items.append((an, getattr(banks, an)))
             total_bytes = sum(t.numel() * t.element_size() for _, t in items)
             max_bank_layer_bytes = sum(
                 tensor.numel() * tensor.element_size() // num_layers
                 for name, tensor in items
-                if name not in ("gate_up_alpha", "down_alpha")
+                if name not in sidecar_names
             )
             bar = byte_bar(total_bytes, "Converting expert banks")
             done_bytes = 0
@@ -389,8 +400,8 @@ def convert_checkpoint(
                 bar.update(nbytes)
                 done_bytes += nbytes
                 _progress("experts", done_bytes, total_bytes)
-                n_bank += name not in ("gate_up_alpha", "down_alpha")
-                n_alpha += name in ("gate_up_alpha", "down_alpha")
+                n_bank += name not in sidecar_names
+                n_alpha += name in sidecar_names
             bar.close()
 
     _progress("finalize")  # writing shard index + copying config/tokenizer
@@ -412,6 +423,12 @@ def convert_checkpoint(
         # read back at load (ftw.load_ftw_banks). dtype/moe_backend were dropped: each
         # tensor already carries its own dtype, and nothing reads a model-level backend.
         "quant_format": quant_format,
+        # b12x keeps distinct W4A16 and W4A4 physical layouts under the same schema.
+        # Old FTWs lack this key and therefore retain the legacy W4A16 interpretation.
+        "moe_activation_dtype": banks.activation_dtype if offload else None,
+        "moe_activation_dtype_reason": (
+            banks.activation_dtype_reason if offload else None
+        ),
         # The reader takes num_layers from the model config (copied into this
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.

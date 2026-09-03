@@ -46,6 +46,15 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
                    help="optional GPU for the hardware-specific NVFP4 repack: a GPU UUID "
                         "(GPU-xxxx..., as nvidia-smi -L prints) or an nvidia-smi index "
                         "(default: CPU, preserving the native NVFP4 layout)")
+    p.add_argument(
+        "--moe-activation-dtype",
+        choices=("auto", "bf16", "nvfp4"),
+        default="auto",
+        help=(
+            "SM120 expert activation layout for a GPU repack. auto uses NVFP4 when "
+            "all ModelOpt input scales are present; explicit nvfp4 fails if unsupported."
+        ),
+    )
     ns = p.parse_args(argv)
     if ns.speculative_mtp == "off" and ns.mtp_quant != "bf16":
         p.error("--mtp-quant nvfp4 requires --speculative-mtp on")
@@ -68,6 +77,7 @@ def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> i
         moe_backend=ns.moe_backend, shard_limit=shard_limit, device=device,
         include_mtp=ns.speculative_mtp == "on",
         mtp_quant=ns.mtp_quant,
+        moe_activation_dtype=ns.moe_activation_dtype,
     )
     dt = time.perf_counter() - t
     c = index["counts"]

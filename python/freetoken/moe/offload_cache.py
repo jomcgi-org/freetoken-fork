@@ -342,6 +342,7 @@ class OffloadMoeCache:
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
+        self.moe_activation_dtype = "bf16"
         # Opt-in decode miss-rate instrumentation. Accumulated on-device (no per-step host
         # sync); read via ``decode_miss_stats``. Graph-safe: the ``+=`` is captured into the
         # decode graph and re-executes with each replay's REAL routing (record_decode_stats
@@ -890,7 +891,11 @@ class OffloadMoeCache:
             self._reload_hot_slots()
 
     def set_alphas(
-        self, gate_up_alpha: torch.Tensor | None, down_alpha: torch.Tensor | None
+        self,
+        gate_up_alpha: torch.Tensor | None,
+        down_alpha: torch.Tensor | None,
+        gate_up_input_scale: torch.Tensor | None = None,
+        down_input_scale: torch.Tensor | None = None,
     ) -> None:
         """Attach the marlin/b12x per-expert global scales (``[L*E]``, GPU resident).
 
@@ -905,8 +910,22 @@ class OffloadMoeCache:
         assert gate_up_alpha is not None and down_alpha is not None
         total = self.num_layers * self.num_experts
         assert gate_up_alpha.shape == down_alpha.shape == (total,)
-        self.gate_up_alpha = gate_up_alpha.to(self.device)
-        self.down_alpha = down_alpha.to(self.device)
+        gate_up_alpha = gate_up_alpha.to(self.device)
+        down_alpha = down_alpha.to(self.device)
+        if gate_up_input_scale is not None or down_input_scale is not None:
+            assert gate_up_input_scale is not None and down_input_scale is not None
+            assert gate_up_input_scale.shape == down_input_scale.shape == (total,)
+            self.gate_up_alpha = torch.stack(
+                (gate_up_alpha, gate_up_input_scale.to(self.device).float())
+            )
+            self.down_alpha = torch.stack(
+                (down_alpha, down_input_scale.to(self.device).float())
+            )
+            self.moe_activation_dtype = "nvfp4"
+        else:
+            self.gate_up_alpha = gate_up_alpha
+            self.down_alpha = down_alpha
+            self.moe_activation_dtype = "bf16"
 
     def set_cpu_executor(self, executor) -> None:
         """Attach the CPU MoE executor (``decode_target`` in {"cpu", "hybrid"}).
@@ -1694,7 +1713,7 @@ class OffloadMoeCache:
         idx = layer_id * self.num_experts + (
             self.id_of_slot.clamp(min=0).long() % self.num_experts
         )
-        return self.gate_up_alpha[idx], self.down_alpha[idx]
+        return self.gate_up_alpha[..., idx], self.down_alpha[..., idx]
 
     def alphas_for_layer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Global scales for a full-layer prefill (overlap or materialize), where
@@ -1704,7 +1723,7 @@ class OffloadMoeCache:
             return None
         lo = layer_id * self.num_experts
         hi = lo + self.num_experts
-        return self.gate_up_alpha[lo:hi], self.down_alpha[lo:hi]
+        return self.gate_up_alpha[..., lo:hi], self.down_alpha[..., lo:hi]
 
     def bank_views(self, n: int | None = None) -> tuple[torch.Tensor, ...]:
         """Per-bank cache views in registration order: the full ``[S]`` slot cache

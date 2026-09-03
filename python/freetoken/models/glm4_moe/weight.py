@@ -24,7 +24,8 @@ from .df11_linear import compress_df11_weight
 _ROUTED_EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
 _ROUTED_EXPERT_KEY_RE = re.compile(
     r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight|weight_scale|weight_scale_2|input_scale)$"
 )
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_ROUTED_EXPERT_KEY_RE,

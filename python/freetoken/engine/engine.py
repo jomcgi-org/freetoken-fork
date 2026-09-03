@@ -738,6 +738,21 @@ class Engine:
                 bank_source=getattr(config, "bank_source", "auto"),
                 hugepages=getattr(config, "moe_bank_hugepages", "auto"),
             )
+            moe_activation_dtype = "bf16"
+            if getattr(config.model_config, "expert_quant", None) == "nvfp4":
+                from freetoken.moe.nvfp4_backends import (
+                    validate_loaded_moe_activation_dtype,
+                )
+
+                moe_activation_dtype, activation_reason = (
+                    validate_loaded_moe_activation_dtype(
+                        self.device, config.moe_activation_dtype, banks
+                    )
+                )
+                logger.info_rank0(
+                    f"MoE activation dtype: {moe_activation_dtype} "
+                    f"({activation_reason})"
+                )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 if (
@@ -812,7 +827,12 @@ class Engine:
                 max_swap_bytes=int(config.moe_hot_adapt_max_swap_gib * 2**30),
                 expert_bytes=hot_expert_bytes,
             )
-            cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            cache.set_alphas(
+                banks.gate_up_alpha,
+                banks.down_alpha,
+                banks.gate_up_input_scale if moe_activation_dtype == "nvfp4" else None,
+                banks.down_input_scale if moe_activation_dtype == "nvfp4" else None,
+            )
         else:
             if disk_layer_ids and config.moe_disk_pager == "uffd":
                 raise NotImplementedError(
@@ -1844,7 +1864,10 @@ def _moe_bank_layer_geometry(
                 base, marker, raw_layer = name.rpartition("#L")
                 logical_name = base if marker and raw_layer.isdecimal() else name
                 size = int(tensor["nbytes"])
-                if logical_name in ("gate_up_alpha", "down_alpha"):
+                if logical_name in (
+                    "gate_up_alpha", "down_alpha",
+                    "gate_up_input_scale", "down_input_scale",
+                ):
                     fixed_bytes += size
                 elif marker and raw_layer.isdecimal():
                     layer_id = int(raw_layer)
@@ -2692,6 +2715,9 @@ def _adjust_config(config: EngineConfig):
     if is_moe:
         object.__setattr__(model_config, "moe_backend", config.moe_backend)
     object.__setattr__(model_config, "nvfp4_backend", config.nvfp4_backend)
+    object.__setattr__(
+        model_config, "moe_activation_dtype", config.moe_activation_dtype
+    )
 
     # Must stay LAST: page_size is only final here (_adjust_dsv4_config sets P=128, the
     # TRTLLM block sets 64). Also covers the programmatic LLM(...) path that bypasses parse_args.

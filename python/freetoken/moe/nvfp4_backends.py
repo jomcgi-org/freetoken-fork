@@ -10,8 +10,9 @@ backend     compute capability          kernel / weight layout
 ==========  ==========================  =============================================
 marlin      sm_80 .. sm_99              vLLM ``fused_marlin_moe`` (W4A16
                                         dequant-in-kernel); Marlin-tiled weights
-b12x        sm_120+ and CUDA>=13        ``flashinfer`` SM12x CuTe-DSL MoE (W4A16);
-                                        b12x-packed weights
+b12x        sm_120 and CUDA>=13         ``flashinfer.b12x_fused_moe`` (W4A4 when
+                                        ModelOpt input scales are complete, otherwise
+                                        W4A16); b12x-packed weights
 triton      anything (fallback)         FreeToken's own Triton kernels; the native
                                         row-major ModelOpt layout (used on sm_120 +
                                         CUDA 12.x, where b12x cannot run)
@@ -41,6 +42,7 @@ themselves are imported, not vendored.
 
 from __future__ import annotations
 
+import inspect
 import os
 
 import torch
@@ -154,6 +156,116 @@ def _b12x_unusable_reason(cc: tuple[int, int]) -> str | None:
     return None
 
 
+def _b12x_a4_unusable_reason() -> str | None:
+    """Return why the installed FlashInfer cannot accept calibrated FC1 scales."""
+    try:
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            _WeightViews,  # noqa: F401
+            launch_sm120_moe,
+        )
+
+        params = inspect.signature(b12x_fused_moe).parameters
+        for name in ("quant_mode", "input_global_scale", "fc2_input_scale"):
+            if name not in params:
+                return f"flashinfer b12x_fused_moe lacks {name}"
+        launch_params = inspect.signature(launch_sm120_moe).parameters
+        for name in ("quant_mode", "input_global_scale", "fc2_input_scale", "_weight_views"):
+            if name not in launch_params:
+                return f"flashinfer launch_sm120_moe lacks {name}"
+    except Exception as exc:
+        return f"flashinfer NVFP4 activation entry is unusable ({exc!r})"
+    return None
+
+
+def resolve_moe_activation_dtype(
+    requested: str,
+    *,
+    compute_capability: tuple[int, int],
+    has_input_scales: bool,
+    input_scale_unusable_reason: str | None = None,
+    b12x_a4_reason: str | None = None,
+) -> tuple[str, str]:
+    """Resolve the routed-expert activation mode without importing CUDA dependencies."""
+    requested = (requested or "auto").strip().lower()
+    if requested not in ("auto", "bf16", "nvfp4"):
+        raise ValueError(
+            f"bad --moe-activation-dtype={requested!r}; expected auto, bf16 or nvfp4"
+        )
+    reason = None
+    if compute_capability != (12, 0):
+        reason = (
+            "NVFP4 activation mode requires sm_120, got "
+            f"sm_{compute_capability[0]}{compute_capability[1]}"
+        )
+    elif not has_input_scales:
+        reason = input_scale_unusable_reason or (
+            "not every gate_up and down expert GEMM carries input_scale"
+        )
+    elif b12x_a4_reason is not None:
+        reason = b12x_a4_reason
+
+    if requested == "nvfp4" and reason is not None:
+        raise RuntimeError(f"--moe-activation-dtype=nvfp4 is unavailable: {reason}")
+    if requested == "bf16":
+        return "bf16", "explicit bf16 request"
+    if reason is not None:
+        return "bf16", reason
+    return "nvfp4", "sm_120 and complete ModelOpt input_scale sidecars"
+
+
+def validate_loaded_moe_activation_dtype(
+    device: torch.device, requested: str, banks
+) -> tuple[str, str]:
+    """Validate a loaded bank layout and return its effective activation mode."""
+    requested = (requested or "auto").strip().lower()
+    if requested not in ("auto", "bf16", "nvfp4"):
+        raise ValueError(
+            f"bad --moe-activation-dtype={requested!r}; expected auto, bf16 or nvfp4"
+        )
+    effective = banks.activation_dtype or "bf16"
+    is_b12x = banks.quant_format == "nvfp4_b12x"
+    has_scales = (
+        banks.gate_up_input_scale is not None
+        and banks.down_input_scale is not None
+    )
+    cc = torch.cuda.get_device_capability(device) if device.type == "cuda" else (0, 0)
+
+    if effective == "nvfp4":
+        if not is_b12x:
+            raise RuntimeError("NVFP4 activation metadata requires nvfp4_b12x banks")
+        _, reason = resolve_moe_activation_dtype(
+            "nvfp4",
+            compute_capability=cc,
+            has_input_scales=has_scales,
+            input_scale_unusable_reason=getattr(
+                banks, "activation_dtype_reason", None
+            ),
+            b12x_a4_reason=_b12x_a4_unusable_reason(),
+        )
+    else:
+        if cc != (12, 0):
+            reason = (
+                "NVFP4 activation mode requires sm_120, got "
+                f"sm_{cc[0]}{cc[1]}"
+            )
+        elif not has_scales:
+            reason = getattr(banks, "activation_dtype_reason", None) or (
+                "not every gate_up and down expert GEMM carries input_scale"
+            )
+        elif is_b12x:
+            reason = "FTW was explicitly converted with the W4A16 b12x bank layout"
+        else:
+            reason = f"expert bank format {banks.quant_format!r} is not b12x W4A4"
+
+    if requested != "auto" and requested != effective:
+        raise RuntimeError(
+            f"--moe-activation-dtype={requested} cannot use this checkpoint's "
+            f"{effective} expert-bank layout; reconvert the FTW for {requested}"
+        )
+    return effective, reason
+
+
 def _b12x_min_intermediate() -> int:
     """Smallest ``moe_intermediate_size`` for which ``auto`` prefers b12x over Triton.
 
@@ -185,6 +297,7 @@ def select_nvfp4_backend(
     intermediate_size: int | None = None,
     requested: str = "auto",
     activation: str = "silu",
+    prefer_b12x_a4: bool = False,
 ) -> str:
     """Pick the NVFP4 expert-GEMM backend for ``device`` (and, in ``auto``, ``intermediate_size``).
 
@@ -202,6 +315,10 @@ def select_nvfp4_backend(
     kernels hard-code silu (their fused epilogue), so any other activation (MiniMax-M3's
     ``swigluoai``) resolves ``auto`` to the Triton kernels -- which dispatch the
     activation as a separate elementwise op -- and rejects a forced marlin/flashinfer.
+
+    ``prefer_b12x_a4`` bypasses the single-token small-I crossover when sm_120 activation
+    quantization is eligible. The native A4 path only exists in b12x, so the activation
+    policy takes precedence over the W4A16 decode heuristic.
 
     Returns the internal backend name (``marlin`` / ``b12x`` / ``triton``); ``flashinfer``
     maps to ``b12x``.
@@ -256,7 +373,7 @@ def select_nvfp4_backend(
         reason = _b12x_unusable_reason(cc)
         if reason is None:
             thr = _b12x_min_intermediate()
-            if intermediate_size is None or intermediate_size >= thr:
+            if prefer_b12x_a4 or intermediate_size is None or intermediate_size >= thr:
                 return "b12x"
             logger.info(
                 f"NVFP4 auto backend: b12x is runnable but moe_intermediate_size="
@@ -500,7 +617,8 @@ def marlin_fused_experts(
 
 
 # ---------------------------------------------------------------------------
-# b12x (flashinfer SM12x CuTe-DSL, W4A16) -- the pack (prepare_w4a16_packed_weights)
+# b12x (flashinfer SM12x CuTe-DSL, W4A4 or W4A16). The W4A16 pack
+# (prepare_w4a16_packed_weights)
 # runs on any CUDA build, but the fused-MoE kernel needs sm_120/121 AND a CUDA>=13
 # *driver* (it JIT-compiles PTX at runtime). select_nvfp4_backend gates on that, so
 # this path is only reached on hardware that can actually run it.
@@ -535,12 +653,145 @@ def _b12x_swizzle_block_scales(scale: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _b12x_repack_layer_a4(
+    layer_banks: dict[str, torch.Tensor],
+    config,
+    device: torch.device,
+    *,
+    chunk: int,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Repack native ModelOpt rows for FlashInfer's SM120 NVFP4 x NVFP4 path."""
+    intermediate_size = config.moe_intermediate_size
+    if intermediate_size % 128 != 0:
+        raise ValueError(
+            "b12x NVFP4 activation repack requires moe_intermediate_size to be a "
+            f"multiple of 128, got {intermediate_size}"
+        )
+    hidden_size = config.hidden_size
+    if hidden_size % 128 != 0:
+        raise ValueError(
+            "b12x NVFP4 activation repack requires hidden_size to be a "
+            f"multiple of 128, got {hidden_size}"
+        )
+    gu_packed_l = layer_banks["gate_up_packed"]
+    gu_scale_l = layer_banks["gate_up_scale"]
+    gu_global_l = layer_banks["gate_up_global"]
+    dn_packed_l = layer_banks["down_packed"]
+    dn_scale_l = layer_banks["down_scale"]
+    dn_global_l = layer_banks["down_global"]
+    E = gu_packed_l.size(0)
+    gate_up_alpha = torch.empty(E, dtype=torch.float32, device=device)
+    down_alpha = torch.empty(E, dtype=torch.float32, device=device)
+
+    for start in range(0, E, chunk):
+        end = min(start + chunk, E)
+        gu_p = gu_packed_l[start:end].to(device)
+        gu_s = gu_scale_l[start:end].to(device).float()
+        gu_g = gu_global_l[start:end].to(device).float()
+        gu_alpha = gu_g.max(dim=1).values
+        if not torch.all(torch.isfinite(gu_alpha) & (gu_alpha > 0)):
+            raise ValueError("b12x NVFP4 gate_up weight globals must be finite and positive")
+        gu_s *= (gu_g / gu_alpha.unsqueeze(1)).unsqueeze(-1)
+
+        # The SM120 NVFP4 kernel consumes [up, gate]. FreeToken's native bank is
+        # [gate, up], so weights and their block scales are swapped together.
+        gu_p = torch.cat(
+            (gu_p[:, intermediate_size:], gu_p[:, :intermediate_size]), dim=1
+        ).contiguous()
+        gu_s = torch.cat(
+            (gu_s[:, intermediate_size:], gu_s[:, :intermediate_size]), dim=1
+        ).contiguous()
+
+        dn_p = dn_packed_l[start:end].to(device)
+        dn_s = dn_scale_l[start:end].to(device).float()
+        dn_g = dn_global_l[start:end].to(device).float()
+        dn_alpha = dn_g.max(dim=1).values
+        if not torch.all(torch.isfinite(dn_alpha) & (dn_alpha > 0)):
+            raise ValueError("b12x NVFP4 down weight globals must be finite and positive")
+        dn_s *= (dn_g / dn_alpha.unsqueeze(1)).unsqueeze(-1)
+
+        gu_packed_l[start:end].copy_(gu_p)
+        gu_scale_l[start:end].copy_(
+            _b12x_swizzle_block_scales(gu_s.to(torch.float8_e4m3fn))
+        )
+        dn_packed_l[start:end].copy_(dn_p)
+        dn_scale_l[start:end].copy_(
+            _b12x_swizzle_block_scales(dn_s.to(torch.float8_e4m3fn))
+        )
+        gate_up_alpha[start:end] = gu_alpha
+        down_alpha[start:end] = dn_alpha
+
+    return (
+        {
+            "gate_up_packed": gu_packed_l,
+            "gate_up_scale": gu_scale_l,
+            "down_packed": dn_packed_l,
+            "down_scale": dn_scale_l,
+        },
+        gate_up_alpha,
+        down_alpha,
+    )
+
+
+def _b12x_a4_weight_views(
+    gate_up_q: torch.Tensor,
+    gate_up_s: torch.Tensor,
+    gate_up_alpha: torch.Tensor,
+    down_q: torch.Tensor,
+    down_s: torch.Tensor,
+    down_alpha: torch.Tensor,
+):
+    """Build FlashInfer views directly over FreeToken's mutable expert-slot cache.
+
+    FlashInfer's functional wrapper converts MMA scale layouts into a cached contiguous
+    copy keyed by the input pointers. FreeToken keeps those pointers stable while loading
+    different experts into a slot, so that cache would retain stale scale bytes. Our b12x
+    banks already store the contiguous swizzled representation consumed by the kernels.
+    Pointing the native view at those banks keeps slot replacement visible and performs no
+    weight or scale copy.
+    """
+    import cutlass
+    import cutlass.cute as cute
+    from flashinfer.cute_dsl.utils import make_ptr
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+        _WeightViews,
+    )
+
+    sf_dtype = cutlass.Float8E4M3FN
+    if not all(t.is_contiguous() for t in (gate_up_q, gate_up_s, down_q, down_s)):
+        raise ValueError("b12x NVFP4 cache banks must be contiguous")
+    gate_up_storage = gate_up_s
+    down_storage = down_s
+    return _WeightViews(
+        w13_fp4=gate_up_q.permute(1, 2, 0).view(torch.float4_e2m1fn_x2),
+        down_fp4=down_q.permute(1, 2, 0).view(torch.float4_e2m1fn_x2),
+        sfb_w13_ptr=make_ptr(
+            sf_dtype, gate_up_storage.data_ptr(), cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        sfb_down_ptr=make_ptr(
+            sf_dtype, down_storage.data_ptr(), cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        w1_alpha=gate_up_alpha,
+        w2_alpha=down_alpha,
+        w1_storage=gate_up_q,
+        w1_scale_storage=gate_up_storage,
+        w2_storage=down_q,
+        w2_scale_storage=down_storage,
+        _w13_sf_storage=gate_up_storage,
+        _down_sf_storage=down_storage,
+    )
+
+
+@torch.no_grad()
 def b12x_repack_layer(
     layer_banks: dict[str, torch.Tensor],
     config,
     device: torch.device,
     *,
     chunk: int = 32,
+    activation_dtype: str = "bf16",
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
     """Repack ONE layer's 6 native NVFP4 banks into flashinfer's SM12x W4A16 layout, in place.
 
@@ -552,6 +803,13 @@ def b12x_repack_layer(
     Returns ``({post-repack bank name -> reinterpreted tensor}, gate_up_alpha, down_alpha)``
     keyed by the 4 ``nvfp4_b12x`` bank names. Staging from the native source works whether
     or not it is pinned (pageable ``.to(device)`` is a synchronous copy)."""
+    if activation_dtype == "nvfp4":
+        return _b12x_repack_layer_a4(
+            layer_banks, config, device, chunk=chunk
+        )
+    if activation_dtype != "bf16":
+        raise ValueError(f"unsupported b12x activation dtype {activation_dtype!r}")
+
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
         prepare_w4a16_packed_weights,
     )
@@ -644,6 +902,7 @@ def b12x_repack_sources_inplace(
     device: torch.device,
     *,
     chunk: int = 32,
+    activation_dtype: str = "bf16",
 ) -> dict[str, list[torch.Tensor] | torch.Tensor]:
     """Convert the native NVFP4 banks to flashinfer's SM12x W4A16 layout in place, per
     layer (thin per-layer loop over :func:`b12x_repack_layer`).
@@ -664,7 +923,8 @@ def b12x_repack_sources_inplace(
     for layer_id in range(num_layers):
         layer_banks = {name: sources[name][layer_id] for name in _NATIVE_NVFP4_BANKS}
         post, gate_up_alpha, down_alpha = b12x_repack_layer(
-            layer_banks, config, device, chunk=chunk
+            layer_banks, config, device, chunk=chunk,
+            activation_dtype=activation_dtype,
         )
         gate_up_q_layers.append(post["gate_up_packed"])
         gate_up_s_layers.append(post["gate_up_scale"])
@@ -713,20 +973,71 @@ def b12x_fused_experts(
     activation: str,
     apply_router_weight_on_input: bool,
 ) -> torch.Tensor:
-    """SM12x W4A16 fused MoE over cache slots (same calling convention as
-    :func:`marlin_fused_experts`). Requires sm_120/121 + a CUDA>=13 driver; reached only
-    when :func:`select_nvfp4_backend` has confirmed the runtime supports it.
+    """SM120 fused MoE over cache slots, using W4A4 when input scales are attached.
 
-    The banks already hold flashinfer's prepared (tiled) layout from
-    :func:`b12x_repack_sources_inplace`, so this wraps them back into a
-    ``W4A16PackedWeights`` and calls the prepared-weights launch directly -- the public
-    ``b12x_fused_moe`` would re-prepare the raw modelopt weights (and ptr-cache them) on
-    every call, which both costs a prepare per step and breaks for the offload cache,
-    whose slot contents move between calls.
+    A two-row alpha tensor carries ``[weight_global, input_global]`` for that
+    projection. This selects FlashInfer's native NVFP4 x NVFP4 path, whose fused
+    frontend quantizes each routed BF16 row once with 16-value E2M1 blocks and e4m3
+    block scales. Legacy one-dimensional alphas retain the prepared W4A16 path.
+
+    The W4A16 banks hold FlashInfer's prepared tiled layout. The W4A4 banks keep raw
+    ModelOpt FP4 weights plus contiguous swizzled scales, so the native launch can view
+    the mutable offload slots without copying or caching stale scale data.
 
     CUDA-graph note: the launch resolves a (shape-keyed, module-cached) scratch workspace
-    on first use and flashinfer raises if that happens *during* capture, so the decode
-    path must be warmed once eagerly before graph capture (FreeToken already does)."""
+    on first use and flashinfer raises if that happens *during* capture. GraphRunner runs
+    one eager model forward for every captured batch size immediately before capture.
+    That forward reaches this same two-row-alpha branch with ``quant_mode="nvfp4"``, so
+    its workspace and static kernel cache entries are populated for the captured shape."""
+    assert activation == "silu", "b12x backend supports gated silu only"
+    assert not apply_router_weight_on_input
+    num_experts = gate_up_q.size(0)
+    hidden_size = hidden_states.size(-1)
+    if gate_up_alpha.ndim == 2:
+        if gate_up_alpha.shape[0] != 2 or down_alpha.shape[0] != 2:
+            raise ValueError("b12x NVFP4 activation scales must be stacked with weight alphas")
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+            launch_sm120_moe,
+        )
+
+        # launch_sm120_moe folds the activation globals into the FC1 and FC2 alphas
+        # unless explicit weight views are supplied. Fold both into the zero-copy view.
+        folded_gate_up_alpha = (
+            gate_up_alpha[0].float() * gate_up_alpha[1].float()
+        ).contiguous()
+        folded_down_alpha = (
+            down_alpha[0].float() * down_alpha[1].float()
+        ).contiguous()
+        weight_views = _b12x_a4_weight_views(
+            gate_up_q, gate_up_s, folded_gate_up_alpha,
+            down_q, down_s, folded_down_alpha,
+        )
+        out = torch.empty(
+            hidden_states.size(0), hidden_size,
+            dtype=hidden_states.dtype, device=hidden_states.device,
+        )
+        return launch_sm120_moe(
+            a=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w1_weight=gate_up_q,
+            w1_weight_sf=gate_up_s,
+            w1_alpha=folded_gate_up_alpha,
+            input_global_scale=gate_up_alpha[1],
+            w2_weight=down_q,
+            w2_weight_sf=down_s,
+            w2_alpha=down_alpha[0],
+            fc2_input_scale=down_alpha[1],
+            num_experts=num_experts,
+            top_k=topk_ids.size(1),
+            num_local_experts=num_experts,
+            scatter_output=out,
+            activation="silu",
+            quant_mode="nvfp4",
+            source_format="modelopt",
+            _weight_views=weight_views,
+        )
+
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
         _launch_sm120_w4a16_moe,
     )
@@ -734,10 +1045,6 @@ def b12x_fused_experts(
         W4A16PackedWeights,
     )
 
-    assert activation == "silu", "b12x backend supports gated silu only"
-    assert not apply_router_weight_on_input
-    num_experts = gate_up_q.size(0)
-    hidden_size = hidden_states.size(-1)
     # down bank is the prepared w2 == [E, K_tiles, ...] with K_tiles == intermediate//16.
     intermediate_size = down_q.size(1) * 16
     prepared = W4A16PackedWeights(

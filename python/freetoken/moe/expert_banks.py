@@ -15,10 +15,11 @@ three places and nothing else.
 
 from __future__ import annotations
 
+import copy
 import glob
 import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -75,6 +76,12 @@ class ExpertBanks:
     # marlin/b12x per-expert global scales ([L*E]); None for formats without them
     gate_up_alpha: torch.Tensor | None = field(default=None)
     down_alpha: torch.Tensor | None = field(default=None)
+    # ModelOpt activation globals, flat [L*E] float32 sidecars when complete.
+    gate_up_input_scale: torch.Tensor | None = field(default=None)
+    down_input_scale: torch.Tensor | None = field(default=None)
+    # Physical b12x bank interpretation. None covers native and legacy formats.
+    activation_dtype: str | None = field(default=None)
+    activation_dtype_reason: str | None = field(default=None)
     # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
     layer_residency: list[str] | None = field(default=None)
     # Legacy compatibility surface. HOT rows now stay authoritative in ``sources``
@@ -91,6 +98,89 @@ class ExpertBanks:
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
+
+
+def _resolve_nvfp4_gpu_policy(
+    model_config,
+    device: torch.device,
+    *,
+    has_input_scales: bool,
+    input_scale_unusable_reason: str | None = None,
+) -> tuple[str, str, str]:
+    """Resolve backend and activation layout after checkpoint sidecars are known."""
+    from freetoken.moe.nvfp4_backends import (
+        _b12x_a4_unusable_reason,
+        resolve_moe_activation_dtype,
+        select_nvfp4_backend,
+    )
+
+    cc = torch.cuda.get_device_capability(device) if device.type == "cuda" else (0, 0)
+    activation_request = getattr(model_config, "moe_activation_dtype", "auto")
+    a4_reason = (
+        _b12x_a4_unusable_reason()
+        if cc == (12, 0)
+        and has_input_scales
+        and (activation_request or "auto").strip().lower() != "bf16"
+        else None
+    )
+    candidate_dtype, _ = resolve_moe_activation_dtype(
+        activation_request,
+        compute_capability=cc,
+        has_input_scales=has_input_scales,
+        input_scale_unusable_reason=input_scale_unusable_reason,
+        b12x_a4_reason=a4_reason,
+    )
+
+    configured_backend = getattr(model_config, "nvfp4_backend", None)
+    implicit_backend = configured_backend is None
+    if implicit_backend:
+        backend_request = "auto" if candidate_dtype == "nvfp4" else "triton"
+    else:
+        backend_request = configured_backend
+    prefer_b12x_a4 = candidate_dtype == "nvfp4" and (
+        implicit_backend or backend_request == "auto"
+    )
+    backend = select_nvfp4_backend(
+        device,
+        getattr(model_config, "moe_intermediate_size", None),
+        backend_request,
+        activation=(
+            getattr(model_config, "moe_activation", None)
+            or getattr(model_config, "hidden_act", "silu")
+        ),
+        prefer_b12x_a4=prefer_b12x_a4,
+    )
+    selected_reason = (
+        a4_reason
+        if backend == "b12x"
+        else f"selected expert backend {backend!r} is not flashinfer b12x"
+    )
+    activation_dtype, activation_reason = resolve_moe_activation_dtype(
+        activation_request,
+        compute_capability=cc,
+        has_input_scales=has_input_scales,
+        input_scale_unusable_reason=input_scale_unusable_reason,
+        b12x_a4_reason=selected_reason,
+    )
+    return backend, activation_dtype, activation_reason
+
+
+def _nvfp4_load_activation_dtype(
+    model_config, device: torch.device, decode_target: str
+) -> str:
+    """Resolve whether activation sidecars can affect this load.
+
+    Only sm_120 GPU decode can use NVFP4 activations. Returning BF16 here lets the
+    source loader skip its separate load-time pass over the checkpoint shards. Final
+    policy resolution still runs after loading and validates explicit requests.
+    """
+    requested = getattr(model_config, "moe_activation_dtype", "auto")
+    requested = (requested or "auto").strip().lower()
+    if requested == "bf16" or decode_target == "cpu" or device.type != "cuda":
+        return "bf16"
+    if torch.cuda.get_device_capability(device) != (12, 0):
+        return "bf16"
+    return requested
 
 
 def _v4_unsupported(quant):
@@ -134,9 +224,10 @@ class _RepackedBank:
 
 
 class _Nvfp4RepackSink:
-    """Streaming layer sink (converter only) for the nvfp4 marlin/b12x backends: repack
-    each completed layer's 6 native banks into the backend's 4-bank layout in place, then
-    forward the renamed banks to the outer FTW sink and stash the per-layer alphas.
+    """Streaming layer sink that resolves layout after activation sidecars are loaded.
+
+    Native Triton banks pass through unchanged. Marlin and b12x banks are repacked in
+    place before being forwarded to the outer FTW sink.
 
     Runs from the loader's reader threads and calls CUDA ops (the repack), so the whole
     per-layer body -- ``set_device`` + repack + forward + stash -- is serialized under one
@@ -144,13 +235,15 @@ class _Nvfp4RepackSink:
     ``*_global`` banks fold into the alphas, so they are released here (the outer sink only
     sees, and releases, the 4 weight banks)."""
 
-    def __init__(self, repack_layer, config, device: torch.device, outer) -> None:
+    def __init__(self, config, device: torch.device, outer) -> None:
         from freetoken.moe.nvfp4_backends import _POST_NVFP4_BANKS
 
-        self._repack_layer = repack_layer
         self._config = config
         self._device = device
         self._outer = outer
+        self.backend: str | None = None
+        self.activation_dtype = "bf16"
+        self.activation_dtype_reason = "activation sidecars have not been loaded"
         self._post_names = _POST_NVFP4_BANKS
         self._lock = threading.Lock()
         self._gate_up_alpha: dict[int, torch.Tensor] = {}
@@ -159,15 +252,55 @@ class _Nvfp4RepackSink:
         # alias storage the outer sink released after writing -- released-tensor caveat).
         self._post: dict[str, dict[int, torch.Tensor]] = {n: {} for n in self._post_names}
 
+    def set_nvfp4_input_scales(
+        self,
+        sources: dict[str, list[torch.Tensor]],
+        *,
+        input_scale_unusable_reason: str | None = None,
+    ) -> None:
+        has_scales = all(
+            name in sources for name in ("gate_up_input_scale", "down_input_scale")
+        )
+        (
+            self.backend,
+            self.activation_dtype,
+            self.activation_dtype_reason,
+        ) = _resolve_nvfp4_gpu_policy(
+            self._config,
+            self._device,
+            has_input_scales=has_scales,
+            input_scale_unusable_reason=input_scale_unusable_reason,
+        )
+
     def __call__(self, layer_id: int, banks: dict) -> None:
         from freetoken.moe.nvfp4_backends import _NATIVE_NVFP4_BANKS
 
         with self._lock:
+            if self.backend is None:
+                raise RuntimeError(
+                    "NVFP4 activation sidecars must be resolved before expert layers"
+                )
+            if self.backend == "triton":
+                self._outer(layer_id, banks)
+                return
             if self._device.type == "cuda":
                 torch.cuda.set_device(self._device)
+            from freetoken.moe.nvfp4_backends import (
+                b12x_repack_layer,
+                marlin_repack_layer,
+            )
+
+            repack_layer = {
+                "marlin": marlin_repack_layer,
+                "b12x": b12x_repack_layer,
+            }[self.backend]
             layer_tensors = {name: banks[name].tensor for name in _NATIVE_NVFP4_BANKS}
-            post, gate_up_alpha, down_alpha = self._repack_layer(
-                layer_tensors, self._config, self._device
+            post, gate_up_alpha, down_alpha = repack_layer(
+                layer_tensors, self._config, self._device,
+                **(
+                    {"activation_dtype": self.activation_dtype}
+                    if self.backend == "b12x" else {}
+                ),
             )
             self._gate_up_alpha[layer_id] = gate_up_alpha
             self._down_alpha[layer_id] = down_alpha
@@ -185,6 +318,7 @@ class _Nvfp4RepackSink:
     def assemble(self, num_layers: int):
         """After the load: flat layer-major ``[L*E]`` alphas + the 4-name post-repack
         per-layer source lists. Asserts every layer streamed through."""
+        assert self.backend in ("marlin", "b12x")
         for by_layer, what in (
             (self._gate_up_alpha, "gate_up_alpha"),
             (self._down_alpha, "down_alpha"),
@@ -202,53 +336,79 @@ class _Nvfp4RepackSink:
 def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     from freetoken.models.weight import load_nvfp4_moe_expert_sources
     from freetoken.moe.nvfp4_backends import (
-        b12x_repack_layer,
         b12x_repack_sources_inplace,
-        marlin_repack_layer,
         marlin_repack_sources_inplace,
-        select_nvfp4_backend,
+        resolve_moe_activation_dtype,
     )
 
-    # Backend pick is a pure hardware/config decision, independent of the loaded data, so
-    # it's resolved up front. The native "nvfp4" layout (decode_target=="cpu", or the
-    # "triton" backend) is written as-loaded straight through the sink. marlin/b12x repack
-    # per expert: when converting (layer_sink given), a wrapper sink repacks each layer as
-    # it completes and forwards the renamed banks to the outer sink; serving (no sink)
-    # repacks the whole materialized bank set in place after load.
-    native = decode_target == "cpu"
-    backend = None
-    if not native:
-        backend = select_nvfp4_backend(
-            device,
-            getattr(model_config, "moe_intermediate_size", None),
-            getattr(model_config, "nvfp4_backend", "auto"),
-            activation=(
-                getattr(model_config, "moe_activation", None)
-                or getattr(model_config, "hidden_act", "silu")
-            ),
-        )
-        native = backend == "triton"
-
+    # Source checkpoints expose activation sidecars immediately before their first
+    # layer. A streaming conversion therefore resolves its physical layout in this
+    # wrapper, while a materialized serving load resolves after the loader returns.
     repack_sink = None
-    if not native and not dummy and layer_sink is not None:
-        repack_layer = {"marlin": marlin_repack_layer, "b12x": b12x_repack_layer}[backend]
-        repack_sink = _Nvfp4RepackSink(repack_layer, model_config, device, layer_sink)
-
-    if native:
-        sink = None if dummy else layer_sink
+    if decode_target == "gpu" and not dummy and layer_sink is not None:
+        repack_sink = _Nvfp4RepackSink(model_config, device, layer_sink)
+        sink = repack_sink
     else:
-        sink = repack_sink  # None for serving/dummy marlin/b12x; the repack wrapper when converting
+        sink = None if dummy else layer_sink
 
-    # parallel only parallelizes the source read; the backend repack below is reused unchanged.
+    load_config = model_config
+    load_activation_dtype = _nvfp4_load_activation_dtype(
+        model_config, device, decode_target
+    )
+    if load_activation_dtype == "bf16" and (
+        getattr(model_config, "moe_activation_dtype", "auto") != "bf16"
+    ):
+        load_config = copy.copy(model_config)
+        object.__setattr__(load_config, "moe_activation_dtype", "bf16")
+
     sources = load_nvfp4_moe_expert_sources(
-        model_path, model_config, dummy=dummy, parallel=parallel, workers=workers, chunk=chunk,
+        model_path, load_config, dummy=dummy, parallel=parallel, workers=workers, chunk=chunk,
         layer_sink=sink,
     )
+    gate_up_input_scale = (
+        torch.cat(sources["gate_up_input_scale"])
+        if "gate_up_input_scale" in sources else None
+    )
+    down_input_scale = (
+        torch.cat(sources["down_input_scale"])
+        if "down_input_scale" in sources else None
+    )
+    has_input_scales = gate_up_input_scale is not None and down_input_scale is not None
+    input_scale_unusable_reason = getattr(
+        sources, "input_scale_unusable_reason", None
+    )
+    cc = torch.cuda.get_device_capability(device) if device.type == "cuda" else (0, 0)
+    if decode_target == "cpu":
+        backend = "triton"
+        activation_dtype, activation_reason = resolve_moe_activation_dtype(
+            getattr(model_config, "moe_activation_dtype", "auto"),
+            compute_capability=cc,
+            has_input_scales=has_input_scales,
+            input_scale_unusable_reason=input_scale_unusable_reason,
+            b12x_a4_reason="CPU decode uses the native Triton expert layout",
+        )
+    elif repack_sink is not None:
+        if repack_sink.backend is None:
+            raise RuntimeError("NVFP4 loader did not report activation sidecars")
+        backend = repack_sink.backend
+        activation_dtype = repack_sink.activation_dtype
+        activation_reason = repack_sink.activation_dtype_reason
+    else:
+        backend, activation_dtype, activation_reason = _resolve_nvfp4_gpu_policy(
+            model_config,
+            device,
+            has_input_scales=has_input_scales,
+            input_scale_unusable_reason=input_scale_unusable_reason,
+        )
     # CPU-compute decode (cpu/hybrid) reads the native ModelOpt rows directly (its
     # dequant-in-GEMV kernel), so keep the native "nvfp4" layout and skip the GPU-tiled
     # marlin/b12x repacks (which only the GPU W4A16 kernels can read).
     if decode_target == "cpu":
         return ExpertBanks("nvfp4", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4"]},
+                           gate_up_input_scale=gate_up_input_scale,
+                           down_input_scale=down_input_scale,
+                           activation_dtype=activation_dtype,
+                           activation_dtype_reason=activation_reason,
                            streamed=sink is not None)
     # Pick the expert-GEMM backend by compute capability (and MoE width: auto keeps
     # small-I MoE on the Triton M=1 GEMV, which beats b12x's tensor cores at single-stream
@@ -257,6 +417,10 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     logger.info(f"NVFP4 expert backend: {backend}")
     if backend == "triton":
         return ExpertBanks("nvfp4", {name: sources[name] for name in _BANK_SCHEMAS["nvfp4"]},
+                           gate_up_input_scale=gate_up_input_scale,
+                           down_input_scale=down_input_scale,
+                           activation_dtype=activation_dtype,
+                           activation_dtype_reason=activation_reason,
                            streamed=sink is not None)
     quant_format = f"nvfp4_{backend}"
     if repack_sink is not None:
@@ -265,15 +429,25 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         post_sources, gate_up_alpha, down_alpha = repack_sink.assemble(num_layers)
         return ExpertBanks(
             quant_format, post_sources,
-            gate_up_alpha=gate_up_alpha, down_alpha=down_alpha, streamed=True,
+            gate_up_alpha=gate_up_alpha, down_alpha=down_alpha,
+            gate_up_input_scale=gate_up_input_scale,
+            down_input_scale=down_input_scale,
+            activation_dtype=activation_dtype,
+            activation_dtype_reason=activation_reason,
+            streamed=True,
         )
     repack = {"marlin": marlin_repack_sources_inplace, "b12x": b12x_repack_sources_inplace}
-    sources = repack[backend](sources, model_config, device)
+    repack_kw = {"activation_dtype": activation_dtype} if backend == "b12x" else {}
+    sources = repack[backend](sources, model_config, device, **repack_kw)
     return ExpertBanks(
         quant_format,
         {name: sources[name] for name in _BANK_SCHEMAS[quant_format]},
         gate_up_alpha=sources["gate_up_alpha"],
         down_alpha=sources["down_alpha"],
+        gate_up_input_scale=gate_up_input_scale,
+        down_input_scale=down_input_scale,
+        activation_dtype=activation_dtype,
+        activation_dtype_reason=activation_reason,
     )
 
 
@@ -450,7 +624,10 @@ def ftw_bank_byte_breakdown(model_path: str) -> tuple[int, int] | None:
         if tensor.get("kind") != "experts_bank":
             continue
         base = str(tensor.get("name", "")).split("#L", 1)[0]
-        if base in ("gate_up_alpha", "down_alpha"):
+        if base in (
+            "gate_up_alpha", "down_alpha",
+            "gate_up_input_scale", "down_input_scale",
+        ):
             fixed_bytes += int(tensor["nbytes"])
         else:
             row_bytes += int(tensor["nbytes"])
@@ -558,6 +735,62 @@ def _load_expert_banks_impl(
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+            if banks.quant_format == "nvfp4" and decode_target == "gpu":
+                from freetoken.moe.nvfp4_backends import (
+                    b12x_repack_sources_inplace,
+                )
+
+                has_input_scales = (
+                    banks.gate_up_input_scale is not None
+                    and banks.down_input_scale is not None
+                )
+                backend, activation_dtype, activation_reason = (
+                    _resolve_nvfp4_gpu_policy(
+                        model_config,
+                        device,
+                        has_input_scales=has_input_scales,
+                        input_scale_unusable_reason=banks.activation_dtype_reason,
+                    )
+                )
+                if activation_dtype == "nvfp4":
+                    assert backend == "b12x"
+                    copied_sources = {
+                        name: [
+                            torch.empty_like(
+                                tensor, pin_memory=tensor.is_pinned()
+                            ).copy_(tensor)
+                            for tensor in rows
+                        ]
+                        for name, rows in banks.sources.items()
+                    }
+                    packed = b12x_repack_sources_inplace(
+                        copied_sources, model_config, device,
+                        activation_dtype=activation_dtype,
+                    )
+                    banks = replace(
+                        banks,
+                        quant_format="nvfp4_b12x",
+                        sources={
+                            name: packed[name]
+                            for name in _BANK_SCHEMAS["nvfp4_b12x"]
+                        },
+                        gate_up_alpha=packed["gate_up_alpha"],
+                        down_alpha=packed["down_alpha"],
+                        activation_dtype=activation_dtype,
+                        activation_dtype_reason=activation_reason,
+                    )
+                elif backend == "triton":
+                    banks = replace(
+                        banks,
+                        activation_dtype=activation_dtype,
+                        activation_dtype_reason=activation_reason,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"native NVFP4 FTW banks cannot use selected {backend!r} "
+                        "W4A16 backend without an already-repacked layout; reconvert "
+                        "the FTW with that explicit backend"
+                    )
             return banks
 
     if indexed and not dummy:

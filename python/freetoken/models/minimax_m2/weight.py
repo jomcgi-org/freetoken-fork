@@ -25,7 +25,8 @@ from .config import parse_config
 _EXPERT_RE = re.compile(r"\.block_sparse_moe\.experts\.\d+\.")
 _EXPERT_KEY_RE = re.compile(
     r"^model\.layers\.(?P<layer>\d+)\.block_sparse_moe\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>w1|w2|w3)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>w1|w2|w3)\."
+    r"(?P<kind>weight|weight_scale|weight_scale_2|input_scale)$"
 )
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,

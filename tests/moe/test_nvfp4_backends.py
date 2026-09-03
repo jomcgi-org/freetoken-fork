@@ -17,6 +17,7 @@ The ``--nvfp4-backend`` selection + CUDA-13 gate is checked without a GPU.
 from __future__ import annotations
 
 import importlib.util
+import sys
 import types
 
 import pytest
@@ -37,6 +38,26 @@ TOPK = 2
 _E2M1 = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 )
+
+
+def _import_expert_banks_without_kernel_runtime(monkeypatch):
+    """Import loader policy helpers without pulling in flashlib's Triton kernels."""
+    from freetoken.moe.nvfp4_backends import (
+        _NATIVE_NVFP4_BANKS,
+        _POST_NVFP4_BANKS,
+    )
+
+    module_name = "freetoken.moe.offload_cache"
+    fake_offload_cache = types.ModuleType(module_name)
+    fake_offload_cache._BANK_BYTES_PER_EXPERT = {}
+    fake_offload_cache._BANK_SCHEMAS = {
+        "nvfp4": _NATIVE_NVFP4_BANKS,
+        "nvfp4_b12x": _POST_NVFP4_BANKS,
+        "nvfp4_marlin": _POST_NVFP4_BANKS,
+    }
+    monkeypatch.setitem(sys.modules, module_name, fake_offload_cache)
+    monkeypatch.delitem(sys.modules, "freetoken.moe.expert_banks", raising=False)
+    return importlib.import_module("freetoken.moe.expert_banks")
 
 
 def _dequant_ref(packed: torch.Tensor, scale: torch.Tensor, row_global: torch.Tensor) -> torch.Tensor:
@@ -427,6 +448,282 @@ def test_nvfp4_backend_selection():
         select_nvfp4_backend(cpu, None, "bogus")
 
 
+def test_moe_activation_dtype_auto_rule_and_explicit_errors():
+    from freetoken.moe.nvfp4_backends import resolve_moe_activation_dtype
+
+    assert resolve_moe_activation_dtype(
+        "auto", compute_capability=(12, 0), has_input_scales=True
+    )[0] == "nvfp4"
+    mode, reason = resolve_moe_activation_dtype(
+        "auto", compute_capability=(12, 0), has_input_scales=False
+    )
+    assert mode == "bf16"
+    assert "not every" in reason
+    mode, reason = resolve_moe_activation_dtype(
+        "auto", compute_capability=(8, 9), has_input_scales=True
+    )
+    assert mode == "bf16"
+    assert "sm_120" in reason
+    with pytest.raises(RuntimeError, match="requires sm_120"):
+        resolve_moe_activation_dtype(
+            "nvfp4", compute_capability=(8, 9), has_input_scales=True
+        )
+    with pytest.raises(RuntimeError, match="lacks input_global_scale"):
+        resolve_moe_activation_dtype(
+            "nvfp4",
+            compute_capability=(12, 0),
+            has_input_scales=True,
+            b12x_a4_reason="flashinfer b12x_fused_moe lacks input_global_scale",
+        )
+
+
+def test_nvfp4_implicit_backend_waits_for_resolved_activation(monkeypatch):
+    from freetoken.moe import nvfp4_backends
+
+    expert_banks = _import_expert_banks_without_kernel_runtime(monkeypatch)
+    _resolve_nvfp4_gpu_policy = expert_banks._resolve_nvfp4_gpu_policy
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    monkeypatch.setattr(nvfp4_backends, "_b12x_a4_unusable_reason", lambda: None)
+    calls = []
+
+    def fake_select(_device, _intermediate, requested, **kwargs):
+        calls.append((requested, kwargs["prefer_b12x_a4"]))
+        return "b12x" if requested == "auto" and kwargs["prefer_b12x_a4"] else "triton"
+
+    monkeypatch.setattr(nvfp4_backends, "select_nvfp4_backend", fake_select)
+    device = torch.device("cuda")
+    implicit = types.SimpleNamespace(
+        nvfp4_backend=None,
+        moe_activation_dtype="auto",
+        moe_intermediate_size=640,
+        hidden_act="silu",
+    )
+    assert _resolve_nvfp4_gpu_policy(
+        implicit, device, has_input_scales=False
+    )[:2] == ("triton", "bf16")
+    assert calls[-1] == ("triton", False)
+    assert _resolve_nvfp4_gpu_policy(
+        implicit, device, has_input_scales=True
+    )[:2] == ("b12x", "nvfp4")
+    assert calls[-1] == ("auto", True)
+
+    explicit_triton = types.SimpleNamespace(**vars(implicit))
+    explicit_triton.nvfp4_backend = "triton"
+    assert _resolve_nvfp4_gpu_policy(
+        explicit_triton, device, has_input_scales=True
+    )[:2] == ("triton", "bf16")
+    assert calls[-1] == ("triton", False)
+
+    explicit_a4 = types.SimpleNamespace(**vars(implicit))
+    explicit_a4.moe_activation_dtype = "nvfp4"
+    with pytest.raises(RuntimeError, match="gate/up input scales differ"):
+        _resolve_nvfp4_gpu_policy(
+            explicit_a4,
+            device,
+            has_input_scales=False,
+            input_scale_unusable_reason="gate/up input scales differ beyond tolerance",
+        )
+
+
+def test_b12x_a4_repack_rejects_unaligned_intermediate():
+    from freetoken.moe.nvfp4_backends import b12x_repack_layer
+
+    cfg = types.SimpleNamespace(moe_intermediate_size=192, hidden_size=256)
+    with pytest.raises(ValueError, match=r"moe_intermediate_size.*192"):
+        b12x_repack_layer({}, cfg, torch.device("cpu"), activation_dtype="nvfp4")
+
+
+def test_b12x_a4_repack_rejects_unaligned_hidden_size():
+    from freetoken.moe.nvfp4_backends import b12x_repack_layer
+
+    cfg = types.SimpleNamespace(moe_intermediate_size=256, hidden_size=192)
+    with pytest.raises(ValueError, match=r"hidden_size.*192"):
+        b12x_repack_layer({}, cfg, torch.device("cpu"), activation_dtype="nvfp4")
+
+
+def test_nvfp4_sidecar_load_resolution_skips_bf16_targets(monkeypatch):
+    expert_banks = _import_expert_banks_without_kernel_runtime(monkeypatch)
+    _nvfp4_load_activation_dtype = expert_banks._nvfp4_load_activation_dtype
+
+    config = types.SimpleNamespace(moe_activation_dtype="auto")
+    assert _nvfp4_load_activation_dtype(
+        config, torch.device("cpu"), "gpu"
+    ) == "bf16"
+    assert _nvfp4_load_activation_dtype(
+        config, torch.device("cuda"), "cpu"
+    ) == "bf16"
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (8, 9))
+    assert _nvfp4_load_activation_dtype(
+        config, torch.device("cuda"), "gpu"
+    ) == "bf16"
+
+
+def test_bf16_activation_skips_input_scale_shard_pass(monkeypatch):
+    package = types.ModuleType("freetoken.models")
+    package.__path__ = []
+    monkeypatch.setitem(sys.modules, "freetoken.models", package)
+    monkeypatch.delitem(sys.modules, "freetoken.models.nvfp4_banks", raising=False)
+
+    source = importlib.util.spec_from_file_location(
+        "freetoken.models.nvfp4_banks",
+        __file__.replace(
+            "tests/moe/test_nvfp4_backends.py",
+            "python/freetoken/models/nvfp4_banks.py",
+        ),
+    )
+    assert source is not None and source.loader is not None
+    module = importlib.util.module_from_spec(source)
+    monkeypatch.setitem(sys.modules, source.name, module)
+    source.loader.exec_module(module)
+
+    def fail_drop(_path):
+        raise AssertionError("BF16 activation must not visit sidecar shards")
+
+    scales, reason = module._load_input_scales(
+        "unused",
+        {"sidecar": "must-not-open.safetensors"},
+        types.SimpleNamespace(moe_activation_dtype="bf16"),
+        object(),
+        drop_page_cache=fail_drop,
+    )
+    assert scales == {}
+    assert reason is None
+
+
+def test_native_ftw_a4_repack_copies_sources_once(monkeypatch):
+    from freetoken.checkpoint import ftw
+    from freetoken.moe import nvfp4_backends
+
+    expert_banks = _import_expert_banks_without_kernel_runtime(monkeypatch)
+
+    sources = {
+        name: [torch.full((2, 2), index, dtype=torch.uint8)]
+        for index, name in enumerate(nvfp4_backends._NATIVE_NVFP4_BANKS)
+    }
+    originals = {name: rows[0].clone() for name, rows in sources.items()}
+    loaded = expert_banks.ExpertBanks(
+        "nvfp4",
+        sources,
+        gate_up_input_scale=torch.ones(2),
+        down_input_scale=torch.ones(2),
+    )
+    monkeypatch.setattr(expert_banks, "resolve_bank_source", lambda *_args: "ftw")
+    monkeypatch.setattr(ftw, "load_ftw_banks", lambda *_args, **_kwargs: loaded)
+    monkeypatch.setattr(
+        expert_banks,
+        "_resolve_nvfp4_gpu_policy",
+        lambda *_args, **_kwargs: ("b12x", "nvfp4", "test A4 policy"),
+    )
+    calls = []
+
+    def fake_repack(copied, *_args, **kwargs):
+        calls.append(copied)
+        assert kwargs["activation_dtype"] == "nvfp4"
+        for name, rows in copied.items():
+            assert rows[0].data_ptr() != sources[name][0].data_ptr()
+            rows[0].add_(1)
+        copied["gate_up_alpha"] = torch.ones(2)
+        copied["down_alpha"] = torch.ones(2)
+        return copied
+
+    monkeypatch.setattr(
+        nvfp4_backends, "b12x_repack_sources_inplace", fake_repack
+    )
+    config = types.SimpleNamespace(num_moe_layers=1)
+    result = expert_banks._load_expert_banks_impl(
+        "unused",
+        config,
+        device=torch.device("cuda"),
+        dtype=torch.bfloat16,
+        decode_target="gpu",
+    )
+
+    assert len(calls) == 1
+    assert result.quant_format == "nvfp4_b12x"
+    assert result.activation_dtype == "nvfp4"
+    for name, original in originals.items():
+        torch.testing.assert_close(sources[name][0], original)
+
+
+def test_native_ftw_rejects_selected_w4a16_backend(monkeypatch):
+    from freetoken.checkpoint import ftw
+
+    expert_banks = _import_expert_banks_without_kernel_runtime(monkeypatch)
+
+    loaded = expert_banks.ExpertBanks(
+        "nvfp4", {"gate_up_packed": [torch.zeros(1, dtype=torch.uint8)]}
+    )
+    monkeypatch.setattr(expert_banks, "resolve_bank_source", lambda *_args: "ftw")
+    monkeypatch.setattr(ftw, "load_ftw_banks", lambda *_args, **_kwargs: loaded)
+    monkeypatch.setattr(
+        expert_banks,
+        "_resolve_nvfp4_gpu_policy",
+        lambda *_args, **_kwargs: ("marlin", "bf16", "explicit marlin request"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"selected 'marlin'.*reconvert"):
+        expert_banks._load_expert_banks_impl(
+            "unused",
+            types.SimpleNamespace(num_moe_layers=1, nvfp4_backend="marlin"),
+            device=torch.device("cuda"),
+            dtype=torch.bfloat16,
+            decode_target="gpu",
+        )
+
+
+def test_b12x_a4_folds_fc2_input_scale_into_weight_views(monkeypatch):
+    from freetoken.moe import nvfp4_backends
+
+    observed = {}
+
+    def fake_weight_views(*args):
+        observed["folded_down_alpha"] = args[5]
+        return object()
+
+    def fake_launch(**kwargs):
+        observed["launch_w2_alpha"] = kwargs["w2_alpha"]
+        return kwargs["scatter_output"]
+
+    dispatch_name = (
+        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch"
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        dispatch_name,
+        types.SimpleNamespace(launch_sm120_moe=fake_launch),
+    )
+    monkeypatch.setattr(nvfp4_backends, "_b12x_a4_weight_views", fake_weight_views)
+
+    experts = 3
+    hidden = torch.zeros((1, 4), dtype=torch.bfloat16)
+    gate_up_q = torch.zeros((experts, 2, 2), dtype=torch.uint8)
+    gate_up_s = torch.zeros_like(gate_up_q)
+    down_q = torch.zeros_like(gate_up_q)
+    down_s = torch.zeros_like(gate_up_q)
+    gate_up_alpha = torch.stack((torch.full((experts,), 2.0), torch.full((experts,), 0.25)))
+    down_alpha = torch.stack((torch.full((experts,), 3.0), torch.full((experts,), 0.125)))
+
+    nvfp4_backends.b12x_fused_experts(
+        hidden,
+        gate_up_q,
+        gate_up_s,
+        gate_up_alpha,
+        down_q,
+        down_s,
+        down_alpha,
+        torch.ones((1, 1)),
+        torch.zeros((1, 1), dtype=torch.int32),
+        "silu",
+        False,
+    )
+
+    torch.testing.assert_close(
+        observed["folded_down_alpha"], down_alpha[0] * down_alpha[1]
+    )
+    torch.testing.assert_close(observed["launch_w2_alpha"], down_alpha[0])
+
+
 @cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache
@@ -469,6 +766,65 @@ def test_b12x_decode_matches_dequant_reference():
         hidden, gu_p, gu_s, g1, dn_p, dn_s, g2, topk_weights, ids, "silu", False
     )
     _assert_close(out, ref)
+
+
+@cuda
+def test_b12x_nvfp4_activation_parity_with_bf16_activation_path():
+    """SM120 only: W4A4 stays within the fixed ModelOpt-style parity gate.
+
+    The 12 percent relative and 8 percent peak-magnitude absolute tolerances account
+    for two additional E2M1 quantization boundaries, at the FC1 input and before FC2.
+    They are intentionally fixed before the first G4 run.
+    """
+    from freetoken.moe.nvfp4_backends import (
+        _b12x_a4_unusable_reason,
+        _b12x_unusable_reason,
+        b12x_fused_experts,
+        b12x_repack_sources_inplace,
+    )
+
+    device = torch.device("cuda")
+    cc = torch.cuda.get_device_capability(device)
+    reason = _b12x_unusable_reason(cc) or _b12x_a4_unusable_reason()
+    if cc != (12, 0) or reason is not None:
+        pytest.skip(f"SM120 b12x NVFP4 path unavailable: {reason or cc}")
+
+    native = _make_native_sources(device, seed=18)
+    w4a16_sources = {name: [row.clone() for row in rows] for name, rows in native.items()}
+    w4a4_sources = {name: [row.clone() for row in rows] for name, rows in native.items()}
+    cfg = types.SimpleNamespace(hidden_size=H, moe_intermediate_size=I)
+    w4a16 = b12x_repack_sources_inplace(
+        w4a16_sources, cfg, device, chunk=E, activation_dtype="bf16"
+    )
+    w4a4 = b12x_repack_sources_inplace(
+        w4a4_sources, cfg, device, chunk=E, activation_dtype="nvfp4"
+    )
+
+    torch.manual_seed(19)
+    hidden = torch.randn(8, H, dtype=torch.bfloat16, device=device) / 4
+    topk_ids = torch.randint(0, E, (8, TOPK), dtype=torch.int32, device=device)
+    topk_weights = torch.rand(8, TOPK, dtype=torch.float32, device=device)
+    gate_input = torch.full((E,), 0.25, dtype=torch.float32, device=device)
+    down_input = torch.full((E,), 0.125, dtype=torch.float32, device=device)
+
+    ref = b12x_fused_experts(
+        hidden,
+        w4a16["gate_up_packed"][0], w4a16["gate_up_scale"][0],
+        w4a16["gate_up_alpha"][:E],
+        w4a16["down_packed"][0], w4a16["down_scale"][0],
+        w4a16["down_alpha"][:E],
+        topk_weights, topk_ids, "silu", False,
+    )
+    out = b12x_fused_experts(
+        hidden,
+        w4a4["gate_up_packed"][0], w4a4["gate_up_scale"][0],
+        torch.stack((w4a4["gate_up_alpha"][:E], gate_input)),
+        w4a4["down_packed"][0], w4a4["down_scale"][0],
+        torch.stack((w4a4["down_alpha"][:E], down_input)),
+        topk_weights, topk_ids, "silu", False,
+    )
+    atol = 0.08 * max(float(ref.float().abs().max()), 1e-3)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0.12, atol=atol)
 
 
 @cuda

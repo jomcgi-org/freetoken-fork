@@ -106,8 +106,13 @@ def validate_glm_nvfp4_bank_geometry(config, sources):
         "down_scale": (e, h, i // 16),
         "down_global": (e, h),
     }
-    assert set(sources) == set(expected), (
-        f"GLM NVFP4 bank names {sorted(sources)} do not match {sorted(expected)}"
+    sidecars = {"gate_up_input_scale", "down_input_scale"}
+    actual_bulk = set(sources) - sidecars
+    assert actual_bulk == set(expected), (
+        f"GLM NVFP4 bank names {sorted(actual_bulk)} do not match {sorted(expected)}"
+    )
+    assert not (set(sources) & sidecars) or sidecars <= set(sources), (
+        "GLM NVFP4 activation sidecars must include both gate_up and down input scales"
     )
     for name, shape in expected.items():
         layers = sources[name]

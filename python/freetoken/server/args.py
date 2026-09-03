@@ -629,9 +629,21 @@ def parse_args(
         default=ServerArgs.nvfp4_backend,
         choices=["auto", "marlin", "flashinfer", "triton"],
         help=(
-            "NVFP4 routed-expert GEMM backend (default: triton, the portable inline-dequant "
-            "kernel). auto picks by GPU (marlin on sm80-99 + vLLM; flashinfer b12x on sm120+ "
-            "& CUDA>=13; else triton). Force one to override; it fails loudly if it cannot run."
+            "NVFP4 routed-expert GEMM backend. The implicit default is Triton unless "
+            "NVFP4 activation auto-selection chooses the SM120 b12x path. auto picks by "
+            "GPU; an explicit choice is never rewritten and fails if it cannot run."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-activation-dtype",
+        default=ServerArgs.moe_activation_dtype,
+        choices=["auto", "bf16", "nvfp4"],
+        help=(
+            "Routed-expert activation dtype. auto uses NVFP4 only on sm120 when every "
+            "expert GEMM has a ModelOpt input scale; bf16 keeps W4A16; nvfp4 fails at "
+            "startup when the architecture, scales, FlashInfer entry, or FTW layout "
+            "cannot support it."
         ),
     )
 

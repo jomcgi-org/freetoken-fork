@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import torch
 from safetensors.torch import save_file
@@ -104,6 +105,11 @@ def _source_checkpoint(path) -> dict[str, torch.Tensor]:
                 raw[f"{prefix}.weight_scale_2"] = torch.tensor(
                     0.25 * (1 + layer + expert), dtype=torch.float32
                 )
+                raw[f"{prefix}.input_scale"] = torch.tensor(
+                    0.125 * (1 + layer + expert)
+                    if proj == "down_proj" else 0.25 * (1 + layer + expert),
+                    dtype=torch.float32,
+                )
 
     raw.update({
         "model.embed_tokens.weight": _bf16(32, H),
@@ -146,6 +152,7 @@ def test_glm_moe_dsa_cpu_ftw_round_trip_native_nvfp4(tmp_path, monkeypatch):
     )
 
     assert index["quant_format"] == "nvfp4"
+    assert index["moe_activation_dtype"] == "bf16"
     assert index["expert_bank_geometry"] == {
         "num_layers": LAYERS - FIRST_MOE,
         "num_experts": E,
@@ -155,8 +162,16 @@ def test_glm_moe_dsa_cpu_ftw_round_trip_native_nvfp4(tmp_path, monkeypatch):
     expected_layer_bytes = E * ((27 * H * I) // 16 + 4 * I + 2 * H)
     assert index["expert_bank_max_layer_bytes"] == expected_layer_bytes
     bank_entries = [entry for entry in index["tensors"] if entry["kind"] == "experts_bank"]
-    assert len(bank_entries) == 6 * (LAYERS - FIRST_MOE)
-    assert all("#L" in entry["name"] for entry in bank_entries)
+    assert len(bank_entries) == 6 * (LAYERS - FIRST_MOE) + 2
+    row_entries = [entry for entry in bank_entries if "#L" in entry["name"]]
+    assert len(row_entries) == 6 * (LAYERS - FIRST_MOE)
+    sidecar_entries = [entry for entry in bank_entries if "#L" not in entry["name"]]
+    assert {entry["name"] for entry in sidecar_entries} == {
+        "gate_up_input_scale", "down_input_scale",
+    }
+    assert min(entry["global_off"] for entry in sidecar_entries) > max(
+        entry["global_off"] for entry in row_entries
+    )
 
     resident_entries = [entry for entry in index["tensors"] if entry["kind"] == "weight"]
     resident_names = {entry["name"] for entry in resident_entries}
@@ -179,6 +194,25 @@ def test_glm_moe_dsa_cpu_ftw_round_trip_native_nvfp4(tmp_path, monkeypatch):
         "gate_up_packed", "gate_up_scale", "gate_up_global",
         "down_packed", "down_scale", "down_global",
     }
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    total_experts = (LAYERS - FIRST_MOE) * E
+    cache = OffloadMoeCache(
+        num_layers=LAYERS - FIRST_MOE,
+        num_experts=E,
+        cache_size=E,
+        device=torch.device("cpu"),
+        quant_format="nvfp4_b12x",
+        prefill_overlap=False,
+    )
+    cache.set_alphas(
+        torch.ones(total_experts), torch.ones(total_experts),
+        banks.gate_up_input_scale, banks.down_input_scale,
+    )
+    gate_scales, down_scales = cache.alphas_for_layer(0)
+    assert gate_scales.shape == down_scales.shape == (2, E)
+    assert torch.equal(gate_scales[1], banks.gate_up_input_scale[:E])
+    assert torch.equal(down_scales[1], banks.down_input_scale[:E])
     for bank_layer, source_layer in enumerate(range(FIRST_MOE, LAYERS)):
         for expert in range(E):
             base = f"model.layers.{source_layer}.mlp.experts.{expert}"
@@ -213,6 +247,106 @@ def test_glm_moe_dsa_cpu_ftw_round_trip_native_nvfp4(tmp_path, monkeypatch):
                 banks.sources["down_global"][bank_layer][expert],
                 down_global.expand(H),
             )
+            assert banks.gate_up_input_scale[bank_layer * E + expert] == raw[
+                f"{base}.gate_proj.input_scale"
+            ]
+            assert banks.down_input_scale[bank_layer * E + expert] == raw[
+                f"{base}.down_proj.input_scale"
+            ]
+
+
+def test_old_ftw_without_activation_sidecars_still_loads(tmp_path):
+    from freetoken.checkpoint.ftw import FTWWriter, load_ftw_banks
+
+    writer = FTWWriter(str(tmp_path))
+    writer.add_tensor(
+        "gate_up_packed", torch.zeros((2, 4), dtype=torch.uint8),
+        kind="experts_bank",
+    )
+    writer.finalize({"quant_format": "nvfp4", "expert_bank_num_layers": 1})
+
+    banks = load_ftw_banks(str(tmp_path), num_layers=1, layer_residency=["pageable"])
+    assert banks is not None
+    assert banks.gate_up_input_scale is None
+    assert banks.down_input_scale is None
+    assert banks.activation_dtype is None
+
+
+def test_native_nvfp4_ftw_gpu_target_on_cpu_skips_cuda_capability(
+    tmp_path, monkeypatch
+):
+    from freetoken.checkpoint.ftw import FTWWriter
+    from freetoken.moe.expert_banks import _load_expert_banks_impl
+
+    writer = FTWWriter(str(tmp_path))
+    writer.add_tensor(
+        "gate_up_packed", torch.zeros((2, 4), dtype=torch.uint8),
+        kind="experts_bank",
+    )
+    writer.finalize({"quant_format": "nvfp4", "expert_bank_num_layers": 1})
+
+    def fail_capability(*_args, **_kwargs):
+        raise AssertionError("CPU load must not query CUDA device capability")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", fail_capability)
+    config = SimpleNamespace(
+        num_moe_layers=1,
+        moe_intermediate_size=640,
+        hidden_act="silu",
+        nvfp4_backend=None,
+        moe_activation_dtype="auto",
+    )
+    banks = _load_expert_banks_impl(
+        str(tmp_path),
+        config,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        decode_target="gpu",
+        layer_residency=["pageable"],
+    )
+    assert banks.quant_format == "nvfp4"
+
+
+def test_gate_up_input_scales_accept_one_ulp_and_reject_real_mismatch(tmp_path):
+    from freetoken.models.glm4_moe.weight import _NVFP4_SOURCE_SPEC
+    from freetoken.models.nvfp4_banks import _load_input_scales
+
+    raw = _source_checkpoint(tmp_path)
+    shard = "model-00001-of-00001.safetensors"
+    base = f"model.layers.{FIRST_MOE}.mlp.experts.0"
+    gate_key = f"{base}.gate_proj.input_scale"
+    up_key = f"{base}.up_proj.input_scale"
+    raw[up_key] = torch.nextafter(raw[gate_key], torch.tensor(float("inf")))
+    save_file(raw, str(tmp_path / shard))
+    weight_map = {name: shard for name in raw}
+    config = SimpleNamespace(
+        num_layers=LAYERS,
+        num_moe_layers=LAYERS - FIRST_MOE,
+        first_k_dense_replace=FIRST_MOE,
+        num_experts=E,
+    )
+
+    scales, reason = _load_input_scales(
+        str(tmp_path),
+        weight_map,
+        config,
+        _NVFP4_SOURCE_SPEC,
+        drop_page_cache=lambda _path: None,
+    )
+    assert reason is None
+    assert scales["gate_up_input_scale"][0][0] == raw[up_key]
+
+    raw[up_key] = raw[gate_key] * 2
+    save_file(raw, str(tmp_path / shard))
+    scales, reason = _load_input_scales(
+        str(tmp_path),
+        weight_map,
+        config,
+        _NVFP4_SOURCE_SPEC,
+        drop_page_cache=lambda _path: None,
+    )
+    assert scales == {}
+    assert reason == "gate/up input scales differ beyond tolerance"
 
 
 def test_checkpoint_cli_without_gpu_never_initializes_cuda(tmp_path, monkeypatch):
