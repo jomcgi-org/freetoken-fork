@@ -7,7 +7,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Iterator, Mapping
+from typing import Callable, Iterator, Mapping
 
 import torch
 from flashlib.kernels.slot_cache import N_STATS, Stat
@@ -342,11 +342,15 @@ class OffloadMoeCache:
         self.hot_adapt_ticks = 0
         self.hot_adapt_ticks_prefill = 0
         self.hot_adapt_ticks_decode = 0
+        self.hot_adapt_ticks_idle = 0
         self.hot_adapt_swaps = 0
+        self.hot_adapt_idle_swaps = 0
         self._hot_adapt_ticks_reported = 0
         self._hot_adapt_ticks_prefill_reported = 0
         self._hot_adapt_ticks_decode_reported = 0
+        self._hot_adapt_ticks_idle_reported = 0
         self._hot_adapt_swaps_reported = 0
+        self._hot_adapt_idle_swaps_reported = 0
         self._hot_decay_factor = 1.0
         self.decayed_decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.float32, device=self.device
@@ -377,6 +381,7 @@ class OffloadMoeCache:
         self._hot_adapt_executor: ThreadPoolExecutor | None = None
         self._hot_adapt_future: Future | None = None
         self._hot_adapt_stop_event = threading.Event()
+        self._hot_adapt_wake_event = threading.Event()
         self._hot_adapt_phase: str | None = None
         self._hot_adapt_swaps_pending = ()
         self._hot_adapt_worker_installs = False
@@ -388,6 +393,11 @@ class OffloadMoeCache:
         self._hot_adapt_tick_covered_seconds = 0.0
         self._hot_adapt_window_started_at: float | None = None
         self._hot_adapt_deferred_logged = False
+        self._hot_adapt_idle_tracker = None
+        self._hot_adapt_tick_boundary: str | None = None
+        self._hot_adapt_tick_planned_swaps = 0
+        self._hot_adapt_tick_executed_swaps = 0
+        self._hot_adapt_tick_rate_before = 0.0
         # Persisted HOT plan state. The adaptation and persistence executors are
         # separate so JSON encoding and fsync never occupy the rerank worker.
         self._hot_plan_counter_seed: dict[int, tuple[float, ...]] = {}
@@ -1052,6 +1062,9 @@ class OffloadMoeCache:
         hot_plan_tier_commit: str = "",
         hot_plan_write_enabled: bool = False,
         hot_plan_interval_seconds: float = 600.0,
+        idle_ms: int = 500,
+        idle_min_interval_ms: int = 2000,
+        tp_size: int = 1,
     ) -> None:
         """Allocate bounded staging, load seeds, and arm online adaptation."""
         if not self.hot_expert_capacity:
@@ -1066,8 +1079,23 @@ class OffloadMoeCache:
             or not 0 < boundary_cap_frac <= 1
         ):
             raise ValueError("HOT boundary cap fraction must be finite and in (0, 1]")
+        if (
+            isinstance(idle_ms, bool)
+            or not isinstance(idle_ms, int)
+            or idle_ms < 0
+        ):
+            raise ValueError("HOT adaptation idle delay must be a non-negative integer")
+        if (
+            isinstance(idle_min_interval_ms, bool)
+            or not isinstance(idle_min_interval_ms, int)
+            or idle_min_interval_ms < 0
+        ):
+            raise ValueError(
+                "HOT adaptation idle minimum interval must be a non-negative integer"
+            )
         from freetoken.moe.host_banks import alloc_pinned_row_staging
         from freetoken.moe.hot_adapt import (
+            HotAdaptIdleTracker,
             HotAdaptIntervalController,
             HotAdaptTokenClock,
             decay_multiplier,
@@ -1117,6 +1145,14 @@ class OffloadMoeCache:
             HotAdaptTokenClock(self.hot_adapt_interval_steps)
             if self.hot_adapt_enabled else None
         )
+        self._hot_adapt_idle_tracker = (
+            None
+            if idle_ms == 0 or tp_size != 1
+            else HotAdaptIdleTracker(
+                idle_seconds=idle_ms / 1000.0,
+                min_interval_seconds=idle_min_interval_ms / 1000.0,
+            )
+        )
         self._hot_decay_factor = decay_multiplier(half_life_steps)
         self._hot_staging_rows = hot_staging_rows(max_swap_bytes, expert_bytes)
         self._hot_staging = alloc_pinned_row_staging(
@@ -1139,6 +1175,7 @@ class OffloadMoeCache:
             max_workers=1, thread_name_prefix="freetoken-hot-adapt"
         )
         self._hot_adapt_stop_event.clear()
+        self._hot_adapt_wake_event.clear()
         self._hot_plan_path = hot_plan_path
         self._hot_plan_identity = hot_plan_identity
         self._hot_plan_tier_commit = hot_plan_tier_commit
@@ -1157,9 +1194,16 @@ class OffloadMoeCache:
         logger.info_rank0(
             f"MoE HOT expert residency: {sum(self.hot_expert_capacity.values())} "
             f"protected GPU rows across {len(self.hot_expert_capacity)} DISK layers, "
-            f"hot_staging_gib={self.hot_staging_bytes / 2**30:.2f}"
+            f"hot_staging_gib={self.hot_staging_bytes / 2**30:.2f}, "
+            f"hot_staging_rows={self._hot_staging_rows}"
         )
         mode = "auto" if controller.auto else f"fixed({controller.current_interval})"
+        if tp_size != 1:
+            idle = "off (tensor parallel)"
+        elif idle_ms == 0:
+            idle = "off"
+        else:
+            idle = f"{idle_ms} ms"
         logger.info_rank0(
             f"MoE HOT adaptation intervals: mode={mode}, "
             f"unit=routed_tokens, "
@@ -1170,7 +1214,9 @@ class OffloadMoeCache:
             f"target_fill_tokens={controller.target_fill_tokens}, "
             f"fill_interval={controller.fill_interval}, "
             f"steady_interval={controller.steady_interval}, "
-            f"current_interval={controller.current_interval}"
+            f"current_interval={controller.current_interval}, "
+            f"idle={idle}, "
+            f"idle_min_interval_ms={idle_min_interval_ms}"
         )
         if not self.hot_adapt_enabled:
             return
@@ -1217,6 +1263,11 @@ class OffloadMoeCache:
         copied: set[tuple[int, int]] = set()
         with torch.inference_mode():
             for stage_row, swap in enumerate(swaps):
+                # Check once per whole expert row. Once a row starts, every bank
+                # for that row is copied. Preemption bounds additional host staging
+                # to one row, but the H2D install of the staged prefix, up to
+                # self._hot_staging_rows rows, still lands on the scheduler stream
+                # before the next forward and costs 25 to 50 ms on node-4.
                 if stop_event is not None and stop_event.is_set():
                     break
                 for bank_id, name in enumerate(self.bank_schema):
@@ -1600,16 +1651,23 @@ class OffloadMoeCache:
             for expert in rows if expert is not None
         )
         rate = hot / total if total else 0.0
-        logger.info_rank0(
-            f"MoE HOT adaptation tick token={token}, boundary={boundary}: "
-            f"decayed_hot_pair_rate={rate:.2%}, "
-            f"ticks={tick_count}, planned_swaps={len(swaps)}, max_swap_gib_per_tick="
-            f"{self.hot_adapt_max_swap_bytes / 2**30:.2f}, boundary_cap_frac="
-            f"{self.hot_adapt_boundary_cap_frac:.2f}"
-        )
+        if boundary != "idle":
+            logger.info_rank0(
+                f"MoE HOT adaptation tick token={token}, boundary={boundary}: "
+                f"decayed_hot_pair_rate={rate:.2%}, "
+                f"ticks={tick_count}, planned_swaps={len(swaps)}, "
+                f"max_swap_gib_per_tick="
+                f"{self.hot_adapt_max_swap_bytes / 2**30:.2f}, "
+                f"boundary_cap_frac={self.hot_adapt_boundary_cap_frac:.2f}"
+            )
         return swaps, rate, tick_count
 
-    def _retire_hot_adaptation_swaps(self, swaps, *, tick_count: int = 1) -> None:
+    def _retire_hot_adaptation_swaps(
+        self,
+        swaps,
+        *,
+        tick_count: int = 1,
+    ) -> None:
         from freetoken.moe.hot_adapt import (
             hot_boundary_interval_tokens,
             retire_hot_swaps,
@@ -1648,6 +1706,9 @@ class OffloadMoeCache:
         self._hot_adapt_future = self._hot_adapt_executor.submit(
             stage, ready, swaps, self._hot_adapt_stop_event
         )
+        self._hot_adapt_future.add_done_callback(
+            lambda _future: self._hot_adapt_wake_event.set()
+        )
 
     def _finish_hot_adaptation_swaps(
         self, copied_rows, staging_seconds: float = 0.0
@@ -1655,10 +1716,25 @@ class OffloadMoeCache:
         from freetoken.moe.hot_adapt import finish_hot_swaps
 
         swaps = self._hot_adapt_swaps_pending
-        finished = finish_hot_swaps(self._hot_mapping_lists(), swaps, copied_rows)
+        executed = tuple(
+            swap
+            for swap in swaps
+            if (swap.layer_id, swap.row) in copied_rows
+        )
+        abandoned = tuple(
+            swap
+            for swap in swaps
+            if (swap.layer_id, swap.row) not in copied_rows
+        )
+        mapping = self._hot_mapping_lists()
+        for swap in abandoned:
+            if swap.outgoing_expert is not None:
+                mapping[swap.layer_id][swap.outgoing_expert] = swap.row
+            self._hot_slot_owners[swap.layer_id][swap.row] = swap.outgoing_expert
+        finished = finish_hot_swaps(mapping, executed, copied_rows)
         if not self._hot_adapt_worker_installs:
-            self._install_staged_hot_rows(swaps)
-        for swap in swaps:
+            self._install_staged_hot_rows(executed)
+        for swap in executed:
             slot = self._hot_slot_for_row[swap.layer_id][swap.row]
             if swap.outgoing_expert is not None:
                 self.slot_for_id[swap.layer_id, swap.outgoing_expert] = -1
@@ -1676,7 +1752,11 @@ class OffloadMoeCache:
             for layer_id, owners in self._hot_slot_owners.items()
         }
         self._checkpoint_published_hot_slot_owners()
-        self.hot_adapt_swaps += len(swaps)
+        if getattr(self, "_hot_adapt_tick_boundary", None) == "idle":
+            self.hot_adapt_idle_swaps += len(executed)
+        else:
+            self.hot_adapt_swaps += len(executed)
+        self._hot_adapt_tick_executed_swaps = len(executed)
         self._hot_adapt_swaps_pending = ()
         self._hot_adapt_worker_installs = False
         self._hot_adapt_phase = None
@@ -1701,7 +1781,10 @@ class OffloadMoeCache:
         )
         self.hot_adapt_interval_steps = controller.current_interval
         clock = self._hot_adapt_token_clock
-        if clock is not None:
+        if (
+            clock is not None
+            and getattr(self, "_hot_adapt_tick_boundary", None) != "idle"
+        ):
             clock.set_interval(self.hot_adapt_interval_steps)
         if backed_off:
             fraction = staging_seconds / self._hot_adapt_tick_covered_seconds
@@ -1721,18 +1804,51 @@ class OffloadMoeCache:
                 f"{controller.steady_interval}, current_interval="
                 f"{controller.current_interval}"
             )
+        if getattr(self, "_hot_adapt_tick_boundary", None) == "idle":
+            self._checkpoint_published_hot_slot_owners()
+            if self._hot_adapt_tick_executed_swaps:
+                self.snapshot_hot_plan()
+            after = self.decayed_hot_pair_rate()
+            logger.info_rank0(
+                f"MoE HOT adaptation idle tick token={self.hot_adapt_routed_tokens}: "
+                f"planned_swaps={self._hot_adapt_tick_planned_swaps}, "
+                f"executed_swaps={self._hot_adapt_tick_executed_swaps}, "
+                f"decayed_hot_pair_rate="
+                f"{self._hot_adapt_tick_rate_before:.2%}->{after:.2%}"
+            )
+            tracker = getattr(self, "_hot_adapt_idle_tracker", None)
+            if tracker is not None:
+                tracker.tick_completed(
+                    time.monotonic(), self._hot_adapt_tick_executed_swaps
+                )
 
-    def _poll_hot_adaptation(self) -> None:
+    def _poll_hot_adaptation(self, *, preempt_idle: bool = False) -> None:
         future = self._hot_adapt_future
         if future is None or not future.done():
             return
         if self._hot_adapt_phase == "plan":
-            swaps, _rate, tick_count = future.result()
+            swaps, rate, tick_count = future.result()
             self._hot_adapt_future = None
             self._hot_adapt_phase = None
+            self._hot_adapt_tick_planned_swaps = len(swaps)
+            self._hot_adapt_tick_rate_before = rate
+            idle_tick = getattr(self, "_hot_adapt_tick_boundary", None) == "idle"
+            if idle_tick and preempt_idle:
+                self._hot_adapt_tick_executed_swaps = 0
+                self.hot_adapt_ticks -= 1
+                self.hot_adapt_ticks_idle -= 1
+                logger.info_rank0(
+                    f"MoE HOT adaptation idle tick token="
+                    f"{self.hot_adapt_routed_tokens}: preempted after planning"
+                )
+                return
             if swaps:
-                self._retire_hot_adaptation_swaps(swaps, tick_count=tick_count)
+                self._retire_hot_adaptation_swaps(
+                    swaps,
+                    tick_count=tick_count,
+                )
             else:
+                self._hot_adapt_tick_executed_swaps = 0
                 self._complete_hot_adaptation_tick(staging_seconds=0.0)
         elif self._hot_adapt_phase == "copy":
             copied_rows, staging_seconds = future.result()
@@ -1821,13 +1937,145 @@ class OffloadMoeCache:
         )
         return self._hot_plan_future
 
+    def _start_hot_adaptation_tick(
+        self, *, token: int, boundary: str, tick_count: int
+    ) -> None:
+        """Snapshot counters and submit one bounded planner boundary."""
+        self._hot_adapt_tick_boundary = boundary
+        self._hot_adapt_tick_planned_swaps = 0
+        self._hot_adapt_tick_executed_swaps = 0
+        self._hot_adapt_tick_rate_before = 0.0
+        self._hot_adapt_tick_interval_tokens = self.hot_adapt_interval_steps
+        self._hot_adapt_tick_staged_bytes = 0
+        assert self._hot_adapt_snapshot_host is not None
+        self._hot_adapt_snapshot_device.copy_(self.decayed_decode_freq)
+        ready = None
+        if self.device.type == "cuda":
+            assert self._hot_adapt_copy_stream is not None
+            assert self._hot_adapt_snapshot_ready is not None
+            begin = torch.cuda.Event()
+            begin.record(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(self._hot_adapt_copy_stream):
+                self._hot_adapt_copy_stream.wait_event(begin)
+                self._hot_adapt_snapshot_host.copy_(
+                    self._hot_adapt_snapshot_device, non_blocking=True
+                )
+                self._hot_adapt_snapshot_ready.record(self._hot_adapt_copy_stream)
+            ready = self._hot_adapt_snapshot_ready
+        else:
+            self._hot_adapt_snapshot_host.copy_(self._hot_adapt_snapshot_device)
+        assert self._hot_adapt_executor is not None
+        self._hot_adapt_phase = "plan"
+        self._hot_adapt_future = self._hot_adapt_executor.submit(
+            self._plan_hot_adaptation,
+            ready,
+            token,
+            boundary,
+            tick_count,
+        )
+        self._hot_adapt_future.add_done_callback(
+            lambda _future: self._hot_adapt_wake_event.set()
+        )
+
+    def _wait_for_hot_adaptation(self, timeout_seconds: float = 0.01) -> None:
+        """Sleep until worker progress or the next bounded request poll."""
+        self._hot_adapt_wake_event.wait(timeout=max(0.0, timeout_seconds))
+        self._hot_adapt_wake_event.clear()
+
+    def _finish_preempted_idle_tick(self) -> None:
+        """Stop an idle tick and restore a safe published set before serving."""
+        if getattr(self, "_hot_adapt_tick_boundary", None) != "idle":
+            return
+        stop_event = getattr(self, "_hot_adapt_stop_event", None)
+        if stop_event is not None:
+            stop_event.set()
+        future = self._hot_adapt_future
+        if (
+            future is not None
+            and self._hot_adapt_phase == "plan"
+            and future.cancel()
+        ):
+            self._hot_adapt_future = None
+            self._hot_adapt_phase = None
+            self._hot_adapt_tick_executed_swaps = 0
+            self.hot_adapt_ticks -= 1
+            self.hot_adapt_ticks_idle -= 1
+            logger.info_rank0(
+                f"MoE HOT adaptation idle tick token={self.hot_adapt_routed_tokens}: "
+                "preempted before planning"
+            )
+        while self._hot_adapt_future is not None:
+            future = self._hot_adapt_future
+            if not future.done():
+                self._wait_for_hot_adaptation()
+                continue
+            self._poll_hot_adaptation(preempt_idle=True)
+
+    def hot_adapt_while_idle(
+        self,
+        request_pending: Callable[[], bool],
+        wait_for_request: Callable[[float], bool] | None = None,
+    ) -> None:
+        """Run eligible idle ticks until convergence or request arrival."""
+        tracker = getattr(self, "_hot_adapt_idle_tracker", None)
+        if not self.hot_adapt_enabled or tracker is None:
+            return
+        tracker.begin_idle(time.monotonic())
+        try:
+            self._poll_hot_adaptation()
+            if not tracker.has_evidence():
+                return
+
+            while True:
+                if request_pending():
+                    self._finish_preempted_idle_tick()
+                    self._hot_adapt_stop_event.clear()
+                    return
+                self._poll_hot_adaptation()
+                now = time.monotonic()
+                if self._hot_adapt_future is None and tracker.due(now):
+                    self._hot_adapt_stop_event.clear()
+                    tracker.tick_started()
+                    self.hot_adapt_ticks += 1
+                    self.hot_adapt_ticks_idle += 1
+                    self._hot_adapt_tick_covered_seconds = 0.0
+                    self._start_hot_adaptation_tick(
+                        token=self.hot_adapt_routed_tokens,
+                        boundary="idle",
+                        tick_count=1,
+                    )
+                    continue
+                if self._hot_adapt_future is None and not tracker.has_evidence():
+                    return
+                timeout_seconds = (
+                    0.01
+                    if self._hot_adapt_future is not None
+                    else tracker.seconds_until_due(now)
+                )
+                if wait_for_request is None:
+                    self._wait_for_hot_adaptation(timeout_seconds)
+                elif wait_for_request(timeout_seconds):
+                    self._finish_preempted_idle_tick()
+                    self._hot_adapt_stop_event.clear()
+                    return
+        except BaseException:
+            if (
+                getattr(self, "_hot_adapt_tick_boundary", None) == "idle"
+                and self._hot_adapt_future is not None
+            ):
+                self._hot_adapt_stop_event.set()
+            raise
+        finally:
+            tracker.end_idle()
+
     def _hot_adapt_token_boundary(self, routed_tokens: int, boundary: str) -> None:
         """Advance the shared routed-token clock without waiting on staging work.
 
         Due thresholds are deferred while work is active, then consumed together
-        at the next free boundary. Tick counters include every consumed threshold,
-        so ``hot_swaps_per_interval`` keeps the accumulated-tick denominator for
-        both automatic and explicit fixed intervals.
+        at the next free boundary. Token tick counters include every consumed
+        threshold, so ``hot_swaps_per_interval`` retains the accumulated token-tick
+        denominator for both automatic and explicit fixed intervals. Idle ticks
+        are tracked separately and excluded from that operator sizing metric.
         """
         if routed_tokens < 0:
             raise ValueError("HOT adaptation routed token count must be non-negative")
@@ -1841,7 +2089,15 @@ class OffloadMoeCache:
             return
         clock = self._hot_adapt_token_clock
         assert clock is not None
+        # An idle fill transition may change the controller interval. Apply it
+        # only when routed-token accounting resumes so the idle tick itself does
+        # not mutate any token-clock field.
+        if clock.interval != self.hot_adapt_interval_steps:
+            clock.set_interval(self.hot_adapt_interval_steps)
         clock.advance(routed_tokens)
+        tracker = getattr(self, "_hot_adapt_idle_tracker", None)
+        if routed_tokens > 0 and tracker is not None:
+            tracker.note_routed_pairs()
         now = time.perf_counter()
         if self._hot_adapt_window_started_at is None:
             self._hot_adapt_window_started_at = now
@@ -1867,37 +2123,16 @@ class OffloadMoeCache:
         self._hot_adapt_deferred_logged = False
         for _ in range(tick_count):
             clock.consume_tick()
-        self._hot_adapt_tick_interval_tokens = self.hot_adapt_interval_steps
-        self._hot_adapt_tick_staged_bytes = 0
+        if tracker is not None:
+            tracker.tick_started()
         self._hot_adapt_tick_covered_seconds = max(
             0.0, now - self._hot_adapt_window_started_at
         )
         self._hot_adapt_window_started_at = now
-        assert self._hot_adapt_snapshot_host is not None
-        self._hot_adapt_snapshot_device.copy_(self.decayed_decode_freq)
-        ready = None
-        if self.device.type == "cuda":
-            assert self._hot_adapt_copy_stream is not None
-            assert self._hot_adapt_snapshot_ready is not None
-            begin = torch.cuda.Event()
-            begin.record(torch.cuda.current_stream(self.device))
-            with torch.cuda.stream(self._hot_adapt_copy_stream):
-                self._hot_adapt_copy_stream.wait_event(begin)
-                self._hot_adapt_snapshot_host.copy_(
-                    self._hot_adapt_snapshot_device, non_blocking=True
-                )
-                self._hot_adapt_snapshot_ready.record(self._hot_adapt_copy_stream)
-            ready = self._hot_adapt_snapshot_ready
-        else:
-            self._hot_adapt_snapshot_host.copy_(self._hot_adapt_snapshot_device)
-        assert self._hot_adapt_executor is not None
-        self._hot_adapt_phase = "plan"
-        self._hot_adapt_future = self._hot_adapt_executor.submit(
-            self._plan_hot_adaptation,
-            ready,
-            clock.routed_tokens,
-            boundary,
-            tick_count,
+        self._start_hot_adaptation_tick(
+            token=clock.routed_tokens,
+            boundary=boundary,
+            tick_count=tick_count,
         )
 
     def hot_adapt_prefill_boundary(self) -> None:
@@ -2310,15 +2545,26 @@ class OffloadMoeCache:
         ticks_decode = (
             self.hot_adapt_ticks_decode - self._hot_adapt_ticks_decode_reported
         )
-        swaps = self.hot_adapt_swaps - self._hot_adapt_swaps_reported
+        ticks_idle = (
+            self.hot_adapt_ticks_idle - self._hot_adapt_ticks_idle_reported
+        )
+        token_ticks = ticks - ticks_idle
+        token_swaps = self.hot_adapt_swaps - self._hot_adapt_swaps_reported
+        idle_swaps = (
+            self.hot_adapt_idle_swaps - self._hot_adapt_idle_swaps_reported
+        )
         # A background copy may complete after the status window that contained
         # its tick. Attribute such completions to one interval instead of dropping
         # them merely because this report window has no new tick.
-        result["hot_swaps_per_interval"] = swaps / max(ticks, 1)
+        result["hot_swaps_per_interval"] = token_swaps / max(token_ticks, 1)
+        result["hot_adapt_idle_swaps_per_tick"] = (
+            idle_swaps / max(ticks_idle, 1)
+        )
         result["decayed_hot_pair_rate"] = self.decayed_hot_pair_rate()
         result["hot_adapt_interval"] = self.hot_adapt_interval_steps
         result["hot_adapt_ticks_prefill"] = ticks_prefill
         result["hot_adapt_ticks_decode"] = ticks_decode
+        result["hot_adapt_ticks_idle"] = ticks_idle
         result.update(self.session_profile_stats(reset=reset))
         if reset:
             self.stat_hot_pairs.zero_()
@@ -2329,7 +2575,9 @@ class OffloadMoeCache:
             self._hot_adapt_ticks_reported = self.hot_adapt_ticks
             self._hot_adapt_ticks_prefill_reported = self.hot_adapt_ticks_prefill
             self._hot_adapt_ticks_decode_reported = self.hot_adapt_ticks_decode
+            self._hot_adapt_ticks_idle_reported = self.hot_adapt_ticks_idle
             self._hot_adapt_swaps_reported = self.hot_adapt_swaps
+            self._hot_adapt_idle_swaps_reported = self.hot_adapt_idle_swaps
         return result
 
     def protected_routing_stats(

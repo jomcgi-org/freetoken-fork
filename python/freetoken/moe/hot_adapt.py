@@ -404,6 +404,78 @@ def atomic_write_hot_plan(
 
 
 @dataclass
+class HotAdaptIdleTracker:
+    """Host-side trigger state for bounded adaptation while serving is idle.
+
+    Preemption bounds host staging to one additional expert row. It does not
+    cancel installation of the staged prefix. Up to the configured staging row
+    count can still be queued on the scheduler stream before the next forward,
+    costing 25 to 50 ms on node-4 at the default 0.5 GiB swap bound.
+    """
+
+    idle_seconds: float
+    min_interval_seconds: float
+    counter_generation: int = 0
+    last_tick_generation: int = 0
+    idle_started_at: float | None = None
+    last_tick_completed_at: float | None = None
+    last_tick_swaps: int = 0
+
+    def __post_init__(self) -> None:
+        if self.idle_seconds < 0 or self.min_interval_seconds < 0:
+            raise ValueError("HOT adaptation idle intervals must be non-negative")
+
+    def note_routed_pairs(self) -> None:
+        self.counter_generation += 1
+
+    def begin_idle(self, now: float) -> None:
+        if self.idle_started_at is None:
+            self.idle_started_at = now
+
+    def end_idle(self) -> None:
+        self.idle_started_at = None
+        self.last_tick_swaps = 0
+
+    def has_evidence(self) -> bool:
+        return (
+            self.counter_generation != self.last_tick_generation
+            or self.last_tick_swaps > 0
+        )
+
+    def due(self, now: float) -> bool:
+        if self.idle_started_at is None or not self.has_evidence():
+            return False
+        if now - self.idle_started_at < self.idle_seconds:
+            return False
+        return (
+            self.last_tick_completed_at is None
+            or now - self.last_tick_completed_at >= self.min_interval_seconds
+        )
+
+    def seconds_until_due(self, now: float) -> float:
+        """Return the bounded wait until the next eligible idle tick."""
+        if self.idle_started_at is None or not self.has_evidence():
+            return 0.0
+        due_at = self.idle_started_at + self.idle_seconds
+        if self.last_tick_completed_at is not None:
+            due_at = max(
+                due_at,
+                self.last_tick_completed_at + self.min_interval_seconds,
+            )
+        return max(0.0, due_at - now)
+
+    def tick_started(self) -> None:
+        self.last_tick_generation = self.counter_generation
+        self.last_tick_swaps = 0
+
+    def tick_completed(self, now: float, swaps: int) -> None:
+        if swaps < 0:
+            raise ValueError("HOT adaptation idle swap count must be non-negative")
+        self.last_tick_completed_at = now
+        self.last_tick_swaps = swaps
+
+
+@dataclass
 class HotAdaptTokenClock:
     """Shared prefill and decode clock for HOT adaptation boundaries.
 

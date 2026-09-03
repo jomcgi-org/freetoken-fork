@@ -218,25 +218,36 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     cache.hot_adapt_interval_steps = 17
     cache._hot_slot_owners = {0: [1]}
     cache.decayed_decode_freq[0] = torch.tensor([1.0, 3.0, 2.0, 4.0])
-    cache.hot_adapt_ticks = 2
+    cache.hot_adapt_ticks = 4
     cache.hot_adapt_ticks_prefill = 1
     cache.hot_adapt_ticks_decode = 1
-    cache.hot_adapt_swaps = 3
+    cache.hot_adapt_ticks_idle = 2
+    cache.hot_adapt_swaps = 1
+    cache.hot_adapt_idle_swaps = 2
 
     stats = cache.disk_prefetch_stats(reset=True)
     assert stats["hot_pair_rate"] == pytest.approx(0.7)
     assert stats["hot_pairs"] == 7
     assert stats["routed_pairs"] == 10
-    assert stats["hot_swaps_per_interval"] == pytest.approx(1.5)
+    assert stats["hot_swaps_per_interval"] == pytest.approx(0.5)
+    assert stats["hot_adapt_idle_swaps_per_tick"] == pytest.approx(1.0)
     assert stats["decayed_hot_pair_rate"] == pytest.approx(0.3)
     assert stats["hot_adapt_interval"] == 17
     assert stats["hot_adapt_ticks_prefill"] == 1
     assert stats["hot_adapt_ticks_decode"] == 1
+    assert stats["hot_adapt_ticks_idle"] == 2
     assert cache.stat_hot_pairs.item() == 0
     assert cache.stat_hot_total_pairs.item() == 0
+
+    cache.hot_adapt_ticks += 3
+    cache.hot_adapt_ticks_idle += 3
+    cache.hot_adapt_idle_swaps += 3
     stats = cache.disk_prefetch_stats(reset=True)
+    assert stats["hot_swaps_per_interval"] == 0.0
     assert stats["hot_adapt_ticks_prefill"] == 0
     assert stats["hot_adapt_ticks_decode"] == 0
+    assert stats["hot_adapt_ticks_idle"] == 3
+    assert stats["hot_adapt_idle_swaps_per_tick"] == 1.0
 
 
 @pytest.mark.cuda

@@ -256,6 +256,8 @@ class Scheduler(SchedulerIOMixin):
                     f"disk hot_pair_rate: {disk.get('hot_pair_rate', 0.0):.2%}, "
                     f"disk hot_swaps/interval: "
                     f"{disk.get('hot_swaps_per_interval', 0.0):.2f}, "
+                    f"hot_adapt_idle_swaps/tick: "
+                    f"{disk.get('hot_adapt_idle_swaps_per_tick', 0.0):.2f}, "
                     f"disk decayed_hot_pair_rate: "
                     f"{disk.get('decayed_hot_pair_rate', 0.0):.2%}, "
                     f"hot_adapt_interval: "
@@ -264,6 +266,8 @@ class Scheduler(SchedulerIOMixin):
                     f"{disk.get('hot_adapt_ticks_prefill', 0)}, "
                     f"hot_adapt_ticks_decode: "
                     f"{disk.get('hot_adapt_ticks_decode', 0)}, "
+                    f"hot_adapt_ticks_idle: "
+                    f"{disk.get('hot_adapt_ticks_idle', 0)}, "
                     f"disk lookahead_hit_rate: "
                     f"{disk['lookahead_hit_rate']:.4f}, "
                     f"disk delta_pages/step: "
@@ -337,6 +341,20 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        idle_hook = getattr(cache, "hot_adapt_while_idle", None)
+        if idle_hook is not None:
+            if self.config.tp_info.size != 1:
+                if not getattr(self, "_hot_adapt_idle_tp_disabled_logged", False):
+                    logger.info_rank0(
+                        "MoE HOT idle adaptation disabled: tensor parallel size "
+                        f"is {self.config.tp_info.size}; synchronized idle ticks "
+                        "are not implemented"
+                    )
+                    self._hot_adapt_idle_tp_disabled_logged = True
+                return
+            queue = self._recv_from_tokenizer
+            idle_hook(lambda: not queue.empty(), queue.wait_for_item)
 
     @torch.inference_mode()
     def rebuild_cache(

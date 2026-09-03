@@ -891,6 +891,32 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-adapt-idle-ms",
+        type=int,
+        default=ServerArgs.moe_hot_adapt_idle_ms,
+        help=(
+            "Idle time before HOT adaptation may use changed routing counters. "
+            "Idle adaptation is supported only when TP == 1; it is inert under "
+            "tensor parallelism. 0 disables idle adaptation. "
+            "Preemption stops host staging at the next row boundary, but the staged "
+            "prefix is still installed on the scheduler stream before the next forward. "
+            "Up to the staging row count logged at startup can be queued, costing "
+            "25 to 50 ms on node-4 at the default 0.5 GiB swap bound "
+            "(default: 500 ms)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-idle-min-interval-ms",
+        type=int,
+        default=ServerArgs.moe_hot_adapt_idle_min_interval_ms,
+        help=(
+            "Minimum time between repeated HOT adaptation idle ticks "
+            "(default: 2000 ms)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-plan-dir",
         type=str,
         default=ServerArgs.moe_hot_plan_dir,

@@ -908,6 +908,11 @@ class Engine:
                 hot_plan_tier_commit=hot_plan_runtime["tier_commit"],
                 hot_plan_write_enabled=hot_plan_runtime["write_enabled"],
                 hot_plan_interval_seconds=hot_plan_runtime["interval_seconds"],
+                idle_ms=getattr(config, "moe_hot_adapt_idle_ms", 500),
+                idle_min_interval_ms=getattr(
+                    config, "moe_hot_adapt_idle_min_interval_ms", 2000
+                ),
+                tp_size=config.tp_info.size,
             )
             cache.set_alphas(
                 banks.gate_up_alpha,
@@ -2504,6 +2509,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_plan_persist": "auto",
     "moe_hot_plan_dir": None,
     "moe_hot_plan_interval_minutes": 10.0,
+    "moe_hot_adapt_idle_ms": 500,
+    "moe_hot_adapt_idle_min_interval_ms": 2000,
     "moe_disk_prefill": "cpu",
     "moe_prefill_coalesce": "populate",
     "moe_prefill_hot_split": "on",

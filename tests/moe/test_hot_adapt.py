@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -13,6 +14,7 @@ import pytest
 from freetoken.moe.hot_adapt import (
     HOT_ADAPT_MAX_STAGING_FRACTION,
     HOT_STAGING_HEADROOM_BYTES,
+    HotAdaptIdleTracker,
     HotAdaptIntervalController,
     HotAdaptTokenClock,
     HotSwap,
@@ -199,6 +201,40 @@ def test_tick_clock_counts_prefill_tokens_and_decode_batch_members():
     assert clock.consume_tick() == 10
     assert clock.advance(10) == 1
     assert clock.routed_tokens == 20
+
+
+def test_idle_trigger_checks_delay_changed_counters_and_minimum_interval():
+    tracker = HotAdaptIdleTracker(
+        idle_seconds=0.5,
+        min_interval_seconds=2.0,
+    )
+    tracker.note_routed_pairs()
+    tracker.begin_idle(10.0)
+
+    assert tracker.seconds_until_due(10.0) == pytest.approx(0.5)
+    assert not tracker.due(10.499)
+    assert tracker.due(10.5)
+
+    tracker.tick_started()
+    tracker.tick_completed(10.6, swaps=1)
+    assert tracker.seconds_until_due(11.0) == pytest.approx(1.6)
+    assert not tracker.due(12.599)
+    assert tracker.due(12.6)
+
+
+def test_idle_trigger_stays_off_without_changed_counters_or_prior_swap():
+    tracker = HotAdaptIdleTracker(
+        idle_seconds=0.5,
+        min_interval_seconds=2.0,
+    )
+    tracker.begin_idle(10.0)
+
+    assert not tracker.due(20.0)
+
+    tracker.note_routed_pairs()
+    tracker.tick_started()
+    tracker.tick_completed(20.0, swaps=0)
+    assert not tracker.due(30.0)
 
 
 def test_auto_clock_makes_fill_ticks_due_at_one_2000_token_boundary():
@@ -539,6 +575,522 @@ def test_synthetic_banks_retire_stage_copy_and_flip_without_host_mirror(monkeypa
         assert cache.slot_for_id[0, 1].item() == old_slot
         assert cache.usage[old_slot].item() == torch.iinfo(torch.int64).max
         assert torch.equal(cache.bank_caches["gate_up"][old_slot], sources["gate_up"][0][1])
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def _idle_test_cache(
+    monkeypatch,
+    *,
+    max_swap_rows=1,
+    seeded=(),
+    idle_ms=1,
+    configure_logs=None,
+    **configure_kwargs,
+):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    if configure_logs is not None:
+        logger = OffloadMoeCache.configure_hot_adaptation.__globals__["logger"]
+        monkeypatch.setattr(logger, "info_rank0", configure_logs.append)
+    sources = {
+        "gate_up": [torch.arange(4 * 3, dtype=torch.int32).view(4, 3)],
+        "down": [torch.arange(4 * 2, dtype=torch.int32).view(4, 2) + 100],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size()
+        for bank in sources.values()
+    )
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=6,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: seeded},
+        hot_expert_capacity={0: 2},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps="auto",
+        max_swap_bytes=max_swap_rows * expert_bytes,
+        expert_bytes=expert_bytes,
+        boundary_cap_frac=1.0,
+        idle_ms=idle_ms,
+        idle_min_interval_ms=0,
+        **configure_kwargs,
+    )
+    return cache
+
+
+def test_idle_ticks_fill_partition_without_advancing_token_clock(monkeypatch):
+    cache = _idle_test_cache(monkeypatch)
+    try:
+        cache.decayed_decode_freq[0].copy_(
+            cache.decayed_decode_freq.new_tensor([1.0, 2.0, 9.0, 8.0])
+        )
+        cache._hot_adapt_idle_tracker.note_routed_pairs()
+        cache._hot_adapt_interval_controller.steady_interval = 2000
+        clock = cache._hot_adapt_token_clock
+        before = (
+            clock.interval,
+            clock.routed_tokens,
+            clock.next_tick_token,
+            clock.last_tick_token,
+        )
+
+        cache.hot_adapt_while_idle(lambda: False)
+
+        after = (
+            clock.interval,
+            clock.routed_tokens,
+            clock.next_tick_token,
+            clock.last_tick_token,
+        )
+        assert after == before
+        assert cache._hot_adapt_interval_controller.fill_complete
+        assert cache.hot_adapt_interval_steps == 2000
+        assert cache.hot_expert_ids == {0: (2, 3)}
+        assert cache.hot_adapt_ticks_idle == 3
+        assert cache.hot_adapt_ticks == 3
+        assert cache.hot_adapt_ticks_prefill == 0
+        assert cache.hot_adapt_ticks_decode == 0
+        assert cache._hot_plan_last_published_owners == {0: (2, 3)}
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_idle_hook_does_not_tick_when_counters_have_not_changed(monkeypatch):
+    cache = _idle_test_cache(monkeypatch)
+    try:
+        before = cache.hot_adapt_routed_tokens
+        checkpoint_before = dict(cache._hot_plan_last_published_owners)
+
+        cache.hot_adapt_while_idle(lambda: False)
+
+        assert cache.hot_adapt_ticks == 0
+        assert cache.hot_adapt_ticks_idle == 0
+        assert cache.hot_adapt_routed_tokens == before
+        assert cache._hot_plan_last_published_owners == checkpoint_before
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_idle_delay_zero_disables_idle_ticks(monkeypatch):
+    cache = _idle_test_cache(monkeypatch, idle_ms=0)
+    try:
+        cache.decayed_decode_freq[0, 3] = 10.0
+
+        cache.hot_adapt_while_idle(lambda: False)
+
+        assert cache._hot_adapt_idle_tracker is None
+        assert cache.hot_adapt_ticks == 0
+        assert cache.hot_adapt_ticks_idle == 0
+        assert cache.hot_expert_ids == {0: ()}
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_tensor_parallelism_disables_idle_ticks_and_logs_staging_bound(monkeypatch):
+    logs = []
+    cache = _idle_test_cache(
+        monkeypatch,
+        idle_ms=500,
+        tp_size=2,
+        configure_logs=logs,
+    )
+    try:
+        assert cache._hot_adapt_idle_tracker is None
+        assert any("hot_staging_rows=1" in message for message in logs)
+        assert any("idle=off (tensor parallel)" in message for message in logs)
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_zero_swap_idle_tick_checkpoints_published_owners(monkeypatch):
+    cache = _idle_test_cache(monkeypatch, seeded=(2, 3))
+    checkpoints = []
+    try:
+        cache.decayed_decode_freq[0].copy_(
+            cache.decayed_decode_freq.new_tensor([1.0, 2.0, 9.0, 8.0])
+        )
+        cache._hot_adapt_idle_tracker.note_routed_pairs()
+        monkeypatch.setattr(
+            cache,
+            "_checkpoint_published_hot_slot_owners",
+            lambda: checkpoints.append(tuple(cache._hot_slot_owners[0])),
+        )
+
+        cache.hot_adapt_while_idle(lambda: False)
+
+        assert cache.hot_adapt_ticks_idle == 1
+        assert cache.hot_adapt_swaps == 0
+        assert checkpoints == [(2, 3)]
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_idle_hook_polls_completed_decode_tick_before_evidence_check(monkeypatch):
+    from concurrent.futures import Future
+
+    cache = _idle_test_cache(monkeypatch, seeded=(2, 3))
+    try:
+        completed = Future()
+        completed.set_result(((), 1.0, 1))
+        cache._hot_adapt_future = completed
+        cache._hot_adapt_phase = "plan"
+        cache._hot_adapt_tick_boundary = "decode"
+
+        cache.hot_adapt_while_idle(lambda: False)
+
+        assert cache._hot_adapt_future is None
+        assert cache._hot_adapt_phase is None
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_cancelled_idle_plan_is_preempted_without_counting_tick(monkeypatch):
+    from concurrent.futures import Future
+
+    cache = _idle_test_cache(monkeypatch)
+    logs = []
+    try:
+        cache._hot_adapt_future = Future()
+        cache._hot_adapt_phase = "plan"
+        cache._hot_adapt_tick_boundary = "idle"
+        cache.hot_adapt_ticks = 1
+        cache.hot_adapt_ticks_idle = 1
+        monkeypatch.setattr(
+            "freetoken.moe.offload_cache.logger.info_rank0", logs.append
+        )
+
+        cache._finish_preempted_idle_tick()
+
+        assert cache.hot_adapt_ticks == 0
+        assert cache.hot_adapt_ticks_idle == 0
+        assert cache._hot_adapt_future is None
+        assert cache._hot_adapt_phase is None
+        assert logs == [
+            "MoE HOT adaptation idle tick token=0: preempted before planning"
+        ]
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_running_idle_plan_is_preempted_without_counting_tick(monkeypatch):
+    from concurrent.futures import Future
+
+    cache = _idle_test_cache(monkeypatch)
+    logs = []
+    try:
+        completed = Future()
+        completed.set_result(
+            ((HotSwap(0, 0, incoming_expert=1, outgoing_expert=None),), 0.0, 1)
+        )
+        cache._hot_adapt_future = completed
+        cache._hot_adapt_phase = "plan"
+        cache._hot_adapt_tick_boundary = "idle"
+        cache.hot_adapt_ticks = 1
+        cache.hot_adapt_ticks_idle = 1
+        monkeypatch.setattr(
+            "freetoken.moe.offload_cache.logger.info_rank0", logs.append
+        )
+
+        cache._finish_preempted_idle_tick()
+
+        assert cache.hot_adapt_ticks == 0
+        assert cache.hot_adapt_ticks_idle == 0
+        assert cache.hot_adapt_swaps == 0
+        assert cache._hot_adapt_future is None
+        assert cache._hot_adapt_phase is None
+        assert logs == [
+            "MoE HOT adaptation idle tick token=0: preempted after planning"
+        ]
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_shutdown_finishes_completed_idle_plan_without_logging_preemption(monkeypatch):
+    from concurrent.futures import Future
+
+    cache = _idle_test_cache(monkeypatch)
+    logs = []
+    try:
+        completed = Future()
+        completed.set_result(
+            ((HotSwap(0, 0, incoming_expert=1, outgoing_expert=None),), 0.0, 1)
+        )
+        cache._hot_adapt_future = completed
+        cache._hot_adapt_phase = "plan"
+        cache._hot_adapt_tick_boundary = "idle"
+        cache.hot_adapt_ticks = 1
+        cache.hot_adapt_ticks_idle = 1
+        cache._hot_adapt_stop_event.set()
+        monkeypatch.setattr(
+            "freetoken.moe.offload_cache.logger.info_rank0", logs.append
+        )
+
+        assert cache._drain_hot_adaptation(time.monotonic() + 5.0)
+
+        assert cache.hot_adapt_ticks == 1
+        assert cache.hot_adapt_ticks_idle == 1
+        assert cache.hot_adapt_idle_swaps == 0
+        assert cache._hot_adapt_future is None
+        assert not any("preempted" in message for message in logs)
+        assert any("executed_swaps=0" in message for message in logs)
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_request_arrival_wakes_bounded_idle_wait(monkeypatch):
+    from threading import Event, Thread
+
+    cache = _idle_test_cache(monkeypatch, idle_ms=500)
+    request_arrived = Event()
+    wait_started = Event()
+
+    class FakeQueue:
+        def empty(self):
+            return not request_arrived.is_set()
+
+        def wait_for_item(self, timeout_seconds):
+            wait_started.set()
+            return request_arrived.wait(timeout_seconds)
+
+    queue = FakeQueue()
+    cache._hot_adapt_idle_tracker.note_routed_pairs()
+
+    def enqueue_request():
+        assert wait_started.wait(timeout=1)
+        time.sleep(0.02)
+        request_arrived.set()
+
+    producer = Thread(target=enqueue_request)
+    producer.start()
+    started_at = time.monotonic()
+    try:
+        cache.hot_adapt_while_idle(
+            lambda: not queue.empty(), queue.wait_for_item
+        )
+
+        assert time.monotonic() - started_at < 0.25
+        assert cache.hot_adapt_ticks_idle == 0
+    finally:
+        request_arrived.set()
+        producer.join(timeout=1)
+        cache.shutdown_hot_adaptation()
+
+
+def test_keyboard_interrupt_stops_inflight_idle_staging_for_shutdown(monkeypatch):
+    from threading import Event
+
+    cache = _idle_test_cache(monkeypatch, seeded=(0, 1))
+    row_started = Event()
+    release_row = Event()
+
+    def controlled_stage(ready, swaps, stop_event=None):
+        if ready is not None:
+            ready.synchronize()
+        row_started.set()
+        assert release_row.wait(timeout=5)
+        return set(), 0.0
+
+    def interrupt_after_tick_starts(timeout_seconds):
+        if cache._hot_adapt_phase != "copy":
+            return Event().wait(timeout_seconds)
+        assert row_started.wait(timeout=5)
+        raise KeyboardInterrupt
+
+    cache._stage_hot_rows = controlled_stage
+    cache.decayed_decode_freq[0].copy_(
+        cache.decayed_decode_freq.new_tensor([1.0, 2.0, 9.0, 8.0])
+    )
+    cache._hot_adapt_idle_tracker.note_routed_pairs()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            cache.hot_adapt_while_idle(
+                lambda: False, interrupt_after_tick_starts
+            )
+
+        assert cache._hot_adapt_stop_event.is_set()
+        assert cache._hot_adapt_future is not None
+    finally:
+        release_row.set()
+        cache.shutdown_hot_adaptation()
+
+
+def test_idle_swap_queues_interval_gated_plan_snapshot(monkeypatch, tmp_path):
+    import json
+
+    path = tmp_path / "freetoken_hot_plan.json"
+    cache = _idle_test_cache(
+        monkeypatch,
+        seeded=(0, 1),
+        hot_plan_path=str(path),
+        hot_plan_identity={"kind": "ftw", "path": "/model", "shards": []},
+        hot_plan_tier_commit="tier-test",
+        hot_plan_write_enabled=True,
+        hot_plan_interval_seconds=60.0,
+    )
+    try:
+        cache.decayed_decode_freq[0].copy_(
+            cache.decayed_decode_freq.new_tensor([8.0, 0.0, 9.0, 0.0])
+        )
+        cache._hot_plan_last_snapshot -= 61.0
+        cache._hot_adapt_idle_tracker.note_routed_pairs()
+
+        cache.hot_adapt_while_idle(lambda: False)
+
+        assert cache.hot_adapt_idle_swaps == 1
+        assert cache._hot_plan_future is not None
+        assert cache._hot_plan_future.result(timeout=5)
+        cache._collect_finished_hot_plan_write()
+        document = json.loads(path.read_text())
+        assert document["protected_slots"] == {"0": [0, 2]}
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_idle_swap_respects_disabled_plan_persistence(monkeypatch, tmp_path):
+    path = tmp_path / "freetoken_hot_plan.json"
+    cache = _idle_test_cache(
+        monkeypatch,
+        seeded=(0, 1),
+        hot_plan_path=str(path),
+        hot_plan_identity={"kind": "ftw", "path": "/model", "shards": []},
+        hot_plan_write_enabled=False,
+    )
+    try:
+        cache.decayed_decode_freq[0].copy_(
+            cache.decayed_decode_freq.new_tensor([8.0, 0.0, 9.0, 0.0])
+        )
+        cache._hot_adapt_idle_tracker.note_routed_pairs()
+
+        cache.hot_adapt_while_idle(lambda: False)
+
+        assert cache.hot_adapt_idle_swaps == 1
+        assert cache._hot_plan_future is None
+        assert not path.exists()
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_new_request_abandons_idle_tick_at_next_row_boundary(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    cache = _idle_test_cache(monkeypatch, max_swap_rows=2, seeded=(0, 1))
+    row_started = Event()
+    release_row = Event()
+    request_arrived = Event()
+
+    def controlled_stage(ready, swaps, stop_event=None):
+        if ready is not None:
+            ready.synchronize()
+        copied = set()
+        started_at = 0.0
+        for stage_row, swap in enumerate(swaps):
+            if stop_event is not None and stop_event.is_set():
+                break
+            for bank_id, name in enumerate(cache.bank_schema):
+                source = cache.bank_sources[name][swap.layer_id]
+                cache._hot_staging[bank_id][stage_row].copy_(
+                    source[swap.incoming_expert]
+                )
+            if stage_row == 0:
+                row_started.set()
+                assert release_row.wait(timeout=5)
+            copied.add((swap.layer_id, swap.row))
+        return copied, started_at
+
+    cache._stage_hot_rows = controlled_stage
+    cache.decayed_decode_freq[0].copy_(
+        cache.decayed_decode_freq.new_tensor([1.0, 2.0, 9.0, 8.0])
+    )
+    cache._hot_adapt_idle_tracker.note_routed_pairs()
+    clock_before = cache.hot_adapt_routed_tokens
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            idle = executor.submit(
+                cache.hot_adapt_while_idle, request_arrived.is_set
+            )
+            assert row_started.wait(timeout=5)
+            request_arrived.set()
+            assert cache._hot_adapt_stop_event.wait(timeout=5)
+            release_row.set()
+            idle.result(timeout=5)
+
+        assert cache.hot_adapt_ticks_idle == 1
+        assert cache.hot_adapt_swaps == 0
+        assert cache.hot_adapt_idle_swaps == 1
+        assert cache._hot_slot_owners[0] == [2, 1]
+        assert cache.hot_row_for_expert[0].tolist() == [-1, 1, 0, -1]
+        assert cache.hot_expert_ids == {0: (1, 2)}
+        assert cache._hot_adapt_future is None
+        assert cache.hot_adapt_routed_tokens == clock_before
+    finally:
+        release_row.set()
+        cache.shutdown_hot_adaptation()
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs CUDA")
+def test_cuda_idle_tick_publishes_without_advancing_token_clock(monkeypatch):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    sources = {
+        "gate_up": [torch.arange(4 * 3, dtype=torch.int32).view(4, 3)],
+        "down": [torch.arange(4 * 2, dtype=torch.int32).view(4, 2)],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size()
+        for bank in sources.values()
+    )
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=6,
+        device=torch.device("cuda"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: ()},
+        hot_expert_capacity={0: 1},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps=1000,
+        max_swap_bytes=expert_bytes,
+        expert_bytes=expert_bytes,
+        idle_ms=1,
+        idle_min_interval_ms=0,
+    )
+    try:
+        assert cache._hot_adapt_idle_tracker is not None
+        cache.decayed_decode_freq[0, 3] = 10.0
+        cache._hot_adapt_idle_tracker.note_routed_pairs()
+        token_before = cache.hot_adapt_routed_tokens
+
+        cache.hot_adapt_while_idle(lambda: False)
+
+        assert cache.hot_expert_ids == {0: (3,)}
+        assert cache.hot_adapt_routed_tokens == token_before
     finally:
         cache.shutdown_hot_adaptation()
 
