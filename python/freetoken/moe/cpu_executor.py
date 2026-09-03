@@ -17,6 +17,7 @@ the subsequent capture embeds in its host/memcpy nodes.
 
 from __future__ import annotations
 
+import ctypes
 import mmap
 import os
 import platform
@@ -63,6 +64,8 @@ _FLAG_SLOTS_PER_LAYER = 16
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
 _PREFILL_POPULATE_SCRATCH_BYTES = 32 << 20
 _PREFILL_GEMM_WEIGHT_ROWS = 32
+CPU_MOE_SPIN_IDLE_US_MIN = 0
+CPU_MOE_SPIN_IDLE_US_MAX = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -74,6 +77,7 @@ class CpuTopology:
     threads_per_core: int
     ht_capable: bool
     total_physical_cores: int = 0
+    core_siblings: tuple[tuple[int, ...], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -84,6 +88,22 @@ class ExecutorModeDecision:
     cpu_count_le_32: bool
     cpus_free_ge_2: bool
     cpus_free: int
+
+
+@dataclass(frozen=True)
+class SpinWorkerPlacement:
+    worker_cpus: tuple[int, ...]
+    spin_cpus: tuple[int, ...]
+    excluded_cpus: tuple[int, ...]
+    reason: str
+
+    @property
+    def spin_threads(self) -> int:
+        return len(self.spin_cpus)
+
+    @property
+    def can_spin(self) -> bool:
+        return bool(self.spin_cpus)
 
 
 def parse_cpu_list(value: str) -> list[int]:
@@ -184,6 +204,17 @@ def read_cpu_topology(
         (package_id, core_id, cpu)
         for (package_id, core_id), cpu in core_reps.items()
     )
+    siblings_by_core: dict[tuple[int, int], tuple[int, ...]] = {}
+    for package_id, core_id, _cpu, siblings in rows:
+        siblings_by_core.setdefault((package_id, core_id), siblings)
+    core_siblings = tuple(
+        tuple(
+            cpu
+            for cpu in siblings_by_core[(package_id, core_id)]
+            if cpu in allowed_cpus
+        )
+        for package_id, core_id, _cpu in physical_cores
+    )
     socket_count = len(system_sockets or cpuinfo_sockets)
     architecture = (machine or platform.machine()).lower()
     return CpuTopology(
@@ -194,19 +225,24 @@ def read_cpu_topology(
         threads_per_core=threads_per_core,
         ht_capable="ht" in flags or "smt" in flags or threads_per_core > 1,
         total_physical_cores=len(system_core_keys),
+        core_siblings=core_siblings,
     )
 
 
 def decide_cpu_executor_mode(
     topology: CpuTopology, executor_threads: int, *, reserved_cpus: int = 0,
 ) -> ExecutorModeDecision:
-    """Resolve auto mode from topology and the CPUs left outside the executor."""
+    """Resolve guarded spin mode from topology and the CPUs left outside spinning."""
+    del reserved_cpus  # Retained for compatibility with the first spin-mode release.
     is_x86 = topology.architecture in ("x86_64", "amd64")
     single_socket_x86 = is_x86 and topology.socket_count == 1
     physical_count = topology.total_physical_cores or len(topology.physical_cores)
     cpu_count_le_32 = 0 < physical_count <= 32
+    spin_capacity = max(0, physical_count - 2)
     cpus_free = max(
-        0, len(topology.logical_cpus) - int(executor_threads) - int(reserved_cpus)
+        0,
+        len(topology.logical_cpus)
+        - min(int(executor_threads), spin_capacity),
     )
     cpus_free_ge_2 = cpus_free >= 2
     if not topology.logical_cpus or not topology.physical_cores:
@@ -215,17 +251,16 @@ def decide_cpu_executor_mode(
         reason = "non-x86 architecture detected"
     elif topology.socket_count != 1:
         reason = "multi-socket system detected"
+    elif physical_count < 3:
+        reason = "fewer than 3 physical cores available for spin placement"
     elif not cpu_count_le_32:
         reason = "more than 32 physical cores detected"
     elif not cpus_free_ge_2:
         reason = "fewer than 2 CPUs free"
     else:
         reason = "auto-detected suitable CPU topology"
-    mode = (
-        "spin"
-        if single_socket_x86 and cpu_count_le_32 and cpus_free_ge_2
-        else "sleep"
-    )
+    can_spin = single_socket_x86 and 3 <= physical_count <= 32 and cpus_free_ge_2
+    mode = "spin" if can_spin else "sleep"
     return ExecutorModeDecision(
         mode=mode,
         reason=reason,
@@ -239,6 +274,94 @@ def decide_cpu_executor_mode(
 def _spin_core_cpus(topology: CpuTopology) -> list[int]:
     """Return one process-visible logical CPU for each physical core."""
     return [cpu for _package_id, _core_id, cpu in topology.physical_cores]
+
+
+def _current_logical_cpu() -> int | None:
+    """Return the CPU running this thread when the platform exposes sched_getcpu."""
+    if platform.system() != "Linux":
+        return None
+    try:
+        sched_getcpu = ctypes.CDLL(None).sched_getcpu
+        sched_getcpu.argtypes = []
+        sched_getcpu.restype = ctypes.c_int
+        cpu = int(sched_getcpu())
+    except (AttributeError, OSError):
+        return None
+    return cpu if cpu >= 0 else None
+
+
+def plan_spin_worker_placement(
+    topology: CpuTopology,
+    executor_threads: int,
+    main_cpu: int | None,
+    *,
+    extra_excluded_cpus: tuple[int, ...] = (),
+) -> SpinWorkerPlacement:
+    """Place bounded spinners while leaving two physical cores unoccupied by them."""
+    groups = tuple(tuple(group) for group in topology.core_siblings if group)
+    if not groups or len(groups) != len(topology.physical_cores):
+        return SpinWorkerPlacement((), (), (), "complete SMT topology unavailable")
+    if main_cpu is None:
+        return SpinWorkerPlacement((), (), (), "current logical CPU unavailable")
+    main_group = next((group for group in groups if main_cpu in group), None)
+    if main_group is None:
+        return SpinWorkerPlacement(
+            (), (), (), f"main-thread CPU {main_cpu} absent from visible topology"
+        )
+
+    excluded = set(main_group)
+    for cpu in extra_excluded_cpus:
+        group = next((siblings for siblings in groups if cpu in siblings), ())
+        excluded.update(group or (cpu,))
+
+    # Reserving two cores protects GPU submission even when no dedicated flag
+    # coordinator is active. SMT siblings are treated as one scheduling resource.
+    spin_cap = len(groups) - 2
+    if spin_cap < 1:
+        return SpinWorkerPlacement(
+            (),
+            (),
+            tuple(sorted(excluded)),
+            "fewer than 3 physical cores available for spin placement",
+        )
+
+    visible = set(topology.logical_cpus)
+    candidate_groups = [group for group in groups if excluded.isdisjoint(group)]
+    spin_cpus = tuple(
+        next(cpu for cpu in group if cpu in visible)
+        for group in candidate_groups[: min(int(executor_threads), spin_cap)]
+        if any(cpu in visible for cpu in group)
+    )
+    if not spin_cpus:
+        return SpinWorkerPlacement(
+            (), (), tuple(sorted(excluded)), "no eligible physical core for spinning"
+        )
+
+    eligible = [cpu for cpu in topology.logical_cpus if cpu not in excluded]
+    order = list(spin_cpus) + [cpu for cpu in eligible if cpu not in spin_cpus]
+    if not order:
+        return SpinWorkerPlacement(
+            (), (), tuple(sorted(excluded)), "no eligible worker CPUs after exclusions"
+        )
+    worker_cpus = tuple(order[index % len(order)] for index in range(executor_threads))
+    return SpinWorkerPlacement(
+        worker_cpus,
+        spin_cpus,
+        tuple(sorted(excluded)),
+        "spin placement satisfied",
+    )
+
+
+def validate_spin_idle_us(value: int) -> int:
+    """Validate the bounded worker busy-poll interval."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("spin_idle_us must be an integer")
+    if not CPU_MOE_SPIN_IDLE_US_MIN <= value <= CPU_MOE_SPIN_IDLE_US_MAX:
+        raise ValueError(
+            "spin_idle_us must be in "
+            f"[{CPU_MOE_SPIN_IDLE_US_MIN}, {CPU_MOE_SPIN_IDLE_US_MAX}]"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -504,6 +627,7 @@ class CpuMoeExecutor:
         device: torch.device,
         executor_mode: str = "sleep",
         spin_wait_us: int = 2000,
+        spin_idle_us: int = 500,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         disk_lookahead: bool = True,
@@ -518,8 +642,11 @@ class CpuMoeExecutor:
                 "executor_mode must be 'sleep', 'spin', or 'auto', got "
                 f"{executor_mode!r}"
             )
-        if int(spin_wait_us) < 0:
+        if isinstance(spin_wait_us, bool) or not isinstance(spin_wait_us, int):
+            raise TypeError("spin_wait_us must be an integer")
+        if spin_wait_us < 0:
             raise ValueError("spin_wait_us must be non-negative")
+        spin_idle_us = validate_spin_idle_us(spin_idle_us)
         self._requested_executor_mode = executor_mode
 
         from freetoken.kernel import _cpu_moe
@@ -682,9 +809,10 @@ class CpuMoeExecutor:
             core_ids = core_ids[:-1]
         topology = None
         effective_mode = executor_mode
+        placement = None
         if executor_mode != "sleep":
             topology = read_cpu_topology()
-        if executor_mode == "auto":
+        if executor_mode != "sleep":
             decision = decide_cpu_executor_mode(
                 topology,
                 nthreads,
@@ -700,37 +828,55 @@ class CpuMoeExecutor:
                 f"({'yes' if decision.cpus_free_ge_2 else 'no'})"
             )
             if effective_mode == "spin":
+                placement = plan_spin_worker_placement(
+                    topology,
+                    nthreads,
+                    _current_logical_cpu(),
+                    extra_excluded_cpus=(coord_core,) if coord_core >= 0 else (),
+                )
+                if not placement.can_spin:
+                    effective_mode = "sleep"
+            mode_source = "auto" if executor_mode == "auto" else "explicit spin"
+            if effective_mode == "spin":
                 logger.info_rank0(
-                    "MOE executor: spin mode enabled "
-                    f"(auto-detected single-socket x86, "
+                    f"MOE executor: spin mode enabled ({mode_source}, "
                     f"{topology.total_physical_cores} cores, "
                     f"{topology.threads_per_core} threads per core, "
                     f"{decision.cpus_free} CPUs free)"
                 )
             else:
-                logger.info_rank0(f"MOE executor: sleep mode ({decision.reason})")
-            logger.info_rank0(f"MOE executor auto checks: {checks}")
-        elif executor_mode == "spin":
-            logger.info_rank0("MOE executor: spin mode enabled (explicit)")
+                fallback_reason = (
+                    placement.reason
+                    if decision.mode == "spin" and placement is not None
+                    else decision.reason
+                )
+                logger.info_rank0(
+                    f"MOE executor: {mode_source} fell back to sleep "
+                    f"({fallback_reason})"
+                )
+            logger.info_rank0(f"MOE executor topology checks: {checks}")
 
-        if effective_mode == "spin" and topology is not None:
-            physical_cpus = [
-                cpu for cpu in _spin_core_cpus(topology) if cpu != coord_core
-            ]
-            if physical_cpus:
-                core_ids = [
-                    physical_cpus[index % len(physical_cpus)]
-                    for index in range(nthreads)
-                ]
+        spin_threads = 0
+        excluded_cpus: tuple[int, ...] = ()
+        if effective_mode == "spin" and placement is not None:
+            core_ids = list(placement.worker_cpus)
+            spin_threads = placement.spin_threads if spin_idle_us > 0 else 0
+            excluded_cpus = placement.excluded_cpus
         self._executor_mode = effective_mode
-        self._report_spin_fallbacks = executor_mode == "spin"
+        self._report_spin_fallbacks = executor_mode != "sleep"
+        self.spin_threads = spin_threads
         if effective_mode == "spin":
             logger.info_rank0(
-                "Core pinning: "
+                f"MOE executor worker placement ({spin_threads}/{nthreads} spin): "
                 + ", ".join(
-                    f"thread {thread_id} -> core {cpu}"
+                    f"thread {thread_id} -> CPU {cpu} "
+                    f"({'spin' if thread_id < spin_threads else 'sleep'})"
                     for thread_id, cpu in enumerate(core_ids)
                 )
+            )
+            logger.info_rank0(
+                "MOE executor excluded CPUs: "
+                + ", ".join(str(cpu) for cpu in excluded_cpus)
             )
         self._coord_core = coord_core
         self._ext = _cpu_moe.CpuMoeExecutor(
@@ -748,7 +894,9 @@ class CpuMoeExecutor:
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
             spin_mode=effective_mode == "spin",
-            spin_wait_us=int(spin_wait_us),
+            spin_thread_count=spin_threads,
+            spin_wait_us=spin_wait_us,
+            spin_idle_us=spin_idle_us,
             **ptrs,
         )
         self._configure_prefill_batch()
@@ -1125,8 +1273,14 @@ class CpuMoeExecutor:
 
         snapshot = self._ext.step_timing_snapshot_and_reset()
         spin_fallbacks = None
+        worker_spin_fallbacks = None
         if getattr(self, "_report_spin_fallbacks", False):
             spin_fallbacks = int(self._ext.spin_fallback_count(True))
+            worker_spin_fallbacks = int(
+                getattr(self._ext, "worker_spin_fallback_count", lambda _reset: 0)(
+                    True
+                )
+            )
         per_layer = {}
         d2h_per_layer = {}
         for raw_layer_id, raw in snapshot.items():
@@ -1166,6 +1320,9 @@ class CpuMoeExecutor:
         }
         if spin_fallbacks is not None:
             result["spin_fallbacks"] = spin_fallbacks
+            result["worker_spin_fallbacks"] = worker_spin_fallbacks
+            result["spin_threads"] = int(getattr(self, "spin_threads", 0))
+            result["total_threads"] = int(getattr(self, "num_threads", 0))
         return result
 
     def resolve_step_timing(
@@ -1230,8 +1387,14 @@ class CpuMoeExecutor:
             "cpu_layers_per_step": cpu_layers,
             "cpu_expert_bytes_per_step": native["total_bytes"],
         }
-        if "spin_fallbacks" in breakdown:
-            result["spin_fallbacks"] = breakdown["spin_fallbacks"]
+        for name in (
+            "spin_fallbacks",
+            "worker_spin_fallbacks",
+            "spin_threads",
+            "total_threads",
+        ):
+            if name in breakdown:
+                result[name] = breakdown[name]
         return result
 
     def register_gpufetch_layer(

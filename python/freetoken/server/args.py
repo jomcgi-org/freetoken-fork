@@ -117,6 +117,18 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _spin_idle_us(value: str) -> int:
+        from freetoken.moe.cpu_executor import validate_spin_idle_us
+
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be an integer") from exc
+        try:
+            return validate_spin_idle_us(parsed)
+        except (TypeError, ValueError) as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
     def _harness_prefix(value: str) -> str:
         kind, separator, prefix = value.partition("=")
         if not separator or not kind.strip() or not prefix.strip():
@@ -832,6 +844,16 @@ def parse_args(
             "(default), 'spin' busy-polls for lower wake latency with a bounded "
             "wait fallback, and 'auto' enables spin on suitable single-socket x86 "
             "systems."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-spin-idle-us",
+        type=_spin_idle_us,
+        default=ServerArgs.moe_cpu_spin_idle_us,
+        help=(
+            "Maximum worker busy-poll time after the last task in spin mode, in "
+            "microseconds. Valid range: 0 to 1000000 (default: 500)."
         ),
     )
 

@@ -95,13 +95,19 @@ def test_step_timing_reports_and_resets_explicit_spin_fallbacks():
     executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
     executor._step_timing = True
     executor._report_spin_fallbacks = True
+    executor.spin_threads = 6
+    executor.num_threads = 14
     executor._step_timing_events = {}
     executor._ext = SimpleNamespace(
         step_timing_snapshot_and_reset=lambda: {},
         spin_fallback_count=lambda reset: reset_calls.append(reset) or 42,
+        worker_spin_fallback_count=lambda reset: reset_calls.append(reset) or 84,
     )
 
     result = executor.step_timing_breakdown()
 
     assert result["spin_fallbacks"] == 42
-    assert reset_calls == [True]
+    assert result["worker_spin_fallbacks"] == 84
+    assert result["spin_threads"] == 6
+    assert result["total_threads"] == 14
+    assert reset_calls == [True, True]

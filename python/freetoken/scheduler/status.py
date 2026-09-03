@@ -159,11 +159,15 @@ class SchedulerStatusReporter:
                     self._decode_timing_totals.get(name, 0.0)
                     + float(timing.get(name, 0.0))
                 )
-            if "spin_fallbacks" in timing:
-                self._decode_timing_totals["spin_fallbacks"] = (
-                    self._decode_timing_totals.get("spin_fallbacks", 0.0)
-                    + float(timing["spin_fallbacks"])
-                )
+            for name in ("spin_fallbacks", "worker_spin_fallbacks"):
+                if name in timing:
+                    self._decode_timing_totals[name] = (
+                        self._decode_timing_totals.get(name, 0.0)
+                        + float(timing[name])
+                    )
+            for name in ("spin_threads", "total_threads"):
+                if name in timing:
+                    self._decode_timing_totals[name] = float(timing[name])
         if getattr(batch, "mtp_drafted", 0):
             self.log(
                 "MTP verify window, route: decode, "
@@ -211,6 +215,17 @@ class SchedulerStatusReporter:
                 timing_msg += (
                     f", spin_fallbacks "
                     f"{int(self._decode_timing_totals['spin_fallbacks'])}"
+                )
+            if "worker_spin_fallbacks" in self._decode_timing_totals:
+                timing_msg += (
+                    f", worker_spin_fallbacks "
+                    f"{int(self._decode_timing_totals['worker_spin_fallbacks'])}"
+                )
+            if "spin_threads" in self._decode_timing_totals:
+                timing_msg += (
+                    f", spin_threads "
+                    f"{int(self._decode_timing_totals['spin_threads'])}/"
+                    f"{int(self._decode_timing_totals['total_threads'])}"
                 )
         self._decode_timing_count = 0
         self._decode_timing_totals.clear()

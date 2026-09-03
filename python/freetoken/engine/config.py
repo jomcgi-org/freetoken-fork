@@ -76,6 +76,8 @@ class EngineConfig:
     # Worker-pool synchronization policy. Sleep preserves the condition-variable
     # path; spin busy-polls worker doorbells; auto enables spin only on suitable CPUs.
     moe_cpu_executor_mode: str = "sleep"
+    # Maximum time a spinning worker polls for the next task before it parks.
+    moe_cpu_spin_idle_us: int = 500
     # Hybrid CPU/GPU decode (--moe-backend offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
