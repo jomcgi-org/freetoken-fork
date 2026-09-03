@@ -32,7 +32,10 @@ recurrence), ``fused_recurrent.py`` (pool-indexed decode kernel with in-kernel K
   WARNING: clobbers the ``v`` argument (the output is written into that buffer to save
   an allocation, as in vLLM where v is an ephemeral projection). Never pass a tensor
   that is read again afterwards.
-- ``fused_recurrent_kda`` -- decode; per-slot state read/write via ``ssm_state_indices``,
+- ``fused_recurrent_kda`` -- vendored unused in this fork: GLM decode runs
+  ``fused_sigmoid_gating_delta_rule_update(is_kda=True)`` from
+  ``fused_sigmoid_gating_recurrent.py``; the file is kept verbatim for upstream
+  diffability. Upstream's contract for it: decode; per-slot state read/write via ``ssm_state_indices``,
   gate + beta-sigmoid + q/k l2norm computed in-kernel. The per-token state store reads
   ``ssm_state_indices`` as a CONTIGUOUS [N, T] block; materialize, never ``expand()``.
 """

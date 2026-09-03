@@ -201,9 +201,17 @@ class Glm5NextKimiDeltaAttention(BaseOP):
             slot_ids = fla.cache_indices.long()
             initial = rec.index_select(0, slot_ids)
             track = fla.track_dst is not None
+            raw_g = raw_g.view(1, total, self.num_heads, self.head_dim)
+            # The kernel validates nothing about the gate layout; this is the seam
+            # that let a per-channel gate reach a per-head kernel unnoticed.
+            assert raw_g.shape[-2:] == (self.num_heads, self.head_dim), raw_g.shape
+            # v is a strided view of the conv output, so the kernel copies it before
+            # writing its output into the copy; nothing reads mixed or v afterwards.
             result = chunk_kda_with_fused_gate(
-                q=q, k=k, v=v,  # v is the ephemeral conv output; the kernel writes into it
-                raw_g=raw_g.view(1, total, self.num_heads, self.head_dim),
+                q=q,
+                k=k,
+                v=v,
+                raw_g=raw_g,
                 beta=beta.view(1, total, self.num_heads),
                 A_log=self.A_log,
                 g_bias=self.dt_bias,
