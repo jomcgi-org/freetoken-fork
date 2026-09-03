@@ -94,6 +94,9 @@ class EngineConfig:
     moe_hot_adapt_interval_steps: str | int = "auto"
     moe_hot_adapt_max_swap_gib: float = 0.5
     moe_hot_adapt_boundary_cap_frac: float = 0.5
+    moe_hot_adapt_prefill_weight: float = 1.0
+    moe_hot_adapt_prefill_run_cap_frac: float = 0.0
+    moe_hot_adapt_post_prefill_tick: bool = False
     # Persist the adapted protected-slot assignment and its decayed routing counts.
     # auto reads an existing plan and writes only when its directory is writable.
     moe_hot_plan_persist: str = "auto"
@@ -390,6 +393,24 @@ class EngineConfig:
             raise ValueError(
                 "--moe-hot-adapt-boundary-cap-frac must be finite and in (0, 1]"
             )
+        if (
+            isinstance(self.moe_hot_adapt_prefill_weight, bool)
+            or not math.isfinite(float(self.moe_hot_adapt_prefill_weight))
+            or not 0 <= self.moe_hot_adapt_prefill_weight <= 1
+        ):
+            raise ValueError(
+                "--moe-hot-adapt-prefill-weight must be finite and in [0, 1]"
+            )
+        if (
+            isinstance(self.moe_hot_adapt_prefill_run_cap_frac, bool)
+            or not math.isfinite(float(self.moe_hot_adapt_prefill_run_cap_frac))
+            or not 0 <= self.moe_hot_adapt_prefill_run_cap_frac <= 1
+        ):
+            raise ValueError(
+                "--moe-hot-adapt-prefill-run-cap-frac must be 0 or finite and in (0, 1]"
+            )
+        if not isinstance(self.moe_hot_adapt_post_prefill_tick, bool):
+            raise ValueError("--moe-hot-adapt-post-prefill-tick must be 'on' or 'off'")
         if self.moe_hot_plan_persist not in ("auto", "on", "off"):
             raise ValueError(
                 "--moe-hot-plan-persist must be 'auto', 'on', or 'off', got "
