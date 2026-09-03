@@ -106,6 +106,66 @@ def _patch_env(monkeypatch, *, major=9, flashinfer=True, sgl=True):
 
 
 @pytest.mark.parametrize(
+    "requested, backend, capability, expected, reason_fragment",
+    [
+        ("auto", "fi", (8, 9), "bf16", "cannot consume FP8 KV"),
+        ("auto", "qsa_sparse", (9, 0), "fp8_e4m3", "support FP8 KV"),
+        ("auto", "fi", (8, 6), "bf16", "lacks native FP8"),
+        ("auto", "fa,fi", (9, 0), "bf16", "cannot consume FP8 KV"),
+        ("auto", "dsa", (9, 0), "bf16", "cannot consume FP8 KV"),
+        ("fp8_e4m3", "triton", (9, 0), "bf16", "cannot consume FP8 KV"),
+        ("bf16", "qsa_sparse", (9, 0), "bf16", "explicitly requested"),
+    ],
+)
+def test_kv_cache_dtype_resolution(
+    requested, backend, capability, expected, reason_fragment
+):
+    from freetoken.engine.engine import _resolve_kv_cache_dtype
+
+    resolved, reason = _resolve_kv_cache_dtype(requested, backend, capability)
+    assert resolved == expected
+    assert reason_fragment in reason
+
+
+def test_adjust_config_auto_enables_fp8_for_qsa_on_sm89(monkeypatch):
+    from freetoken.engine import engine
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    monkeypatch.setattr(engine, "_current_cuda_capability", lambda: (8, 9))
+    config = _config("qsa", attention_backend="auto", kv_cache_dtype="auto")
+    _adjust_config(config)
+    assert config.attention_backend == "qsa_sparse"
+    assert config.kv_cache_dtype == "fp8_e4m3"
+
+
+def test_adjust_config_excludes_glm_dsa_latent_cache_from_fp8(monkeypatch):
+    from freetoken.engine import engine
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch)
+    monkeypatch.setattr(engine, "_current_cuda_capability", lambda: (9, 0))
+    config = _config("dsa", attention_backend="auto", kv_cache_dtype="auto")
+    _adjust_config(config)
+    assert config.attention_backend == "dsa"
+    assert config.kv_cache_dtype == "bf16"
+
+
+def test_cuda_capability_uses_the_assigned_visible_gpu(monkeypatch):
+    from freetoken.engine import engine
+
+    seen = []
+    monkeypatch.setattr(engine, "assigned_visible_gpu", lambda: 3)
+    monkeypatch.setattr(
+        engine.torch.cuda,
+        "get_device_capability",
+        lambda device: seen.append(device) or (9, 0),
+    )
+    assert engine._current_cuda_capability() == (9, 0)
+    assert seen == [3]
+
+
+@pytest.mark.parametrize(
     "kind, expected",
     [
         ("full", "fa,fi"),  # sm90 tree

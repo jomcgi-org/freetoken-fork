@@ -63,6 +63,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
+        kv_dtype: torch.dtype | None = None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -95,9 +96,10 @@ class QSAKVCache(MHAKVCache):
             head_dim=head_dim,
             num_pages=num_pages,
             page_size=page_size,
-            dtype=dtype,
+            dtype=kv_dtype or dtype,
             device=device,
             layer_ids=layer_ids,
+            compute_dtype=dtype,
         )
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)

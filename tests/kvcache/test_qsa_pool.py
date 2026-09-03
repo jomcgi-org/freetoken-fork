@@ -77,6 +77,7 @@ def _config(spec, *, page_size=64, max_running_req=3):
         model_config=mc,
         page_size=page_size,
         dtype=torch.bfloat16,
+        kv_cache_dtype="bf16",
         tp_info=SimpleNamespace(size=1),
         max_running_req=max_running_req,
     )
@@ -103,6 +104,34 @@ def test_kv_slabs_cover_sparse_layers_only():
     pool.k_cache(7)
     with pytest.raises(KeyError):
         pool.k_cache(0)
+
+
+def test_fp8_pool_keeps_index_tiers_in_compute_dtype():
+    pool = QSAKVCache(
+        num_kv_heads=2,
+        num_layers=8,
+        head_dim=64,
+        num_pages=4,
+        page_size=64,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.float8_e4m3fn,
+        device=torch.device("meta"),
+        index_head_dim=32,
+        num_index_layers=4,
+        index_ratio=4,
+        num_req_slots=4,
+        layer_ids=(1, 3, 5, 7),
+    )
+    assert pool.dtype == torch.float8_e4m3fn
+    assert pool.compute_dtype == torch.bfloat16
+    assert pool.k_scale == pool.v_scale == 1.0
+    assert pool._cmp_k_buffer.dtype == torch.bfloat16
+    assert pool._pending_ring.dtype == torch.bfloat16
+
+    from freetoken.kvcache import _validate_fp8_kv_pool
+
+    config = SimpleNamespace(kv_cache_dtype="fp8_e4m3", attention_backend="qsa_sparse")
+    assert _validate_fp8_kv_pool(config, pool, torch.bfloat16) is pool
 
 
 def test_ring_capacity_and_ratio_are_parameters():
@@ -173,6 +202,72 @@ def test_spec_bytes_per_token_divides_the_index_slab():
     bsa = _spec(num_kv_heads=2, head_dim=256, index_head_dim=128, num_index_layers=12,
                 layer_ids=FULL_LAYER_IDS, index_ratio=1, attn_type=AttnType.BSA)
     assert spec_kv_bytes_per_token(bsa, config) == REAL_KV_BYTES + 128 * 12 * 2
+
+
+def test_fp8_halves_only_the_primary_kv_slab_bytes():
+    spec = _spec(
+        num_kv_heads=2,
+        head_dim=256,
+        index_head_dim=128,
+        num_index_layers=12,
+        layer_ids=FULL_LAYER_IDS,
+    )
+    config = _config(spec)
+    bf16_bytes = spec_kv_bytes_per_token(spec, config)
+    config.kv_cache_dtype = "fp8_e4m3"
+    fp8_bytes = spec_kv_bytes_per_token(spec, config)
+
+    assert bf16_bytes == 24_576 + 768
+    assert fp8_bytes == 12_288 + 768
+    assert bf16_bytes - fp8_bytes == 12_288
+
+
+def test_node4_fp8_savings_become_726_more_nvfp4_hot_slots():
+    from freetoken.engine.cache_budget import resolve_moe_cache_auto
+    from freetoken.kernel.aot_models import expert_bank_row_bytes
+
+    spec = _spec(
+        num_kv_heads=2,
+        head_dim=256,
+        index_head_dim=128,
+        num_index_layers=12,
+        layer_ids=FULL_LAYER_IDS,
+    )
+    config = _config(spec)
+    bf16_per_page = QSAKVCache.kv_cost(config)[0]
+    config.kv_cache_dtype = "fp8_e4m3"
+    fp8_per_page = QSAKVCache.kv_cost(config)[0]
+    reserve_tokens = 163_840
+    bf16_kv_bytes = bf16_per_page * (reserve_tokens // config.page_size)
+    fp8_kv_bytes = fp8_per_page * (reserve_tokens // config.page_size)
+    row_bytes = sum(expert_bank_row_bytes("nvfp4", 2560, 640).values())
+
+    assert bf16_kv_bytes == 4_152_360_960
+    assert fp8_kv_bytes == 2_139_095_040
+    assert bf16_kv_bytes - fp8_kv_bytes == 2_013_265_920
+    assert row_bytes == 2_772_480
+
+    budget = bf16_kv_bytes + 1_000 * row_bytes
+    common = dict(
+        baseline_free=budget,
+        weights_bytes=0,
+        memory_ratio=1.0,
+        fixed_cache_size=0,
+        per_expert_bytes=row_bytes,
+        num_experts=512,
+        total_experts=36 * 512,
+        prefill_overlap=False,
+        kv_reserve_tokens=reserve_tokens,
+        page_size=config.page_size,
+        quant_format="nvfp4",
+    )
+    bf16_slots, _, _ = resolve_moe_cache_auto(
+        cache_per_page=bf16_per_page, **common
+    )
+    fp8_slots, _, _ = resolve_moe_cache_auto(
+        cache_per_page=fp8_per_page, **common
+    )
+    assert (bf16_slots, fp8_slots) == (1_000, 1_726)
 
 
 def test_kv_cost_prices_ring_and_scratch_as_fixed():

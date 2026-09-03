@@ -20,6 +20,72 @@ from .common import Fixture, requires_cuda, parsed_config, selection_spy
 QSA_LAYER = 3
 
 
+def test_qsa_rejects_non_unit_kv_scales_before_launch():
+    from freetoken.kernel.kv_scale import require_unit_kv_scales
+
+    with pytest.raises(ValueError, match="only unit FP8 KV scales"):
+        require_unit_kv_scales(k_scale=0.5, v_scale=1.0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("query_rows", [8, 1], ids=["prefill", "decode"])
+def test_fp8_kv_attention_matches_bf16_for_shipping_qsa_shape(query_rows):
+    """FP8 K/V stays within 10 percent relative or 0.08 absolute of BF16."""
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
+    from freetoken.kernel.store import store_cache
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(41 + query_rows)
+    num_pages, page_size = 2, 64
+    q = torch.randn(
+        query_rows, 24, 256, device=device, dtype=torch.bfloat16, generator=generator
+    ) * 0.25
+    k_bf16 = torch.randn(
+        num_pages,
+        page_size,
+        2,
+        256,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    ) * 0.125
+    v_bf16 = torch.randn(
+        k_bf16.shape,
+        device=device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    ) * 0.125
+    logical_indices = torch.arange(96, device=device, dtype=torch.int32).repeat(
+        query_rows, 1
+    )
+    block_table = torch.tensor([[0, 1]], device=device, dtype=torch.int32)
+    token_to_req = torch.zeros(query_rows, device=device, dtype=torch.int32)
+
+    reference = qsa_sparse_paged_attention(
+        q, k_bf16, v_bf16, logical_indices, block_table, token_to_req
+    )
+    k_fp8 = torch.empty_like(k_bf16, dtype=torch.float8_e4m3fn)
+    v_fp8 = torch.empty_like(v_bf16, dtype=torch.float8_e4m3fn)
+    store_cache(
+        k_fp8.view(num_pages * page_size, 2, 256),
+        v_fp8.view(num_pages * page_size, 2, 256),
+        torch.arange(num_pages * page_size, device=device, dtype=torch.int32),
+        k_bf16.view(num_pages * page_size, 2, 256),
+        v_bf16.view(num_pages * page_size, 2, 256),
+    )
+    actual = qsa_sparse_paged_attention(
+        q,
+        k_fp8,
+        v_fp8,
+        logical_indices,
+        block_table,
+        token_to_req,
+    )
+    torch.testing.assert_close(
+        actual.float(), reference.float(), rtol=0.10, atol=0.08
+    )
+
+
 def _inputs(fixture: Fixture, lengths, extra: int = 0, seed: int = 11):
     generator = torch.Generator(device=fixture.device).manual_seed(seed)
     return [

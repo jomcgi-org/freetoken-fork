@@ -17,6 +17,7 @@ from freetoken.kvcache.disk_prefix_cache import (
     LazyKVRestore,
     capture_hybrid_prefix_tensors,
     make_block_index,
+    model_cache_identity,
     priority_streaming_plan,
     restore_hybrid_prefix_tensors,
     token_chain_hash,
@@ -37,14 +38,39 @@ def _payload(seed: int = 0) -> dict[str, torch.Tensor]:
     }
 
 
-def _store(path, identity="model-a", budget=1 << 20):
+def _store(path, identity="model-a", budget=1 << 20, kv_dtype="bf16"):
     return DiskPrefixStore(
         path,
         budget,
         identity=identity,
         checkpoint_fingerprint=identity,
         config_hash="config-a",
+        kv_dtype=kv_dtype,
     )
+
+
+@pytest.fixture
+def cpu_byte_store(monkeypatch):
+    """Run the CUDA store kernel contract as a byte-copy loop on this CPU suite."""
+    from freetoken.kernel import store
+
+    calls = []
+
+    class Module:
+        def __init__(self, element_size):
+            self.element_size = element_size
+
+        def launch(self, k_cache, v_cache, indices, k, v):
+            assert k_cache.dtype == v_cache.dtype == k.dtype == v.dtype == torch.uint8
+            assert k_cache.shape[1] == v_cache.shape[1] == self.element_size
+            assert k.shape[1] == v.shape[1] == self.element_size
+            calls.append((k_cache, v_cache, indices, k, v))
+            for source_row, destination_row in enumerate(indices.tolist()):
+                k_cache[destination_row].copy_(k[source_row])
+                v_cache[destination_row].copy_(v[source_row])
+
+    monkeypatch.setattr(store, "_jit_store_module", Module)
+    return calls
 
 
 def test_store_round_trip_with_synthetic_hybrid_state(tmp_path):
@@ -95,7 +121,8 @@ def test_lazy_restore_off_materializes_indexed_entry(tmp_path):
     reader.close()
 
 
-def test_version_one_entry_without_block_index_falls_back_to_eager(tmp_path):
+@pytest.mark.parametrize("version", ["1", "2"])
+def test_old_version_entry_is_a_stale_miss(tmp_path, version):
     ids = torch.arange(8, dtype=torch.int32)
     key = token_chain_hash("model-a", ids)
     path = tmp_path / f"{ids.numel():012d}-{key}.safetensors"
@@ -104,7 +131,7 @@ def test_version_one_entry_without_block_index_falls_back_to_eager(tmp_path):
         str(path),
         metadata={
             "format": FORMAT,
-            "version": "1",
+            "version": version,
             "identity": "model-a",
             "checkpoint_fingerprint": "model-a",
             "config_hash": "config-a",
@@ -115,9 +142,47 @@ def test_version_one_entry_without_block_index_falls_back_to_eager(tmp_path):
     )
     store = _store(tmp_path)
     entry = store.lookup_longest(ids)
-    assert entry is not None and not entry.supports_lazy_restore
-    assert torch.equal(entry.tensors["qsa_kv"], _payload()["qsa_kv"])
+    assert entry is None
+    assert path.exists()
+    assert store.stats()["misses"] == 1
+    assert store.stats()["stale_format"] == 1
+    assert store.stats()["corrupt_entries"] == 0
     store.close()
+
+
+def test_kv_dtype_tag_mismatch_is_a_non_destructive_miss(tmp_path):
+    ids = torch.arange(8, dtype=torch.int32)
+    writer = _store(tmp_path, kv_dtype="fp8_e4m3")
+    assert writer.enqueue(ids, _payload())
+    writer.close()
+    path = next(tmp_path.glob("*.safetensors"))
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        assert handle.metadata()["kv_dtype"] == "fp8_e4m3"
+
+    reader = _store(tmp_path, kv_dtype="bf16")
+    assert reader.lookup_longest(ids) is None
+    assert reader.stats()["misses"] == 1
+    assert reader.stats()["dtype_mismatches"] == 1
+    assert reader.stats()["stale_format"] == 1
+    assert reader.stats()["corrupt_entries"] == 0
+    assert path.exists()
+    reader.close()
+
+
+def test_model_cache_identity_includes_resolved_kv_dtype(tmp_path):
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config={"kind": "qsa"},
+        dtype=torch.bfloat16,
+        kv_cache_dtype="bf16",
+        page_size=64,
+        tp_info=SimpleNamespace(rank=0, size=1),
+    )
+    bf16_identity, _, bf16_hash = model_cache_identity(config)
+    config.kv_cache_dtype = "fp8_e4m3"
+    fp8_identity, _, fp8_hash = model_cache_identity(config)
+    assert fp8_identity != bf16_identity
+    assert fp8_hash != bf16_hash
 
 
 def test_priority_plan_keeps_sink_then_streams_newest_first():
@@ -127,7 +192,9 @@ def test_priority_plan_keeps_sink_then_streams_newest_first():
     assert sorted((*eager, *streamed)) == list(range(10))
 
 
-def test_lazy_reader_installs_only_requested_pages_into_physical_mapping(tmp_path):
+def test_lazy_reader_installs_only_requested_pages_into_physical_mapping(
+    tmp_path, cpu_byte_store
+):
     ids = torch.arange(8, dtype=torch.int32)
     payload = {**_payload(), BLOCK_INDEX_TENSOR: make_block_index(8, 2)}
     store = _store(tmp_path)
@@ -162,6 +229,7 @@ def test_lazy_reader_installs_only_requested_pages_into_physical_mapping(tmp_pat
     assert torch.equal(logical, payload["qsa_kv"])
     assert restore.complete
     assert completed == [True]
+    assert cpu_byte_store
     store.close()
 
 
@@ -363,7 +431,7 @@ def test_bounded_writer_queue_drops_on_overflow(tmp_path):
     store.close()
 
 
-def test_capture_and_restore_covers_qsa_gdn_and_ple_state():
+def test_capture_and_restore_covers_qsa_gdn_and_ple_state(cpu_byte_store):
     kv = SimpleNamespace(
         _kv_buffer=torch.arange(2 * 2 * 2 * 4 * 1 * 2, dtype=torch.float32).view(
             2, 2, 2, 4, 1, 2
@@ -403,3 +471,36 @@ def test_capture_and_restore_covers_qsa_gdn_and_ple_state():
     assert torch.equal(kv._kv_buffer.flatten(2, 3), expected_kv)
     assert torch.equal(pool.conv_states[:, 2], expected_conv)
     assert torch.equal(pending, expected_pending)
+    assert cpu_byte_store
+
+
+def test_fp8_disk_restore_round_trip_uses_uint8_views(cpu_byte_store):
+    kv = SimpleNamespace(
+        _kv_buffer=torch.zeros(2, 2, 2, 2, 1, 3, dtype=torch.float8_e4m3fn),
+        _cmp_k_buffer=torch.zeros(1, 2, 1, dtype=torch.bfloat16),
+        _pending_ring=torch.zeros(1, 1, 2, 1, dtype=torch.bfloat16),
+        index_ratio=2,
+        device=torch.device("cpu"),
+    )
+    linear = SimpleNamespace(
+        conv_states=torch.zeros(1, 1, 1),
+        recurrent_states=torch.zeros(1, 1, 1),
+        slot_states={},
+    )
+    locations = torch.tensor([2, 3, 0, 1], dtype=torch.int32)
+    source = torch.arange(2 * 2 * 4 * 1 * 3, dtype=torch.float32).view(2, 2, 4, 1, 3)
+    source = source.to(torch.float8_e4m3fn)
+    tensors = {
+        "qsa_kv": source,
+        "conv": torch.zeros(1, 1),
+        "recurrent": torch.zeros(1, 1),
+    }
+
+    restore_hybrid_prefix_tensors(
+        kv, linear, tensors, kv_indices=locations, linear_slot=0
+    )
+
+    restored = kv._kv_buffer.flatten(2, 3).index_select(2, locations.to(torch.long))
+    assert torch.equal(restored.view(torch.uint8), source.view(torch.uint8))
+    assert len(cpu_byte_store) == 2
+    assert all(call[0].dtype == call[3].dtype == torch.uint8 for call in cpu_byte_store)

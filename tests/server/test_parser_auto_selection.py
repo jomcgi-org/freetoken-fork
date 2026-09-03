@@ -113,3 +113,16 @@ def test_hot_adapt_interval_accepts_auto_or_an_explicit_integer(value, expected)
     )
 
     assert args.moe_hot_adapt_interval_steps == expected
+
+
+@pytest.mark.parametrize("value", ["auto", "bf16", "fp8_e4m3"])
+def test_kv_cache_dtype_cli_choices(value):
+    args, _ = parse_args(
+        ["--model", ANON_PATH, "--dtype", "bfloat16", "--kv-cache-dtype", value]
+    )
+    assert args.kv_cache_dtype == value
+
+
+def test_kv_cache_dtype_cli_default_is_auto():
+    args, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    assert args.kv_cache_dtype == "auto"

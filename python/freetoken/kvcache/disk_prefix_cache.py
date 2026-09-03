@@ -1,8 +1,8 @@
 """Crash-safe whole-prefix storage for hybrid KV and recurrent state.
 
 Entries use safetensors so startup can validate metadata without reading tensor data and a
-corrupt file cannot execute pickled code. Version 2 adds a page index for demand-loading QSA KV;
-version 1 entries remain readable through the eager restore path.
+corrupt file cannot execute pickled code. Version 2 added a page index for demand-loading QSA
+KV. Version 3 adds the required ``kv_dtype`` metadata tag. Untagged older entries are rejected.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from safetensors.torch import save_file
 
 
 FORMAT = "freetoken_disk_prefix"
-VERSION = 2
-_READABLE_VERSIONS = frozenset((1, VERSION))
+VERSION = 3
+_READABLE_VERSIONS = frozenset((VERSION,))
 _SUFFIX = ".safetensors"
 _TMP_MARKER = ".tmp-"
 BLOCK_INDEX_TENSOR = "qsa_block_index"
@@ -73,6 +73,7 @@ def model_cache_identity(config) -> tuple[str, str, str]:
     runtime_geometry = {
         "model_config": _stable_json_value(config.model_config),
         "dtype": str(config.dtype),
+        "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "bf16")),
         "page_size": int(config.page_size),
         "tp_rank": int(config.tp_info.rank),
         "tp_size": int(config.tp_info.size),
@@ -223,6 +224,7 @@ class DiskPrefixStore:
         identity: str,
         checkpoint_fingerprint: str = "",
         config_hash: str = "",
+        kv_dtype: str = "bf16",
         queue_size: int = 2,
         lazy_restore: bool = True,
         hot_blocks: int = 32,
@@ -237,6 +239,9 @@ class DiskPrefixStore:
         self.identity = identity
         self.checkpoint_fingerprint = checkpoint_fingerprint
         self.config_hash = config_hash
+        if kv_dtype not in ("bf16", "fp8_e4m3"):
+            raise ValueError(f"unsupported disk prefix KV dtype {kv_dtype!r}")
+        self.kv_dtype = kv_dtype
         self.lazy_restore = bool(lazy_restore)
         self.hot_blocks = max(0, int(hot_blocks))
         self._entries: dict[tuple[int, str], Path] = {}
@@ -252,6 +257,8 @@ class DiskPrefixStore:
             "first_token_after_restore_ms": 0.0,
             "prefill_ms_saved": 0.0,
             "fingerprint_mismatches": 0,
+            "dtype_mismatches": 0,
+            "stale_format": 0,
             "corrupt_entries": 0,
             "torn_writes": 0,
             "writes": 0,
@@ -284,6 +291,7 @@ class DiskPrefixStore:
             "identity": self.identity,
             "checkpoint_fingerprint": self.checkpoint_fingerprint,
             "config_hash": self.config_hash,
+            "kv_dtype": self.kv_dtype,
             "token_count": str(token_ids.numel()),
             "token_hash": token_chain_hash(self.identity, token_ids),
             "prefill_tokens_per_s": str(prefill_rate),
@@ -306,11 +314,18 @@ class DiskPrefixStore:
             try:
                 with safe_open(str(path), framework="pt", device="cpu") as handle:
                     meta = handle.metadata() or {}
-                if (
-                    meta.get("format") != FORMAT
-                    or int(meta.get("version", "-1")) not in _READABLE_VERSIONS
-                ):
+                if meta.get("format") != FORMAT:
                     raise ValueError("unsupported disk prefix format")
+                version = int(meta.get("version", "-1"))
+                if version not in _READABLE_VERSIONS:
+                    with self._lock:
+                        self._stats["stale_format"] += 1
+                    continue
+                if meta.get("kv_dtype") != self.kv_dtype:
+                    with self._lock:
+                        self._stats["dtype_mismatches"] += 1
+                        self._stats["stale_format"] += 1
+                    continue
                 if meta.get("identity") != self.identity:
                     with self._lock:
                         self._stats["fingerprint_mismatches"] += 1
@@ -437,6 +452,10 @@ class DiskPrefixStore:
             try:
                 with safe_open(str(path), framework="pt", device="cpu") as handle:
                     meta = handle.metadata() or {}
+                    if meta.get("kv_dtype") != self.kv_dtype:
+                        with self._lock:
+                            self._stats["dtype_mismatches"] += 1
+                        continue
                     if meta.get("identity") != self.identity:
                         with self._lock:
                             self._stats["fingerprint_mismatches"] += 1
@@ -529,7 +548,11 @@ class DiskPrefixStore:
             try:
                 with safe_open(str(path), framework="pt", device="cpu") as handle:
                     meta = handle.metadata() or {}
-                    if meta.get("identity") != self.identity or meta.get("token_hash") != key:
+                    if (
+                        meta.get("kv_dtype") != self.kv_dtype
+                        or meta.get("identity") != self.identity
+                        or meta.get("token_hash") != key
+                    ):
                         continue
                     keys = set(handle.keys())
                     if "expert_profile.version" not in keys:
@@ -732,18 +755,26 @@ def restore_hybrid_prefix_tensors(
     restore_kv: bool = True,
 ) -> torch.Tensor | None:
     """Install paged data and recurrent state, returning table-local QSA pending state."""
+    from freetoken.kernel import store_cache
+
     device = kv_cache.device
     flat = kv_cache._kv_buffer.flatten(2, 3)
-    locations = kv_indices.to(torch.long)
+    locations = kv_indices.to(device=device)
     if restore_kv:
         source_kv = tensors["qsa_kv"]
         kv_scratch = torch.empty(source_kv[:, 0].shape, dtype=source_kv.dtype, device=device)
         for layer in range(flat.shape[1]):
             kv_scratch.copy_(source_kv[:, layer])
-            flat[:, layer].index_copy_(1, locations, kv_scratch)
+            store_cache(
+                flat[0, layer],
+                flat[1, layer],
+                locations,
+                kv_scratch[0],
+                kv_scratch[1],
+            )
     if "qsa_index" in tensors:
         ratio = int(kv_cache.index_ratio)
-        rows = locations[::ratio] // ratio
+        rows = locations[::ratio].to(torch.long) // ratio
         source_index = tensors["qsa_index"]
         index_scratch = torch.empty(
             source_index[0].shape, dtype=source_index.dtype, device=device
@@ -926,10 +957,18 @@ class LazyKVRestore:
             self._copy_stream.synchronize()
 
     def _copy_block(self, source, flat, locations, start: int, end: int) -> None:
+        from freetoken.kernel import store_cache
+
         for layer in range(flat.shape[1]):
             page = source[:, layer, start:end]
             scratch = page.to(device=self.kv_cache.device)
-            flat[:, layer].index_copy_(1, locations, scratch)
+            store_cache(
+                flat[0, layer],
+                flat[1, layer],
+                locations,
+                scratch[0],
+                scratch[1],
+            )
 
     def _finish_once(self) -> None:
         if not self.complete:

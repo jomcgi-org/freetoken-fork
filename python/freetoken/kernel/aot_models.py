@@ -11,8 +11,9 @@ Derivations, which must be kept in lockstep with the runtime call sites by hand
 (a drifted derivation misses the prebuilt cache by spec name and falls back to
 JIT, which needs nvcc):
 
-- store: ``element_size = num_kv_heads * head_dim * 2`` (bf16 KV row), one per
-  paged-KV attention group (kvcache/mha_pool.py, kvcache/hybrid_swa_pool.py).
+- store: ``element_size = num_kv_heads * head_dim * itemsize``, for both bf16
+  and fp8 e4m3 KV rows, one pair per paged-KV attention group
+  (kvcache/mha_pool.py, kvcache/hybrid_swa_pool.py).
   DSV4 writes its MLA latent via torch scatter and contributes nothing.
 - index: ``element_size = hidden_size * 2`` (bf16 embedding row) paired with
   the runtime ``num_splits_for`` rule (layers/embedding.py -> kernel/index.py).
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 
 from .index import num_splits_for
 
-KV_CACHE_DTYPE_BYTES = 2  # every current model allocates bf16 paged KV
+KV_CACHE_DTYPE_BYTES = (1, 2)  # fp8 e4m3 and bf16 paged KV
 EMBED_DTYPE_BYTES = 2  # embedding weights stay bf16 on the indexing() path
 
 
@@ -384,7 +385,11 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
 
 
 def store_element_sizes(model: AotModel) -> set[int]:
-    return {kv * hd * KV_CACHE_DTYPE_BYTES for kv, hd in model.kv_groups}
+    return {
+        kv * hd * dtype_bytes
+        for kv, hd in model.kv_groups
+        for dtype_bytes in KV_CACHE_DTYPE_BYTES
+    }
 
 
 def index_variants(model: AotModel) -> set[tuple[int, int]]:

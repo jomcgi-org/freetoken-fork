@@ -78,6 +78,26 @@ def test_generic_kv_cost_and_solve_parity():
     assert MHAKVCache.min_kv_tokens(config) == config.page_size
 
 
+def test_cost_uses_the_selected_pool_family_storage_dtype():
+    from freetoken.kvcache.base import spec_kv_bytes_per_token
+
+    config = _generic_config()
+    config.kv_cache_dtype = "fp8_e4m3"
+    full = config.model_config.kv_cache_group_specs()[0]
+    assert spec_kv_bytes_per_token(full, config) == 2 * 64 * 2 * 1 * 2
+
+    bsa = _spec("full", AttnType.BSA, index_head_dim=32)
+    config.model_config.kv_cache_group_specs = lambda: (bsa,)
+    # BSA still allocates its K/V slab in the 16-bit compute dtype, regardless
+    # of a stale FP8 config flag, so its budget must not claim an FP8 discount.
+    assert spec_kv_bytes_per_token(bsa, config) == 2 * 64 * 2 * 2 * 2 + 32 * 2 * 2
+
+    swa = _spec("swa", AttnType.SWA, sliding_window=128)
+    config.model_config.has_swa_attention = True
+    config.model_config.kv_cache_group_specs = lambda: (full, swa)
+    assert spec_kv_bytes_per_token(full, config) == 2 * 64 * 2 * 2 * 2
+
+
 def _dsv4_config(num_page_override=None):
     from freetoken.models.deepseek_v4.args import DeepseekV4Args
 
@@ -237,6 +257,13 @@ def test_create_kv_pool_builds_the_right_family():
     pool2 = create_kv_pool(config2, num_pages=8, device=torch.device("cpu"), dtype=torch.bfloat16)
     assert isinstance(pool2, HybridSWAKVCache)
     assert pool2.swa_num_tokens == _swa_paged_num_tokens(config2, 9)
+
+    config2.kv_cache_dtype = "fp8_e4m3"
+    config2.attention_backend = "future_swa_fp8"
+    with pytest.raises(ValueError, match="has no matching FP8 pool"):
+        create_kv_pool(
+            config2, num_pages=8, device=torch.device("cpu"), dtype=torch.bfloat16
+        )
 
 
 def test_linear_state_pool_prices_itself():

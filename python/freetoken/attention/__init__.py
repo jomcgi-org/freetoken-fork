@@ -33,6 +33,9 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
+    # Whether this backend can read e4m3 K/V storage without materializing a
+    # BF16 cache-sized dequantization buffer.
+    supports_fp8_kv: bool = False
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -132,6 +135,7 @@ def create_m3_sparse_backend(config: ModelConfig):
     "qsa_sparse",
     BackendInfo(
         supported_types=frozenset({AttnType.QSA}),
+        supports_fp8_kv=True,
         # 64-token pages: a 4-token compress group never straddles a page, so the
         # compressed row of a group is page_base // 4 + block-in-page.
         page_sizes=(64,),

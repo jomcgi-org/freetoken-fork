@@ -500,6 +500,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        choices=["auto", "bf16", "fp8_e4m3"],
+        default=ServerArgs.kv_cache_dtype,
+        help=(
+            "FULL-attention K/V storage dtype. Auto selects fp8_e4m3 on sm_89+ "
+            "when every selected attention backend can consume it, otherwise bf16."
+        ),
+    )
+
+    parser.add_argument(
         "--model-source",
         type=str,
         default="huggingface",
