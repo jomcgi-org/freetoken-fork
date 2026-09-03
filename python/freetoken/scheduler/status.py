@@ -223,6 +223,7 @@ class SchedulerStatusReporter:
             f"{stats['first_token_after_restore_ms']:.2f}, "
             f"estimated prefill_ms_saved: {stats['prefill_ms_saved']:.2f}, "
             f"write_drops: {stats['write_drops']}, "
+            f"stale_format: {stats['stale_format']}, "
             f"corrupt: {stats['corrupt_entries']}, "
             f"fingerprint_mismatch: {stats['fingerprint_mismatches']}"
         )

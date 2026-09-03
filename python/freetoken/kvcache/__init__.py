@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
+import torch
+
 from freetoken.utils import Registry
 
 if TYPE_CHECKING:
-    import torch
     from freetoken.models import ModelConfig
 
 from .base import (
@@ -79,7 +80,9 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
     from .dsv4_paged_pool import DSV4PagedKVCache
 
     model_config = config.model_config
-    if resolve_pool_class(model_config) is DSV4PagedKVCache:
+    pool_cls = resolve_pool_class(model_config)
+    kv_dtype = pool_cls.kv_dtype_for_config(config, dtype)
+    if pool_cls is DSV4PagedKVCache:
         # DSV4 is driven by the generic CacheManager over the shared page table; the pool is
         # the only DSV4-specific piece (the swa_pool plug-in: window tier + cmp/idx/state
         # shadows). Sizing reads dsv4_args, never the group spec.
@@ -92,7 +95,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             n_scratch=config.max_running_req + 1,
         )
         pool._init_paged_state(config.max_running_req, config.cache_type != "naive")
-        return pool
+        return _validate_fp8_kv_pool(config, pool, dtype)
 
     num_swa_tokens = None
     # Both the naive and radix SWA paths share the global-paged swa pool; radix sizes it by
@@ -108,16 +111,46 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         from freetoken.spec_decode import MTP_DRAFT_STEPS
 
         num_speculative_tokens = MTP_DRAFT_STEPS
-    return create_kvcache_pool(
+    pool = create_kvcache_pool(
         model_config=model_config,
         num_pages=num_pages + 1,  # +1 for dummy page
         page_size=config.page_size,
         num_swa_tokens=num_swa_tokens,
         device=device,
         dtype=dtype,
+        kv_dtype=kv_dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
         num_speculative_tokens=num_speculative_tokens,
     )
+    return _validate_fp8_kv_pool(config, pool, dtype)
+
+
+def _validate_fp8_kv_pool(config, pool, compute_dtype: torch.dtype):
+    """Reject a capability/pool mismatch before the first cache write."""
+    if getattr(config, "kv_cache_dtype", "bf16") != "fp8_e4m3":
+        return pool
+
+    missing = [
+        name
+        for name in ("compute_dtype", "k_scale", "v_scale")
+        if not hasattr(pool, name)
+    ]
+    actual_dtype = getattr(pool, "dtype", None)
+    actual_compute = getattr(pool, "compute_dtype", None)
+    if (
+        actual_dtype != torch.float8_e4m3fn
+        or actual_compute != compute_dtype
+        or missing
+    ):
+        backend = getattr(config, "attention_backend", "unknown")
+        detail = f"missing metadata {missing}" if missing else (
+            f"storage dtype={actual_dtype}, compute dtype={actual_compute}"
+        )
+        raise ValueError(
+            f"attention backend {backend!r} selected FP8 KV, but "
+            f"{type(pool).__name__} has no matching FP8 pool ({detail})"
+        )
+    return pool
 
 
 def create_kvcache_pool(
@@ -129,7 +162,9 @@ def create_kvcache_pool(
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
     num_speculative_tokens: int = 0,
+    kv_dtype: torch.dtype | None = None,
 ) -> BaseKVCachePool:
+    kv_dtype = kv_dtype or dtype
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
 
@@ -140,7 +175,7 @@ def create_kvcache_pool(
             page_size=page_size,
             num_swa_tokens=num_swa_tokens,
             device=device,
-            dtype=dtype,
+            dtype=kv_dtype,
         )
 
     from .mha_pool import MHAKVCache
@@ -207,6 +242,7 @@ def create_kvcache_pool(
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,
+            kv_dtype=kv_dtype,
             device=device,
             index_head_dim=spec.index_head_dim,
             num_index_layers=spec.num_index_layers,
@@ -250,7 +286,8 @@ def create_kvcache_pool(
         num_layers=model_config.num_layers,
         head_dim=head_dim,
         device=device,
-        dtype=dtype,
+        dtype=kv_dtype,
+        compute_dtype=dtype,
         layer_ids=layer_ids,
     )
 

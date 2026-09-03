@@ -133,6 +133,7 @@ def _emit_all(path: str) -> None:
         nvfp4_dense_linear, nvfp4_dense_linear_t, nvfp4_transpose_resident,
     )
     from freetoken.kernel.triton.nvfp4_dequant import dequant_nvfp4
+    from freetoken.kernel.triton.qsa import qsa_sparse_paged_attention
     from freetoken.moe.fused_nvfp4 import (
         fused_experts_decode_nvfp4_marlin, fused_experts_decode_nvfp4_serial,
         fused_experts_nvfp4,
@@ -189,6 +190,20 @@ def _emit_all(path: str) -> None:
         fused_experts_decode_fp8_blockscale(hidden, gu, gus, dn, dns, tw, tids))
     out["moe_prefill_fp8"] = f32(
         fused_experts_fp8_blockscale(hidden, gu, gus, dn, dns, tw, tids, E))
+
+    # QSA sparse attention over unit-scale e4m3 K/V.
+    qsa_q = torch.randn(2, 8, 16, dtype=torch.bfloat16, device=dev)
+    qsa_k = torch.randn(1, 64, 2, 16, device=dev).to(FP8)
+    qsa_v = torch.randn(1, 64, 2, 16, device=dev).to(FP8)
+    qsa_indices = torch.arange(16, dtype=torch.int32, device=dev).repeat(2, 1)
+    out["qsa_attend"] = f32(qsa_sparse_paged_attention(
+        qsa_q,
+        qsa_k,
+        qsa_v,
+        qsa_indices,
+        torch.zeros(1, 1, dtype=torch.int32, device=dev),
+        torch.zeros(2, dtype=torch.int32, device=dev),
+    ))
 
     # nvfp4 dense: row-major + transposed resident, gemv / in-kernel gemm / scratch gemm
     N, K = 128, 256

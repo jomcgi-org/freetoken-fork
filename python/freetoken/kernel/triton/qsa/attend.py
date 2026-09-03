@@ -9,6 +9,13 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.kernel.kv_scale import require_unit_kv_scales
+from freetoken.kernel.triton.e4m3_compat import (
+    e4m3_kernel_view,
+    e4m3_native_cx,
+    e4m3_u8_to_f32,
+)
+
 
 @triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
@@ -41,6 +48,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     PAGE_TABLE_WIDTH: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    KV_IS_FP8: tl.constexpr,
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     NUM_TILES: tl.constexpr,
@@ -119,6 +127,19 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             mask=valid[:, None],
             other=0.0,
         )
+        # FP8 cache loads use the backend's static per-head unit scale. In
+        # emulation mode the host passes uint8 views, so decode only the
+        # selected tile before converting it to the query compute dtype.
+        if KV_IS_FP8:
+            if e4m3_native_cx():
+                keys = keys.to(query.dtype)
+                values = values.to(query.dtype)
+            else:
+                keys = e4m3_u8_to_f32(keys).to(query.dtype)
+                values = e4m3_u8_to_f32(values).to(query.dtype)
+        else:
+            keys = keys.to(query.dtype)
+            values = values.to(query.dtype)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -232,8 +253,13 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    *,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA directly over paged BF16 or e4m3 K/V caches."""
+
+    require_unit_kv_scales(k_scale, v_scale)
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -247,7 +273,8 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    assert k_cache.dtype == v_cache.dtype
+    assert k_cache.dtype in (q.dtype, torch.float8_e4m3fn)
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
@@ -258,6 +285,11 @@ def qsa_sparse_paged_attention(
     assert out.shape == q.shape and out.dtype == q.dtype and out.stride(2) == 1
     if not q.shape[0]:
         return out
+
+    kv_is_fp8 = k_cache.dtype == torch.float8_e4m3fn
+    if kv_is_fp8:
+        k_cache = e4m3_kernel_view(k_cache)
+        v_cache = e4m3_kernel_view(v_cache)
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
@@ -329,6 +361,7 @@ def qsa_sparse_paged_attention(
         PAGE_TABLE_WIDTH=block_table.shape[1],
         GROUP_SIZE=group_size,
         HEAD_DIM=q.shape[2],
+        KV_IS_FP8=kv_is_fp8,
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         NUM_TILES=num_tiles,

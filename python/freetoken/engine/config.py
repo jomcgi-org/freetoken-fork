@@ -21,6 +21,9 @@ class EngineConfig:
     dtype: torch.dtype
     max_running_req: int = 4
     attention_backend: str = "auto"
+    # FULL-attention K/V storage. "auto" is resolved after the attention
+    # backend and assigned GPU are known.
+    kv_cache_dtype: str = "auto"
     moe_backend: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
@@ -172,6 +175,11 @@ class EngineConfig:
 
         validate_speculative_mtp(self.speculative_mtp)
         validate_mtp_draft_tokens(self.mtp_draft_tokens)
+        if self.kv_cache_dtype not in ("auto", "bf16", "fp8_e4m3"):
+            raise ValueError(
+                "--kv-cache-dtype must be 'auto', 'bf16', or 'fp8_e4m3', got "
+                f"{self.kv_cache_dtype!r}"
+            )
         if self.bank_source not in ("auto", "ftw", "index"):
             raise ValueError(
                 "--bank-source must be 'auto', 'ftw', or 'index', got "

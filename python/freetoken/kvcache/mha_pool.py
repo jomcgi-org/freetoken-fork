@@ -22,6 +22,14 @@ class MHAKVCache(BaseKVCachePool):
     dense slot, avoiding a multiple-x over-allocation of unused slabs.
     """
 
+    @classmethod
+    def kv_dtype_for_config(
+        cls, config, compute_dtype: torch.dtype | None = None
+    ) -> torch.dtype:
+        if getattr(config, "kv_cache_dtype", "bf16") == "fp8_e4m3":
+            return torch.float8_e4m3fn
+        return compute_dtype or config.dtype
+
     def __init__(
         self,
         num_kv_heads: int,
@@ -32,6 +40,7 @@ class MHAKVCache(BaseKVCachePool):
         dtype: torch.dtype,
         device: torch.device,
         layer_ids: Sequence[int] | None = None,
+        compute_dtype: torch.dtype | None = None,
     ) -> None:
         tp_info = get_tp_info()
         local_kv_heads = div_even(num_kv_heads, tp_info.size, allow_replicate=True)
@@ -55,6 +64,12 @@ class MHAKVCache(BaseKVCachePool):
         self._k_buffer = self._kv_buffer[0]
         self._v_buffer = self._kv_buffer[1]
         self._device = device
+        self._compute_dtype = compute_dtype or dtype
+        # FlashInfer accepts scalar K/V dequant scales. QSA explicitly rejects
+        # non-unit scales until its kernel applies them. Unit scales are static
+        # and broadcast to every KV head, so no per-token scale slab is allocated.
+        self._k_scale = 1.0
+        self._v_scale = 1.0
         self._storage_shape = (num_pages * page_size, local_kv_heads, head_dim)
 
     def rebuild(self, num_pages: int) -> None:
@@ -142,6 +157,18 @@ class MHAKVCache(BaseKVCachePool):
     @property
     def dtype(self) -> torch.dtype:
         return self._kv_buffer.dtype
+
+    @property
+    def compute_dtype(self) -> torch.dtype:
+        return self._compute_dtype
+
+    @property
+    def k_scale(self) -> float:
+        return self._k_scale
+
+    @property
+    def v_scale(self) -> float:
+        return self._v_scale
 
     @property
     def num_layers(self) -> int:

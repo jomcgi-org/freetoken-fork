@@ -100,6 +100,7 @@ class Scheduler(SchedulerIOMixin):
                     identity=identity,
                     checkpoint_fingerprint=checkpoint_fingerprint,
                     config_hash=config_hash,
+                    kv_dtype=config.kv_cache_dtype,
                     lazy_restore=config.lazy_restore == "on",
                     hot_blocks=hot_blocks,
                 )
@@ -107,6 +108,7 @@ class Scheduler(SchedulerIOMixin):
                     f"Disk prefix cache enabled at {config.kv_disk_cache_dir!r}, "
                     f"budget={config.kv_disk_cache_gib:.2f} GiB, "
                     f"lazy_restore={config.lazy_restore}, hot_blocks={hot_blocks}, "
+                    f"kv_dtype={config.kv_cache_dtype}, "
                     f"fingerprint={checkpoint_fingerprint}, config={config_hash[:12]}"
                 )
 

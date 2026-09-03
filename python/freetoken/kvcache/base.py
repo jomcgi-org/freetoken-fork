@@ -18,18 +18,27 @@ class CacheRebuildRejected(Exception):
 
 def spec_kv_bytes_per_token(spec, config) -> int:
     """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
-    per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
-    branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)
+    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. The
+    selected pool family supplies its actual storage dtype, then pool families compose
+    this arithmetic over THEIR OWN groups. (2 bytes/elem == the torch.bfloat16
+    dsa_pool.DSAKVCache._alloc hardcodes; keep the two in lockstep if the slab dtype ever
+    changes.)
 
     ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
     ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
+    # Price the dtype the selected pool family actually allocates. This keeps a
+    # future backend capability flag from discounting BSA, SWA, or latent pools
+    # that have not implemented FP8 conversion and scale metadata.
+    from . import resolve_pool_class
+
+    kv_itemsize = resolve_pool_class(config.model_config).kv_dtype_for_config(
+        config
+    ).itemsize
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
         * div_even(spec.num_kv_heads, config.tp_info.size, allow_replicate=True)
-        * config.dtype.itemsize
+        * kv_itemsize
         * spec.num_layers
     )
     return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
@@ -44,6 +53,13 @@ class BaseKVCachePool(ABC):
     # Pools whose buffers are bound into per-forward model scratch (DSV4's tiers) need the
     # model re-bound after a rebuild; the engine asks before it resizes.
     needs_rebind_on_rebuild: ClassVar[bool] = False
+
+    @classmethod
+    def kv_dtype_for_config(
+        cls, config, compute_dtype: torch.dtype | None = None
+    ) -> torch.dtype:
+        """Storage dtype this pool family will allocate for ``config``."""
+        return compute_dtype or config.dtype
 
     # ---- sizing/cost classmethods: run BEFORE the pool exists (startup budget solve,
     # --moe-cache-auto). The engine measures memory and passes bytes in; each pool family

@@ -57,7 +57,8 @@ class FIMetadata(BaseAttnMetadata):
     page_size:          Literal[1] # currently only support page_size=1
     pos_encoding_mode:  str
     seq_lens_cpu:       torch.Tensor  # on cpu
-    dtype:              torch.dtype
+    q_dtype:            torch.dtype
+    kv_dtype:           torch.dtype
     wrapper:            BatchPrefillWithPagedKVCacheWrapper | BatchDecodeWithPagedKVCacheWrapper
     initialized:        bool = False
     # fmt: on
@@ -165,9 +166,8 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                data_type=metadata.dtype,
-                q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                q_data_type=metadata.q_dtype,
+                kv_data_type=metadata.kv_dtype,
                 non_blocking=True,
             )
         else:
@@ -182,8 +182,8 @@ class FlashInferBackend(BaseAttnBackend):
                 page_size=metadata.page_size,
                 pos_encoding_mode=metadata.pos_encoding_mode,
                 seq_lens=metadata.seq_lens_cpu,
-                q_data_type=metadata.dtype,
-                kv_data_type=metadata.dtype,
+                q_data_type=metadata.q_dtype,
+                kv_data_type=metadata.kv_dtype,
                 non_blocking=True,
                 causal=True,
             )
@@ -220,7 +220,13 @@ class FlashInferBackend(BaseAttnBackend):
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
         kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
-        return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
+        run_kwargs = {"q": q, "paged_kv_cache": kv_cache}
+        if metadata.kv_dtype == torch.float8_e4m3fn:
+            run_kwargs.update(
+                k_scale=self.kvcache.k_scale,
+                v_scale=self.kvcache.v_scale,
+            )
+        return metadata.wrapper.run(**run_kwargs)
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
@@ -255,7 +261,8 @@ class FlashInferBackend(BaseAttnBackend):
             page_size=1,
             pos_encoding_mode="NONE",
             seq_lens_cpu=seq_len_cpu,
-            dtype=self.kvcache.dtype,
+            q_dtype=self.kvcache.compute_dtype,
+            kv_dtype=self.kvcache.dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
         )
 

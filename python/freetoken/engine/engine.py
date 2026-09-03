@@ -13,7 +13,7 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from freetoken.gpu_select import gpu_identity
+from freetoken.gpu_select import assigned_visible_gpu, gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
@@ -139,6 +139,39 @@ def _backend_requirements_met(name: str) -> bool:
     if any(i.requires_sm100 for i in infos) and not is_sm100_family():
         return False
     return True
+
+
+def _current_cuda_capability() -> tuple[int, int] | None:
+    try:
+        return tuple(torch.cuda.get_device_capability(assigned_visible_gpu()))
+    except (AssertionError, RuntimeError):
+        return None
+
+
+def _resolve_kv_cache_dtype(
+    requested: str,
+    attention_backend: str,
+    capability: tuple[int, int] | None,
+) -> tuple[str, str]:
+    """Resolve FULL-attention KV storage and return its startup explanation."""
+    if requested not in ("auto", "bf16", "fp8_e4m3"):
+        raise ValueError(f"unsupported KV cache dtype {requested!r}")
+    if requested == "bf16":
+        return "bf16", "explicitly requested"
+
+    if capability is None:
+        return "bf16", "no CUDA compute capability is available"
+    if capability < (8, 9):
+        return "bf16", f"sm_{capability[0]}{capability[1]} lacks native FP8 support"
+
+    unsupported = [
+        part
+        for part in attention_backend.split(",")
+        if not attention_backend_info(part).supports_fp8_kv
+    ]
+    if unsupported:
+        return "bf16", f"attention backend {','.join(unsupported)!r} cannot consume FP8 KV"
+    return "fp8_e4m3", f"sm_{capability[0]}{capability[1]} and {attention_backend} support FP8 KV"
 
 
 def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
@@ -2482,6 +2515,18 @@ def _adjust_config(config: EngineConfig):
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
     _validate_attention_backend_choice(config, override, required_attn_types)
 
+    requested_kv_dtype = getattr(config, "kv_cache_dtype", "auto")
+    resolved_kv_dtype, kv_dtype_reason = _resolve_kv_cache_dtype(
+        requested_kv_dtype,
+        config.attention_backend,
+        _current_cuda_capability(),
+    )
+    override("kv_cache_dtype", resolved_kv_dtype)
+    logger.info_rank0(
+        f"KV cache dtype: kv_dtype={resolved_kv_dtype}, requested={requested_kv_dtype}, "
+        f"reason={kv_dtype_reason}"
+    )
+
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts
         override("moe_cache_size", math.ceil(total_experts * config.moe_cache_rate))
@@ -2727,6 +2772,7 @@ def _adjust_config(config: EngineConfig):
     # hit an "Auto-selected ..." log at all).
     resolved = [
         f"attention_backend={config.attention_backend!r}",
+        f"kv_dtype={config.kv_cache_dtype!r}",
         f"cache_type={getattr(config, 'cache_type', 'radix')!r}",
         f"page_size={config.page_size}",
     ]

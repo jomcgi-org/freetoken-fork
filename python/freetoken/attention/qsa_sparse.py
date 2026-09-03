@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Callable, List
 
 import torch
 from freetoken.core import Batch, get_global_ctx
+from freetoken.kernel.kv_scale import require_unit_kv_scales
 from freetoken.utils import init_logger
 
 from .base import AttentionSpec, BaseAttnBackend, BaseAttnMetadata
@@ -108,8 +109,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
         assert isinstance(self.kvcache, QSAKVCache), (
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
+        require_unit_kv_scales(self.kvcache.k_scale, self.kvcache.v_scale)
         self.device = self.kvcache.device
-        self.dtype = self.kvcache.dtype
+        # Indexer scratch and compressed-key tiers stay in the model compute
+        # dtype even when the separate attention K/V slabs use e4m3 storage.
+        self.dtype = self.kvcache.compute_dtype
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -324,6 +328,8 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale=self.kvcache.k_scale,
+            v_scale=self.kvcache.v_scale,
         )
 
     def _ensure_lazy_kv(

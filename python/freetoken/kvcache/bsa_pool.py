@@ -34,6 +34,13 @@ class BSAKVCache(MHAKVCache):
     page_size]`` -- serves K/V and index keys alike.
     """
 
+    @classmethod
+    def kv_dtype_for_config(
+        cls, config, compute_dtype: torch.dtype | None = None
+    ) -> torch.dtype:
+        # The sparse M3 attend kernel has no FP8 load path yet.
+        return compute_dtype or config.dtype
+
     def __init__(
         self,
         num_kv_heads: int,
