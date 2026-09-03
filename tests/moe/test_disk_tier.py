@@ -174,6 +174,8 @@ def test_real_hot_split_geometry_uses_slots_beyond_expert_domain():
         hot_expert_ids={layer_id: tuple(range(hot_rows)) for layer_id in range(layers)},
     )
     cache._restore_hot_slot_metadata()
+    alpha = torch.arange(layers * experts, dtype=torch.float32)
+    cache.set_alphas(alpha, alpha + 1)
 
     first_slot = cache._hot_slot_for_row[0][0]
     last_slot = cache._hot_slot_for_row[layers - 1][-1]
@@ -181,6 +183,19 @@ def test_real_hot_split_geometry_uses_slots_beyond_expert_domain():
     assert last_slot > experts
     assert cache.id_of_slot[last_slot].item() == ((layers - 1) * experts + hot_rows - 1)
     assert cache.id_of_slot[last_slot].item() % experts == hot_rows - 1
+    views, last_layer_alphas, row_count = cache.prefill_slot_tables(layers - 1)
+    assert last_layer_alphas is not None
+    assert {table.shape[0] for table in (*views, *last_layer_alphas)} == {cache_size}
+    assert last_layer_alphas[0][last_slot].item() == (layers - 1) * experts + hot_rows - 1
+    route_ids = torch.tensor([[first_slot, last_slot]], dtype=torch.int32)
+    assert row_count == cache_size
+    assert int(route_ids.max()) < row_count
+    layer_sized_alphas = (alpha[:experts], alpha[:experts])
+    cache.alphas_for_slots = lambda _layer_id: layer_sized_alphas
+    with pytest.raises(
+        AssertionError, match=r"alpha table gate_up_alpha has 512 rows, expected 2564"
+    ):
+        cache.prefill_slot_tables(layers - 1)
 
 
 def test_disk_stats_report_hot_pair_rate_and_reset():
@@ -1111,7 +1126,16 @@ def test_disk_hot_cold_split_weight_accounting():
 
 
 def _prefill_hot_split_fixture(
-    monkeypatch, *, hot_slots, split="on", oom=False, model_type="qwen4_exp"
+    monkeypatch,
+    *,
+    hot_slots,
+    split="on",
+    split_kernel="grouped",
+    with_slot_tables=False,
+    oom=False,
+    unsupported_grouped=False,
+    quant_format="nvfp4",
+    model_type="qwen4_exp",
 ):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer
@@ -1137,11 +1161,23 @@ def _prefill_hot_split_fixture(
         calls.append(("prepare", cold))
         return object()
 
+    bank_tables = (
+        torch.empty((12, 0), dtype=torch.bfloat16),
+        torch.empty((12, 0), dtype=torch.bfloat16),
+    )
+
+    def bank_views():
+        views = (bank_tables[0], bank_tables[1])
+        calls.append(("bank_views", views))
+        return views
+
     cache = SimpleNamespace(
         model_config=SimpleNamespace(model_type=model_type),
         layer_residency=["disk"],
         moe_disk_prefill="cpu",
         moe_prefill_hot_split=split,
+        moe_prefill_split_kernel=split_kernel,
+        quant_format=quant_format,
         prefill_overlap=False,
         cpu_executor=Executor(),
         cache_size=12,
@@ -1153,15 +1189,18 @@ def _prefill_hot_split_fixture(
             ("schedule", ids.clone())
         ),
         prefetch_disk_experts=lambda layer_id, ids: calls.append(("prefetch",)),
-        bank_views=lambda: (
-            torch.empty((12, 0), dtype=torch.bfloat16),
-            torch.empty((12, 0), dtype=torch.bfloat16),
-        ),
+        bank_views=bank_views,
         alphas_for_slots=lambda layer_id: None,
         record_prefill_hot_split=lambda raw, mask: calls.append(
             ("stats", raw.clone(), mask.clone())
         ),
     )
+    if with_slot_tables:
+        def prefill_slot_tables(layer_id):
+            calls.append(("slot_tables", layer_id))
+            return cache.bank_views(), None, 12
+
+        cache.prefill_slot_tables = prefill_slot_tables
     layer = OffloadMoELayer(
         layer_id=0,
         num_experts=4,
@@ -1172,6 +1211,7 @@ def _prefill_hot_split_fixture(
     layer.offload_cache = cache
 
     def gpu_gemm(*args, **kwargs):
+        calls.append(("gpu_views", kwargs["views"], kwargs["is_prefill"]))
         calls.append(
             (
                 "gpu",
@@ -1183,6 +1223,8 @@ def _prefill_hot_split_fixture(
         )
         if oom:
             raise torch.OutOfMemoryError("synthetic CUDA out of memory")
+        if unsupported_grouped and kwargs["is_prefill"]:
+            raise AssertionError("synthetic grouped geometry")
         # Match fused_experts_impl's prefill contract: it overwrites and returns
         # its hidden-state input. The split must protect the CPU input from this.
         args[2].copy_(gpu_output)
@@ -1200,12 +1242,16 @@ def _prefill_hot_split_fixture(
 @pytest.mark.parametrize(
     "model_type", ["qwen4_exp", "glm4_moe", "glm_moe_dsa", "glm5_next"]
 )
+@pytest.mark.parametrize("with_slot_tables", [False, True])
 def test_prefill_hot_split_populates_and_batches_only_cold_routes(
-    monkeypatch, model_type
+    monkeypatch, model_type, with_slot_tables
 ):
     layer, hidden, weights, ids, calls, cpu_out, gpu_out = (
         _prefill_hot_split_fixture(
-            monkeypatch, hot_slots=[7, -1, 9, -1], model_type=model_type
+            monkeypatch,
+            hot_slots=[7, -1, 9, -1],
+            model_type=model_type,
+            with_slot_tables=with_slot_tables,
         )
     )
 
@@ -1227,11 +1273,12 @@ def test_prefill_hot_split_populates_and_batches_only_cold_routes(
     # Cold routes are clamped to a slot this chunk has resident (the first hot
     # slot, 7), never to slot 0, which may be unwritten on a fresh cache.
     assert gpu[2].tolist() == [[7, 7], [9, 7], [7, 7]]
-    assert gpu[3:] == (None, False)
+    assert gpu[3:] == (12, True)
     adaptation = next(call[1] for call in calls if call[0] == "adapt")
     assert adaptation.tolist() == [[0, 1], [2, 3], [0, 3]]
     stats = next(call for call in calls if call[0] == "stats")
     assert int(stats[2].sum()) == 3
+    assert any(call[0] == "slot_tables" for call in calls) is with_slot_tables
 
 
 @pytest.mark.parametrize(
@@ -1255,7 +1302,7 @@ def test_prefill_hot_split_degrades_to_full_cpu(monkeypatch, hot_slots, oom):
 
 def test_prefill_hot_split_rejects_slot_outside_bank_before_gemm(monkeypatch):
     layer, hidden, weights, ids, calls, _cpu_out, _gpu_out = _prefill_hot_split_fixture(
-        monkeypatch, hot_slots=[12, -1, 9, -1]
+        monkeypatch, hot_slots=[12, -1, 9, -1], split_kernel="decode"
     )
 
     with pytest.raises(
@@ -1264,6 +1311,94 @@ def test_prefill_hot_split_rejects_slot_outside_bank_before_gemm(monkeypatch):
         layer._prefill_routed(hidden, weights, ids)
 
     assert not any(call[0] == "gpu" for call in calls)
+
+
+def test_prefill_hot_split_decode_kernel_flag_preserves_ab_path(monkeypatch):
+    layer, hidden, weights, ids, calls, _cpu_out, _gpu_out = (
+        _prefill_hot_split_fixture(
+            monkeypatch,
+            hot_slots=[7, -1, 9, -1],
+            split_kernel="decode",
+        )
+    )
+
+    layer._prefill_routed(hidden, weights, ids)
+
+    gpu = next(call for call in calls if call[0] == "gpu")
+    assert gpu[3:] == (None, False)
+
+
+def test_prefill_hot_split_grouped_assertion_falls_back_once_per_cache(
+    monkeypatch, caplog
+):
+    layer, hidden, weights, ids, calls, _cpu_out, _gpu_out = (
+        _prefill_hot_split_fixture(
+            monkeypatch,
+            hot_slots=[7, -1, 9, -1],
+            unsupported_grouped=True,
+            with_slot_tables=True,
+        )
+    )
+
+    layer._prefill_routed(hidden, weights, ids.clone())
+    layer._prefill_routed(hidden, weights, ids.clone())
+
+    second_layer = type(layer)(
+        layer_id=1,
+        num_experts=4,
+        top_k=2,
+        hidden_size=8,
+        intermediate_size=8,
+    )
+    layer.offload_cache.layer_residency = ["disk", "disk"]
+    second_layer.offload_cache = layer.offload_cache
+    second_layer._prefill_routed(hidden, weights, ids.clone())
+
+    gpu_calls = [call for call in calls if call[0] == "gpu"]
+    assert [call[3:] for call in gpu_calls] == [
+        (12, True), (None, False), (None, False), (12, True), (None, False)
+    ]
+    assert layer._prefill_split_grouped_disabled
+    assert second_layer._prefill_split_grouped_disabled
+    assert layer.offload_cache._prefill_split_grouped_fallback_warned
+    first_split_views = next(call[1] for call in calls if call[0] == "bank_views")
+    grouped_views = next(
+        call[1]
+        for call in calls
+        if call[0] == "gpu_views" and call[2]
+    )
+    fallback_views = next(
+        call[1]
+        for call in calls
+        if call[0] == "gpu_views" and not call[2]
+    )
+    assert grouped_views is not first_split_views
+    assert fallback_views is first_split_views
+    warnings = [
+        record for record in caplog.records
+        if "Grouped HOT prefill is unsupported" in record.message
+    ]
+    assert len(warnings) == 1
+
+
+def test_prefill_hot_split_non_nvfp4_skips_grouped_silently(monkeypatch, caplog):
+    layer, hidden, weights, ids, calls, _cpu_out, _gpu_out = (
+        _prefill_hot_split_fixture(
+            monkeypatch,
+            hot_slots=[7, -1, 9, -1],
+            unsupported_grouped=True,
+            quant_format="bf16",
+        )
+    )
+
+    layer._prefill_routed(hidden, weights, ids)
+
+    gpu = next(call for call in calls if call[0] == "gpu")
+    assert gpu[3:] == (None, False)
+    assert not any(
+        "Grouped HOT prefill is unsupported" in record.message
+        for record in caplog.records
+    )
 
 
 def test_prefill_hot_split_flag_off_preserves_full_cpu_path(monkeypatch):
