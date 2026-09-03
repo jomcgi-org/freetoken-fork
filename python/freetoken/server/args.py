@@ -844,6 +844,34 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-plan-persist",
+        choices=["auto", "on", "off"],
+        default=ServerArgs.moe_hot_plan_persist,
+        help=(
+            "Persist the adapted HOT expert plan across restarts. 'auto' reads an "
+            "existing plan and writes when the plan directory is writable (default); "
+            "'on' requests the same behavior with an explicit startup warning if writes "
+            "are unavailable; 'off' disables reads and writes."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-plan-dir",
+        type=str,
+        default=ServerArgs.moe_hot_plan_dir,
+        help=(
+            "Directory for freetoken_hot_plan.json. Defaults to the model directory."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-plan-interval-minutes",
+        type=float,
+        default=ServerArgs.moe_hot_plan_interval_minutes,
+        help="Minutes between background HOT plan writes (default: 10).",
+    )
+
+    parser.add_argument(
         "--moe-collect-stats",
         action="store_true",
         default=ServerArgs.moe_collect_stats,

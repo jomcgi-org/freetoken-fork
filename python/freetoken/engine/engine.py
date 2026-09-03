@@ -823,6 +823,16 @@ class Engine:
                     num_moe_layers,
                 )
             )
+            hot_expert_ids, hot_plan_seed, hot_plan_runtime = (
+                _resolve_persisted_hot_plan(
+                    config,
+                    disk_layer_ids,
+                    num_moe_layers,
+                    hot_expert_ids,
+                    hot_expert_capacity,
+                    hot_expert_bytes,
+                )
+            )
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -865,6 +875,18 @@ class Engine:
                 boundary_cap_frac=getattr(
                     config, "moe_hot_adapt_boundary_cap_frac", 0.5
                 ),
+                persisted_counter_seed=(
+                    hot_plan_seed.counters if hot_plan_seed is not None else None
+                ),
+                persisted_seeded_layers=(
+                    hot_plan_seed.seeded_layers
+                    if hot_plan_seed is not None else frozenset()
+                ),
+                hot_plan_path=hot_plan_runtime["path"],
+                hot_plan_identity=hot_plan_runtime["identity"],
+                hot_plan_tier_commit=hot_plan_runtime["tier_commit"],
+                hot_plan_write_enabled=hot_plan_runtime["write_enabled"],
+                hot_plan_interval_seconds=hot_plan_runtime["interval_seconds"],
             )
             cache.set_alphas(
                 banks.gate_up_alpha,
@@ -2115,6 +2137,130 @@ def _profiled_hot_pair_rate(
     return hot / total if total else 0.0
 
 
+def _resolve_persisted_hot_plan(
+    config: EngineConfig,
+    disk_layer_ids: frozenset[int],
+    num_moe_layers: int,
+    static_plan: dict[int, tuple[int, ...]],
+    capacity: dict[int, int],
+    expert_bytes: int,
+):
+    """Read a compatible plan before protected rows are loaded into the cache."""
+    from freetoken.moe.hot_adapt import (
+        checkpoint_identity,
+        hot_plan_directory_writable,
+        hot_plan_path,
+        load_hot_plan,
+        resolve_tier_commit,
+    )
+    from freetoken.utils.hf import download_hf_weight
+
+    mode = getattr(config, "moe_hot_plan_persist", "auto")
+    interval_seconds = float(
+        getattr(config, "moe_hot_plan_interval_minutes", 10.0)
+    ) * 60.0
+    path = hot_plan_path(config.model_path, getattr(config, "moe_hot_plan_dir", None))
+    if not capacity:
+        return static_plan, None, {
+            "path": path,
+            "identity": None,
+            "tier_commit": "",
+            "write_enabled": False,
+            "interval_seconds": interval_seconds,
+        }
+    tier_commit = resolve_tier_commit()
+    runtime = {
+        "path": path,
+        "identity": None,
+        "tier_commit": tier_commit,
+        "write_enabled": False,
+        "interval_seconds": interval_seconds,
+    }
+    if mode == "off":
+        logger.info_rank0(
+            f"MoE HOT plan persistence: read=off, write=off, tier_commit={tier_commit}"
+        )
+        logger.info_rank0(
+            "MoE HOT plan source: static profile, age=n/a, layers_seeded=0, "
+            "counters_seeded=no"
+        )
+        return static_plan, None, runtime
+
+    try:
+        resolved_model_path = download_hf_weight(config.model_path)
+        if not resolved_model_path:
+            raise ValueError("checkpoint resolver returned no local path")
+        path = hot_plan_path(
+            resolved_model_path, getattr(config, "moe_hot_plan_dir", None)
+        )
+        runtime["path"] = path
+        identity = checkpoint_identity(resolved_model_path)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning_rank0(
+            f"MoE HOT plan disabled: checkpoint path resolution or identity failed: {exc}"
+        )
+        logger.info_rank0(
+            f"MoE HOT plan persistence: read=unavailable, write=off, "
+            f"tier_commit={tier_commit}"
+        )
+        logger.info_rank0(
+            "MoE HOT plan source: static profile, age=n/a, layers_seeded=0, "
+            "counters_seeded=no"
+        )
+        return static_plan, None, runtime
+
+    runtime["identity"] = identity
+    writable = hot_plan_directory_writable(path)
+    runtime["write_enabled"] = writable and config.tp_info.is_primary()
+    exists = os.path.isfile(path)
+    seed = None
+    current_hot_budget_bytes = sum(capacity.values()) * expert_bytes
+    if exists:
+        try:
+            seed = load_hot_plan(
+                path,
+                identity=identity,
+                disk_layer_ids=disk_layer_ids,
+                num_layers=num_moe_layers,
+                num_experts=config.model_config.num_experts,
+                current_capacity=capacity,
+                current_hot_budget_bytes=current_hot_budget_bytes,
+                static_expert_ids=static_plan,
+                tier_commit=tier_commit,
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning_rank0(f"MoE HOT persisted plan ignored: {exc}")
+    logger.info_rank0(
+        f"MoE HOT plan persistence: read={'present' if exists else 'absent'}, "
+        f"write={'on' if runtime['write_enabled'] else 'off'}, path={path!r}, "
+        f"resolved_model_path={resolved_model_path!r}, tier_commit={tier_commit}"
+    )
+    if mode == "on" and not writable:
+        logger.warning_rank0(
+            f"--moe-hot-plan-persist on cannot write plan directory for {path!r}"
+        )
+    if seed is None:
+        logger.info_rank0(
+            "MoE HOT plan source: static profile, age=n/a, layers_seeded=0, "
+            "counters_seeded=no"
+        )
+        return static_plan, None, runtime
+    if seed.tier_mismatch:
+        logger.warning_rank0(
+            f"MoE HOT persisted plan tier_commit={seed.tier_commit} differs from "
+            f"serving tier_commit={tier_commit}; loading it because checkpoint identity matches"
+        )
+    logger.info_rank0(
+        f"MoE HOT plan source: persisted file {path!r}, age={seed.age_seconds:.0f}s, "
+        f"layers_seeded={len(seed.seeded_layers)}/{len(disk_layer_ids)}, "
+        f"counters_seeded={'yes' if seed.counters else 'no'}, "
+        f"plan was saved at {seed.saved_hot_budget_bytes} byte budget, "
+        f"current is {current_hot_budget_bytes}, "
+        f"tier_commit={seed.tier_commit}"
+    )
+    return seed.expert_ids, seed, runtime
+
+
 def _resolve_hot_expert_setup(
     config: EngineConfig,
     disk_layer_ids: frozenset[int],
@@ -2334,6 +2480,9 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
     "moe_hot_adapt_boundary_cap_frac": 0.5,
+    "moe_hot_plan_persist": "auto",
+    "moe_hot_plan_dir": None,
+    "moe_hot_plan_interval_minutes": 10.0,
     "moe_disk_prefill": "cpu",
     "moe_prefill_coalesce": "populate",
     "moe_prefill_hot_split": "on",

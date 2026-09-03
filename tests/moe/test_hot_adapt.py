@@ -620,3 +620,754 @@ def test_rebuild_drains_hot_adaptation_before_replacing_bank_caches(monkeypatch)
     finally:
         release.set()
         cache.shutdown_hot_adaptation()
+
+
+def test_persisted_counter_seed_survives_reset(monkeypatch):
+    import torch
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    kernels = ModuleType("freetoken.moe.offload_kernels")
+    kernels.reset_cache = lambda _cache: None
+    monkeypatch.setitem(sys.modules, "freetoken.moe.offload_kernels", kernels)
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.device = torch.device("cpu")
+    cache.decayed_decode_freq = torch.full((2, 3), 99.0)
+    cache._hot_plan_counter_seed = {0: (1.0, 2.0, 3.0)}
+    cache._restore_hot_slot_metadata = lambda: None
+    cache.expert_recency = torch.zeros((2, 3), dtype=torch.int64)
+    cache.session_profile_ids = None
+    cache.cpu_executor = None
+
+    cache.reset()
+
+    assert cache.decayed_decode_freq[0].tolist() == [1.0, 2.0, 3.0]
+    assert cache.decayed_decode_freq[1].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_fully_persisted_seed_starts_fill_complete(monkeypatch):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    sources = {
+        "gate_up": [torch.arange(4 * 3, dtype=torch.int32).view(4, 3)],
+        "down": [torch.arange(4 * 2, dtype=torch.int32).view(4, 2)],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size() for bank in sources.values()
+    )
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=6,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (1, 3)},
+        hot_expert_capacity={0: 2},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps="auto",
+        max_swap_bytes=expert_bytes,
+        expert_bytes=expert_bytes,
+        persisted_counter_seed={0: (1.0, 9.0, 2.0, 8.0)},
+        persisted_seeded_layers=frozenset({0}),
+    )
+    try:
+        assert cache._hot_adapt_interval_controller.fill_complete
+        assert cache.hot_adapt_interval_steps == 1000
+        assert cache.decayed_decode_freq[0].tolist() == [1.0, 9.0, 2.0, 8.0]
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_missing_persisted_layer_keeps_fill_interval(monkeypatch):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    sources = {
+        "gate_up": [
+            torch.arange(4 * 3, dtype=torch.int32).view(4, 3),
+            torch.arange(4 * 3, dtype=torch.int32).view(4, 3) + 100,
+        ],
+        "down": [
+            torch.arange(4 * 2, dtype=torch.int32).view(4, 2),
+            torch.arange(4 * 2, dtype=torch.int32).view(4, 2) + 100,
+        ],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size() for bank in sources.values()
+    )
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=6,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0, 1})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value] * 2,
+        hot_expert_ids={0: (1,), 1: (2,)},
+        hot_expert_capacity={0: 1, 1: 1},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps="auto",
+        max_swap_bytes=expert_bytes,
+        expert_bytes=expert_bytes,
+        persisted_counter_seed={0: (1.0, 9.0, 2.0, 8.0)},
+        persisted_seeded_layers=frozenset({0}),
+    )
+    try:
+        controller = cache._hot_adapt_interval_controller
+        assert not controller.fill_complete
+        assert cache.hot_adapt_interval_steps == controller.fill_interval
+        assert cache.decayed_decode_freq[1].tolist() == [0.0] * 4
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_periodic_plan_snapshot_writes_from_background_worker(monkeypatch, tmp_path):
+    import json
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    sources = {
+        "gate_up": [torch.arange(4 * 3, dtype=torch.int32).view(4, 3)],
+        "down": [torch.arange(4 * 2, dtype=torch.int32).view(4, 2)],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size() for bank in sources.values()
+    )
+    identity = {"kind": "ftw", "path": "/model", "shards": []}
+    path = tmp_path / "freetoken_hot_plan.json"
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=6,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (1, 3)},
+        hot_expert_capacity={0: 2},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps="auto",
+        max_swap_bytes=expert_bytes,
+        expert_bytes=expert_bytes,
+        hot_plan_path=str(path),
+        hot_plan_identity=identity,
+        hot_plan_tier_commit="tier-test",
+        hot_plan_write_enabled=True,
+        hot_plan_interval_seconds=0.001,
+    )
+    try:
+        cache.decayed_decode_freq[0].copy_(torch.tensor([1.0, 9.0, 2.0, 8.0]))
+        future = cache.snapshot_hot_plan(force=True)
+        assert future is not None
+        assert future.result(timeout=5)
+        cache._collect_finished_hot_plan_write()
+
+        document = json.loads(path.read_text())
+        assert document["protected_slots"] == {"0": [1, 3]}
+        assert document["counter_dtype"] == "float32"
+        assert document["tier_commit"] == "tier-test"
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_shutdown_survives_periodic_and_final_plan_write_oserrors(
+    monkeypatch, tmp_path
+):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    sources = {
+        "gate_up": [torch.arange(4 * 3, dtype=torch.int32).view(4, 3)],
+        "down": [torch.arange(4 * 2, dtype=torch.int32).view(4, 2)],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size() for bank in sources.values()
+    )
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=6,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (1, 3)},
+        hot_expert_capacity={0: 2},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps="auto",
+        max_swap_bytes=expert_bytes,
+        expert_bytes=expert_bytes,
+        hot_plan_path=str(tmp_path / "freetoken_hot_plan.json"),
+        hot_plan_identity={"kind": "ftw", "path": "/model", "shards": []},
+        hot_plan_tier_commit="tier-test",
+        hot_plan_write_enabled=True,
+        hot_plan_interval_seconds=0.001,
+    )
+    cache.decayed_decode_freq[0].copy_(torch.tensor([1.0, 9.0, 2.0, 8.0]))
+    writes = []
+    warnings = []
+
+    def fail_write(_path, _document, **_kwargs):
+        writes.append(len(writes) + 1)
+        raise OSError(f"write failure {writes[-1]}")
+
+    method_globals = cache._write_hot_plan_snapshot.__globals__
+    monkeypatch.setattr(method_globals["logger"], "warning_rank0", warnings.append)
+    monkeypatch.setattr("freetoken.moe.hot_adapt.atomic_write_hot_plan", fail_write)
+
+    periodic = cache.snapshot_hot_plan(force=True)
+    assert periodic is not None
+    assert isinstance(periodic.exception(timeout=5), OSError)
+
+    cache.shutdown_hot_adaptation()
+
+    assert writes == [1, 2]
+    assert sum("MoE HOT plan write failed" in message for message in warnings) == 2
+    assert cache._hot_adapt_executor is None
+    assert cache._hot_plan_executor is None
+
+
+def test_shutdown_fences_final_write_that_misses_deadline(monkeypatch, tmp_path):
+    import threading
+    import time
+
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    sources = {
+        "gate_up": [torch.arange(4 * 3, dtype=torch.int32).view(4, 3)],
+        "down": [torch.arange(4 * 2, dtype=torch.int32).view(4, 2)],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size() for bank in sources.values()
+    )
+    path = tmp_path / "freetoken_hot_plan.json"
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=6,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (1, 3)},
+        hot_expert_capacity={0: 2},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps="auto",
+        max_swap_bytes=expert_bytes,
+        expert_bytes=expert_bytes,
+        hot_plan_path=str(path),
+        hot_plan_identity={"kind": "ftw", "path": "/model", "shards": []},
+        hot_plan_tier_commit="tier-test",
+        hot_plan_write_enabled=True,
+        hot_plan_interval_seconds=1.0,
+    )
+    cache.decayed_decode_freq[0].copy_(torch.tensor([1.0, 9.0, 2.0, 8.0]))
+    cache._drain_hot_adaptation = lambda _deadline: False
+    cache._hot_adapt_future = None
+    entered_fsync = threading.Event()
+    release_fsync = threading.Event()
+    real_fsync = __import__("os").fsync
+
+    def blocked_fsync(fd):
+        entered_fsync.set()
+        release_fsync.wait(timeout=2.0)
+        real_fsync(fd)
+
+    monkeypatch.setattr("freetoken.moe.hot_adapt.os.fsync", blocked_fsync)
+    method_globals = cache.shutdown_hot_adaptation.__globals__
+    monkeypatch.setitem(method_globals, "_HOT_PLAN_FINAL_WRITE_SECONDS", 0.05)
+    warnings = []
+    monkeypatch.setattr(method_globals["logger"], "warning_rank0", warnings.append)
+    recorded_futures = []
+    snapshot = cache.snapshot_hot_plan
+
+    def record_snapshot(**kwargs):
+        future = snapshot(**kwargs)
+        recorded_futures.append(future)
+        return future
+
+    cache.snapshot_hot_plan = record_snapshot
+
+    started = time.monotonic()
+    cache.shutdown_hot_adaptation(timeout_seconds=0.01)
+    elapsed = time.monotonic() - started
+    assert entered_fsync.is_set()
+    release_fsync.set()
+    assert recorded_futures[-1].result(timeout=2.0) is False
+
+    print(f"bounded final-write shutdown elapsed: {elapsed:.3f} s")
+    assert elapsed < 0.25
+    assert not path.exists()
+    assert any(
+        "attempted 2 experts across 1 layers; write did not confirm within 0.05 s"
+        in message
+        for message in warnings
+    )
+
+
+def test_hot_plan_fence_cancel_times_out_while_publish_holds_lock(monkeypatch):
+    from concurrent.futures import Future
+    import threading
+    import time
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    method_globals = OffloadMoeCache._abandon_hot_plan_write.__globals__
+    monkeypatch.setitem(method_globals, "_HOT_PLAN_FENCE_CANCEL_SECONDS", 0.02)
+    fence = method_globals["_HotPlanWriteFence"]()
+    write_future = Future()
+    assert write_future.set_running_or_notify_cancel()
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache._hot_plan_write_fence = fence
+    cache._hot_plan_future = write_future
+    entered_replace = threading.Event()
+    release_replace = threading.Event()
+    published = []
+    warnings = []
+
+    def blocked_replace(_source, _target):
+        entered_replace.set()
+        release_replace.wait(timeout=2.0)
+
+    monkeypatch.setattr(method_globals["os"], "replace", blocked_replace)
+    monkeypatch.setattr(method_globals["logger"], "warning_rank0", warnings.append)
+    publisher = threading.Thread(
+        target=lambda: published.append(fence.publish("source", "target")),
+        daemon=True,
+    )
+    publisher.start()
+    assert entered_replace.wait(timeout=1.0)
+
+    started = time.monotonic()
+    try:
+        cache._abandon_hot_plan_write(write_future)
+        elapsed = time.monotonic() - started
+    finally:
+        release_replace.set()
+        publisher.join(timeout=1.0)
+        write_future.set_result(True)
+
+    print(f"bounded HOT plan fence cancellation elapsed: {elapsed:.3f} s")
+    assert elapsed < 0.2
+    assert fence._cancelled
+    assert published == [True]
+    assert cache._hot_plan_write_fence is None
+    assert cache._hot_plan_future is None
+    assert any(
+        "fence lock acquire timed out; abandoning write without confirmation"
+        in message
+        for message in warnings
+    )
+
+
+def test_ordinary_tick_forwards_stop_event_and_stops_between_rows(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    import torch
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache._hot_staging_rows = 2
+    cache.bank_schema = ("gate_up",)
+    cache.bank_sources = {"gate_up": [torch.tensor([[1], [2]])]}
+    stop = threading.Event()
+    cache._hot_adapt_stop_event = stop
+    cache._hot_adapt_executor = ThreadPoolExecutor(max_workers=1)
+    cache._hot_adapt_tick_interval_tokens = 1
+    cache.hot_adapt_max_swap_bytes = 2
+    cache.hot_adapt_expert_bytes = 1
+    cache._hot_slot_owners = {0: [None, None]}
+    cache.hot_expert_ids = {0: ()}
+    cache.device = torch.device("cpu")
+    cache._hot_mapping_lists = lambda: [[-1, -1]]
+    cache._replace_hot_mapping = lambda _mapping: None
+
+    class StagingRow:
+        def copy_(self, _source):
+            stop.set()
+
+    class StagingBank:
+        def __getitem__(self, _row):
+            return StagingRow()
+
+    cache._hot_staging = [StagingBank()]
+    swaps = (
+        HotSwap(0, 0, incoming_expert=0, outgoing_expert=None),
+        HotSwap(0, 1, incoming_expert=1, outgoing_expert=None),
+    )
+
+    try:
+        cache._retire_hot_adaptation_swaps(swaps, tick_count=1)
+        copied, _elapsed = cache._hot_adapt_future.result(timeout=5)
+    finally:
+        cache._hot_adapt_executor.shutdown(wait=True)
+
+    assert copied == {(0, 0)}
+
+
+def test_shutdown_timeout_persists_last_published_slot_checkpoint(
+    monkeypatch, tmp_path
+):
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+    import json
+    import threading
+
+    import torch
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+
+    class FakeExecutor:
+        def shutdown(self, **_kwargs):
+            pass
+
+    class TimedOutFuture:
+        def result(self, timeout=None):
+            raise FuturesTimeoutError
+
+        def done(self):
+            return False
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.cpu_executor = None
+    cache._hot_plan_stop_event = threading.Event()
+    cache._hot_adapt_stop_event = threading.Event()
+    cache._hot_adapt_future = TimedOutFuture()
+    cache._hot_adapt_phase = "copy"
+    cache._hot_adapt_executor = FakeExecutor()
+    cache._hot_adapt_stop_wait_seconds = lambda: 0.0
+    cache._hot_slot_owners = {0: [None, 3]}
+    cache._hot_plan_last_published_owners = {0: (1, 3)}
+    cache._hot_plan_future = None
+    cache._hot_plan_write_enabled = True
+    from concurrent.futures import ThreadPoolExecutor
+
+    cache._hot_plan_executor = ThreadPoolExecutor(max_workers=1)
+    cache._hot_plan_path = str(tmp_path / "freetoken_hot_plan.json")
+    cache._hot_plan_identity = {"kind": "ftw", "path": "/model", "shards": []}
+    cache._hot_plan_tier_commit = "tier-test"
+    cache._hot_plan_zero_logged = False
+    cache._hot_plan_last_snapshot = 0.0
+    cache._hot_plan_interval_seconds = 1.0
+    cache.hot_expert_capacity = {0: 2}
+    cache.num_layers = 1
+    cache.num_experts = 4
+    cache.hot_adapt_hot_budget_bytes = 100
+    cache.decayed_decode_freq = torch.tensor([[1.0, 9.0, 2.0, 8.0]])
+    warnings = []
+    monkeypatch.setattr(
+        cache.shutdown_hot_adaptation.__globals__["logger"],
+        "warning_rank0",
+        warnings.append,
+    )
+
+    cache.shutdown_hot_adaptation(timeout_seconds=0.0)
+
+    document = json.loads((tmp_path / "freetoken_hot_plan.json").read_text())
+    assert document["protected_slots"] == {"0": [1, 3]}
+    assert any(
+        "wrote the last published slot set containing 2 seeded experts from 1 layers"
+        in message
+        for message in warnings
+    )
+
+
+def test_shutdown_timeout_reports_intended_snapshot_not_stale_file(
+    monkeypatch, tmp_path
+):
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+    import json
+    import threading
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+
+    class FakeExecutor:
+        def shutdown(self, **_kwargs):
+            pass
+
+    class TimedOutFuture:
+        def result(self, timeout=None):
+            raise FuturesTimeoutError
+
+        def done(self):
+            return False
+
+    path = tmp_path / "freetoken_hot_plan.json"
+    path.write_text(json.dumps({"protected_slots": {"0": [0]}}))
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.cpu_executor = None
+    cache._hot_plan_stop_event = threading.Event()
+    cache._hot_adapt_stop_event = threading.Event()
+    cache._hot_adapt_future = TimedOutFuture()
+    cache._hot_adapt_executor = FakeExecutor()
+    cache._hot_adapt_stop_wait_seconds = lambda: 0.0
+    cache._hot_plan_future = None
+    cache._hot_plan_executor = None
+    cache._hot_plan_write_enabled = False
+    cache._hot_plan_last_published_owners = {0: (1, 3)}
+    cache._hot_plan_path = str(path)
+    warnings = []
+    monkeypatch.setattr(
+        cache.shutdown_hot_adaptation.__globals__["logger"],
+        "warning_rank0",
+        warnings.append,
+    )
+
+    cache.shutdown_hot_adaptation(timeout_seconds=0.0)
+
+    assert any(
+        "attempted 2 experts across 1 layers; no plan was published" in message
+        for message in warnings
+    )
+
+
+def test_shutdown_reports_written_but_unreadable_fallback(monkeypatch):
+    from concurrent.futures import Future, TimeoutError as FuturesTimeoutError
+    import threading
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+
+    class FakeExecutor:
+        def shutdown(self, **_kwargs):
+            pass
+
+    class TimedOutFuture:
+        def result(self, timeout=None):
+            raise FuturesTimeoutError
+
+        def done(self):
+            return False
+
+    written = Future()
+    written.set_result(True)
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.cpu_executor = None
+    cache._hot_plan_stop_event = threading.Event()
+    cache._hot_adapt_stop_event = threading.Event()
+    cache._hot_adapt_future = TimedOutFuture()
+    cache._hot_adapt_executor = FakeExecutor()
+    cache._hot_adapt_stop_wait_seconds = lambda: 0.0
+    cache._hot_plan_future = None
+    cache._hot_plan_executor = None
+    cache._hot_plan_write_enabled = False
+    cache._hot_plan_last_published_owners = {0: (1, 3)}
+    cache.snapshot_hot_plan = lambda **_kwargs: written
+    cache._persisted_hot_plan_counts = lambda: None
+    warnings = []
+    monkeypatch.setattr(
+        cache.shutdown_hot_adaptation.__globals__["logger"],
+        "warning_rank0",
+        warnings.append,
+    )
+
+    cache.shutdown_hot_adaptation(timeout_seconds=0.0)
+
+    assert any(
+        "plan written and fsynced; readback failed; "
+        "the file on disk is the new plan"
+        in message
+        for message in warnings
+    )
+
+
+def test_shutdown_bounds_fake_inflight_adaptation_future(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache._hot_plan_stop_event = threading.Event()
+    cache._hot_adapt_stop_event = threading.Event()
+    cache.cpu_executor = None
+    release = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+    cache._hot_adapt_future = executor.submit(release.wait)
+    cache._hot_adapt_executor = executor
+    copy_stream = object()
+    cache._hot_adapt_copy_stream = copy_stream
+    cache._hot_plan_future = None
+    cache._hot_plan_executor = None
+    cache._hot_plan_write_enabled = False
+    cache._hot_plan_last_published_owners = {}
+    cache.hot_adapt_boundary_cap_frac = 1.0
+    cache.hot_adapt_hot_budget_bytes = 40 << 30
+    method_globals = cache.shutdown_hot_adaptation.__globals__
+    monkeypatch.setitem(method_globals, "_HOT_ADAPT_STOP_WAIT_MAX_SECONDS", 0.01)
+    monkeypatch.setitem(method_globals, "_HOT_ADAPT_EXECUTOR_JOIN_SECONDS", 0.02)
+    monkeypatch.setitem(method_globals, "_HOT_PLAN_FINAL_WRITE_SECONDS", 0.01)
+    warnings = []
+    infos = []
+    monkeypatch.setattr(method_globals["logger"], "warning_rank0", warnings.append)
+    monkeypatch.setattr(method_globals["logger"], "info_rank0", infos.append)
+
+    started = time.monotonic()
+    try:
+        cache.shutdown_hot_adaptation(timeout_seconds=0.01)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+
+    bound = 0.01 + 0.01 + 0.01 + 0.02
+    print(f"bounded in-flight adaptation shutdown elapsed: {elapsed:.3f} s")
+    assert elapsed <= bound + 0.15
+    assert cache._hot_plan_stop_event.is_set()
+    assert cache._hot_adapt_stop_event.is_set()
+    assert cache._hot_adapt_executor is executor
+    assert cache._hot_adapt_copy_stream is copy_stream
+    assert any("stop wait clamped from 82 to 0.01 s" in message for message in warnings)
+    assert any("executor join exceeded" in message for message in warnings)
+    assert sum("MoE HOT shutdown" in message for message in infos) == 4
+
+
+def test_exit_safe_executor_does_not_hold_process_at_atexit():
+    import subprocess
+    import time
+
+    script = """
+import time
+from freetoken.exit_safe_executor import ExitSafeThreadPoolExecutor
+
+executor = ExitSafeThreadPoolExecutor(max_workers=1)
+executor.submit(time.sleep, 4.0)
+"""
+    started = time.monotonic()
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=2.0)
+    elapsed = time.monotonic() - started
+
+    print(f"bounded executor process exit elapsed: {elapsed:.3f} s")
+    assert elapsed < 2.0
+
+
+def test_shutdown_continues_after_adaptation_worker_oserror(monkeypatch):
+    from concurrent.futures import Future
+    import threading
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+
+    class FakeExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def shutdown(self, **kwargs):
+            self.calls.append(kwargs)
+
+    failed = Future()
+    failed.set_exception(OSError("staging failed"))
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache._hot_plan_stop_event = threading.Event()
+    cache._hot_adapt_stop_event = threading.Event()
+    cache.cpu_executor = None
+    cache._hot_adapt_future = failed
+    cache._hot_adapt_phase = "copy"
+    cache._hot_adapt_executor = FakeExecutor()
+    cache._hot_plan_future = None
+    cache._hot_plan_executor = None
+    cache._hot_plan_write_enabled = False
+    cache._hot_plan_last_published_owners = {}
+    copy_stream = object()
+    cache._hot_adapt_copy_stream = copy_stream
+    warnings = []
+    monkeypatch.setattr(
+        cache.shutdown_hot_adaptation.__globals__["logger"],
+        "warning_rank0",
+        warnings.append,
+    )
+    executor = cache._hot_adapt_executor
+
+    cache.shutdown_hot_adaptation()
+
+    assert sum("staging failed" in message for message in warnings) == 1
+    assert executor.calls == [{"wait": True, "cancel_futures": False}]
+    assert cache._hot_adapt_copy_stream is None
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="requires CUDA")
+def test_cuda_seeded_process_has_persisted_coverage_before_first_request(monkeypatch):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    device = torch.device("cuda")
+    sources = {
+        "gate_up": [torch.arange(4 * 3, dtype=torch.int32).view(4, 3).pin_memory()],
+        "down": [torch.arange(4 * 2, dtype=torch.int32).view(4, 2).pin_memory()],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size() for bank in sources.values()
+    )
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=6,
+        device=device,
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (1, 3)},
+        hot_expert_capacity={0: 2},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps="auto",
+        max_swap_bytes=expert_bytes,
+        expert_bytes=expert_bytes,
+        persisted_counter_seed={0: (1.0, 9.0, 2.0, 8.0)},
+        persisted_seeded_layers=frozenset({0}),
+    )
+    try:
+        torch.cuda.synchronize()
+        assert cache.decayed_hot_pair_rate() == pytest.approx(17.0 / 20.0)
+        assert cache._hot_adapt_interval_controller.fill_complete
+    finally:
+        cache.shutdown_hot_adaptation()

@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import math
+import os
+import struct
+import subprocess
+import tempfile
+import time
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+from freetoken.utils import init_logger
+
+
+logger = init_logger(__name__)
+
+HOT_PLAN_VERSION = 1
+HOT_PLAN_FILENAME = "freetoken_hot_plan.json"
+HOT_PLAN_TIER_COMMIT_ENV = "FREETOKEN_TIER_COMMIT"
 
 
 # Covers the fixed mapped-host mapping/snapshot tensors and one row of rounding
@@ -17,6 +35,372 @@ HOT_ADAPT_TARGET_FILL_TOKENS = 2000
 # Keep the established identifier for compatibility; its unit is now routed tokens.
 HOT_ADAPT_STEADY_INTERVAL_STEPS = 1000
 HOT_ADAPT_MAX_STAGING_FRACTION = 0.25
+
+
+@dataclass(frozen=True)
+class HotPlanSeed:
+    """Validated persisted state selected for the current HOT geometry."""
+
+    expert_ids: dict[int, tuple[int, ...]]
+    counters: dict[int, tuple[float, ...]]
+    seeded_layers: frozenset[int]
+    age_seconds: float
+    saved_hot_budget_bytes: int
+    tier_commit: str
+    tier_mismatch: bool
+
+
+def resolve_tier_commit() -> str:
+    """Return the serving code revision without depending on the model directory."""
+    env_value = os.environ.get(HOT_PLAN_TIER_COMMIT_ENV, "").strip()
+    if env_value:
+        logger.info_rank0(
+            f"HOT plan tier commit={env_value!r} source={HOT_PLAN_TIER_COMMIT_ENV}"
+        )
+        return env_value
+
+    from freetoken import version as freetoken_version
+
+    version_file = Path(freetoken_version.__file__ or "").resolve()
+    installed_package = any(
+        part in {"site-packages", "dist-packages"} for part in version_file.parts
+    )
+    source_file = Path(__file__).resolve()
+    source_root = next(
+        (
+            parent
+            for parent in source_file.parents
+            if (parent / "pyproject.toml").is_file()
+            and (parent / "python" / "freetoken" / "moe" / "hot_adapt.py").resolve()
+            == source_file
+        ),
+        None,
+    )
+    if not installed_package and source_root is not None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(source_root), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            git_root = Path(result.stdout.strip()).resolve()
+            if git_root == source_root:
+                result = subprocess.run(
+                    [
+                        "git", "-C", str(source_root), "describe", "--always", "--dirty"
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                value = result.stdout.strip()
+                if value:
+                    logger.info_rank0(
+                        f"HOT plan tier commit={value!r} source=git"
+                    )
+                    return value
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    value = f"package-{freetoken_version.__version__}"
+    logger.warning_rank0(
+        f"HOT plan tier commit={value!r} source=package-version; "
+        "git metadata unavailable or package is installed"
+    )
+    return value
+
+
+def hot_plan_path(model_path: str, plan_dir: str | None = None) -> str:
+    directory = os.path.expanduser(plan_dir or model_path)
+    return os.path.join(directory, HOT_PLAN_FILENAME)
+
+
+def hot_plan_directory_writable(path: str) -> bool:
+    """Probe actual create access, including ACL and read-only mount failures."""
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=directory, prefix=".freetoken-hot-plan-probe-"
+        ):
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def checkpoint_identity(model_path: str) -> dict[str, Any]:
+    """Build a cheap checkpoint identity from its small index and shard metadata."""
+    directory = os.path.realpath(os.path.expanduser(model_path))
+    candidates = (
+        ("ftw", "freetoken_weight.json"),
+        ("safetensors_index", "freetoken_bank_index.json"),
+    )
+    for kind, filename in candidates:
+        index_path = os.path.join(directory, filename)
+        if not os.path.isfile(index_path):
+            continue
+        with open(index_path, "rb") as handle:
+            raw = handle.read()
+        index = json.loads(raw)
+        shards = []
+        for entry in index.get("shards", ()):
+            shard_name = entry.get("file")
+            if not isinstance(shard_name, str):
+                raise ValueError(f"checkpoint index {filename!r} has an invalid shard")
+            stat = os.stat(os.path.join(directory, shard_name))
+            shards.append(
+                {
+                    "file": shard_name,
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                }
+            )
+        if not shards:
+            raise ValueError(f"checkpoint index {filename!r} has no shards")
+        return {
+            "kind": kind,
+            "path": directory,
+            "index": filename,
+            "index_sha256": hashlib.sha256(raw).hexdigest(),
+            "shards": shards,
+        }
+    raise FileNotFoundError(f"no FTW or expert-bank index found under {directory!r}")
+
+
+def _validated_counter_row(value: Any, num_experts: int, layer_id: int) -> tuple[float, ...]:
+    if not isinstance(value, str):
+        raise ValueError(
+            f"counter layer {layer_id} must be base64 float32 data"
+        )
+    try:
+        packed = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"counter layer {layer_id} is not valid base64") from exc
+    expected_bytes = num_experts * 4
+    if len(packed) != expected_bytes:
+        raise ValueError(
+            f"counter layer {layer_id} has {len(packed)} bytes, expected {expected_bytes}"
+        )
+    row = struct.unpack(f"<{num_experts}f", packed)
+    if any(not math.isfinite(item) or item < 0 for item in row):
+        raise ValueError(f"counter layer {layer_id} has an invalid value")
+    return row
+
+
+def load_hot_plan(
+    path: str,
+    *,
+    identity: Mapping[str, Any],
+    disk_layer_ids: frozenset[int],
+    num_layers: int,
+    num_experts: int,
+    current_capacity: Mapping[int, int],
+    current_hot_budget_bytes: int,
+    static_expert_ids: Mapping[int, Sequence[int]],
+    tier_commit: str,
+    now: float | None = None,
+) -> HotPlanSeed:
+    """Validate and resize one persisted plan for the current protected slots."""
+    with open(path, encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise ValueError("HOT plan top-level value must be an object")
+    if raw.get("version") != HOT_PLAN_VERSION:
+        raise ValueError(f"unsupported HOT plan version {raw.get('version')!r}")
+    if raw.get("ftw_identity") != dict(identity):
+        raise ValueError("FTW identity mismatch")
+    if raw.get("num_layers") != num_layers or raw.get("num_experts") != num_experts:
+        raise ValueError("expert geometry mismatch")
+    saved_disk = raw.get("disk_layer_ids")
+    if saved_disk != sorted(disk_layer_ids):
+        raise ValueError("DISK layer set mismatch")
+    saved_budget = raw.get("hot_budget_bytes")
+    if isinstance(saved_budget, bool) or not isinstance(saved_budget, int) or saved_budget <= 0:
+        raise ValueError("invalid saved HOT budget")
+    if (
+        isinstance(current_hot_budget_bytes, bool)
+        or not isinstance(current_hot_budget_bytes, int)
+        or current_hot_budget_bytes <= 0
+    ):
+        raise ValueError("invalid current HOT budget")
+    budget_grew = current_hot_budget_bytes > saved_budget
+    written_at = raw.get("written_at")
+    if isinstance(written_at, bool) or not isinstance(written_at, (int, float)):
+        raise ValueError("invalid HOT plan timestamp")
+    if not math.isfinite(float(written_at)):
+        raise ValueError("invalid HOT plan timestamp")
+    if raw.get("counter_dtype") != "float32" or raw.get("counter_encoding") != "base64-le":
+        raise ValueError("HOT plan counters are not marked float32")
+    protected = raw.get("protected_slots")
+    counters_raw = raw.get("decayed_counters")
+    ranked_raw = raw.get("counter_ranked")
+    if not all(isinstance(section, dict) for section in (protected, counters_raw, ranked_raw)):
+        raise ValueError("HOT plan layer sections must be objects")
+
+    selected = {
+        layer_id: tuple(int(expert) for expert in static_expert_ids.get(layer_id, ()))
+        for layer_id in disk_layer_ids
+    }
+    counters: dict[int, tuple[float, ...]] = {}
+    seeded_layers: set[int] = set()
+    for layer_id in sorted(disk_layer_ids):
+        key = str(layer_id)
+        if key not in protected:
+            continue
+        slots = protected[key]
+        if not isinstance(slots, list):
+            raise ValueError(f"protected slot layer {layer_id} must be a list")
+        slot_ids = tuple(int(expert) for expert in slots)
+        if (
+            len(set(slot_ids)) != len(slot_ids)
+            or any(expert < 0 or expert >= num_experts for expert in slot_ids)
+        ):
+            raise ValueError(f"protected slot layer {layer_id} has invalid expert ids")
+        row = _validated_counter_row(counters_raw.get(key), num_experts, layer_id)
+        ranked = ranked_raw.get(key)
+        if (
+            not isinstance(ranked, list)
+            or len(ranked) != len(slot_ids)
+            or set(ranked) != set(slot_ids)
+        ):
+            raise ValueError(
+                f"counter-ranked layer {layer_id} does not match protected residents"
+            )
+        capacity = int(current_capacity[layer_id])
+        chosen_list = [int(expert) for expert in ranked[:capacity]]
+        if budget_grew and capacity > len(chosen_list):
+            resident_set = set(slot_ids)
+            next_ranked = sorted(
+                (expert for expert in range(num_experts) if expert not in resident_set),
+                key=lambda expert: (-row[expert], expert),
+            )
+            chosen_list.extend(next_ranked[: capacity - len(chosen_list)])
+        chosen = tuple(chosen_list)
+        selected[layer_id] = chosen
+        counters[layer_id] = row
+        seeded_layers.add(layer_id)
+    if not seeded_layers:
+        raise ValueError("HOT plan has no protected layers for this process")
+    if not any(any(value != 0.0 for value in row) for row in counters.values()):
+        raise ValueError("HOT plan counters are all zero")
+
+    saved_tier = raw.get("tier_commit")
+    if not isinstance(saved_tier, str) or not saved_tier.strip():
+        raise ValueError("HOT plan tier_commit is missing")
+    timestamp = float(written_at)
+    return HotPlanSeed(
+        expert_ids=selected,
+        counters=counters,
+        seeded_layers=frozenset(seeded_layers),
+        age_seconds=max(0.0, (time.time() if now is None else now) - timestamp),
+        saved_hot_budget_bytes=saved_budget,
+        tier_commit=saved_tier,
+        tier_mismatch=saved_tier != tier_commit,
+    )
+
+
+def make_hot_plan_document(
+    *,
+    identity: Mapping[str, Any],
+    disk_layer_ids: Sequence[int],
+    num_layers: int,
+    num_experts: int,
+    hot_budget_bytes: int,
+    tier_commit: str,
+    protected_slots: Mapping[int, Sequence[int | None]],
+    decayed_counters: Mapping[int, Sequence[float]],
+    written_at: float | None = None,
+) -> dict[str, Any] | None:
+    """Create a compact JSON document, or None for an all-zero snapshot."""
+    counter_rows = {
+        int(layer_id): tuple(float(value) for value in decayed_counters[layer_id])
+        for layer_id in sorted(decayed_counters)
+    }
+    for layer_id, row in counter_rows.items():
+        if len(row) != num_experts:
+            raise ValueError(
+                f"counter layer {layer_id} has {len(row)} values, expected {num_experts}"
+            )
+        if any(not math.isfinite(value) or value < 0 for value in row):
+            raise ValueError(f"counter layer {layer_id} has an invalid value")
+    if not any(any(value != 0.0 for value in row) for row in counter_rows.values()):
+        return None
+    counters = {
+        str(layer_id): base64.b64encode(
+            struct.pack(f"<{num_experts}f", *row)
+        ).decode("ascii")
+        for layer_id, row in counter_rows.items()
+    }
+    protected: dict[str, list[int]] = {}
+    ranked: dict[str, list[int]] = {}
+    for layer_id in sorted(protected_slots):
+        if layer_id not in counter_rows:
+            raise ValueError(f"protected layer {layer_id} has no counter row")
+        residents = [int(expert) for expert in protected_slots[layer_id] if expert is not None]
+        if (
+            len(set(residents)) != len(residents)
+            or any(expert < 0 or expert >= num_experts for expert in residents)
+        ):
+            raise ValueError(f"protected layer {layer_id} has invalid expert ids")
+        protected[str(layer_id)] = residents
+        row = counter_rows[layer_id]
+        ranked[str(layer_id)] = sorted(
+            residents, key=lambda expert: (-row[expert], expert)
+        )
+    return {
+        "version": HOT_PLAN_VERSION,
+        "written_at": time.time() if written_at is None else float(written_at),
+        "ftw_identity": dict(identity),
+        "disk_layer_ids": sorted(int(layer_id) for layer_id in disk_layer_ids),
+        "num_layers": int(num_layers),
+        "num_experts": int(num_experts),
+        "hot_budget_bytes": int(hot_budget_bytes),
+        "tier_commit": str(tier_commit),
+        "counter_dtype": "float32",
+        "counter_encoding": "base64-le",
+        "protected_slots": protected,
+        "counter_ranked": ranked,
+        "decayed_counters": counters,
+    }
+
+
+def atomic_write_hot_plan(
+    path: str,
+    document: Mapping[str, Any],
+    *,
+    publish: Callable[[str, str], bool] | None = None,
+) -> bool:
+    """Publish one durable plan, or return false when its publish fence closes."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(document, handle, separators=(",", ":"), allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if publish is not None and not publish(temporary, path):
+            return False
+        if publish is None:
+            os.replace(temporary, path)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(directory, flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return True
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 @dataclass
