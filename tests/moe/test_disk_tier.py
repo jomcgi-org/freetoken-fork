@@ -204,6 +204,8 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     cache._hot_slot_owners = {0: [1]}
     cache.decayed_decode_freq[0] = torch.tensor([1.0, 3.0, 2.0, 4.0])
     cache.hot_adapt_ticks = 2
+    cache.hot_adapt_ticks_prefill = 1
+    cache.hot_adapt_ticks_decode = 1
     cache.hot_adapt_swaps = 3
 
     stats = cache.disk_prefetch_stats(reset=True)
@@ -213,8 +215,88 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     assert stats["hot_swaps_per_interval"] == pytest.approx(1.5)
     assert stats["decayed_hot_pair_rate"] == pytest.approx(0.3)
     assert stats["hot_adapt_interval"] == 17
+    assert stats["hot_adapt_ticks_prefill"] == 1
+    assert stats["hot_adapt_ticks_decode"] == 1
     assert cache.stat_hot_pairs.item() == 0
     assert cache.stat_hot_total_pairs.item() == 0
+    stats = cache.disk_prefetch_stats(reset=True)
+    assert stats["hot_adapt_ticks_prefill"] == 0
+    assert stats["hot_adapt_ticks_decode"] == 0
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_hot_adaptation_fill_spans_two_2000_token_prefill_boundaries():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    experts, tokens, top_k = 8, 2000, 2
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=experts,
+        cache_size=2 * experts,
+        device=torch.device("cuda"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    sources = {
+        "gate_up": [torch.arange(experts, dtype=torch.uint8).view(experts, 1)],
+        "down": [torch.arange(experts, dtype=torch.uint8).view(experts, 1)],
+    }
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: ()},
+        hot_expert_capacity={0: experts},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2000,
+        interval_steps="auto",
+        max_swap_bytes=2,
+        expert_bytes=2,
+    )
+    try:
+        routed = torch.tensor(
+            [
+                [token % experts, (token + 1) % experts]
+                for token in range(tokens)
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        counted = cache.ensure_experts_hot(0, routed.clone())
+        cache.record_hot_adapt_prefill_tokens(counted)
+        assert routed.numel() // top_k == tokens
+        cache.hot_adapt_prefill_boundary()
+        cache._hot_adapt_future.result(timeout=10)
+        cache._poll_hot_adaptation()
+        cache._hot_adapt_future.result(timeout=10)
+        cache._poll_hot_adaptation()
+
+        assert cache.hot_adapt_routed_tokens == tokens
+        assert cache.hot_adapt_ticks_prefill == 8
+        assert cache.hot_adapt_swaps == 4
+        assert sum(owner is not None for owner in cache._hot_slot_owners[0]) == 4
+
+        counted = cache.ensure_experts_hot(0, routed.clone())
+        cache.record_hot_adapt_prefill_tokens(counted)
+        cache.hot_adapt_prefill_boundary()
+        cache._hot_adapt_future.result(timeout=10)
+        cache._poll_hot_adaptation()
+        cache._hot_adapt_future.result(timeout=10)
+        cache._poll_hot_adaptation()
+
+        assert cache.hot_adapt_routed_tokens == 2 * tokens
+        assert cache.hot_adapt_ticks_prefill == 16
+        assert cache.hot_adapt_swaps == 8
+        assert cache._hot_staging_rows == 1
+        assert all(owner is not None for owner in cache._hot_slot_owners[0])
+        assert cache.decayed_decode_freq[0].tolist() == pytest.approx(
+            [500.0 * (2.0 ** (-1.0 / 2000.0)) + 500.0] * experts
+        )
+    finally:
+        cache.shutdown_hot_adaptation()
 
 
 def test_ftw_writer_keeps_mmap_padding_in_one_shard(tmp_path):
@@ -1131,6 +1213,7 @@ def _prefill_hot_split_fixture(
         calls.append(("adapt", ids.clone()))
         mapping = torch.tensor(hot_slots, dtype=ids.dtype)
         ids.copy_(mapping[ids.long()])
+        return int(ids.shape[0])
 
     def prepare(layer_id, ids):
         cold = {int(i) for i in ids.reshape(-1).tolist() if int(i) >= 0}
@@ -1158,6 +1241,9 @@ def _prefill_hot_split_fixture(
             torch.empty((12, 0), dtype=torch.bfloat16),
         ),
         alphas_for_slots=lambda layer_id: None,
+        record_hot_adapt_prefill_tokens=lambda tokens: calls.append(
+            ("adapt_tokens", tokens)
+        ),
         record_prefill_hot_split=lambda raw, mask: calls.append(
             ("stats", raw.clone(), mask.clone())
         ),
@@ -1230,6 +1316,7 @@ def test_prefill_hot_split_populates_and_batches_only_cold_routes(
     assert gpu[3:] == (None, False)
     adaptation = next(call[1] for call in calls if call[0] == "adapt")
     assert adaptation.tolist() == [[0, 1], [2, 3], [0, 3]]
+    assert next(call[1] for call in calls if call[0] == "adapt_tokens") == 3
     stats = next(call for call in calls if call[0] == "stats")
     assert int(stats[2].sum()) == 3
 

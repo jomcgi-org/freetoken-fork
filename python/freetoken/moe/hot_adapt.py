@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -9,9 +10,62 @@ from typing import Mapping, Sequence
 # Covers the fixed mapped-host mapping/snapshot tensors and one row of rounding
 # when max_swap_bytes is smaller than, or not divisible by, an expert row.
 HOT_STAGING_HEADROOM_BYTES = 64 << 20
+# This target spaces the initial due thresholds. It does not promise a complete
+# fill at the first 2,000-token boundary: the per-boundary byte cap intentionally
+# spreads an all-cold fill across about two requests at its default fraction.
 HOT_ADAPT_TARGET_FILL_TOKENS = 2000
+# Keep the established identifier for compatibility; its unit is now routed tokens.
 HOT_ADAPT_STEADY_INTERVAL_STEPS = 1000
 HOT_ADAPT_MAX_STAGING_FRACTION = 0.25
+
+
+@dataclass
+class HotAdaptTokenClock:
+    """Shared prefill and decode clock for HOT adaptation boundaries.
+
+    Due thresholds accumulate while an earlier rerank or copy is active. The
+    next free boundary consumes them together, and each threshold still counts
+    as one interval for reporting, including for an explicit fixed interval.
+    """
+
+    interval: int
+    routed_tokens: int = 0
+    next_tick_token: int = 0
+    last_tick_token: int = 0
+
+    def __post_init__(self) -> None:
+        if self.interval <= 0:
+            raise ValueError("HOT adaptation token interval must be positive")
+        if self.next_tick_token == 0:
+            self.next_tick_token = self.interval
+
+    def advance(self, routed_tokens: int) -> int:
+        """Add routed tokens and return the number of interval ticks now due."""
+        if routed_tokens < 0:
+            raise ValueError("HOT adaptation routed token count must be non-negative")
+        self.routed_tokens += routed_tokens
+        if self.routed_tokens < self.next_tick_token:
+            return 0
+        return 1 + (self.routed_tokens - self.next_tick_token) // self.interval
+
+    def consume_tick(self) -> int:
+        """Consume one due tick and return its routed-token threshold."""
+        if self.routed_tokens < self.next_tick_token:
+            raise RuntimeError("HOT adaptation token tick is not due")
+        token = self.next_tick_token
+        self.last_tick_token = token
+        self.next_tick_token += self.interval
+        return token
+
+    def set_interval(self, interval: int) -> None:
+        """Apply a new auto interval without moving the clock backwards."""
+        if interval <= 0:
+            raise ValueError("HOT adaptation token interval must be positive")
+        self.interval = interval
+        self.next_tick_token = max(
+            self.next_tick_token,
+            self.last_tick_token + interval,
+        )
 
 
 @dataclass
@@ -113,6 +167,57 @@ def hot_staging_rows(max_swap_bytes: int, expert_bytes: int) -> int:
     return max(1, max_swap_bytes // expert_bytes)
 
 
+def hot_catchup_swap_bytes(
+    max_swap_bytes: int,
+    expert_bytes: int,
+    tick_count: int,
+    *,
+    hot_budget_bytes: int,
+    boundary_cap_frac: float,
+) -> int:
+    """Row-aligned planner bound for all ticks sharing one request boundary.
+
+    The boundary cap deliberately prevents one 2,000-token prefill chunk from
+    filling an all-cold HOT partition. With the default 0.5 fraction, the
+    initial fill normally completes at about the second request boundary.
+    """
+    if (
+        max_swap_bytes < 0
+        or expert_bytes <= 0
+        or tick_count <= 0
+        or hot_budget_bytes <= 0
+    ):
+        raise ValueError("HOT catch-up staging geometry must be positive")
+    if (
+        isinstance(boundary_cap_frac, bool)
+        or not math.isfinite(boundary_cap_frac)
+        or not 0 < boundary_cap_frac <= 1
+    ):
+        raise ValueError("HOT boundary cap fraction must be finite and in (0, 1]")
+    swaps_per_tick = max_swap_bytes // expert_bytes
+    tick_bound = swaps_per_tick * tick_count * expert_bytes
+    # A valid HOT partition always contains at least one whole row. Preserve
+    # progress when the fractional cap is smaller than that single row.
+    boundary_bound = max(expert_bytes, int(hot_budget_bytes * boundary_cap_frac))
+    boundary_bound -= boundary_bound % expert_bytes
+    return min(tick_bound, boundary_bound)
+
+
+def hot_boundary_interval_tokens(
+    tick_interval: int,
+    max_swap_bytes: int,
+    staged_bytes: int,
+) -> int:
+    """Token span whose nominal swap allowance covers actual boundary bytes."""
+    if tick_interval <= 0 or max_swap_bytes <= 0 or staged_bytes < 0:
+        raise ValueError("HOT boundary bandwidth geometry must be positive")
+    staged_intervals = max(
+        1,
+        (staged_bytes + max_swap_bytes - 1) // max_swap_bytes,
+    )
+    return tick_interval * staged_intervals
+
+
 def hot_staging_budget_bytes(max_swap_bytes: int) -> int:
     """Conservative governor charge for staging payload plus fixed control data."""
     if max_swap_bytes < 0:
@@ -137,7 +242,11 @@ def update_decayed_counts(
     half_life_steps: int,
     elapsed_steps: int = 1,
 ) -> tuple[float, ...]:
-    """CPU reference for one exact decay-and-add accumulator update."""
+    """CPU reference for one exact decay-and-add accumulator update.
+
+    Prefill and decode follow the same rate rule: each routed pair contributes
+    one, with no per-step, per-batch, or per-chunk normalization.
+    """
     if len(previous) != len(routed):
         raise ValueError("previous and routed counts must have the same length")
     factor = decay_multiplier(half_life_steps, elapsed_steps)

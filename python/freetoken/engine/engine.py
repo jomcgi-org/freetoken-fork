@@ -811,6 +811,9 @@ class Engine:
                 interval_steps=config.moe_hot_adapt_interval_steps,
                 max_swap_bytes=int(config.moe_hot_adapt_max_swap_gib * 2**30),
                 expert_bytes=hot_expert_bytes,
+                boundary_cap_frac=getattr(
+                    config, "moe_hot_adapt_boundary_cap_frac", 0.5
+                ),
             )
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
@@ -1258,11 +1261,15 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
-        if batch.is_decode and self.moe_offload_cache is not None:
+        if self.moe_offload_cache is not None:
             # The current model work is already ordered on self.stream. Adaptation
-            # retires or publishes rows here so the next decode observes one complete
-            # mapping, while file-to-pinned copies continue on a worker thread.
-            self.moe_offload_cache.hot_adapt_step_boundary()
+            # retires or publishes rows here so the next forward observes one complete
+            # mapping, while file-to-pinned copies continue on a worker thread. Prefill
+            # uses the exact flattened token count routed through each MoE layer.
+            if batch.is_decode:
+                self.moe_offload_cache.hot_adapt_step_boundary(batch.size)
+            else:
+                self.moe_offload_cache.hot_adapt_prefill_boundary()
 
         if not getattr(batch, "mtp_verify", False):
             self._record_mtp_hidden(batch)
@@ -2259,6 +2266,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_halflife_steps": 2000,
     "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
+    "moe_hot_adapt_boundary_cap_frac": 0.5,
     "moe_disk_prefill": "cpu",
     "moe_prefill_coalesce": "populate",
     "moe_prefill_hot_split": "on",
