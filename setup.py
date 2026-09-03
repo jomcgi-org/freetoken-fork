@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 from setuptools import setup
@@ -70,6 +71,19 @@ setup(
                 "python/freetoken/kernel/csrc/uffd_pager.cpp",
             ],
             extra_compile_args=["-O3", "-std=c++17", "-pthread"],
+        ),
+        *(
+            [
+                CppExtension(
+                    name="freetoken.kernel._ple_uring",
+                    sources=[
+                        "python/freetoken/kernel/csrc/ple_uring/ple_uring_ext.cpp",
+                    ],
+                    extra_compile_args=["-O3", "-std=c++17"],
+                )
+            ]
+            if sys.platform == "linux"
+            else []
         ),
     ],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},

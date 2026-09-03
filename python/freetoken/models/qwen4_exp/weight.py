@@ -576,7 +576,8 @@ def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
     ``pinned`` preserves the original O_DIRECT concatenate, fill, then pin route. ``cached``,
     ``disk``, and ``hmm`` map each data payload from its safetensors file with ``MAP_SHARED``
     and ``MADV_RANDOM``. Folded E2M1 scales use anonymous FP16 banks. Their model backends
-    differ in how rows reach the GPU.
+    differ in how rows reach the GPU. ``uring`` resolves its own immutable file extents and
+    therefore does not call this loader.
     """
     if backend not in ("pinned", "cached", "disk", "hmm"):
         raise ValueError(

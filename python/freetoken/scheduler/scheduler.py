@@ -296,6 +296,15 @@ class Scheduler(SchedulerIOMixin):
                         f"ple_hit_rate: {ple_stats['ple_hit_rate']:.4f}, "
                         f"ple_overflow_fallbacks: {ple_stats['ple_overflow_fallbacks']}"
                     )
+                if "ple_rows_per_step" in ple_stats:
+                    message += (
+                        f", ple_rows_per_step: {ple_stats['ple_rows_per_step']:.2f}, "
+                        f"ple_gather_ms_per_decode_step: "
+                        f"{ple_stats['ple_gather_ms_per_decode_step']:.2f}, "
+                        f"ple_gather_ms_per_prefill_chunk: "
+                        f"{ple_stats['ple_gather_ms_per_prefill_chunk']:.2f}, "
+                        f"ple_dedup_rate: {ple_stats['ple_dedup_rate']:.4f}"
+                    )
             logger.info_rank0(message)
 
         self.status_reporter = SchedulerStatusReporter(

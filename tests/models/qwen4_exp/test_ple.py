@@ -733,7 +733,7 @@ def test_decode_graph_replay_matches_eager():
     positions = torch.full((bs,), 8, dtype=torch.int32, device="cuda")
     slots = torch.arange(1, bs + 1, dtype=torch.int32, device="cuda")
     batch = SimpleNamespace(
-        padded_reqs=[None] * bs, is_decode=True, is_prefill=False,
+        padded_reqs=[None] * bs, phase="decode", is_decode=True, is_prefill=False,
         input_ids=torch.randint(0, VOCAB, (bs,), device="cuda", dtype=torch.int32),
         positions=positions, linear_table_idx=slots,
     )

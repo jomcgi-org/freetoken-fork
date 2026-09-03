@@ -182,9 +182,77 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        backend = getattr(engine_config, "ple_backend", "pinned")
+        if backend == "uring":
+            from .ple import process_major_faults
+            from .ple_uring import UringTable, resolve_uring_source
+
+            args = self._config.qwen4_args
+            graph_sizes = getattr(engine_config, "cuda_graph_bs", None) or ()
+            max_decode_batch_size = max(
+                int(getattr(engine_config, "max_running_req", 1)),
+                int(getattr(engine_config, "cuda_graph_max_bs", 0) or 0),
+                max(graph_sizes, default=0),
+            )
+            max_tokens = max(
+                max_decode_batch_size,
+                int(
+                    getattr(
+                        engine_config,
+                        "max_forward_len",
+                        getattr(engine_config, "max_extend_tokens", 0),
+                    )
+                ),
+            )
+            required_capacity = max_tokens * args.num_ngram_heads
+            source = resolve_uring_source(
+                engine_config.model_path, self._config.qwen4_args
+            )
+            self._ple_disk_backends = []
+            self._ple_major_fault_base = process_major_faults()
+            self._ple_staging_ns = 0
+            pin = torch.cuda.is_available()
+            self._ple_decode_contexts = torch.empty(
+                (max_decode_batch_size, args.ngram_size - 1),
+                dtype=torch.int64,
+                pin_memory=pin,
+            )
+            self._ple_decode_input_ids = torch.empty(
+                max_decode_batch_size, dtype=torch.int64, pin_memory=pin
+            )
+            self._ple_waited_events = [None] * max_decode_batch_size
+            reserved = 0
+            staging_mib = int(
+                getattr(engine_config, "ple_uring_staging_mib", 64)
+            )
+            for ple in ple_layers:
+                streamed = UringTable(
+                    source,
+                    staging_mib,
+                    int(getattr(engine_config, "ple_uring_queue_depth", 64)),
+                    max_decode_batch_size=max_decode_batch_size,
+                    rows_per_token=args.num_ngram_heads,
+                    required_capacity_rows=required_capacity,
+                )
+                reserved += streamed.staging_nbytes
+                self._ple_disk_backends.append(streamed)
+                ple.ple_embedding.attach_table(streamed)
+                ple.ple_embedding.snapshot_host_hash_constants(
+                    max_decode_batch_size
+                )
+            logger.info_rank0(
+                f"PLE startup: layers={len(ple_layers)}, "
+                f"per_layer_budget_mib={staging_mib}, "
+                f"total_resident_bytes={reserved}, "
+                f"{self._ple_disk_backends[0].startup_description()}"
+            )
+            self._ple_disk_decode = tuple(
+                zip(ple_layers, self._ple_disk_backends)
+            )
+            return reserved
+
         from .weight import load_ple_table
 
-        backend = getattr(engine_config, "ple_backend", "pinned")
         table = load_ple_table(
             engine_config.model_path, self._config.qwen4_args, backend=backend,
         )
@@ -422,6 +490,34 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                     logger.warning_rank0(
                         f"could not write --ple-cache-profile-out {profile_out!r}: {exc}"
                     )
+        uring = [table for table in backends if hasattr(table, "uring_stats")]
+        if uring:
+            stats = [table.uring_stats() for table in uring]
+            requested = sum(int(item["requested_rows"]) for item in stats)
+            read = sum(int(item["read_rows"]) for item in stats)
+            decode_steps = max(
+                (int(item["decode_fills"]) for item in stats), default=0
+            )
+            prefill_chunks = max(
+                (int(item["prefill_fills"]) for item in stats), default=0
+            )
+            decode_read = sum(int(item["decode_read_rows"]) for item in stats)
+            result.update({
+                "ple_rows_per_step": (
+                    decode_read / decode_steps if decode_steps else 0.0
+                ),
+                "ple_gather_ms_per_decode_step": (
+                    sum(int(item["decode_gather_ns"]) for item in stats)
+                    / 1_000_000.0 / decode_steps if decode_steps else 0.0
+                ),
+                "ple_gather_ms_per_prefill_chunk": (
+                    sum(int(item["prefill_gather_ns"]) for item in stats)
+                    / 1_000_000.0 / prefill_chunks if prefill_chunks else 0.0
+                ),
+                "ple_dedup_rate": (
+                    1.0 - read / requested if requested else 0.0
+                ),
+            })
         if reset:
             for table in backends:
                 table.reset_stats()

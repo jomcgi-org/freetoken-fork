@@ -1142,6 +1142,67 @@ def test_disk_ple_load_reserves_zero_expert_pin_budget(monkeypatch):
     assert snapshotted == [8]
 
 
+def test_uring_ple_load_charges_pinned_staging_to_expert_budget(monkeypatch):
+    from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
+    import freetoken.models.qwen4_exp.ple_uring as ple_uring
+
+    attached = []
+    snapshotted = []
+    layer = SimpleNamespace(
+        ple_embedding=SimpleNamespace(
+            attach_table=attached.append,
+            snapshot_host_hash_constants=snapshotted.append,
+        )
+    )
+    model = Qwen4ExpForCausalLM.__new__(Qwen4ExpForCausalLM)
+    model.model = SimpleNamespace(ple_layers=[layer])
+    model._config = SimpleNamespace(
+        qwen4_args=SimpleNamespace(num_ngram_heads=16, ngram_size=3)
+    )
+    source = SimpleNamespace(num_rows=1000)
+    constructed = []
+
+    class FakeUring:
+        staging_nbytes = 987_654
+        prefetch_pages = 0
+
+        def __init__(self, table, staging_mib, queue_depth, **kwargs):
+            constructed.append((table, staging_mib, queue_depth, kwargs))
+
+        def startup_description(self):
+            return "backend=uring, test"
+
+    monkeypatch.setattr(ple_uring, "resolve_uring_source", lambda *_args: source)
+    monkeypatch.setattr(ple_uring, "UringTable", FakeUring)
+    engine_config = SimpleNamespace(
+        model_path="/tmp/model",
+        ple_backend="uring",
+        ple_uring_staging_mib=64,
+        ple_uring_queue_depth=32,
+        use_dummy_weight=False,
+        max_running_req=3,
+        max_forward_len=5,
+        cuda_graph_bs=[1, 8],
+        cuda_graph_max_bs=6,
+    )
+
+    assert model.load_host_tables(engine_config) == 987_654
+    assert attached == model._ple_disk_backends
+    assert snapshotted == [8]
+    assert constructed == [
+        (
+            source,
+            64,
+            32,
+            {
+                "max_decode_batch_size": 8,
+                "rows_per_token": 16,
+                "required_capacity_rows": 128,
+            },
+        )
+    ]
+
+
 def test_cached_ple_load_reserves_row_bank_and_applies_warm_profile(monkeypatch):
     from freetoken.models.qwen4_exp.model import Qwen4ExpForCausalLM
     import freetoken.models.qwen4_exp.ple as ple

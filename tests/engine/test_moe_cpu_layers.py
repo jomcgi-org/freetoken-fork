@@ -713,7 +713,7 @@ def test_engine_config_rejects_invalid_uffd_settings():
         EngineConfig(**base, moe_pager_budget_gib=0)
 
 
-@pytest.mark.parametrize("backend", ["pinned", "cached", "disk", "hmm"])
+@pytest.mark.parametrize("backend", ["pinned", "cached", "disk", "uring", "hmm"])
 def test_engine_config_accepts_ple_backends(backend):
     import torch
 
@@ -782,12 +782,38 @@ def test_engine_config_rejects_invalid_ple_backend():
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
 
-    with pytest.raises(ValueError, match="--ple-backend.*pinned.*cached.*disk.*hmm"):
+    with pytest.raises(
+        ValueError, match="--ple-backend.*pinned.*cached.*disk.*uring.*hmm"
+    ):
         EngineConfig(
             model_path="/tmp/model",
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             ple_backend="ram",
+        )
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("ple_uring_staging_mib", 0, "--ple-uring-staging-mib"),
+        ("ple_uring_queue_depth", 0, "--ple-uring-queue-depth"),
+        ("ple_uring_queue_depth", 4097, "--ple-uring-queue-depth"),
+    ],
+)
+def test_engine_config_rejects_invalid_ple_uring_settings(field, value, match):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    kwargs = {field: value}
+    with pytest.raises(ValueError, match=match):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            **kwargs,
         )
 
 
