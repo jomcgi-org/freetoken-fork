@@ -137,6 +137,10 @@ class EngineConfig:
     # DISK grouped decode callback order. "before" preserves the existing critical
     # path; "after" notifies CPU workers before issuing advisory expert prefetch.
     moe_cpu_precb: str = "before"
+    # Optionally suppress repeat WILLNEED advice for recently computed DISK experts.
+    moe_cpu_willneed: str = "always"
+    moe_cpu_willneed_recent_steps: int = 256
+    moe_cpu_willneed_fault_ceiling: float = 2000.0
     # Host expert-tier budgets are resolved together at engine startup. The pin
     # budget is internal; its explicit input remains FREETOKEN_PIN_BUDGET_GB.
     host_cache_reserve_gib: float | None = None
@@ -334,6 +338,18 @@ class EngineConfig:
                 "--moe-cpu-precb must be 'before' or 'after', got "
                 f"{self.moe_cpu_precb!r}"
             )
+        if self.moe_cpu_willneed not in ("always", "recent"):
+            raise ValueError(
+                "--moe-cpu-willneed must be 'always' or 'recent', got "
+                f"{self.moe_cpu_willneed!r}"
+            )
+        if self.moe_cpu_willneed_recent_steps <= 0:
+            raise ValueError("--moe-cpu-willneed-recent-steps must be positive")
+        if (
+            not math.isfinite(float(self.moe_cpu_willneed_fault_ceiling))
+            or self.moe_cpu_willneed_fault_ceiling <= 0
+        ):
+            raise ValueError("--moe-cpu-willneed-fault-ceiling must be positive")
         if self.moe_disk_decode not in ("cpu", "gpufetch"):
             raise ValueError(
                 "--moe-disk-decode must be 'cpu' or 'gpufetch', got "

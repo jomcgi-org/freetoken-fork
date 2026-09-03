@@ -1450,6 +1450,8 @@ struct StepTimingAccum {
   int64_t notify_ns = 0;
   int64_t seen_to_doorbell_ns = 0;
   int64_t done_store_ns = 0;
+  int64_t last_seen_ns = 0;
+  int64_t last_done_stored_ns = 0;
   int64_t compute_ns = 0;
   int64_t signal_ns = 0;
   int64_t wake_max_ns = 0;
@@ -2722,6 +2724,8 @@ struct CpuMoeExecutor {
   }
 
   static int64_t steady_now_ns() {
+    // std::chrono::steady_clock is CLOCK_MONOTONIC on Linux, matching Python's
+    // time.monotonic_ns() used to calibrate the surrounding CUDA events.
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
@@ -2862,6 +2866,8 @@ struct CpuMoeExecutor {
       row.notify_ns += notify_ns;
       row.seen_to_doorbell_ns += seen_to_doorbell_ns;
       row.done_store_ns += done_store_ns;
+      row.last_seen_ns = seen_ns;
+      row.last_done_stored_ns = done_stored_ns;
       row.compute_ns += compute_ns;
       row.signal_ns += signal_ns;
       row.wake_max_ns = std::max(row.wake_max_ns, wake_ns);
@@ -2894,6 +2900,8 @@ struct CpuMoeExecutor {
       values["coord_pre_us"] =
           static_cast<double>(row.seen_to_doorbell_ns) / 1000.0;
       values["coord_post_us"] = static_cast<double>(row.done_store_ns) / 1000.0;
+      values["last_seen_ns"] = row.last_seen_ns;
+      values["last_done_stored_ns"] = row.last_done_stored_ns;
       values["compute_us"] = static_cast<double>(row.compute_ns) / 1000.0;
       values["signal_us"] = static_cast<double>(row.signal_ns) / 1000.0;
       values["wake_max_us"] = static_cast<double>(row.wake_max_ns) / 1000.0;
