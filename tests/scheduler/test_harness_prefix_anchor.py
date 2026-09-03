@@ -1,39 +1,53 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import torch
 
 from freetoken.core import Batch, Context, Req, SamplingParams
-from freetoken.kvcache.linear_state_pool import LinearStatePool
-from freetoken.models.config import LinearGatedDeltaGroupConfig
 from freetoken.scheduler.cache import CacheManager
 
 
+class _Pool:
+    """Small CPU double for the scheduler-visible LinearStatePool surface."""
+
+    def __init__(self, num_slots=8):
+        self.conv_states = torch.zeros(1, num_slots, 1, 3)
+        self._free_slots = list(range(1, num_slots))
+
+    def alloc(self, n=1):
+        return [self._free_slots.pop() for _ in range(n)]
+
+
 def _pool(num_slots=8):
-    group = LinearGatedDeltaGroupConfig(
-        name="linear",
-        layer_ids=(0,),
-        num_key_heads=2,
-        num_value_heads=4,
-        key_head_dim=16,
-        value_head_dim=16,
-        conv_kernel_dim=4,
-        output_gate="silu",
-    )
-    return LinearStatePool(
-        group,
-        num_slots=num_slots,
-        dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-        tp_size=1,
-    )
+    return _Pool(num_slots)
+
+
+def _stub_fla_metadata_dependencies(monkeypatch):
+    """Expose scheduler metadata helpers without importing Triton kernels."""
+    fla = ModuleType("freetoken.kernel.fla")
+    fla.__path__ = []
+    chunk = ModuleType("freetoken.kernel.fla.chunk")
+    chunk.CHUNK_SIZE = 64
+    index = ModuleType("freetoken.kernel.fla.index")
+
+    def prepare_chunk_offsets(cu_seqlens, chunk_size):
+        lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        chunks = torch.div(lens + chunk_size - 1, chunk_size, rounding_mode="floor")
+        return torch.cat([cu_seqlens.new_tensor([0]), chunks]).cumsum(-1)
+
+    index.prepare_chunk_offsets = prepare_chunk_offsets
+    monkeypatch.setitem(sys.modules, "freetoken.kernel.fla", fla)
+    monkeypatch.setitem(sys.modules, "freetoken.kernel.fla.chunk", chunk)
+    monkeypatch.setitem(sys.modules, "freetoken.kernel.fla.index", index)
 
 
 def test_harness_anchor_wins_over_deepest_prefill_track(monkeypatch):
     import freetoken.core as core
     from freetoken.attention.linear import build_fla_metadata
 
+    _stub_fla_metadata_dependencies(monkeypatch)
     pool = _pool()
     monkeypatch.setattr(
         core,
@@ -62,10 +76,11 @@ def test_harness_anchor_wins_over_deepest_prefill_track(monkeypatch):
     assert req.mamba_last_track_seqlen == 64
 
 
-def test_prefill_admission_aligns_and_carries_harness_anchor():
+def test_prefill_admission_aligns_and_carries_harness_anchor(monkeypatch):
     from freetoken.message import UserMsg
     from freetoken.scheduler.prefill import PrefillManager
 
+    _stub_fla_metadata_dependencies(monkeypatch)
     cache = SimpleNamespace(
         is_hybrid=True,
         admit_expert_profile=lambda _uid, _ids: None,
@@ -94,16 +109,17 @@ def test_chunked_anchor_persistence_does_not_touch_radix_ownership(monkeypatch):
         def contains(self, _token_ids):
             return False
 
-    pool = _pool()
     page_table = torch.arange(4 * 256, dtype=torch.int32).view(4, 256)
-    manager = CacheManager(
-        num_pages=1024,
-        page_size=1,
-        page_table=page_table,
-        type="hybrid_radix",
-        linear_state_pool=pool,
-        disk_prefix_store=Store(),
+    manager = object.__new__(CacheManager)
+    manager.is_hybrid = True
+    manager.disk_prefix_store = Store()
+    manager.page_table = page_table
+    manager.free_slots = torch.arange(1024, dtype=torch.int32)
+    manager.prefix_cache = SimpleNamespace(
+        full_evictable_size=0,
+        mamba_evictable_size=0,
     )
+    pool = _pool()
     req = Req(
         input_ids=torch.arange(129, dtype=torch.int32),
         table_idx=0,
@@ -146,16 +162,11 @@ def test_existing_disk_anchor_is_not_rewritten(monkeypatch):
         def contains(self, _token_ids):
             return True
 
-    pool = _pool()
     page_table = torch.zeros(4, 256, dtype=torch.int32)
-    manager = CacheManager(
-        num_pages=1024,
-        page_size=1,
-        page_table=page_table,
-        type="hybrid_radix",
-        linear_state_pool=pool,
-        disk_prefix_store=Store(),
-    )
+    manager = object.__new__(CacheManager)
+    manager.is_hybrid = True
+    manager.disk_prefix_store = Store()
+    manager.page_table = page_table
     req = SimpleNamespace(
         cache_anchor_len=64,
         mamba_last_track_seqlen=64,
