@@ -2298,9 +2298,13 @@ def test_disk_hot_adaptation_forced_tick_preserves_decode_parity(tmp_path):
         source[0][0].numel() * source[0].element_size()
         for source in banks.sources.values()
     )
+    # The per-boundary cap (default half the hot budget) floors to one row
+    # on this two-row partition, which would spread the two expected swaps
+    # over more boundaries than the test drives; allow the whole budget.
     cache.configure_hot_adaptation(
         half_life_steps=2, interval_steps=1,
         max_swap_bytes=2 * row_bytes, expert_bytes=row_bytes,
+        boundary_cap_frac=1.0,
     )
     executor = CpuMoeExecutor(
         cache, top_k=top_k, activation="silu",
