@@ -652,7 +652,9 @@ class Scheduler(SchedulerIOMixin):
                 if isinstance(req, ChunkedReq):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
                     # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
+                    # already copied (overlap), so cache_req double-frees the prior chunk. The
+                    # harness helper only stages immutable tensors for a disk write. It performs
+                    # no radix insertion and changes no KV page or recurrent-slot ownership.
                     if not req.aborted:
                         self.cache_manager.persist_intermediate_cache_anchor(req)
                     if req.aborted:

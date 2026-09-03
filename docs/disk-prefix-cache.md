@@ -6,19 +6,29 @@ Enable the lane with both flags:
 --kv-disk-cache-dir /nvme/freetoken-prefixes --kv-disk-cache-gib 1024
 ```
 
+Harness signatures are configurable as repeated `kind=prefix` entries. Supplying
+the flag at least once replaces the built-in OpenCode and Pi signatures:
+
+```text
+--kv-harness-prefixes my-agent="You are My Agent," \
+--kv-harness-prefixes another-agent="You are Another Agent."
+```
+
+Matching ignores leading whitespace and letter case. OpenAI text content parts are
+joined before matching.
+
 `--lazy-restore on` is the default. Set it to `off` for the eager parity baseline.
 
 The default budget is zero, which disables all disk-prefix work. The byte budget applies to
 all complete entry files in the directory. Files are evicted by oldest last-use time.
 
-Version 2 stores one complete prefix plus a page boundary index per entry. Version 1 entries
-remain readable and automatically use eager restore because they have no block index. The key
-combines the FTW fingerprint, a hash of the runtime model geometry, TP rank and size, and the
-exact token chain. Restore still compares the stored token tensor with the request prefix, so
-the digest is never trusted as
-proof of equality. A startup scan reads safetensors headers only. Foreign fingerprints are
-skipped, incomplete temp files are removed, and corrupt entries are deleted without failing a
-request.
+Version 3 stores one complete prefix, a page boundary index, and the required KV dtype tag per
+entry. Older formats are counted as stale and are not restored. The key combines the FTW
+fingerprint, a hash of the runtime model geometry, TP rank and size, and the exact token chain.
+Restore still compares the stored token tensor with the request prefix, so the digest is never
+trusted as proof of equality. A startup scan reads safetensors headers only. Foreign fingerprints
+are skipped, incomplete temp files are removed, and corrupt entries are deleted without failing
+a request.
 
 Each payload contains:
 
@@ -45,14 +55,29 @@ does the safetensors write, file sync, atomic rename, and LRU pass. A full queue
 write and increments `write_drops`; write-side disk I/O never runs in the decode loop. A selected
 missing KV page can still perform the intended synchronous read on the demand-fault path.
 
-OpenCode and Pi requests also materialize the stable system-and-tools root as its own entry. The
-tokenizer recognizes their system prompt signatures, renders the leading system run with the same
-tool schemas and template arguments, and takes the exact token common prefix with the full prompt.
-The boundary is rounded down to the hybrid recurrence alignment. If it falls in an intermediate
-prefill chunk, the scheduler stages that snapshot directly to disk without inserting the chunk
-into the live radix tree or changing page ownership. A later session whose first user message is
-different can therefore restore the shared root, and the entry remains available after restart.
-Unknown clients keep the normal whole-turn cache behavior.
+Configured coding-harness requests can also materialize the stable system-and-tools root as its
+own entry. The tokenizer recognizes a configured system prompt signature, renders the leading
+system run with the same tool schemas and template arguments, and takes the exact token common
+prefix with the full prompt. The boundary is rounded down to the hybrid recurrence alignment.
+
+The root entry is written only when all of these conditions hold:
+
+* a nonzero disk-prefix budget created a `DiskPrefixStore` for a hybrid radix cache
+* the request is split across multiple prefill chunks
+* the aligned anchor lies strictly inside the current non-final chunk
+* the anchor is also aligned to the disk cache page size
+* the request still owns a valid table row and the bounded writer accepts the job
+
+The scheduler stages that snapshot directly to disk. It never inserts the harness root into the
+live radix tree and never changes KV page or recurrent-slot ownership. The live tree therefore
+keeps exactly the same deepest checkpoint it would keep for a prompt with no harness match.
+Single-chunk prompts, anchors reached only by the final chunk, disabled disk storage, unaligned
+anchors, and unknown clients retain the normal cache behavior. A later session whose first user
+message differs can restore a successfully written root, including after restart.
+
+Scheduler status lines expose `harness_anchor_persisted`,
+`harness_anchor_skipped_final_chunk`, `harness_anchor_skipped_no_store`, and
+`harness_anchor_skipped_unaligned` alongside the other disk-prefix counters.
 
 For the RadixArk Qwen3.8 Flash-Next geometry at TP=1 and bf16, a 32,768-token entry is about
 902.4 MiB before its small safetensors header:

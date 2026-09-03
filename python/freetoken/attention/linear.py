@@ -116,16 +116,22 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     )
     boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
     dst, h_row, conv_src, boundary_rows = [], [], [], []
+    from freetoken.scheduler.prefill import ChunkedReq
+
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:
             continue
-        # A known harness root wins when it lies strictly inside this extend. Otherwise
-        # preserve the existing deepest-boundary policy. The anchor is globally aligned,
-        # and hybrid cached/chunk boundaries are aligned too, so the relative offset is
-        # an exact recurrent chunk boundary.
-        anchor = r.cache_anchor_len
+        # Only a prefill-validated disk anchor may select an earlier snapshot. Ordinary and
+        # final requests always preserve the existing deepest-boundary policy.
+        anchor = (
+            r.cache_anchor_len
+            if getattr(r, "cache_anchor_persistable", False)
+            else None
+        )
         if (
             anchor is not None
+            and isinstance(r, ChunkedReq)
+            and r.extend_len > 0
             and r.cached_len < anchor < r.cached_len + r.extend_len
             and (anchor - r.cached_len) % CHUNK_SIZE == 0
         ):

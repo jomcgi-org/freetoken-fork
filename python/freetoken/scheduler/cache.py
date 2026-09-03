@@ -74,6 +74,12 @@ class CacheManager:
         # temporary restore lock here, and the scheduler thread releases it at its next cache seam.
         self._lazy_unlocks: queue.SimpleQueue[object] = queue.SimpleQueue()
         self._lazy_restores_by_node: dict[object, object] = {}
+        self._harness_anchor_stats = {
+            "harness_anchor_persisted": 0,
+            "harness_anchor_skipped_final_chunk": 0,
+            "harness_anchor_skipped_no_store": 0,
+            "harness_anchor_skipped_unaligned": 0,
+        }
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
     supports_runtime_rebuild = True
@@ -318,13 +324,13 @@ class CacheManager:
     def _queue_disk_prefix(
         self, req: Req, length: int, kv_indices: torch.Tensor, linear_slot: int,
         expert_profile=None,
-    ) -> None:
+    ) -> bool:
         store = self.disk_prefix_store
         if store is None or length <= 0:
-            return
+            return False
         if not store.can_enqueue():
             store.note_write_drop()
-            return
+            return False
         from freetoken.kvcache.disk_prefix_cache import (
             stage_hybrid_prefix_for_write,
         )
@@ -338,9 +344,10 @@ class CacheManager:
                 table_idx=req.table_idx,
                 extra_tensors=(expert_profile.to_tensors() if expert_profile is not None else None),
             )
-            store.enqueue(req.input_ids[:length], staged, ready=ready)
+            return store.enqueue(req.input_ids[:length], staged, ready=ready)
         except Exception:
             store.note_write_drop()
+            return False
 
     def _queue_disk_node(
         self, token_ids: torch.Tensor, kv_indices: torch.Tensor, linear_slot: int,
@@ -378,23 +385,59 @@ class CacheManager:
         waits for the engine stream before draining the completed chunk.
         """
         length = req.cache_anchor_len
+        store = self.disk_prefix_store
+        if length is not None and (not self.is_hybrid or store is None):
+            self.note_harness_anchor("skipped_no_store")
+            return
+        if length is not None and align_down(length, self.page_size) != length:
+            self.note_harness_anchor("skipped_unaligned")
+            return
+        from .prefill import ChunkedReq
+
         if (
             not self.is_hybrid
-            or self.disk_prefix_store is None
+            or store is None
             or length is None
+            or not getattr(req, "cache_anchor_persistable", False)
+            or not isinstance(req, ChunkedReq)
             or req.mamba_last_track_seqlen != length
             or req.mamba_ping_pong is None
             or length <= 0
             or length > req.cached_len
+            or req.table_idx == -1
         ):
             return
         token_ids = req.input_ids[:length]
-        if self.disk_prefix_store.contains(token_ids):
+        if store.contains(token_ids):
             return
         frozen_idx = 1 - req.mamba_next_track_idx
         frozen = req.mamba_ping_pong[frozen_idx]
         page_indices = self.page_table[req.table_idx, :length]
-        self._queue_disk_prefix(req, length, page_indices, frozen)
+        if self._queue_disk_prefix(req, length, page_indices, frozen):
+            self.note_harness_anchor("persisted")
+
+    def note_harness_anchor(self, outcome: str) -> None:
+        """Record one anchor outcome, including disabled-store drops for unit observability."""
+        key = f"harness_anchor_{outcome}"
+        store = self.disk_prefix_store
+        note = getattr(store, "note_harness_anchor", None)
+        if note is not None:
+            note(outcome)
+            return
+        stats = getattr(self, "_harness_anchor_stats", None)
+        if stats is None:
+            stats = self._harness_anchor_stats = {}
+        stats[key] = stats.get(key, 0) + 1
+
+    def harness_anchor_stats(self) -> dict[str, int]:
+        store_stats = getattr(self.disk_prefix_store, "stats", None)
+        if callable(store_stats):
+            return {
+                key: int(value)
+                for key, value in store_stats().items()
+                if key.startswith("harness_anchor_")
+            }
+        return dict(getattr(self, "_harness_anchor_stats", {}))
 
     @property
     def available_size(self) -> int:

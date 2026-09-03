@@ -155,6 +155,7 @@ def tokenize_worker(
     local_bs: int,
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
+    harness_prefixes: tuple[str, ...] = (),
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
@@ -167,7 +168,7 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, harness_prefixes=harness_prefixes)
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )

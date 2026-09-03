@@ -128,6 +128,26 @@ def test_kv_cache_dtype_cli_default_is_auto():
     assert args.kv_cache_dtype == "auto"
 
 
+def test_repeated_harness_prefix_flags_replace_defaults():
+    args, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--kv-harness-prefixes",
+            "custom=You are Custom,",
+            "--kv-harness-prefixes",
+            "second=You are Second.",
+        ]
+    )
+
+    assert args.kv_harness_prefixes == (
+        "custom=You are Custom,",
+        "second=You are Second.",
+    )
+
+
 def test_hot_adapt_boundary_cap_flag_reaches_server_config():
     args, _ = parse_args(
         [
