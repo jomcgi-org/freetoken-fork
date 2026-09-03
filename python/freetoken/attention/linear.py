@@ -119,9 +119,21 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:
             continue
-        # deepest mid-chunk boundary strictly inside the extend (h has the per-chunk state;
-        # the exact extend-end / aligned-final state lives in the live slot -> finish-donate).
-        c = (r.extend_len - 1) // CHUNK_SIZE
+        # A known harness root wins when it lies strictly inside this extend. Otherwise
+        # preserve the existing deepest-boundary policy. The anchor is globally aligned,
+        # and hybrid cached/chunk boundaries are aligned too, so the relative offset is
+        # an exact recurrent chunk boundary.
+        anchor = r.cache_anchor_len
+        if (
+            anchor is not None
+            and r.cached_len < anchor < r.cached_len + r.extend_len
+            and (anchor - r.cached_len) % CHUNK_SIZE == 0
+        ):
+            c = (anchor - r.cached_len) // CHUNK_SIZE
+        else:
+            # deepest mid-chunk boundary strictly inside the extend (h has the per-chunk state;
+            # the exact extend-end / aligned-final state lives in the live slot -> finish-donate).
+            c = (r.extend_len - 1) // CHUNK_SIZE
         if c < 1:
             continue
         off = int(cu_host[i])

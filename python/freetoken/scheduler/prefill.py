@@ -216,6 +216,8 @@ class PrefillAdder:
         req.lazy_kv_restore = lazy_kv_restore
         req.restore_started_at = restore_started_at
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
+        req.cache_anchor_len = pending_req.cache_anchor_len
+        req.cache_anchor_kind = pending_req.cache_anchor_kind
         req.expert_profile = pending_req.expert_profile
         req.expert_profile_restored = bool(
             pending_req.expert_profile is not None and cached_len > 0
@@ -287,6 +289,12 @@ class PrefillManager:
     clock: Callable[[], float] = time.monotonic
 
     def add_one_req(self, req: UserMsg) -> None:
+        cache_anchor_len = None
+        if self.cache_manager.is_hybrid and req.cache_anchor_len is not None:
+            from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+            aligned = align_down(req.cache_anchor_len, CHUNK_SIZE)
+            cache_anchor_len = aligned if aligned > 0 else None
         pending = PendingReq(
             req.uid,
             req.input_ids,
@@ -294,6 +302,8 @@ class PrefillManager:
             mm_embeds=req.mm_embeds,
             priority=req.priority,
             arrival_time=req.arrival_time,
+            cache_anchor_len=cache_anchor_len,
+            cache_anchor_kind=req.cache_anchor_kind,
         )
         # This is the multi-lane payoff seam: the request has just entered the
         # waiting queue, before it owns a table row or reaches first prefill.

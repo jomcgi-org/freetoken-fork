@@ -45,6 +45,15 @@ does the safetensors write, file sync, atomic rename, and LRU pass. A full queue
 write and increments `write_drops`; write-side disk I/O never runs in the decode loop. A selected
 missing KV page can still perform the intended synchronous read on the demand-fault path.
 
+OpenCode and Pi requests also materialize the stable system-and-tools root as its own entry. The
+tokenizer recognizes their system prompt signatures, renders the leading system run with the same
+tool schemas and template arguments, and takes the exact token common prefix with the full prompt.
+The boundary is rounded down to the hybrid recurrence alignment. If it falls in an intermediate
+prefill chunk, the scheduler stages that snapshot directly to disk without inserting the chunk
+into the live radix tree or changing page ownership. A later session whose first user message is
+different can therefore restore the shared root, and the entry remains available after restart.
+Unknown clients keep the normal whole-turn cache behavior.
+
 For the RadixArk Qwen3.8 Flash-Next geometry at TP=1 and bf16, a 32,768-token entry is about
 902.4 MiB before its small safetensors header:
 

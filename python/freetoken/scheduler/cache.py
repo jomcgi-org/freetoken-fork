@@ -368,6 +368,34 @@ class CacheManager:
         except Exception:
             store.note_write_drop()
 
+    def persist_intermediate_cache_anchor(self, req: Req) -> None:
+        """Persist a tracked harness root while a chunked prefill keeps running.
+
+        This deliberately does not insert into the live radix tree or transfer page
+        ownership. Overlap scheduling has already built the next chunk from the old
+        handle, so an intermediate insert would recreate the stale-handle double-free
+        this scheduler explicitly avoids. Staging is safe here: the scheduler stream
+        waits for the engine stream before draining the completed chunk.
+        """
+        length = req.cache_anchor_len
+        if (
+            not self.is_hybrid
+            or self.disk_prefix_store is None
+            or length is None
+            or req.mamba_last_track_seqlen != length
+            or req.mamba_ping_pong is None
+            or length <= 0
+            or length > req.cached_len
+        ):
+            return
+        token_ids = req.input_ids[:length]
+        if self.disk_prefix_store.contains(token_ids):
+            return
+        frozen_idx = 1 - req.mamba_next_track_idx
+        frozen = req.mamba_ping_pong[frozen_idx]
+        page_indices = self.page_table[req.table_idx, :length]
+        self._queue_disk_prefix(req, length, page_indices, frozen)
+
     @property
     def available_size(self) -> int:
         evictable = (self.prefix_cache.full_evictable_size if (self.is_hybrid or self.is_swa)

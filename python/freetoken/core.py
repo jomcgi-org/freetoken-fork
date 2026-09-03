@@ -49,6 +49,10 @@ class Req:
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
+    # Tokenizer-derived reusable prefix for known coding harnesses. The scheduler
+    # aligns the raw template boundary to the hybrid recurrence checkpoint grid.
+    cache_anchor_len: int | None = None
+    cache_anchor_kind: str | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---

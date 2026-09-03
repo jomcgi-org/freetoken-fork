@@ -93,18 +93,29 @@ def _tokenize_requests(
     tokenize_manager: Any,
     messages: List[TokenizeMsg],
     logger: Any,
-) -> tuple[List[TokenizeMsg], List[torch.Tensor], List[UserReply]]:
+) -> tuple[
+    List[TokenizeMsg],
+    List[tuple[torch.Tensor, int | None, str | None]],
+    List[UserReply],
+]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
 
     Successful tokenization deliberately emits no prompt-token reply: accounting starts
     only when the scheduler later confirms first-prefill admission.
     """
     ok_msgs: List[TokenizeMsg] = []
-    ok_tensors: List[torch.Tensor] = []
+    ok_results: List[tuple[torch.Tensor, int | None, str | None]] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
-            tokens = tokenize_manager.tokenize([msg])[0]
+            tokenize_with_anchor = getattr(
+                tokenize_manager, "tokenize_with_cache_anchor", None
+            )
+            if tokenize_with_anchor is None:
+                tokens = tokenize_manager.tokenize([msg])[0]
+                cache_anchor_len = cache_anchor_kind = None
+            else:
+                tokens, cache_anchor_len, cache_anchor_kind = tokenize_with_anchor(msg)
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -129,8 +140,8 @@ def _tokenize_requests(
             )
             continue
         ok_msgs.append(msg)
-        ok_tensors.append(tokens)
-    return ok_msgs, ok_tensors, errors
+        ok_results.append((tokens, cache_anchor_len, cache_anchor_kind))
+    return ok_msgs, ok_results, errors
 
 
 @torch.inference_mode()
@@ -272,7 +283,7 @@ def tokenize_worker(
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template
                 # that rejects the message layout) becomes a terminal error reply for THAT uid
                 # instead of an uncaught exception that kills the worker and bricks the server.
-                ok_msgs, ok_tensors, errors = _tokenize_requests(
+                ok_msgs, ok_results, errors = _tokenize_requests(
                     tokenize_manager, tokenize_msg, logger
                 )
                 if errors:
@@ -283,12 +294,14 @@ def tokenize_worker(
                     backend = [
                         UserMsg(
                             uid=msg.uid,
-                            input_ids=t,
+                            input_ids=result[0],
                             sampling_params=msg.sampling_params,
                             priority=msg.priority,
                             arrival_time=msg.arrival_time,
+                            cache_anchor_len=result[1],
+                            cache_anchor_kind=result[2],
                         )
-                        for msg, t in zip(ok_msgs, ok_tensors, strict=True)
+                        for msg, result in zip(ok_msgs, ok_results, strict=True)
                     ]
                     send_backend.put(backend[0] if len(backend) == 1 else BatchBackendMsg(data=backend))
             if len(abort_msg) > 0:

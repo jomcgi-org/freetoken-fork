@@ -652,6 +652,8 @@ class Scheduler(SchedulerIOMixin):
                     # Don't cache intermediate chunks; the full prompt is cached once when the
                     # final chunk is processed. Caching here snapshots a handle the next chunk
                     # already copied (overlap), so cache_req double-frees the prior chunk.
+                    if not req.aborted:
+                        self.cache_manager.persist_intermediate_cache_anchor(req)
                     if req.aborted:
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this

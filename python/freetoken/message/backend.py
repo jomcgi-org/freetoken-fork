@@ -40,6 +40,11 @@ class UserMsg(BaseBackendMsg):
     mm_embeds: torch.Tensor | None = None
     priority: int = 0
     arrival_time: float = field(default_factory=time.monotonic)
+    # Optional tokenizer-derived boundary at the end of a known coding harness's
+    # stable system/tool preamble. Hybrid caches persist this boundary separately
+    # so fresh sessions can reuse it even when their first user message differs.
+    cache_anchor_len: int | None = None
+    cache_anchor_kind: str | None = None
 
 
 @dataclass
