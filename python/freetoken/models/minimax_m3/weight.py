@@ -16,7 +16,7 @@ Norms, the router gate, ``e_score_correction_bias`` (kept fp32), embeddings and
 lm_head are unquantized and stream through verbatim. Routed experts are NVFP4
 (``w1/w3/w2`` = gate/up/down, same ModelOpt layout as MiniMax-M2) and go to the
 offload cache via ``load_nvfp4_expert_sources``; expert ``input_scale`` calibration
-tensors are unused (W4A16) and never match the bank spec.
+tensors are carried by the bank loader for the optional SM120 W4A4 path.
 
 FTW caveat: an FTW checkpoint stores whatever iter_weights yielded at CONVERSION time,
 and the model is built from the env at SERVE time -- the two must agree (a mismatch
@@ -47,7 +47,7 @@ from .config import parse_config
 _EXPERT_KEY_RE = re.compile(
     r"^language_model\.model\.layers\.(?P<layer>\d+)\.block_sparse_moe\."
     r"experts\.(?P<expert>\d+)\.(?P<proj>w1|w2|w3)\."
-    r"(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<kind>weight|weight_scale|weight_scale_2|input_scale)$"
 )
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,

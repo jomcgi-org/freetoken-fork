@@ -23,7 +23,11 @@ class EngineConfig:
     attention_backend: str = "auto"
     moe_backend: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
-    nvfp4_backend: str = "triton"
+    # None is the implicit Triton default. Keeping the sentinel lets activation-scale
+    # auto-selection distinguish it from an explicit --nvfp4-backend triton.
+    nvfp4_backend: str | None = None
+    # Routed activation precision for the SM120 flashinfer expert path.
+    moe_activation_dtype: str = "auto"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
     # experts in parallel but falls back to serial when free RAM can't cover the banks + the
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
@@ -165,6 +169,11 @@ class EngineConfig:
     num_token_override: int | None = None
 
     def __post_init__(self) -> None:
+        if self.moe_activation_dtype not in ("auto", "bf16", "nvfp4"):
+            raise ValueError(
+                "--moe-activation-dtype must be 'auto', 'bf16', or 'nvfp4', got "
+                f"{self.moe_activation_dtype!r}"
+            )
         from freetoken.spec_decode import (
             validate_mtp_draft_tokens,
             validate_speculative_mtp,

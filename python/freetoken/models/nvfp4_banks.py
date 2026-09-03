@@ -43,6 +43,14 @@ LayerToBank = Callable[[int, object], int | None]
 DropPageCache = Callable[[str], None]
 
 
+class Nvfp4ExpertSources(dict):
+    """Expert-bank tensors plus an optional activation-sidecar rejection reason."""
+
+    def __init__(self, *args, input_scale_unusable_reason: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.input_scale_unusable_reason = input_scale_unusable_reason
+
+
 @dataclass(frozen=True)
 class Nvfp4ExpertSourceSpec:
     key_pattern: re.Pattern[str]
@@ -50,10 +58,12 @@ class Nvfp4ExpertSourceSpec:
     layer_to_bank: LayerToBank
     desc: str
     # Optional source-layout aliases to the native ModelOpt names used internally:
-    # weight, weight_scale, weight_scale_2.
+    # weight, weight_scale, weight_scale_2, input_scale.
     kind_aliases: dict[str, str] | None = None
     # compressed-tensors stores the quant-side global; dequant uses its reciprocal.
     invert_global_scale: bool = False
+    # The same convention applies independently to activation input scales.
+    invert_input_scale: bool = False
 
 
 def _source_kind(spec: Nvfp4ExpertSourceSpec, match: re.Match[str]) -> str:
@@ -66,6 +76,90 @@ def _global_scale(spec: Nvfp4ExpertSourceSpec, tensor: torch.Tensor) -> torch.Te
     if spec.invert_global_scale:
         value = value.reciprocal()
     return value.to(dtype=torch.float16, copy=True)
+
+
+def _input_scale(spec: Nvfp4ExpertSourceSpec, tensor: torch.Tensor) -> torch.Tensor:
+    value = tensor.reshape(()).float()
+    if spec.invert_input_scale:
+        value = value.reciprocal()
+    return value.to(dtype=torch.float32, copy=True)
+
+
+def _load_input_scales(
+    folder: str,
+    weight_map: dict,
+    config,
+    spec: Nvfp4ExpertSourceSpec,
+    *,
+    drop_page_cache: DropPageCache,
+) -> tuple[dict[str, list[torch.Tensor]], str | None]:
+    """Load complete ModelOpt activation-scale sidecars, or return no sidecars.
+
+    Gate and up consume the same routed activation, so FlashInfer's fused FC1 has one
+    input global per expert. A partial export or unequal gate/up values is represented
+    as the feature-disabled state rather than guessed or averaged.
+
+    The caller resolves CPU decode, non-sm_120 devices, and an explicit BF16 request to
+    ``config.moe_activation_dtype == "bf16"`` before loading. Those paths return before
+    allocating the sidecar table or opening any checkpoint shard.
+    """
+    activation_dtype = getattr(config, "moe_activation_dtype", "auto")
+    if (activation_dtype or "auto").strip().lower() == "bf16":
+        return {}, None
+
+    num_layers = _num_moe_layers(config)
+    num_experts = int(config.num_experts)
+    values = torch.empty((num_layers, num_experts, 3), dtype=torch.float32)
+    seen = torch.zeros((num_layers, num_experts, 3), dtype=torch.bool)
+    role_index = {"gate": 0, "up": 1, "down": 2}
+    by_shard: dict[str, list[tuple[str, re.Match[str], int]]] = collections.defaultdict(list)
+
+    for name, shard in weight_map.items():
+        match = spec.key_pattern.match(name)
+        if match is None or _source_kind(spec, match) != "input_scale":
+            continue
+        bank_layer = _bank_layer(spec, int(match.group("layer")), config)
+        if bank_layer is not None:
+            by_shard[shard].append((name, match, bank_layer))
+
+    if not by_shard:
+        return {}, None
+
+    for shard in sorted(by_shard):
+        path = os.path.join(folder, shard)
+        with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+            for name, match, bank_layer in by_shard[shard]:
+                expert = int(match.group("expert"))
+                role = spec.proj_to_role[match.group("proj")]
+                role_id = role_index[role]
+                if seen[bank_layer, expert, role_id]:
+                    raise ValueError(f"{spec.desc}: duplicate activation input scale {name}")
+                values[bank_layer, expert, role_id] = _input_scale(
+                    spec, handle.get_tensor(name)
+                )
+                seen[bank_layer, expert, role_id] = True
+        drop_page_cache(path)
+
+    if not bool(seen.all()):
+        return {}, None
+    if not bool(torch.isfinite(values).all()) or not bool((values > 0).all()):
+        return {}, None
+    gate = values[:, :, 0]
+    up = values[:, :, 1]
+    if not torch.allclose(
+        gate,
+        up,
+        rtol=4 * torch.finfo(torch.float32).eps,
+        atol=0.0,
+    ):
+        return {}, "gate/up input scales differ beyond tolerance"
+    # A tiny accepted export discrepancy is resolved conservatively with the larger
+    # scale so both halves remain representable under one fused FC1 input global.
+    gate_up = torch.maximum(gate, up)
+    return {
+        "gate_up_input_scale": [row.contiguous() for row in gate_up],
+        "down_input_scale": [row.contiguous() for row in values[:, :, 2]],
+    }, None
 
 
 def quantize_nvfp4_group16(
@@ -230,6 +324,15 @@ def _stream_nvfp4_expert_source_banks(
     H = int(getattr(config, "hidden_size"))
     I = int(getattr(config, "moe_intermediate_size"))
     num_layers = _num_moe_layers(config)
+    input_scales, input_scale_unusable_reason = _load_input_scales(
+        folder, weight_map, config, spec, drop_page_cache=drop_page_cache
+    )
+    sidecar_setter = getattr(layer_sink, "set_nvfp4_input_scales", None)
+    if sidecar_setter is not None:
+        sidecar_setter(
+            input_scales,
+            input_scale_unusable_reason=input_scale_unusable_reason,
+        )
 
     by_layer: list[dict[str, list[tuple[str, re.Match[str]]]]] = [
         collections.defaultdict(list) for _ in range(num_layers)
@@ -237,6 +340,8 @@ def _stream_nvfp4_expert_source_banks(
     for name, shard in weight_map.items():
         match = spec.key_pattern.match(name)
         if match is None:
+            continue
+        if _source_kind(spec, match) == "input_scale":
             continue
         bank_layer = _bank_layer(spec, int(match.group("layer")), config)
         if bank_layer is not None:
@@ -329,7 +434,11 @@ def _stream_nvfp4_expert_source_banks(
         for name, tensor in tensors.items():
             completed[name].append(tensor)
 
-    return dict(completed)
+    completed.update(input_scales)
+    return Nvfp4ExpertSources(
+        completed,
+        input_scale_unusable_reason=input_scale_unusable_reason,
+    )
 
 
 def load_nvfp4_expert_source_banks(
@@ -372,6 +481,10 @@ def load_nvfp4_expert_source_banks(
             layer_sink=layer_sink,
         )
 
+    input_scales, input_scale_unusable_reason = _load_input_scales(
+        folder, weight_map, config, spec, drop_page_cache=drop_page_cache
+    )
+
     E = config.num_experts
     H = config.hidden_size
     I = config.moe_intermediate_size
@@ -396,6 +509,8 @@ def load_nvfp4_expert_source_banks(
         kind = _source_kind(spec, match)
         if kind == "weight_scale_2":
             global_shards[shard].append((name, match, bank_layer))
+        elif kind == "input_scale":
+            continue
         elif kind in {"weight", "weight_scale"}:
             weight_shards[shard].append((name, match, bank_layer))
         else:
@@ -472,14 +587,15 @@ def load_nvfp4_expert_source_banks(
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
-    return {
+    return Nvfp4ExpertSources({
         "gate_up_packed": gate_up_packed,
         "gate_up_scale": gate_up_scale,
         "gate_up_global": gate_up_global,
         "down_packed": down_packed,
         "down_scale": down_scale,
         "down_global": down_global,
-    }
+        **input_scales,
+    }, input_scale_unusable_reason=input_scale_unusable_reason)
 
 
 def load_nvfp4_expert_source_banks_parallel(
@@ -514,6 +630,9 @@ def load_nvfp4_expert_source_banks_parallel(
     folder = download_hf_weight(model_path)
     with open(os.path.join(folder, "model.safetensors.index.json"), encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
+    input_scales, input_scale_unusable_reason = _load_input_scales(
+        folder, weight_map, config, spec, drop_page_cache=drop_page_cache
+    )
 
     E = config.num_experts
     H = config.hidden_size
@@ -532,6 +651,8 @@ def load_nvfp4_expert_source_banks_parallel(
         kind = _source_kind(spec, match)
         if kind == "weight_scale_2":
             global_names_by_shard[shard].append(name)
+        elif kind == "input_scale":
+            continue
         elif kind in {"weight", "weight_scale"}:
             weight_info[name] = (match, bank_layer)
         else:
@@ -603,14 +724,15 @@ def load_nvfp4_expert_source_banks_parallel(
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
-    return {
+    return Nvfp4ExpertSources({
         "gate_up_packed": gate_up_packed,
         "gate_up_scale": gate_up_scale,
         "gate_up_global": gate_up_global,
         "down_packed": down_packed,
         "down_scale": down_scale,
         "down_global": down_global,
-    }
+        **input_scales,
+    }, input_scale_unusable_reason=input_scale_unusable_reason)
 
 
 __all__ = [

@@ -31,7 +31,8 @@ _PACKED_EXPERT_PATTERN = re.compile(
 _NVFP4_EXPERT_RE = re.compile(r"\.experts\.\d+\.")
 _NVFP4_EXPERT_KEY_RE = re.compile(
     r"^model\.language_model\.layers\.(?P<layer>\d+)\.experts\.(?P<expert>\d+)\."
-    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+    r"(?P<kind>weight|weight_scale|weight_scale_2|input_scale)$"
 )
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_NVFP4_EXPERT_KEY_RE,
