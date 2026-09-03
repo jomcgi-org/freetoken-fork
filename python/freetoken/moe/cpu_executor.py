@@ -402,8 +402,11 @@ class CpuMoeExecutor:
         self._prefill_coalesce_degrades = 0
         self._prefill_coalesce_warned = False
         self._prefill_populate_bytes = 0
+        self._prefill_populate_skipped_tmpfs_bytes = 0
         self._prefill_populate_ns = 0
         self._prefill_populate_overlap_ns = 0
+        self._prefill_release_pages = 0
+        self._prefill_release_skipped_tmpfs_bytes = 0
         self._prefill_populate_scratch = None
         self._prefill_populate_overlap: _PrefillPopulateOverlap | None = None
         self._prefill_populate_overlap_lock = threading.Lock()
@@ -1019,6 +1022,12 @@ class CpuMoeExecutor:
             if pager is not None:
                 pager_groups.setdefault(pager, []).append(bank)
                 continue
+            if getattr(bank, "_tmpfs_backed", False):
+                skipped = bank.selected_rows_nbytes(selected)
+                self._prefill_populate_skipped_tmpfs_bytes = getattr(
+                    self, "_prefill_populate_skipped_tmpfs_bytes", 0
+                ) + skipped
+                continue
             file_banks.append(bank)
         scratch = getattr(self, "_prefill_populate_scratch", None)
         if file_banks and scratch is None:
@@ -1346,11 +1355,20 @@ class CpuMoeExecutor:
             if pager is not None:
                 pager_groups.setdefault(pager, []).append(bank)
                 continue
+            if getattr(bank, "_tmpfs_backed", False):
+                skipped = bank.selected_rows_nbytes(lease.experts)
+                self._prefill_release_skipped_tmpfs_bytes = getattr(
+                    self, "_prefill_release_skipped_tmpfs_bytes", 0
+                ) + skipped
+                continue
             release = getattr(bank, "release_rows", None)
             if release is None:
                 continue
             try:
-                release(lease.experts)
+                released_pages = release(lease.experts)
+                self._prefill_release_pages = getattr(
+                    self, "_prefill_release_pages", 0
+                ) + int(released_pages or 0)
             except (MemoryError, OSError, RuntimeError) as exc:
                 logger.warning_rank0(
                     f"CPU MoE prefill one-pass advice failed for layer "
@@ -1381,8 +1399,11 @@ class CpuMoeExecutor:
         self._prefill_coalesce_ns = 0
         self._prefill_coalesce_degrades = 0
         self._prefill_populate_bytes = 0
+        self._prefill_populate_skipped_tmpfs_bytes = 0
         self._prefill_populate_ns = 0
         self._prefill_populate_overlap_ns = 0
+        self._prefill_release_pages = 0
+        self._prefill_release_skipped_tmpfs_bytes = 0
         self._prefill_batch_rows = 0
         self._prefill_batch_gemms = 0
         self._prefill_batch_degrades = 0
@@ -1463,12 +1484,21 @@ class CpuMoeExecutor:
             "moe_prefill_populate_bytes": getattr(
                 self, "_prefill_populate_bytes", 0
             ),
+            "moe_prefill_populate_skipped_tmpfs_bytes": getattr(
+                self, "_prefill_populate_skipped_tmpfs_bytes", 0
+            ),
             "moe_prefill_populate_ms": getattr(
                 self, "_prefill_populate_ns", 0
             ) / 1_000_000,
             "moe_prefill_populate_overlap_ms": getattr(
                 self, "_prefill_populate_overlap_ns", 0
             ) / 1_000_000,
+            "moe_prefill_release_pages": getattr(
+                self, "_prefill_release_pages", 0
+            ),
+            "moe_prefill_release_skipped_tmpfs_bytes": getattr(
+                self, "_prefill_release_skipped_tmpfs_bytes", 0
+            ),
             "moe_prefill_batch_rows": getattr(
                 self, "_prefill_batch_rows", 0
             ),
@@ -1528,8 +1558,11 @@ class CpuMoeExecutor:
             self._prefill_coalesce_ns = 0
             self._prefill_coalesce_degrades = 0
             self._prefill_populate_bytes = 0
+            self._prefill_populate_skipped_tmpfs_bytes = 0
             self._prefill_populate_ns = 0
             self._prefill_populate_overlap_ns = 0
+            self._prefill_release_pages = 0
+            self._prefill_release_skipped_tmpfs_bytes = 0
             self._prefill_batch_rows = 0
             self._prefill_batch_gemms = 0
             self._prefill_batch_degrades = 0

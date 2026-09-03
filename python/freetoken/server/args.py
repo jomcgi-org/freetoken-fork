@@ -689,6 +689,22 @@ def parse_args(
             "MADV_HUGEPAGE support; 'off' disables the advice."
         ),
     )
+    parser.add_argument(
+        "--moe-bank-hugepages-tmpfs",
+        default=ServerArgs.moe_bank_hugepages_tmpfs,
+        metavar="DIR",
+        help=(
+            "Mirror file-backed DISK expert banks into a tmpfs mounted with "
+            "huge=always or huge=within_size, then map the mirrors. Requires "
+            "--moe-bank-hugepages auto or on; off rejects this option."
+        ),
+    )
+    parser.add_argument(
+        "--moe-bank-hugepages-tmpfs-margin-gib",
+        type=float,
+        default=ServerArgs.moe_bank_hugepages_tmpfs_margin_gib,
+        help="Free tmpfs capacity retained beyond all DISK bank mirrors (default: 1 GiB).",
+    )
 
     moe_cache_group = parser.add_mutually_exclusive_group()
     moe_cache_group.add_argument(

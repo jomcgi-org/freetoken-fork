@@ -416,11 +416,28 @@ class Engine:
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
-        self._host_tables_bytes = 0
-        if hasattr(self.model, "load_host_tables"):
-            self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
-        if is_offload_moe_backend(config.moe_backend):
-            self._init_offload_moe_cache(config)
+        from freetoken.moe.host_banks import (
+            format_hugepage_status,
+            read_meminfo_hugepages,
+            requested_hugepages,
+        )
+
+        hugepage_mode = getattr(config, "moe_bank_hugepages", "auto")
+        hugepage_before = read_meminfo_hugepages()
+        # PLE tables load before expert banks, so both phases must share one policy
+        # and one owner collection for the startup report.
+        with requested_hugepages(hugepage_mode) as hugepage_scope:
+            self._host_tables_bytes = 0
+            if hasattr(self.model, "load_host_tables"):
+                self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
+            if is_offload_moe_backend(config.moe_backend):
+                self._init_offload_moe_cache(config)
+        hugepage_after = read_meminfo_hugepages()
+        if hugepage_scope.banks:
+            for line in format_hugepage_status(
+                hugepage_scope, hugepage_mode, hugepage_before, hugepage_after,
+            ).splitlines():
+                logger.info_rank0(line)
         if hasattr(self.model, "prepare_for_runtime"):
             self.model.prepare_for_runtime()
 
@@ -770,6 +787,10 @@ class Engine:
                 disk_pager=disk_pager,
                 bank_source=getattr(config, "bank_source", "auto"),
                 hugepages=getattr(config, "moe_bank_hugepages", "auto"),
+                hugepages_tmpfs=getattr(config, "moe_bank_hugepages_tmpfs", None),
+                hugepages_tmpfs_margin_gib=getattr(
+                    config, "moe_bank_hugepages_tmpfs_margin_gib", 1.0,
+                ),
             )
             moe_activation_dtype = "bf16"
             if getattr(config.model_config, "expert_quant", None) == "nvfp4":
@@ -2354,6 +2375,8 @@ _DENSE_MOE_SETTINGS = {
     "expert_load": "auto",
     "bank_source": "auto",
     "moe_bank_hugepages": "auto",
+    "moe_bank_hugepages_tmpfs": None,
+    "moe_bank_hugepages_tmpfs_margin_gib": 1.0,
 }
 
 
