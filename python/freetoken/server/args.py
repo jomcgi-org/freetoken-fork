@@ -824,6 +824,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-cpu-executor-mode",
+        choices=["sleep", "spin", "auto"],
+        default=ServerArgs.moe_cpu_executor_mode,
+        help=(
+            "CPU MoE worker synchronization: 'sleep' uses condition variables "
+            "(default), 'spin' busy-polls for lower wake latency with a bounded "
+            "wait fallback, and 'auto' enables spin on suitable single-socket x86 "
+            "systems."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-layers",
         type=str,
         default=ServerArgs.moe_cpu_layers,

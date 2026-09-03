@@ -1691,11 +1691,14 @@ struct CpuMoeExecutor {
   std::mutex sync_mtx;
   std::condition_variable sync_cv;
 
-  bool stop = false;
-  uint64_t cur_gen = 0;
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> cur_gen{0};
   MoeTask* cur_task = nullptr;
   std::atomic<uint64_t> submitted{0};
   std::atomic<uint64_t> completed{0};
+  bool spin_mode = false;
+  std::chrono::nanoseconds spin_wait_window{std::chrono::milliseconds(2)};
+  std::atomic<uint64_t> spin_fallbacks{0};
 
   std::atomic<int64_t> p1_next{0};
   std::atomic<int64_t> p2_next{0};
@@ -1771,7 +1774,8 @@ struct CpuMoeExecutor {
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
                  uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
-                 std::vector<int> core_ids_, bool task_timing_enabled_ = false)
+                 std::vector<int> core_ids_, bool task_timing_enabled_ = false,
+                 bool spin_mode_ = false, int64_t spin_wait_us_ = 2000)
       : num_threads(num_threads_ > 0 ? num_threads_ : 1),
         num_layers(num_layers_),
         num_experts(num_experts_),
@@ -1793,6 +1797,8 @@ struct CpuMoeExecutor {
         swiglu_limit(static_cast<float>(swiglu_limit_)),
         task_timing_enabled(task_timing_enabled_),
         timed_worker_mode(task_timing_enabled_),
+        spin_mode(spin_mode_),
+        spin_wait_window(std::chrono::microseconds(std::max<int64_t>(0, spin_wait_us_))),
         step_timing(static_cast<size_t>(num_layers_)),
         core_ids(std::move(core_ids_)) {
     DotChoice c = select_dot();
@@ -2048,7 +2054,7 @@ struct CpuMoeExecutor {
     if (coord_thread.joinable()) coord_thread.join();
     {
       std::lock_guard<std::mutex> lk(task_mtx);
-      stop = true;
+      stop.store(true, std::memory_order_release);
     }
     task_cv.notify_all();
     for (auto& th : workers)
@@ -2680,48 +2686,51 @@ struct CpuMoeExecutor {
     }
   }
 
-  void worker_loop(int tid) {
-    pin_self(tid);
-    uint64_t my_gen = 0;
-    for (;;) {
-      MoeTask* t;
-      {
-        std::unique_lock<std::mutex> lk(task_mtx);
-        task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
-        if (stop) return;
-        my_gen = cur_gen;
-        t = cur_task;
-      }
-      run_task_body(t);
-      if (done_count.fetch_add(1) + 1 == num_threads) {
-        completed.store(my_gen, std::memory_order_release);
-        {
-          std::lock_guard<std::mutex> lk(sync_mtx);
-        }
-        sync_cv.notify_all();
-      }
-    }
-  }
-
   static int64_t steady_now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
   }
 
-  void timed_worker_loop(int tid) {
+  static void cpu_pause() {
+#if CPU_MOE_X86
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+  }
+
+  bool await_task(uint64_t& my_gen, MoeTask*& t) {
+    if (!spin_mode) {
+      std::unique_lock<std::mutex> lk(task_mtx);
+      task_cv.wait(lk, [&] {
+        return stop.load(std::memory_order_acquire) ||
+               cur_gen.load(std::memory_order_acquire) != my_gen;
+      });
+      if (stop.load(std::memory_order_acquire)) return false;
+      my_gen = cur_gen.load(std::memory_order_relaxed);
+      t = cur_task;
+      return true;
+    }
+    for (;;) {
+      const uint64_t observed = cur_gen.load(std::memory_order_acquire);
+      if (observed != my_gen) {
+        my_gen = observed;
+        t = cur_task;
+        return true;
+      }
+      if (stop.load(std::memory_order_acquire)) return false;
+      cpu_pause();
+    }
+  }
+
+  void worker_loop_impl(int tid, bool timed) {
     pin_self(tid);
     uint64_t my_gen = 0;
     for (;;) {
       MoeTask* t;
-      {
-        std::unique_lock<std::mutex> lk(task_mtx);
-        task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
-        if (stop) return;
-        my_gen = cur_gen;
-        t = cur_task;
-      }
-      if (t->timing_active) {
+      if (!await_task(my_gen, t)) return;
+      if (timed && t->timing_active) {
         int64_t expected = 0;
         if (t->t_first_worker_ns.compare_exchange_strong(
                 expected, -1, std::memory_order_acq_rel)) {
@@ -2730,10 +2739,16 @@ struct CpuMoeExecutor {
       }
       run_task_body(t);
       if (done_count.fetch_add(1) + 1 == num_threads) {
-        if (t->timing_active)
+        if (timed && t->timing_active)
           t->t_compute_done_ns.store(steady_now_ns(), std::memory_order_release);
+        if (spin_mode) {
+          if (timed && t->timing_active)
+            t->t_signalled_ns.store(steady_now_ns(), std::memory_order_release);
+          completed.store(my_gen, std::memory_order_release);
+          continue;
+        }
         completed.store(my_gen, std::memory_order_release);
-        if (t->timing_active) {
+        if (timed && t->timing_active) {
           t->t_signalled_ns.store(
               steady_now_ns(), std::memory_order_release);
         }
@@ -2744,6 +2759,10 @@ struct CpuMoeExecutor {
       }
     }
   }
+
+  void worker_loop(int tid) { worker_loop_impl(tid, false); }
+
+  void timed_worker_loop(int tid) { worker_loop_impl(tid, true); }
 
   void build_decode_groups(const MoeTask* t) {
     std::fill(expert_offsets.begin(), expert_offsets.end(), 0);
@@ -2887,10 +2906,10 @@ struct CpuMoeExecutor {
       {
         std::lock_guard<std::mutex> lk(task_mtx);
         cur_task = t;
-        ++cur_gen;
-        submitted.store(cur_gen, std::memory_order_release);
+        const uint64_t next = cur_gen.fetch_add(1, std::memory_order_release) + 1;
+        submitted.store(next, std::memory_order_release);
       }
-      task_cv.notify_all();
+      if (!spin_mode) task_cv.notify_all();
       return;
     }
     n_iblk = (I + IBLK - 1) / IBLK;
@@ -2968,17 +2987,40 @@ struct CpuMoeExecutor {
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       cur_task = t;
-      ++cur_gen;
-      submitted.store(cur_gen, std::memory_order_release);
+      const uint64_t next = cur_gen.fetch_add(1, std::memory_order_release) + 1;
+      submitted.store(next, std::memory_order_release);
     }
-    task_cv.notify_all();
+    if (!spin_mode) task_cv.notify_all();
   }
 
   void sync(MoeTask* timing_task = nullptr) {
     const uint64_t target = submitted.load(std::memory_order_acquire);
+    if (spin_mode) {
+      const auto deadline = std::chrono::steady_clock::now() + spin_wait_window;
+      while (completed.load(std::memory_order_acquire) < target &&
+             std::chrono::steady_clock::now() < deadline) {
+        cpu_pause();
+      }
+      if (completed.load(std::memory_order_acquire) >= target) return;
+      spin_fallbacks.fetch_add(1, std::memory_order_relaxed);
+      std::unique_lock<std::mutex> lk(sync_mtx);
+      const auto sleep_window = spin_wait_window.count() > 0
+          ? spin_wait_window
+          : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::milliseconds(1));
+      while (completed.load(std::memory_order_acquire) < target) {
+        sync_cv.wait_for(lk, sleep_window);
+      }
+      return;
+    }
     std::unique_lock<std::mutex> lk(sync_mtx);
     sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
     (void)timing_task;
+  }
+
+  uint64_t spin_fallback_count(bool reset) {
+    return reset ? spin_fallbacks.exchange(0, std::memory_order_relaxed)
+                 : spin_fallbacks.load(std::memory_order_relaxed);
   }
 
   void submit_with_cuda_stream(uintptr_t stream, uintptr_t task) {
@@ -3240,7 +3282,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
       .def(py::init<int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                    double, double, std::vector<int>, bool>(),
+                    double, double, std::vector<int>, bool, bool, int64_t>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
@@ -3249,7 +3291,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
            py::arg("down_bias_ptr"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
-           py::arg("core_ids"), py::arg("task_timing_enabled") = false)
+           py::arg("core_ids"), py::arg("task_timing_enabled") = false,
+           py::arg("spin_mode") = false, py::arg("spin_wait_us") = 2000)
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))
@@ -3287,6 +3330,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_task_timing", &CpuMoeExecutor::set_task_timing, py::arg("enabled"))
       .def("step_timing_snapshot_and_reset",
            &CpuMoeExecutor::step_timing_snapshot_and_reset)
+      .def("spin_fallback_count", &CpuMoeExecutor::spin_fallback_count,
+           py::arg("reset") = false)
       .def("gpufetch_stats", &CpuMoeExecutor::gpufetch_stats, py::arg("reset"))
       .def("gpufetch_error_code", &CpuMoeExecutor::gpufetch_error_code)
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,

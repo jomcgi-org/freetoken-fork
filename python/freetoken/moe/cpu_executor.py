@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import mmap
 import os
+import platform
 import threading
 import time
 import weakref
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 
 import torch
 
@@ -61,6 +63,182 @@ _FLAG_SLOTS_PER_LAYER = 16
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
 _PREFILL_POPULATE_SCRATCH_BYTES = 32 << 20
 _PREFILL_GEMM_WEIGHT_ROWS = 32
+
+
+@dataclass(frozen=True)
+class CpuTopology:
+    architecture: str
+    logical_cpus: tuple[int, ...]
+    physical_cores: tuple[tuple[int, int, int], ...]
+    socket_count: int
+    threads_per_core: int
+    ht_capable: bool
+    total_physical_cores: int = 0
+
+
+@dataclass(frozen=True)
+class ExecutorModeDecision:
+    mode: str
+    reason: str
+    single_socket_x86: bool
+    cpu_count_le_32: bool
+    cpus_free_ge_2: bool
+    cpus_free: int
+
+
+def parse_cpu_list(value: str) -> list[int]:
+    """Parse Linux CPU-list syntax such as ``0-3,8-11``."""
+    cpus: set[int] = set()
+    for raw_part in value.strip().split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if "-" not in part:
+            cpus.add(int(part))
+            continue
+        first_text, last_text = part.split("-", 1)
+        first, last = int(first_text), int(last_text)
+        if first < 0 or last < first:
+            raise ValueError(f"invalid CPU range {part!r}")
+        cpus.update(range(first, last + 1))
+    return sorted(cpus)
+
+
+def _cpuinfo_fields(cpuinfo_text: str) -> tuple[set[str], set[int]]:
+    flags: set[str] = set()
+    sockets: set[int] = set()
+    for line in cpuinfo_text.splitlines():
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key = key.strip().lower()
+        if key in ("flags", "features"):
+            flags.update(value.strip().lower().split())
+        elif key == "physical id":
+            try:
+                sockets.add(int(value.strip()))
+            except ValueError:
+                pass
+    return flags, sockets
+
+
+def read_cpu_topology(
+    sys_cpu_root: str | os.PathLike[str] = "/sys/devices/system/cpu",
+    cpuinfo_path: str | os.PathLike[str] = "/proc/cpuinfo",
+    *,
+    machine: str | None = None,
+    allowed_cpus: set[int] | None = None,
+) -> CpuTopology:
+    """Read the process-visible Linux socket, core, and SMT topology."""
+    if allowed_cpus is None:
+        try:
+            allowed_cpus = set(os.sched_getaffinity(0))
+        except AttributeError:
+            allowed_cpus = set(range(os.cpu_count() or 1))
+
+    try:
+        cpuinfo_text = Path(cpuinfo_path).read_text(encoding="utf-8")
+    except OSError:
+        cpuinfo_text = ""
+    flags, cpuinfo_sockets = _cpuinfo_fields(cpuinfo_text)
+
+    rows: list[tuple[int, int, int, tuple[int, ...]]] = []
+    system_core_keys: set[tuple[int, int]] = set()
+    system_sockets: set[int] = set()
+    root = Path(sys_cpu_root)
+    for cpu_dir in root.glob("cpu[0-9]*"):
+        suffix = cpu_dir.name[3:]
+        if not suffix.isdigit():
+            continue
+        cpu = int(suffix)
+        topology_dir = cpu_dir / "topology"
+        try:
+            core_id = int((topology_dir / "core_id").read_text().strip())
+            package_id = int(
+                (topology_dir / "physical_package_id").read_text().strip()
+            )
+        except (OSError, ValueError):
+            continue
+        system_core_keys.add((package_id, core_id))
+        system_sockets.add(package_id)
+        if cpu not in allowed_cpus:
+            continue
+        try:
+            siblings = tuple(
+                parse_cpu_list(
+                    (topology_dir / "thread_siblings_list").read_text()
+                )
+            )
+        except (OSError, ValueError):
+            continue
+        rows.append((package_id, core_id, cpu, siblings or (cpu,)))
+
+    rows.sort(key=lambda row: row[2])
+    logical_cpus = tuple(row[2] for row in rows)
+    core_reps: dict[tuple[int, int], int] = {}
+    threads_per_core = 1
+    for package_id, core_id, cpu, siblings in rows:
+        core_reps.setdefault((package_id, core_id), cpu)
+        threads_per_core = max(threads_per_core, len(siblings))
+    physical_cores = tuple(
+        (package_id, core_id, cpu)
+        for (package_id, core_id), cpu in core_reps.items()
+    )
+    socket_count = len(system_sockets or cpuinfo_sockets)
+    architecture = (machine or platform.machine()).lower()
+    return CpuTopology(
+        architecture=architecture,
+        logical_cpus=logical_cpus,
+        physical_cores=physical_cores,
+        socket_count=socket_count,
+        threads_per_core=threads_per_core,
+        ht_capable="ht" in flags or "smt" in flags or threads_per_core > 1,
+        total_physical_cores=len(system_core_keys),
+    )
+
+
+def decide_cpu_executor_mode(
+    topology: CpuTopology, executor_threads: int, *, reserved_cpus: int = 0,
+) -> ExecutorModeDecision:
+    """Resolve auto mode from topology and the CPUs left outside the executor."""
+    is_x86 = topology.architecture in ("x86_64", "amd64")
+    single_socket_x86 = is_x86 and topology.socket_count == 1
+    physical_count = topology.total_physical_cores or len(topology.physical_cores)
+    cpu_count_le_32 = 0 < physical_count <= 32
+    cpus_free = max(
+        0, len(topology.logical_cpus) - int(executor_threads) - int(reserved_cpus)
+    )
+    cpus_free_ge_2 = cpus_free >= 2
+    if not topology.logical_cpus or not topology.physical_cores:
+        reason = "CPU topology unavailable"
+    elif not is_x86:
+        reason = "non-x86 architecture detected"
+    elif topology.socket_count != 1:
+        reason = "multi-socket system detected"
+    elif not cpu_count_le_32:
+        reason = "more than 32 physical cores detected"
+    elif not cpus_free_ge_2:
+        reason = "fewer than 2 CPUs free"
+    else:
+        reason = "auto-detected suitable CPU topology"
+    mode = (
+        "spin"
+        if single_socket_x86 and cpu_count_le_32 and cpus_free_ge_2
+        else "sleep"
+    )
+    return ExecutorModeDecision(
+        mode=mode,
+        reason=reason,
+        single_socket_x86=single_socket_x86,
+        cpu_count_le_32=cpu_count_le_32,
+        cpus_free_ge_2=cpus_free_ge_2,
+        cpus_free=cpus_free,
+    )
+
+
+def _spin_core_cpus(topology: CpuTopology) -> list[int]:
+    """Return one process-visible logical CPU for each physical core."""
+    return [cpu for _package_id, _core_id, cpu in topology.physical_cores]
 
 
 @dataclass(frozen=True)
@@ -324,6 +502,8 @@ class CpuMoeExecutor:
         num_threads: int,
         max_tokens: int,
         device: torch.device,
+        executor_mode: str = "sleep",
+        spin_wait_us: int = 2000,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         disk_lookahead: bool = True,
@@ -333,6 +513,15 @@ class CpuMoeExecutor:
         prefill_batch: str | bool = "on",
         max_prefill_tokens: int | None = None,
     ) -> None:
+        if executor_mode not in ("sleep", "spin", "auto"):
+            raise ValueError(
+                "executor_mode must be 'sleep', 'spin', or 'auto', got "
+                f"{executor_mode!r}"
+            )
+        if int(spin_wait_us) < 0:
+            raise ValueError("spin_wait_us must be non-negative")
+        self._requested_executor_mode = executor_mode
+
         from freetoken.kernel import _cpu_moe
 
         fmt = cache.quant_format
@@ -491,6 +680,58 @@ class CpuMoeExecutor:
             coord_core = core_ids[-1]
             nthreads -= 1
             core_ids = core_ids[:-1]
+        topology = None
+        effective_mode = executor_mode
+        if executor_mode != "sleep":
+            topology = read_cpu_topology()
+        if executor_mode == "auto":
+            decision = decide_cpu_executor_mode(
+                topology,
+                nthreads,
+                reserved_cpus=1 if coord_core >= 0 else 0,
+            )
+            effective_mode = decision.mode
+            checks = (
+                f"single-socket x86 "
+                f"({'yes' if decision.single_socket_x86 else 'no'}), "
+                f"CPU count <=32 "
+                f"({'yes' if decision.cpu_count_le_32 else 'no'}), "
+                f"CPUs free >=2 "
+                f"({'yes' if decision.cpus_free_ge_2 else 'no'})"
+            )
+            if effective_mode == "spin":
+                logger.info_rank0(
+                    "MOE executor: spin mode enabled "
+                    f"(auto-detected single-socket x86, "
+                    f"{topology.total_physical_cores} cores, "
+                    f"{topology.threads_per_core} threads per core, "
+                    f"{decision.cpus_free} CPUs free)"
+                )
+            else:
+                logger.info_rank0(f"MOE executor: sleep mode ({decision.reason})")
+            logger.info_rank0(f"MOE executor auto checks: {checks}")
+        elif executor_mode == "spin":
+            logger.info_rank0("MOE executor: spin mode enabled (explicit)")
+
+        if effective_mode == "spin" and topology is not None:
+            physical_cpus = [
+                cpu for cpu in _spin_core_cpus(topology) if cpu != coord_core
+            ]
+            if physical_cpus:
+                core_ids = [
+                    physical_cpus[index % len(physical_cpus)]
+                    for index in range(nthreads)
+                ]
+        self._executor_mode = effective_mode
+        self._report_spin_fallbacks = executor_mode == "spin"
+        if effective_mode == "spin":
+            logger.info_rank0(
+                "Core pinning: "
+                + ", ".join(
+                    f"thread {thread_id} -> core {cpu}"
+                    for thread_id, cpu in enumerate(core_ids)
+                )
+            )
         self._coord_core = coord_core
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
@@ -506,6 +747,8 @@ class CpuMoeExecutor:
             swiglu_alpha=float(swiglu_alpha),
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
+            spin_mode=effective_mode == "spin",
+            spin_wait_us=int(spin_wait_us),
             **ptrs,
         )
         self._configure_prefill_batch()
@@ -881,6 +1124,9 @@ class CpuMoeExecutor:
             }
 
         snapshot = self._ext.step_timing_snapshot_and_reset()
+        spin_fallbacks = None
+        if getattr(self, "_report_spin_fallbacks", False):
+            spin_fallbacks = int(self._ext.spin_fallback_count(True))
         per_layer = {}
         d2h_per_layer = {}
         for raw_layer_id, raw in snapshot.items():
@@ -910,7 +1156,7 @@ class CpuMoeExecutor:
             total["total_tasks"] += row["tasks"]
             total["total_experts"] += row["experts"]
             total["total_bytes"] += row["bytes"]
-        return {
+        result = {
             "per_layer": per_layer,
             "total": total,
             "submit_d2h_us": {
@@ -918,6 +1164,9 @@ class CpuMoeExecutor:
                 "total": sum(d2h_per_layer.values()),
             },
         }
+        if spin_fallbacks is not None:
+            result["spin_fallbacks"] = spin_fallbacks
+        return result
 
     def resolve_step_timing(
         self,
@@ -966,7 +1215,7 @@ class CpuMoeExecutor:
         breakdown = self.step_timing_breakdown(bs)
         native = breakdown["total"]
         cpu_layers = len(breakdown["per_layer"])
-        return {
+        result = {
             "cpu_head_us": max(0.0, cpu_head_us),
             "gpu_mid_us": max(0.0, gpu_mid_us),
             "cpu_tail_us": max(0.0, cpu_tail_us),
@@ -981,6 +1230,9 @@ class CpuMoeExecutor:
             "cpu_layers_per_step": cpu_layers,
             "cpu_expert_bytes_per_step": native["total_bytes"],
         }
+        if "spin_fallbacks" in breakdown:
+            result["spin_fallbacks"] = breakdown["spin_fallbacks"]
+        return result
 
     def register_gpufetch_layer(
         self,

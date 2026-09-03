@@ -86,6 +86,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--kv-reserve-tokens` | 8192 | Usable KV token floor reserved before `--moe-cache-auto` fills experts; the internal dummy page is additional |
 | `--kv-ladder` | on | With one running request and `--moe-cache-auto`, grow KV in 32768-token request-boundary steps by taking expert slots; the effective floor is at least 65536 tokens, or the configured growth cap when that cap is lower. The default is inert at higher concurrency, while explicit `on` rejects it; `off` keeps startup sizing fixed. Growth is one-way until restart: expert slots surrendered to reach the cap do not return, so one long conversation lowers the slot count for later short requests |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
+| `--moe-cpu-executor-mode` | sleep | CPU worker synchronization: `sleep`, `spin`, or topology-aware `auto` |
 | `--moe-step-timing` | off | Append diagnostic decode timing fields. `cpu_wake_us`: per-layer worker wake latency (doorbell to first worker thread). `cpu_compute_us`: per-layer compute time (first worker to last worker done). `cpu_signal_us`: per-layer signal time (last worker to done flag published). `cpu_layers_per_step`: count of decode layers in this step. `cpu_expert_bytes_per_step`: total expert weight bytes accessed this step. |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-disk-layers` | none | FTW MoE layers kept in the DISK tier and computed on CPU |
@@ -96,6 +97,10 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+
+`--moe-cpu-executor-mode` defaults to `sleep`, which keeps the condition-variable worker path. `spin` busy-polls atomic task counters for lower wake latency and falls back to a condition-variable wait after a 2 ms spin window if CPU work stalls. `auto` selects spin only for a single-socket x86 system with at most 32 physical cores and at least two logical CPUs left free after executor allocation; otherwise it selects sleep. With `--moe-step-timing`, explicit spin mode also reports the interval's `spin_fallbacks` count.
+
+Spin mode has a real power and thermal cost because its workers busy-poll. To realize the latency gain, CPU C-states must also be disabled with `cpupower idle-set -D 0` or the kernel parameter `processor.max_cstate=1`; otherwise deep-idle transitions can make spinning ineffective. Weigh this sustained power cost against the workload's latency requirements.
 
 ### API behaviour
 

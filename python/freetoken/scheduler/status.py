@@ -159,6 +159,11 @@ class SchedulerStatusReporter:
                     self._decode_timing_totals.get(name, 0.0)
                     + float(timing.get(name, 0.0))
                 )
+            if "spin_fallbacks" in timing:
+                self._decode_timing_totals["spin_fallbacks"] = (
+                    self._decode_timing_totals.get("spin_fallbacks", 0.0)
+                    + float(timing["spin_fallbacks"])
+                )
         if getattr(batch, "mtp_drafted", 0):
             self.log(
                 "MTP verify window, route: decode, "
@@ -202,6 +207,11 @@ class SchedulerStatusReporter:
                     "cpu_expert_bytes_per_step",
                 )
             )
+            if "spin_fallbacks" in self._decode_timing_totals:
+                timing_msg += (
+                    f", spin_fallbacks "
+                    f"{int(self._decode_timing_totals['spin_fallbacks'])}"
+                )
         self._decode_timing_count = 0
         self._decode_timing_totals.clear()
         constrained_requests = self._constrained_requests

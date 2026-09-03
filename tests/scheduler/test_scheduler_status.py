@@ -254,6 +254,7 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
         "cpu_signal_us": 40,
         "cpu_layers_per_step": 27,
         "cpu_expert_bytes_per_step": 10_000,
+        "spin_fallbacks": 2,
     }
     second = _decode_batch(1)
     second.moe_step_timing = {
@@ -266,6 +267,7 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
         "cpu_signal_us": 60,
         "cpu_layers_per_step": 29,
         "cpu_expert_bytes_per_step": 14_000,
+        "spin_fallbacks": 3,
     }
     clock["t"] = 1.0
     rep.report_batch(first, running_reqs=1, queue_reqs=0,
@@ -284,6 +286,7 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
     assert "cpu_signal_us: 50" in line
     assert "cpu_layers_per_step: 28" in line
     assert "cpu_expert_bytes_per_step: 12000" in line
+    assert "spin_fallbacks 5" in line
 
 
 def test_decode_line_omits_moe_step_timing_when_disabled():
@@ -299,6 +302,7 @@ def test_decode_line_omits_moe_step_timing_when_disabled():
         "cpu_signal_us",
         "cpu_layers_per_step",
         "cpu_expert_bytes_per_step",
+        "spin_fallbacks",
     ):
         assert field not in line
 

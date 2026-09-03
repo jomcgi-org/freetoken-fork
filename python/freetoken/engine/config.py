@@ -73,6 +73,9 @@ class EngineConfig:
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
+    # Worker-pool synchronization policy. Sleep preserves the condition-variable
+    # path; spin busy-polls worker doorbells; auto enables spin only on suitable CPUs.
+    moe_cpu_executor_mode: str = "sleep"
     # Hybrid CPU/GPU decode (--moe-backend offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a

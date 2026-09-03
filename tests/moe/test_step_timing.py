@@ -88,3 +88,20 @@ def test_step_timing_breakdown_is_zero_and_does_not_call_native_when_off():
         },
         "submit_d2h_us": {"per_layer": {}, "total": 0.0},
     }
+
+
+def test_step_timing_reports_and_resets_explicit_spin_fallbacks():
+    reset_calls = []
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor._step_timing = True
+    executor._report_spin_fallbacks = True
+    executor._step_timing_events = {}
+    executor._ext = SimpleNamespace(
+        step_timing_snapshot_and_reset=lambda: {},
+        spin_fallback_count=lambda reset: reset_calls.append(reset) or 42,
+    )
+
+    result = executor.step_timing_breakdown()
+
+    assert result["spin_fallbacks"] == 42
+    assert reset_calls == [True]
