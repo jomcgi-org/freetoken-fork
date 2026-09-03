@@ -128,6 +128,66 @@ def test_kv_cache_dtype_cli_default_is_auto():
     assert args.kv_cache_dtype == "auto"
 
 
+def test_moe_cpu_precb_defaults_to_before_and_accepts_after():
+    default, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    after, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-cpu-precb",
+            "after",
+        ]
+    )
+
+    assert default.moe_cpu_precb == "before"
+    assert after.moe_cpu_precb == "after"
+
+
+def test_moe_cpu_precb_rejects_unknown_mode():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--dtype",
+                "bfloat16",
+                "--moe-cpu-precb",
+                "during",
+            ]
+        )
+
+
+def test_moe_cpu_willneed_defaults_and_accepts_recent():
+    default, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    recent, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-cpu-willneed",
+            "recent",
+        ]
+    )
+
+    assert default.moe_cpu_willneed == "always"
+    assert default.moe_cpu_willneed_recent_steps == 256
+    assert default.moe_cpu_willneed_fault_ceiling == 2000.0
+    assert recent.moe_cpu_willneed == "recent"
+
+
+def test_moe_cpu_willneed_rejects_invalid_values():
+    base = ["--model", ANON_PATH, "--dtype", "bfloat16"]
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--moe-cpu-willneed", "sometimes"])
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--moe-cpu-willneed-recent-steps", "0"])
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--moe-cpu-willneed-fault-ceiling", "0"])
+
+
 def test_repeated_harness_prefix_flags_replace_defaults():
     args, _ = parse_args(
         [

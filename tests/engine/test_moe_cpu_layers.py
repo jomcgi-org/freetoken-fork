@@ -78,6 +78,14 @@ def test_step_timing_resolves_phase_boundaries_and_overlap_without_cuda():
         step_timing_snapshot_and_reset=lambda: {
             8: {
                 "wake_us": 100,
+                "groups_us": 20,
+                "gil_us": 30,
+                "precb_us": 40,
+                "notify_us": 10,
+                "coord_pre_us": 5,
+                "coord_post_us": 7,
+                "last_seen_ns": 0,
+                "last_done_stored_ns": 0,
                 "compute_us": 3900,
                 "signal_us": 20,
                 "tasks": 1,
@@ -86,6 +94,14 @@ def test_step_timing_resolves_phase_boundaries_and_overlap_without_cuda():
             },
             39: {
                 "wake_us": 300,
+                "groups_us": 60,
+                "gil_us": 70,
+                "precb_us": 80,
+                "notify_us": 90,
+                "coord_pre_us": 11,
+                "coord_post_us": 17,
+                "last_seen_ns": 0,
+                "last_done_stored_ns": 0,
                 "compute_us": 7700,
                 "signal_us": 60,
                 "tasks": 1,
@@ -104,6 +120,15 @@ def test_step_timing_resolves_phase_boundaries_and_overlap_without_cuda():
         # min(cpu, hot GPU span): min(4ms, 3ms) + min(8ms, 5ms)
         "overlap_us": 8_000,
         "cpu_wake_us": 200,
+        "cpu_groups_us": 40,
+        "cpu_gil_us": 50,
+        "cpu_precb_us": 60,
+        "cpu_notify_us": 50,
+        "cpu_coord_us": 20,
+        "cpu_gpu_in_us": 0,
+        "cpu_gpu_out_us": 0,
+        "cpu_d2h_us": 1_000,
+        "cpu_h2d_us": 5_000,
         "cpu_compute_us": 5800,
         "cpu_signal_us": 40,
         "cpu_layers_per_step": 2,
@@ -863,6 +888,30 @@ def test_engine_config_rejects_invalid_disk_lookahead_mode():
             dtype=torch.bfloat16,
             moe_disk_lookahead="auto",
         )
+
+
+def test_engine_config_validates_cpu_willneed_settings():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    base = {
+        "model_path": "/tmp/model",
+        "tp_info": DistributedInfo(0, 1),
+        "dtype": torch.bfloat16,
+    }
+    config = EngineConfig(**base, moe_cpu_willneed="recent")
+    assert config.moe_cpu_willneed == "recent"
+    assert config.moe_cpu_willneed_recent_steps == 256
+    assert config.moe_cpu_willneed_fault_ceiling == 2000.0
+
+    with pytest.raises(ValueError, match="--moe-cpu-willneed.*always.*recent"):
+        EngineConfig(**base, moe_cpu_willneed="sometimes")
+    with pytest.raises(ValueError, match="recent-steps must be positive"):
+        EngineConfig(**base, moe_cpu_willneed_recent_steps=0)
+    with pytest.raises(ValueError, match="fault-ceiling must be positive"):
+        EngineConfig(**base, moe_cpu_willneed_fault_ceiling=0)
 
 
 @pytest.mark.parametrize("pager", ["madvise", "uffd"])

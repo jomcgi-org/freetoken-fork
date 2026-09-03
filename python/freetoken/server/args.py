@@ -164,6 +164,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 0")
         return n
 
+    def _positive_float(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a positive number") from exc
+        if not math.isfinite(n) or n <= 0:
+            raise argparse.ArgumentTypeError("must be > 0")
+        return n
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -1096,6 +1105,43 @@ def parse_args(
             "Measure CPU-head, GPU-middle, CPU-tail, and within-layer CPU/GPU "
             "overlap time for decode steps, and append interval averages to the "
             "decode status line. This diagnostic synchronizes each timed step."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-precb",
+        choices=["before", "after"],
+        default=ServerArgs.moe_cpu_precb,
+        help=(
+            "Run the DISK decode expert-prefetch callback before or after notifying "
+            "CPU workers (default: before)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-willneed",
+        choices=["always", "recent"],
+        default=ServerArgs.moe_cpu_willneed,
+        help=(
+            "Issue WILLNEED for every routed DISK expert or skip recently touched "
+            "experts during decode (default: always)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-willneed-recent-steps",
+        type=_positive_int,
+        default=ServerArgs.moe_cpu_willneed_recent_steps,
+        help="Decode-step recency window for --moe-cpu-willneed recent (default: 256).",
+    )
+
+    parser.add_argument(
+        "--moe-cpu-willneed-fault-ceiling",
+        type=_positive_float,
+        default=ServerArgs.moe_cpu_willneed_fault_ceiling,
+        help=(
+            "Major faults per decode step that temporarily restores always mode "
+            "(default: 2000)."
         ),
     )
 
