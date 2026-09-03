@@ -467,6 +467,33 @@ def test_e2m1_ple_identical_global_scales_are_folded(tmp_path):
     assert torch.equal(got, reference)
 
 
+def test_ple_scope_names_final_banks_and_marks_scale_scratch_transient(
+    tmp_path, monkeypatch,
+):
+    import freetoken.models.qwen4_exp.weight as weight
+
+    from freetoken.moe.host_banks import requested_hugepages
+
+    _quantized_ple_checkpoint(tmp_path, "e2m1g16")
+    monkeypatch.setattr(weight, "read_range_into", lambda *_args, **_kwargs: 0)
+    args = SimpleNamespace(
+        split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=QUANT_NGRAM_DIM
+    )
+    with requested_hugepages("off") as scope:
+        table = load_ple_table(str(tmp_path), args, pin=False)
+
+    reported = {
+        tensor._freetoken_host_bank for tensor in scope.sources["PLE table"]
+    }
+    assert reported == {table.bank, table.scale_bank}
+    transient = {
+        bank for bank in scope.banks.values()
+        if bank._hugepage_status["transient"]
+    }
+    assert len(transient) == 1
+    assert reported.isdisjoint(transient)
+
+
 @pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
 def test_quantized_ple_staging_uses_packed_stride_and_matches_reference(
     tmp_path, table_format
@@ -878,6 +905,52 @@ def test_pinned_ple_backend_never_constructs_file_mapping(checkpoint, monkeypatc
     table = weight.load_ple_table(folder, args, backend="pinned", pin=False)
     assert table.tensor.shape == (NGRAM_SHARDS * NGRAM_ROWS, NGRAM_DIM)
     assert "file" not in backings
+
+
+@pytest.mark.parametrize("backend", ["pinned", "disk"])
+def test_ple_banks_obey_off_policy_and_join_model_scope(
+    checkpoint, backend, monkeypatch,
+):
+    import freetoken.models.qwen4_exp.weight as weight
+
+    from freetoken.moe.host_banks import requested_hugepages
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    if backend == "pinned":
+        monkeypatch.setattr(weight, "read_range_into", lambda *_args, **_kwargs: 0)
+    with requested_hugepages("off") as scope:
+        table = load_ple_table(folder, args, backend=backend, pin=False)
+
+    expected = (
+        {bank for bank in (table.bank, table.scale_bank) if bank is not None}
+        if backend == "pinned"
+        else set((*table.banks, *table.scale_banks))
+    )
+    assert expected <= set(scope.banks.values())
+    assert {
+        tensor._freetoken_host_bank for tensor in scope.sources["PLE table"]
+    } == expected
+    for bank in scope.banks.values():
+        assert bank._hugepage_status["mode"] == "off"
+        assert bank._hugepage_status["advised_bytes"] == 0
+
+
+def test_disk_ple_banks_are_excluded_from_forced_file_thp(checkpoint, monkeypatch):
+    from freetoken.moe import host_banks
+
+    folder, _raw = checkpoint
+    args = SimpleNamespace(split_ngram_parts=NGRAM_SHARDS, ngram_head_dim=NGRAM_DIM)
+    monkeypatch.setattr(host_banks, "hugepages_supported", lambda **_kwargs: True)
+    with host_banks.requested_hugepages("on"):
+        table = load_ple_table(folder, args, backend="disk", pin=False)
+
+    assert all(
+        bank._hugepage_status["reason"].startswith(
+            "excluded: file THP not available for PLE"
+        )
+        for bank in (*table.banks, *table.scale_banks)
+    )
 
 
 def test_disk_ple_stats_report_pages_and_major_fault_delta(monkeypatch):

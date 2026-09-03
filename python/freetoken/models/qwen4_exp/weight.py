@@ -29,7 +29,7 @@ from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
     load_nvfp4_expert_source_banks,
 )
-from freetoken.moe.host_banks import HostBank, read_range_into
+from freetoken.moe.host_banks import HostBank, current_hugepage_scope, read_range_into
 from freetoken.utils import download_hf_weight
 from freetoken.utils.progress import byte_bar
 from tqdm import tqdm
@@ -599,7 +599,9 @@ def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
     scale_scratch = None
     if layout.global_scales is not None:
         assert layout.stored_scale_dtype is not None
-        scale_scratch = HostBank(scale_shape, layout.stored_scale_dtype)
+        scale_scratch = HostBank(
+            scale_shape, layout.stored_scale_dtype, transient=True,
+        )
 
     def load_folded_scale_shard(shard: int, destination: torch.Tensor) -> None:
         assert scale_scratch is not None and layout.global_scales is not None
@@ -629,6 +631,8 @@ def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
                 HostBank(
                     (layout.rows, layout.stored_cols), layout.data_dtype, backing="file",
                     file_path=part.path, file_offset=part.offset,
+                    uvm_managed=backend == "hmm",
+                    file_thp_exclusion="PLE data shard",
                 )
             )
             if layout.scale_dtype is not None:
@@ -643,16 +647,27 @@ def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
                         HostBank(
                             scale_shape, layout.scale_dtype, backing="file",
                             file_path=scale_part.path, file_offset=scale_part.offset,
+                            uvm_managed=backend == "hmm",
+                            file_thp_exclusion="PLE scale shard",
                         )
                     )
                 else:
-                    scale_bank = HostBank(scale_shape, layout.scale_dtype)
+                    scale_bank = HostBank(
+                        scale_shape, layout.scale_dtype,
+                        uvm_managed=backend == "hmm",
+                    )
                     load_folded_scale_shard(shard, scale_bank.tensor)
                     scale_banks.append(scale_bank)
-        return DiskPleTable(
+        table = DiskPleTable(
             tuple(banks), layout.rows, layout.weight_scale, layout.format,
             layout.cols, tuple(scale_banks),
         )
+        scope = current_hugepage_scope()
+        if scope is not None:
+            scope.sources.setdefault("PLE table", []).extend(
+                bank.tensor for bank in (*table.banks, *table.scale_banks)
+            )
+        return table
 
     bank = HostBank((expected * layout.rows, layout.stored_cols), layout.data_dtype)
     scale_bank = None
@@ -696,13 +711,21 @@ def load_ple_table(model_path: str, qwen4_args, *, backend: str = "pinned",
         bank.pin()
         if scale_bank is not None:
             scale_bank.pin()
-    return PleTable(
+    table = PleTable(
         bank=bank,
         weight_scale=layout.weight_scale,
         format=layout.format,
         head_dim=layout.cols,
         scale_bank=scale_bank,
     )
+    scope = current_hugepage_scope()
+    if scope is not None:
+        scope.sources.setdefault("PLE table", []).extend(
+            bank.tensor
+            for bank in (table.bank, table.scale_bank)
+            if bank is not None
+        )
+    return table
 
 
 # ======================================================================================

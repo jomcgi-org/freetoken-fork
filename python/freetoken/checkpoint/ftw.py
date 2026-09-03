@@ -464,6 +464,8 @@ def load_ftw_banks(
     layer_residency: list[str] | None = None, disk_pager=None,
     hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
     hot_expert_capacity: dict[int, int] | None = None,
+    hugepages_tmpfs: str | None = None,
+    hugepages_tmpfs_margin_bytes: int = 1 << 30,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
@@ -494,7 +496,8 @@ def load_ftw_banks(
     unaffected by the row split and appended as fixed-residency sidecars.
     """
     from freetoken.moe.host_banks import (
-        HostBank, HostResidency, PinPipeline, alloc_banks, born_pinned_default,
+        HostBank, HostResidency, PinPipeline, TmpfsMirrorSource, alloc_banks,
+        born_pinned_default, prepare_tmpfs_bank_mirrors,
     )
     from freetoken.utils.progress import byte_bar
 
@@ -575,6 +578,37 @@ def load_ftw_banks(
             "DISK residency requires per-layer FTW expert banks; this "
             "checkpoint has legacy flat bank entries. Reconvert it with `ft checkpoint`."
         )
+    if hugepages_tmpfs and disk_pager is not None:
+        reader.close()
+        raise ValueError(
+            "--moe-bank-hugepages-tmpfs cannot be used with --moe-disk-pager uffd"
+        )
+
+    tmpfs_paths: dict[str, str] = {}
+    tmpfs_huge = None
+    if hugepages_tmpfs:
+        mirror_sources = []
+        for by_layer in per_layer_groups.values():
+            for layer_id, entry in by_layer.items():
+                if layer_id not in disk_layers:
+                    continue
+                source_path, source_offset, source_length = reader.file_region(entry)
+                mirror_sources.append(TmpfsMirrorSource(
+                    entry["name"], source_path, source_offset, source_length,
+                ))
+        tmpfs_paths, tmpfs_huge, capacity = prepare_tmpfs_bank_mirrors(
+            hugepages_tmpfs,
+            mirror_sources,
+            margin_bytes=hugepages_tmpfs_margin_bytes,
+            workers=workers,
+            chunk=chunk,
+        )
+        bank_bytes, margin, required, free, reusable, available = capacity
+        logger.info_rank0(
+            f"MoE DISK tmpfs mirrors: huge={tmpfs_huge}; "
+            f"capacity required={bank_bytes} bank + {margin} margin = {required} "
+            f"bytes; available={free} free + {reusable} reusable = {available} bytes"
+        )
 
     # Row banks: one padded-window HostBank per (name, layer_id) for the flat layout, plus
     # how to carve the real [num_experts, *row_shape] tensor out of its head; ``None`` marks
@@ -623,6 +657,13 @@ def load_ftw_banks(
                     "file_path": path_, "file_offset": file_off,
                     "disk_pager": disk_pager,
                 }
+                if hugepages_tmpfs:
+                    kw.update(
+                        file_path=tmpfs_paths[e["name"]],
+                        file_offset=0,
+                        tmpfs_backed=True,
+                        tmpfs_huge=tmpfs_huge,
+                    )
             bank = HostBank(
                 tuple(e["shape"]), _dtype_of(e["dtype"]),
                 backing=_backing(layer_id), **kw,

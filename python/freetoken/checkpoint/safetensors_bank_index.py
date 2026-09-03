@@ -362,10 +362,15 @@ def load_indexed_banks(
     disk_pager=None,
     hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
     hot_expert_capacity: dict[int, int] | None = None,
+    hugepages_tmpfs: str | None = None,
+    hugepages_tmpfs_margin_bytes: int = 1 << 30,
 ):
     """Load packed banks, directly mapping only layers labelled ``DISK``."""
     from freetoken.moe.expert_banks import ExpertBanks
-    from freetoken.moe.host_banks import HostBank, HostResidency, born_pinned_default
+    from freetoken.moe.host_banks import (
+        HostBank, HostResidency, TmpfsMirrorSource, born_pinned_default,
+        prepare_tmpfs_bank_mirrors,
+    )
 
     folder, index = ensure_safetensors_bank_index(model_path)
     if index["num_layers"] != num_layers:
@@ -384,6 +389,34 @@ def load_indexed_banks(
         raise ValueError(f"unknown host residency labels: {sorted(set(residency) - valid)}")
 
     disk_layers = {layer for layer, label in enumerate(residency) if label == "disk"}
+    if hugepages_tmpfs and disk_pager is not None:
+        raise ValueError(
+            "--moe-bank-hugepages-tmpfs cannot be used with --moe-disk-pager uffd"
+        )
+    tmpfs_paths: dict[str, str] = {}
+    tmpfs_huge = None
+    if hugepages_tmpfs:
+        mirror_sources = [
+            TmpfsMirrorSource(
+                f"{entry['bank']}#L{entry['layer']:05d}",
+                os.path.join(folder, entry["file"]),
+                entry["offset"],
+                entry["length"],
+            )
+            for entry in index["banks"]
+            if entry["layer"] in disk_layers
+        ]
+        tmpfs_paths, tmpfs_huge, capacity = prepare_tmpfs_bank_mirrors(
+            hugepages_tmpfs,
+            mirror_sources,
+            margin_bytes=hugepages_tmpfs_margin_bytes,
+        )
+        bank_bytes, margin, required, free, reusable, available = capacity
+        logger.info_rank0(
+            f"MoE DISK tmpfs mirrors: huge={tmpfs_huge}; "
+            f"capacity required={bank_bytes} bank + {margin} margin = {required} "
+            f"bytes; available={free} free + {reusable} reusable = {available} bytes"
+        )
     born = born_pinned_default()
     sources: dict[str, list[torch.Tensor | None]] = {
         "gate_up": [None] * num_layers,
@@ -408,13 +441,17 @@ def load_indexed_banks(
         file_path = os.path.join(folder, entry["file"])
         if layer in disk_layers:
             backing = "uffd" if disk_pager is not None else "file"
+            mirror_key = f"{entry['bank']}#L{layer:05d}"
+            mapped_path = tmpfs_paths.get(mirror_key, file_path)
             bank = HostBank(
                 tuple(entry["shape"]),
                 _TORCH_DTYPE[entry["dtype"]],
                 backing=backing,
-                file_path=file_path,
-                file_offset=entry["offset"],
+                file_path=mapped_path,
+                file_offset=0 if mirror_key in tmpfs_paths else entry["offset"],
                 disk_pager=disk_pager,
+                tmpfs_backed=mirror_key in tmpfs_paths,
+                tmpfs_huge=tmpfs_huge if mirror_key in tmpfs_paths else None,
             )
         else:
             backing = "cuda" if born and residency[layer] == "pinned" else "mmap"

@@ -42,6 +42,10 @@ class EngineConfig:
     # "auto" advises supported Linux mappings, "on" requires Linux support, and
     # "off" preserves ordinary page mappings.
     moe_bank_hugepages: str = "auto"
+    # Optional tmpfs mirror for file-backed DISK expert banks. The mount must use
+    # huge=always or huge=within_size. Existing matching mirrors count toward capacity.
+    moe_bank_hugepages_tmpfs: str | None = None
+    moe_bank_hugepages_tmpfs_margin_gib: float = 1.0
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
@@ -210,6 +214,19 @@ class EngineConfig:
             raise ValueError(
                 "--moe-bank-hugepages must be 'auto', 'on', or 'off', got "
                 f"{self.moe_bank_hugepages!r}"
+            )
+        if self.moe_bank_hugepages == "off" and self.moe_bank_hugepages_tmpfs:
+            raise ValueError(
+                "--moe-bank-hugepages-tmpfs requires "
+                "--moe-bank-hugepages auto or on"
+            )
+        if (
+            not math.isfinite(float(self.moe_bank_hugepages_tmpfs_margin_gib))
+            or self.moe_bank_hugepages_tmpfs_margin_gib < 0
+        ):
+            raise ValueError(
+                "--moe-bank-hugepages-tmpfs-margin-gib must be a finite "
+                "non-negative number"
             )
         if (
             not math.isfinite(float(self.kv_disk_cache_gib))

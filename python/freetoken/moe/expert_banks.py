@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import math
 import os
 import threading
 from dataclasses import dataclass, field, replace
@@ -680,6 +681,8 @@ def _load_expert_banks_impl(
     hot_expert_ids: dict[int, tuple[int, ...]] | None = None,
     hot_expert_capacity: dict[int, int] | None = None,
     bank_source: str = "auto",
+    hugepages_tmpfs: str | None = None,
+    hugepages_tmpfs_margin_bytes: int = 1 << 30,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -718,6 +721,14 @@ def _load_expert_banks_impl(
         layer_residency
         and HostResidency.DISK.value in layer_residency
     )
+    if hugepages_tmpfs and not wants_disk:
+        raise ValueError(
+            "--moe-bank-hugepages-tmpfs requires at least one DISK expert layer"
+        )
+    if hugepages_tmpfs and disk_pager is not None:
+        raise ValueError(
+            "--moe-bank-hugepages-tmpfs cannot be used with --moe-disk-pager uffd"
+        )
     if (wants_disk or hot_expert_ids or hot_expert_capacity) and (
         not model_path or not (ftw or indexed)
     ):
@@ -732,6 +743,8 @@ def _load_expert_banks_impl(
             layer_residency=layer_residency, disk_pager=disk_pager,
             hot_expert_ids=hot_expert_ids,
             hot_expert_capacity=hot_expert_capacity,
+            hugepages_tmpfs=hugepages_tmpfs,
+            hugepages_tmpfs_margin_bytes=hugepages_tmpfs_margin_bytes,
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
@@ -802,6 +815,8 @@ def _load_expert_banks_impl(
             disk_pager=disk_pager,
             hot_expert_ids=hot_expert_ids,
             hot_expert_capacity=hot_expert_capacity,
+            hugepages_tmpfs=hugepages_tmpfs,
+            hugepages_tmpfs_margin_bytes=hugepages_tmpfs_margin_bytes,
         )
         logger.info_rank0(
             f"expert banks: safetensors indexed path (checkpoint {model_path})"
@@ -869,16 +884,32 @@ def load_expert_banks(
     hot_expert_capacity: dict[int, int] | None = None,
     bank_source: str = "auto",
     hugepages: str = "auto",
+    hugepages_tmpfs: str | None = None,
+    hugepages_tmpfs_margin_gib: float = 1.0,
 ) -> ExpertBanks:
     """Load expert banks under one THP policy and emit its startup probe report."""
     from freetoken.moe.host_banks import (
+        current_hugepage_scope,
         format_hugepage_status,
         read_meminfo_hugepages,
         requested_hugepages,
     )
 
-    before = read_meminfo_hugepages()
-    with requested_hugepages(hugepages):
+    margin_gib = float(hugepages_tmpfs_margin_gib)
+    if not math.isfinite(margin_gib) or margin_gib < 0:
+        raise ValueError("tmpfs hugepage margin must be finite and non-negative")
+    if hugepages == "off" and hugepages_tmpfs:
+        raise ValueError(
+            "--moe-bank-hugepages-tmpfs requires --moe-bank-hugepages auto or on"
+        )
+    margin_bytes = int(margin_gib * (1 << 30))
+    active_scope = current_hugepage_scope()
+    if active_scope is not None:
+        if active_scope.mode != hugepages:
+            raise RuntimeError(
+                f"expert-bank hugepage policy {hugepages!r} conflicts with active "
+                f"model-load policy {active_scope.mode!r}"
+            )
         banks = _load_expert_banks_impl(
             model_path,
             model_config,
@@ -895,9 +926,36 @@ def load_expert_banks(
             hot_expert_ids=hot_expert_ids,
             hot_expert_capacity=hot_expert_capacity,
             bank_source=bank_source,
+            hugepages_tmpfs=hugepages_tmpfs,
+            hugepages_tmpfs_margin_bytes=margin_bytes,
         )
+        active_scope.sources.update(banks.sources)
+        return banks
+    before = read_meminfo_hugepages()
+    with requested_hugepages(hugepages) as scope:
+        banks = _load_expert_banks_impl(
+            model_path,
+            model_config,
+            device=device,
+            dtype=dtype,
+            dummy=dummy,
+            parallel=parallel,
+            workers=workers,
+            chunk=chunk,
+            decode_target=decode_target,
+            layer_sink=layer_sink,
+            layer_residency=layer_residency,
+            disk_pager=disk_pager,
+            hot_expert_ids=hot_expert_ids,
+            hot_expert_capacity=hot_expert_capacity,
+            bank_source=bank_source,
+            hugepages_tmpfs=hugepages_tmpfs,
+            hugepages_tmpfs_margin_bytes=margin_bytes,
+        )
+        scope.sources.update(banks.sources)
     after = read_meminfo_hugepages()
-    logger.info_rank0(format_hugepage_status(banks, hugepages, before, after))
+    for line in format_hugepage_status(scope, hugepages, before, after).splitlines():
+        logger.info_rank0(line)
     return banks
 
 

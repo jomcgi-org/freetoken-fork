@@ -426,6 +426,10 @@ class HMMMappedTable(PinnedUVATable):
             not getattr(bank, "_disk", False) for bank in table.scale_banks
         ):
             raise ValueError("HMM PLE requires read-only file-backed scale mappings")
+        for shard, bank in enumerate(table.banks):
+            bank.register_uvm_range(f"PLE data shard {shard}")
+        for shard, bank in enumerate(table.scale_banks):
+            bank.register_uvm_range(f"PLE scale shard {shard}")
         self.table = table
         self.weight = None
         self.scale = float(table.weight_scale)

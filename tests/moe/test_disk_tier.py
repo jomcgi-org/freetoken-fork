@@ -440,8 +440,11 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     executor._prefill_coalesce_ns = 2_500_000
     executor._prefill_coalesce_degrades = 1
     executor._prefill_populate_bytes = 590_000_000
+    executor._prefill_populate_skipped_tmpfs_bytes = 610_000_000
     executor._prefill_populate_ns = 175_000_000
     executor._prefill_populate_overlap_ns = 125_000_000
+    executor._prefill_release_pages = 144_000
+    executor._prefill_release_skipped_tmpfs_bytes = 610_000_000
     executor._prefill_batch_rows = 20_480
     executor._prefill_batch_gemms = 420
     executor._disk_major_fault_base = 10
@@ -460,8 +463,11 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["moe_prefill_coalesce_ms"] == 2.5
     assert stats["moe_prefill_coalesce_degrades"] == 1
     assert stats["moe_prefill_populate_bytes"] == 590_000_000
+    assert stats["moe_prefill_populate_skipped_tmpfs_bytes"] == 610_000_000
     assert stats["moe_prefill_populate_ms"] == 175.0
     assert stats["moe_prefill_populate_overlap_ms"] == 125.0
+    assert stats["moe_prefill_release_pages"] == 144_000
+    assert stats["moe_prefill_release_skipped_tmpfs_bytes"] == 610_000_000
     assert stats["moe_prefill_batch_rows"] == 20_480
     assert stats["moe_prefill_batch_gemms"] == 420
     assert stats["gpufetch_fills_per_step"] == 0.0
@@ -479,8 +485,11 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert executor._prefill_batch_gemms == 0
     assert executor._prefill_coalesce_degrades == 0
     assert executor._prefill_populate_bytes == 0
+    assert executor._prefill_populate_skipped_tmpfs_bytes == 0
     assert executor._prefill_populate_ns == 0
     assert executor._prefill_populate_overlap_ns == 0
+    assert executor._prefill_release_pages == 0
+    assert executor._prefill_release_skipped_tmpfs_bytes == 0
     assert executor._disk_major_fault_base == 16
 
 
@@ -825,6 +834,51 @@ def test_cpu_prefill_populate_reuses_bounded_scratch_and_accounts_bytes():
     assert executor._prefill_populate_bytes == 300
     assert executor._prefill_populate_ns > 0
     assert executor._prefill_coalesce_degrades == 0
+
+
+def test_cpu_prefill_tmpfs_skips_io_and_reports_logical_bytes(monkeypatch):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    monkeypatch.setenv("FREETOKEN_PREFILL_EAGER_RELEASE", "1")
+
+    class Bank:
+        _pager = None
+        _tmpfs_backed = True
+
+        def selected_rows_nbytes(self, expert_ids):
+            return 100 * len(set(expert_ids))
+
+        def populate_experts(self, expert_ids, scratch):
+            raise AssertionError("tmpfs populate must not read")
+
+        def release_rows(self, expert_ids):
+            raise AssertionError("tmpfs release must not advise")
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor.num_experts = 8
+    executor._disk_banks = {0: [Bank()]}
+    executor._disk_prefetch_calls = [0]
+    executor._disk_prefetch_pages = [0]
+    executor._prefill_coalesce_enabled = True
+    executor._prefill_coalesce_mode = "populate"
+    executor._prefill_coalesce_limits = {0: 8}
+    executor._prefill_populate_scratch = None
+    executor._prefill_coalesce_experts = 0
+    executor._prefill_coalesce_ns = 0
+    executor._prefill_coalesce_degrades = 0
+    executor._prefill_coalesce_warned = False
+    executor._prefill_populate_bytes = 0
+    executor._prefill_release_pages = 0
+
+    lease = executor.prepare_prefill_layer(0, [3, 1, 3])
+    executor.release_prefill_layer(lease)
+
+    assert lease.experts == (1, 3)
+    assert executor._prefill_populate_scratch is None
+    assert executor._prefill_populate_bytes == 0
+    assert executor._prefill_populate_skipped_tmpfs_bytes == 200
+    assert executor._prefill_release_pages == 0
+    assert executor._prefill_release_skipped_tmpfs_bytes == 200
 
 
 def test_cpu_prefill_populate_failure_falls_back_to_willneed():

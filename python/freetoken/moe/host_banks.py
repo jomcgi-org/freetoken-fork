@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import glob
+import hashlib
 import math
 import mmap
 import os
@@ -28,6 +30,7 @@ import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from enum import Enum
 
 import torch
@@ -39,6 +42,7 @@ logger = init_logger(__name__)
 _BLK = 4096  # O_DIRECT alignment (page size)
 _HUGEPAGE = 2 << 20
 _HUGEPAGE_MODES = ("auto", "on", "off")
+_DEFAULT_TMPFS_MARGIN = 1 << 30
 
 
 class HostResidency(str, Enum):
@@ -82,30 +86,6 @@ def hugepages_enabled(mode: str, *, supported: bool | None = None) -> bool:
             "--moe-bank-hugepages on requires Linux MADV_HUGEPAGE support"
         )
     return mode != "off" and available
-
-
-def hugepage_row_alignment(
-    row_stride: int, row0_offset: int = 0, *, hugepage_size: int = _HUGEPAGE,
-) -> tuple[int, int] | None:
-    """Return ``(first_row, period)`` whose starts are hugepage aligned.
-
-    ``None`` means no row start can align for this immutable packed layout. The
-    result describes alignment arithmetic only and never adds padding to FTW.
-    """
-    if row_stride <= 0 or hugepage_size <= 0:
-        raise ValueError("row_stride and hugepage_size must be positive")
-    offset = row0_offset % hugepage_size
-    divisor = math.gcd(row_stride, hugepage_size)
-    if offset % divisor:
-        return None
-    period = hugepage_size // divisor
-    if period == 1:
-        return 0, 1
-    first = (
-        (-offset // divisor)
-        * pow(row_stride // divisor, -1, period)
-    ) % period
-    return first, period
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -228,6 +208,287 @@ def _filesystem_type(path: str) -> str:
         return "unknown"
 
 
+def _mount_info(path: str) -> tuple[str, set[str]]:
+    """Return the nearest Linux mount's filesystem and combined mount options."""
+    if sys.platform != "linux":
+        return "unavailable", set()
+    target = os.path.realpath(path)
+    best: tuple[int, str, set[str]] = (0, "unknown", set())
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as handle:
+            for line in handle:
+                left, right = line.rstrip().split(" - ", 1)
+                fields = left.split()
+                mountpoint = fields[4].replace("\\040", " ")
+                if target != mountpoint and not target.startswith(
+                    mountpoint.rstrip("/") + "/"
+                ):
+                    continue
+                right_fields = right.split()
+                options = set(fields[5].split(","))
+                if len(right_fields) > 2:
+                    options.update(right_fields[2].split(","))
+                if len(mountpoint) >= best[0]:
+                    best = (len(mountpoint), right_fields[0], options)
+    except (OSError, ValueError, IndexError):
+        return "unknown", set()
+    return best[1], best[2]
+
+
+def tmpfs_huge_mode(path: str) -> str:
+    """Validate a tmpfs file-THP directory and return its effective mount mode."""
+    if not os.path.isdir(path) or not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+        raise RuntimeError(
+            f"--moe-bank-hugepages-tmpfs {path!r} is not a reachable writable directory"
+        )
+    filesystem, options = _mount_info(path)
+    if filesystem != "tmpfs":
+        raise RuntimeError(
+            f"--moe-bank-hugepages-tmpfs {path!r} is on {filesystem}, expected tmpfs"
+        )
+    huge = next((option.split("=", 1)[1] for option in options
+                 if option.startswith("huge=")), "never")
+    if huge == "advise":
+        raise RuntimeError(
+            f"tmpfs {path!r} uses huge=advise; remount it with huge=always or "
+            "huge=within_size"
+        )
+    if huge not in ("always", "within_size"):
+        raise RuntimeError(
+            f"tmpfs {path!r} uses huge={huge}; file THP requires huge=always or "
+            "huge=within_size"
+        )
+    return huge
+
+
+def tmpfs_capacity_arithmetic(
+    bank_bytes: int, margin_bytes: int, free_bytes: int, reusable_bytes: int = 0,
+) -> tuple[int, int]:
+    """Return ``(required, available)`` for the mirror capacity check."""
+    values = (bank_bytes, margin_bytes, free_bytes, reusable_bytes)
+    if any(value < 0 for value in values):
+        raise ValueError("tmpfs capacity inputs must be non-negative")
+    return bank_bytes + margin_bytes, free_bytes + reusable_bytes
+
+
+def require_tmpfs_capacity(
+    bank_bytes: int, margin_bytes: int, free_bytes: int, reusable_bytes: int = 0,
+    *, stale_mirrors: tuple[str, ...] = (),
+) -> tuple[int, int]:
+    """Apply the startup capacity check, raising with its exact arithmetic."""
+    required, available = tmpfs_capacity_arithmetic(
+        bank_bytes, margin_bytes, free_bytes, reusable_bytes,
+    )
+    if available < required:
+        stale = (
+            "; stale mirrors evicted=" + ", ".join(stale_mirrors)
+            if stale_mirrors else ""
+        )
+        raise RuntimeError(
+            "tmpfs cannot hold DISK expert-bank mirrors plus margin: "
+            f"required={bank_bytes} bank bytes + {margin_bytes} margin bytes = "
+            f"{required}; available={free_bytes} free bytes + {reusable_bytes} "
+            f"reusable mirror bytes = {available}{stale}"
+        )
+    return required, available
+
+
+@dataclass(frozen=True)
+class TmpfsMirrorSource:
+    """One exact DISK expert-bank byte range to mirror."""
+
+    key: str
+    path: str
+    offset: int
+    length: int
+
+
+def _range_identity(source: TmpfsMirrorSource, *, sample_size: int = 4096) -> str:
+    """Return a cheap, change-sensitive identity without reading the full range."""
+    stat = os.stat(source.path)
+    if source.offset + source.length > stat.st_size:
+        raise OSError(
+            f"tmpfs mirror range for {source.key!r} ends at "
+            f"{source.offset + source.length}, past {source.path!r} size {stat.st_size}"
+        )
+    digest = hashlib.sha256()
+    digest.update(
+        f"v1\0{stat.st_size}\0{stat.st_mtime_ns}\0{source.offset}\0"
+        f"{source.length}\0".encode()
+    )
+    last = max(source.length - sample_size, 0)
+    offsets = sorted({
+        0,
+        max(source.length // 4 - sample_size // 2, 0),
+        max(source.length // 2 - sample_size // 2, 0),
+        max(3 * source.length // 4 - sample_size // 2, 0),
+        last,
+    })
+    fd = os.open(source.path, os.O_RDONLY)
+    try:
+        for relative in offsets:
+            relative = min(relative, last)
+            wanted = min(sample_size, source.length - relative)
+            data = os.pread(
+                fd, wanted, source.offset + relative,
+            )
+            if len(data) != wanted:
+                raise OSError(
+                    f"short sampled hash read for {source.key}: "
+                    f"{len(data)} of {wanted} bytes at {source.offset + relative}"
+                )
+            digest.update(relative.to_bytes(8, "little"))
+            digest.update(data)
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
+
+
+def _copy_mirror(source: TmpfsMirrorSource, target: str, *, chunk: int) -> None:
+    """Copy one range into a named pending file, then atomically publish it."""
+    pending = f"{target}.pending.{os.getpid()}.{threading.get_ident()}"
+    source_fd = os.open(source.path, os.O_RDONLY)
+    try:
+        target_fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except BaseException:
+        os.close(source_fd)
+        raise
+    try:
+        os.ftruncate(target_fd, source.length)
+        offset = 0
+        while offset < source.length:
+            want = min(chunk, source.length - offset)
+            parts = []
+            got = 0
+            while got < want:
+                data = os.pread(
+                    source_fd, want - got, source.offset + offset + got,
+                )
+                if not data:
+                    raise OSError(
+                        f"short tmpfs mirror read for {source.key}: "
+                        f"{got} of {want} bytes at {source.offset + offset}"
+                    )
+                parts.append(data)
+                got += len(data)
+            data = b"".join(parts)
+            written = 0
+            while written < want:
+                count = os.pwrite(target_fd, data[written:], offset + written)
+                if count <= 0:
+                    raise OSError(f"short tmpfs mirror write for {source.key}")
+                written += count
+            offset += want
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pending)
+        raise
+    finally:
+        os.close(target_fd)
+        os.close(source_fd)
+    if os.path.getsize(pending) != source.length:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pending)
+        raise OSError(f"tmpfs mirror size mismatch for {source.key}")
+    logger.debug(f"copied tmpfs mirror {source.key}: {source.length} bytes")
+    # tmpfs is volatile memory. fsync would add no durability, so do not issue it.
+    os.replace(pending, target)
+
+
+def prepare_tmpfs_bank_mirrors(
+    directory: str,
+    sources: list[TmpfsMirrorSource],
+    *,
+    margin_bytes: int = _DEFAULT_TMPFS_MARGIN,
+    workers: int = 8,
+    chunk: int = _DEFAULT_CHUNK,
+) -> tuple[dict[str, str], str, tuple[int, int, int, int, int, int]]:
+    """Validate, capacity-check, and populate tmpfs mirrors in parallel."""
+    if not sources:
+        raise RuntimeError(
+            "--moe-bank-hugepages-tmpfs requires at least one DISK expert bank"
+        )
+    huge_mode = tmpfs_huge_mode(directory)
+    for pending in glob.glob(os.path.join(directory, "freetoken-*.pending.*")):
+        match = re.search(r"\.pending\.(\d+)\.", pending)
+        if match is not None:
+            try:
+                os.kill(int(match.group(1)), 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue
+            else:
+                continue
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(pending)
+    targets: dict[str, str] = {}
+    reusable = 0
+    pending_sources: list[tuple[TmpfsMirrorSource, str]] = []
+    stale_mirrors: list[str] = []
+    for source in sources:
+        if source.offset < 0 or source.length <= 0:
+            raise ValueError(f"invalid tmpfs mirror range for {source.key!r}")
+    with ThreadPoolExecutor(max_workers=min(max(workers, 1), len(sources))) as pool:
+        source_identities = list(pool.map(_range_identity, sources))
+    for source, identity in zip(sources, source_identities):
+        # Keep names bounded defensively even if a future bank schema has long keys.
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", source.key)[:80]
+        key_hash = hashlib.sha256(source.key.encode()).hexdigest()[:12]
+        mirror_name = f"{safe_key}-{key_hash}"
+        target = os.path.join(
+            directory, f"freetoken-{mirror_name}-{identity[:24]}.bank",
+        )
+        if source.key in targets:
+            raise ValueError(f"duplicate tmpfs mirror key {source.key!r}")
+        targets[source.key] = target
+        stale_patterns = (
+            re.compile(
+                rf"freetoken-{re.escape(safe_key)}-[0-9a-f]{{24}}\.bank"
+            ),
+            re.compile(
+                rf"freetoken-{re.escape(mirror_name)}-[0-9a-f]{{24}}\.bank"
+            ),
+        )
+        for candidate in glob.glob(os.path.join(directory, "freetoken-*.bank")):
+            if (
+                candidate != target
+                and any(
+                    pattern.fullmatch(os.path.basename(candidate))
+                    for pattern in stale_patterns
+                )
+            ):
+                stale_mirrors.append(os.path.basename(candidate))
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(candidate)
+        try:
+            size = os.path.getsize(target)
+        except OSError:
+            size = -1
+        if size == source.length:
+            reusable += size
+        else:
+            pending_sources.append((source, target))
+    stats = os.statvfs(directory)
+    free = stats.f_bavail * stats.f_frsize
+    bank_bytes = sum(source.length for source in sources)
+    required, available = require_tmpfs_capacity(
+        bank_bytes, margin_bytes, free, reusable,
+        stale_mirrors=tuple(sorted(set(stale_mirrors))),
+    )
+
+    def copy_one(item: tuple[TmpfsMirrorSource, str]) -> None:
+        source, target = item
+        _copy_mirror(source, target, chunk=chunk)
+
+    with ThreadPoolExecutor(max_workers=min(max(workers, 1), len(pending_sources) or 1)) as pool:
+        for future in [pool.submit(copy_one, item) for item in pending_sources]:
+            future.result()
+    return targets, huge_mode, (
+        bank_bytes, margin_bytes, required, free, reusable, available,
+    )
+
+
 _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 
 
@@ -278,26 +539,56 @@ def read_meminfo_hugepages(path: str = "/proc/meminfo") -> dict[str, int] | None
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 key, separator, raw = line.partition(":")
-                if separator and key in ("AnonHugePages", "FileHugePages"):
+                if separator and key in (
+                    "AnonHugePages", "ShmemHugePages", "FileHugePages",
+                ):
                     values[key] = int(raw.split()[0])
     except (OSError, ValueError, IndexError):
         return None
-    return values if len(values) == 2 else None
+    return values or None
 
 
 _requested_hugepage_mode = "auto"
 
 
+@dataclass
+class HugepageLoadScope:
+    """Host banks allocated during one consistently configured model load."""
+
+    mode: str
+    banks: dict[int, object]
+    sources: dict[str, list[object]] = field(default_factory=dict)
+
+
+_active_hugepage_scope: HugepageLoadScope | None = None
+
+
+def current_hugepage_scope() -> HugepageLoadScope | None:
+    return _active_hugepage_scope
+
+
 @contextlib.contextmanager
 def requested_hugepages(mode: str):
-    """Install the bank-mapping THP policy for one expert-bank load."""
-    global _requested_hugepage_mode
+    """Install and collect the bank-mapping THP policy for one model load."""
+    global _active_hugepage_scope, _requested_hugepage_mode
     hugepages_enabled(mode)
+    if _active_hugepage_scope is not None:
+        if _active_hugepage_scope.mode != mode:
+            raise RuntimeError(
+                f"nested hugepage policy {mode!r} conflicts with active policy "
+                f"{_active_hugepage_scope.mode!r}"
+            )
+        yield _active_hugepage_scope
+        return
+    scope = HugepageLoadScope(mode, {})
     previous, _requested_hugepage_mode = _requested_hugepage_mode, mode
+    previous_scope, _active_hugepage_scope = _active_hugepage_scope, scope
     try:
-        yield
+        yield scope
     finally:
+        _active_hugepage_scope = previous_scope
         _requested_hugepage_mode = previous
+
 
 def _env_born_pinned() -> bool | None:
     """``FREETOKEN_BANK_CUDA_ALLOC`` tri-state: unset -> ``None`` (default applies), else the parsed boolean."""
@@ -327,7 +618,7 @@ class HostBank:
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
     * ``"file"`` -- a read-only shared mapping of one FTW bank entry. It stays
-      DISK resident and applies ``MADV_RANDOM`` at creation.
+      DISK resident and applies ``MADV_RANDOM`` at creation unless backed by tmpfs.
     * ``"uffd"`` -- a writable anonymous mapping registered with the process-wide
       UFFD pager. Its FTW pages are installed on demand and governed by userspace LRU.
 
@@ -338,18 +629,29 @@ class HostBank:
         "tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_disk",
         "_view_offset", "_uffd", "_pager", "_pager_region", "_file_path",
         "_map_offset", "_mapping", "_mapping_addr", "_mapping_length",
-        "_hugepage_status",
+        "_hugepage_status", "_uvm_managed", "_uvm_registered",
+        "_tmpfs_backed",
     )
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None, file_path: str | None = None,
-                 file_offset: int = 0, disk_pager=None):
+                 file_offset: int = 0, disk_pager=None,
+                 uvm_managed: bool = False, tmpfs_backed: bool = False,
+                 tmpfs_huge: str | None = None,
+                 file_thp_exclusion: str | None = None,
+                 transient: bool = False):
         if backing is None:
             plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
             born = born_pinned_default() and (plan is None or not plan.has_unpinned)
             backing = "cuda" if born else "mmap"
         assert backing in ("mmap", "cuda", "file", "uffd"), backing
+        if tmpfs_backed and backing != "file":
+            raise ValueError("tmpfs_backed requires file backing")
+        if file_thp_exclusion is not None and backing != "file":
+            raise ValueError("file_thp_exclusion requires file backing")
+        if uvm_managed and backing == "uffd":
+            raise ValueError("a UFFD bank cannot also be managed by UVM/HMM")
         huge_enabled = hugepages_enabled(_requested_hugepage_mode)
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
@@ -357,7 +659,9 @@ class HostBank:
         # and spanning-row accounting all use those units, and registration permits
         # at most one partial page of mapping padding. Excluding UFFD from THP costs
         # those banks 2 MiB page coverage, but preserves the pager's mapping invariant.
-        huge_eligible = huge_enabled and backing not in ("cuda", "uffd")
+        huge_eligible = huge_enabled and not uvm_managed and (
+            backing == "mmap" or tmpfs_backed
+        )
         allocation_alignment = (
             _HUGEPAGE
             if huge_eligible
@@ -366,6 +670,9 @@ class HostBank:
         asize = _round_up(self.nbytes, allocation_alignment)
         self._disk = backing in ("file", "uffd")
         self._uffd = backing == "uffd"
+        self._uvm_managed = uvm_managed
+        self._uvm_registered = False
+        self._tmpfs_backed = tmpfs_backed
         self._pager = disk_pager
         self._pager_region = None
         self._file_path = file_path
@@ -382,13 +689,18 @@ class HostBank:
             "reason": "disabled" if not huge_enabled else "not attempted",
             "filesystem": "anonymous" if backing != "file" else "unknown",
             "alignment_error": None,
-            "pin_before_kib": None,
-            "pin_after_kib": None,
+            "pin_thp_kib": None,
+            "advised_bytes": 0,
+            "uvm_excluded_bytes": 0,
+            "uvm_registration": None,
+            "tmpfs_huge": tmpfs_huge,
+            "file_thp_exclusion": file_thp_exclusion,
+            "transient": transient,
         }
         if backing == "file":
             if file_path is None:
                 raise ValueError("file-backed HostBank requires file_path")
-            map_alignment = _HUGEPAGE if huge_enabled else mmap.ALLOCATIONGRANULARITY
+            map_alignment = _HUGEPAGE if huge_eligible else mmap.ALLOCATIONGRANULARITY
             map_off = file_offset // map_alignment * map_alignment
             self._map_offset = map_off
             self._view_offset = file_offset - map_off
@@ -398,7 +710,7 @@ class HostBank:
             map_len = self._view_offset + self.nbytes
             fd = os.open(file_path, os.O_RDONLY)
             try:
-                if huge_enabled:
+                if huge_eligible:
                     try:
                         self._mapping = _AlignedFileMapping(fd, map_len, map_off)
                         self._buf = self._mapping.buffer
@@ -407,11 +719,8 @@ class HostBank:
                         if _requested_hugepage_mode == "on":
                             raise
                         self._mapping = self._buf = mmap.mmap(
-                            fd,
-                            map_len,
-                            flags=mmap.MAP_SHARED,
-                            prot=mmap.PROT_READ,
-                            offset=map_off,
+                            fd, map_len, flags=mmap.MAP_SHARED,
+                            prot=mmap.PROT_READ, offset=map_off,
                         )
                         self._hugepage_status["alignment_error"] = str(exc)
                 else:
@@ -430,7 +739,6 @@ class HostBank:
             # direct-IO readers need page alignment, but cudaHostAlloc only guarantees ~512 in practice
             # over-allocate one block and carve the aligned window; the numpy slice keeps the pinned storage alive via .base
             raw = alloc_pinned_tensor(asize + _BLK, dtype=torch.uint8)  # cudaMallocHost
-            raw.zero_()  # keep the anonymous-mmap guarantee: unwritten regions stay zero
             off = (-raw.data_ptr()) % _BLK
             self._buf = raw.numpy()[off:off + asize]
             self._mapping = raw
@@ -439,6 +747,9 @@ class HostBank:
             self._mapping_length = asize
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+            if self._uvm_managed:
+                self._apply_uvm_exclusion()
+            raw.zero_()  # keep the anonymous-mmap guarantee for unwritten bytes
         else:
             if huge_eligible:
                 self._mapping, self._buf, self.addr = _aligned_anonymous_mapping(asize)
@@ -456,7 +767,10 @@ class HostBank:
             self._mapping_addr = self.addr
             self._mapping_length = asize
             self._pinned = False
-            self._apply_hugepage_advice()
+            if self._uvm_managed:
+                self._apply_uvm_exclusion()
+            else:
+                self._apply_hugepage_advice()
             if self._uffd:
                 if file_path is None or disk_pager is None:
                     raise ValueError(
@@ -486,24 +800,55 @@ class HostBank:
         if backing == "file":
             if not self._mapping_addr:
                 self._mapping_addr = self.addr - self._view_offset
-            try:
-                _madvise(self._mapping_addr, self._mapping_length, mmap.MADV_RANDOM)
-            except (AttributeError, OSError):
-                pass
+            if not self._tmpfs_backed:
+                try:
+                    _madvise(
+                        self._mapping_addr, self._mapping_length, mmap.MADV_RANDOM,
+                    )
+                except (AttributeError, OSError):
+                    pass
             self._hugepage_status["filesystem"] = _filesystem_type(file_path)
-            self._apply_hugepage_advice()
+            if self._uvm_managed:
+                self._apply_uvm_exclusion()
+            else:
+                self._apply_hugepage_advice()
         # The CPU executor only receives tensors. Keep the owning mapping reachable from
         # each direct FTW view so it can issue expert-granular prefetches.
         self.tensor._freetoken_host_bank = self
         self._locked = False
+        if _active_hugepage_scope is not None:
+            _active_hugepage_scope.banks[id(self)] = self
 
     def _apply_hugepage_advice(self) -> None:
         if self._uffd:
             self._hugepage_status["reason"] = "excluded: UFFD uses 4 KiB pager pages"
             return
+        status = self._hugepage_status
+        if status["backing"] == "file" and not self._tmpfs_backed:
+            exclusion = status["file_thp_exclusion"]
+            if _requested_hugepage_mode == "on" and exclusion is not None:
+                status["reason"] = f"excluded: file THP not available for {exclusion}"
+                logger.info(f"MoE bank hugepages: {status['reason']}")
+                return
+            status["reason"] = "off: regular filesystem has no selected file-THP path"
+            if _requested_hugepage_mode == "on":
+                raise RuntimeError(
+                    "--moe-bank-hugepages on cannot provide file THP for a DISK "
+                    "expert bank on a regular filesystem; use "
+                    "--moe-bank-hugepages-tmpfs to mirror DISK expert banks"
+                )
+            return
         if not hugepages_enabled(_requested_hugepage_mode):
             return
-        status = self._hugepage_status
+        if self._tmpfs_backed:
+            status["attempted"] = True
+            status["advised"] = True
+            status["advised_bytes"] = self.nbytes
+            fallback = status.get("alignment_error")
+            status["reason"] = f"tmpfs huge={status['tmpfs_huge']}"
+            if fallback:
+                status["reason"] += f"; unaligned mmap fallback ({fallback})"
+            return
         status["attempted"] = True
         try:
             _madvise(
@@ -513,9 +858,76 @@ class HostBank:
             )
         except (AttributeError, OSError) as exc:
             status["reason"] = f"unsupported ({exc})"
+            if _requested_hugepage_mode == "on":
+                raise RuntimeError(
+                    f"--moe-bank-hugepages on failed to advise {self.nbytes} bytes"
+                ) from exc
             return
         status["advised"] = True
+        status["advised_bytes"] = self.nbytes
         status["reason"] = "MADV_HUGEPAGE accepted"
+
+    def _apply_uvm_exclusion(self) -> int:
+        """Exclude the exact logical range at the UVM/HMM registration seam."""
+        status = self._hugepage_status
+        status["attempted"] = True
+        advice = getattr(mmap, "MADV_NOHUGEPAGE", None)
+        if advice is None:
+            status["reason"] = "MADV_NOHUGEPAGE unavailable"
+            if sys.platform == "linux":
+                raise RuntimeError(
+                    "UVM/HMM host range requires Linux MADV_NOHUGEPAGE support"
+                )
+            return 0
+        start = self._mapping_addr + self._view_offset
+        page_start = max(
+            self._mapping_addr,
+            start // mmap.PAGESIZE * mmap.PAGESIZE,
+        )
+        page_end = _round_up(start + self.nbytes, mmap.PAGESIZE)
+        mapping_end = self._mapping_addr + self._mapping_length
+        excluded_length = min(page_end, mapping_end) - page_start
+        if excluded_length <= 0:
+            raise RuntimeError(
+                f"cannot exclude {self.nbytes} UVM/HMM bytes from THP: empty range"
+            )
+        try:
+            _madvise(page_start, excluded_length, advice)
+        except OSError as exc:
+            status["reason"] = f"MADV_NOHUGEPAGE failed ({exc})"
+            if sys.platform == "linux":
+                raise RuntimeError(
+                    f"cannot exclude {self.nbytes} UVM/HMM bytes from THP"
+                ) from exc
+            return 0
+        status["uvm_excluded_bytes"] = self.nbytes
+        status["reason"] = "MADV_NOHUGEPAGE accepted"
+        return self.nbytes
+
+    def register_uvm_range(self, label: str) -> None:
+        """Record the exact range handed to UVM/HMM at its backend seam."""
+        if self._uvm_registered:
+            return
+        if not self._uvm_managed:
+            if self._hugepage_status["advised"]:
+                raise RuntimeError(
+                    f"refusing late UVM/HMM registration for {label}: construct "
+                    "the HostBank with uvm_managed=True before it is populated"
+                )
+            self._uvm_managed = True
+        excluded_bytes = self._apply_uvm_exclusion()
+        if excluded_bytes != self.nbytes:
+            raise RuntimeError(
+                f"refusing UVM/HMM registration for {label}: THP exclusion failed"
+            )
+        self._uvm_registered = True
+        self._hugepage_status["uvm_registration"] = label
+        logger.info(
+            f"UVM/HMM THP exclusion: {label} "
+            f"[{self.addr:#x}, {self.addr + self.nbytes:#x}), "
+            f"{self.nbytes} bytes, "
+            "MADV_NOHUGEPAGE accepted"
+        )
 
     @property
     def residency(self) -> HostResidency:
@@ -560,8 +972,11 @@ class HostBank:
             ) from exc
         self._pinned = True
         after = _mapping_huge_kib(self._mapping_addr, self._mapping_length)
-        self._hugepage_status["pin_before_kib"] = before
-        self._hugepage_status["pin_after_kib"] = after
+        if before is not None and after is not None:
+            self._hugepage_status["pin_thp_kib"] = (
+                before["AnonHugePages"] + before["ShmemPmdMapped"],
+                after["AnonHugePages"] + after["ShmemPmdMapped"],
+            )
 
     def release(self) -> None:
         """Drop the resident pages; the address space stays valid, the contents become undefined.
@@ -624,9 +1039,10 @@ class HostBank:
 
         The data is deliberately discarded. Reading the backing file populates the
         page cache so the executor's fixed mmap pointers encounter minor faults.
-        UFFD banks stay on their pager-owned prefetch path.
+        UFFD banks stay on their pager-owned prefetch path. Tmpfs mirrors need no
+        read and report their skipped logical bytes through the executor separately.
         """
-        if not self._disk or self._uffd:
+        if not self._disk or self._uffd or self._tmpfs_backed:
             return 0
         if self._file_path is None:
             raise OSError("file-backed bank has no source path")
@@ -676,9 +1092,10 @@ class HostBank:
         unconditional ``MADV_DONTNEED``, this does not discard pages that were already
         part of the decode working set before prefill. Platforms without NOREUSE fall
         back to DONTNEED on the same page-deduplicated ranges. UFFD residency is owned
-        by its bounded native LRU and is left to that pager.
+        by its bounded native LRU and is left to that pager. Tmpfs mirrors keep their
+        pages and report their skipped logical bytes through the executor separately.
         """
-        if not self._disk or self._uffd:
+        if not self._disk or self._uffd or self._tmpfs_backed:
             return 0
         stride = self.tensor.stride(0) * self.tensor.element_size()
         ranges = coalesced_page_ranges(
@@ -703,6 +1120,15 @@ class HostBank:
                     self._mapping_addr + start, end - start, mmap.MADV_DONTNEED
                 )
         return sum((length + _BLK - 1) // _BLK for _start, length in ranges)
+
+    def selected_rows_nbytes(self, row_ids) -> int:
+        """Return the deduplicated logical bytes selected from the row axis."""
+        stride = self.tensor.stride(0) * self.tensor.element_size()
+        return sum(
+            length for _start, length in coalesced_row_ranges(
+                row_ids, stride, limit=self.nbytes,
+            )
+        )
 
 
 def coalesced_page_ranges(
@@ -792,6 +1218,7 @@ def _tensor_host_bank(tensor):
 
 
 def _layer_ranges(layer_ids: list[int]) -> str:
+    """Format sorted layer ids as compact inclusive ranges."""
     if not layer_ids:
         return "none"
     ranges: list[str] = []
@@ -806,20 +1233,59 @@ def _layer_ranges(layer_ids: list[int]) -> str:
     return ",".join(ranges)
 
 
-def _pin_measurement(status: dict) -> str:
-    before = status.get("pin_before_kib")
-    after = status.get("pin_after_kib")
-    if before is None or after is None:
-        return "pin-thp=not-measured"
-    before_kib = before["AnonHugePages"] + before["ShmemPmdMapped"]
-    after_kib = after["AnonHugePages"] + after["ShmemPmdMapped"]
+def _meminfo_delta(
+    key: str,
+    before: dict[str, int] | None,
+    after: dict[str, int] | None,
+) -> int | None:
+    if before is None or after is None or key not in before or key not in after:
+        return None
+    return after[key] - before[key]
+
+
+def _format_counter_delta(key: str, value: int | None) -> str:
+    return f"{key}=unavailable" if value is None else f"{key}={value:+d}KiB"
+
+
+def _row_offset(owner) -> int | None:
+    tensor = getattr(owner, "tensor", None)
+    if tensor is None or tensor.ndim == 0:
+        return None
+    return int(tensor.data_ptr()) % _HUGEPAGE
+
+
+def _pin_outcome(status: dict) -> str:
+    measurement = status.get("pin_thp_kib")
+    if measurement is None:
+        return "n/a"
+    before_kib, after_kib = measurement
     if before_kib == 0:
-        outcome = "unobserved-before-register"
-    elif after_kib >= before_kib:
-        outcome = "retained"
-    else:
-        outcome = "split-or-dropped"
-    return f"pin-thp={before_kib}->{after_kib}KiB({outcome})"
+        return "n/a"
+    return "kept" if after_kib >= before_kib else "split-or-dropped"
+
+
+def _pin_summary(owners: list[object]) -> str:
+    measurements = [
+        owner._hugepage_status.get("pin_thp_kib") for owner in owners
+    ]
+    measured = [
+        measurement for measurement in measurements if measurement is not None
+    ]
+    if not measured or all(before_kib == 0 for before_kib, _after_kib in measured):
+        return "pin-thp: n/a"
+    kept = sum(
+        before_kib > 0 and after_kib >= before_kib
+        for before_kib, after_kib in measured
+    )
+    retained = [
+        after_kib for before_kib, after_kib in measured if before_kib > 0
+    ]
+    low, high = min(retained), max(retained)
+    retained_range = str(low) if low == high else f"{low}..{high}"
+    return (
+        f"pin-thp: kept {kept}/{len(owners)}, "
+        f"retained {retained_range} KiB"
+    )
 
 
 def format_hugepage_status(
@@ -828,92 +1294,169 @@ def format_hugepage_status(
     before: dict[str, int] | None,
     after: dict[str, int] | None,
 ) -> str:
-    """Build the single startup line listing grouped per-bank mapping results."""
-    owners: dict[int, object] = {}
-    for tensors in banks.sources.values():
-        for tensor in tensors:
-            owner = _tensor_host_bank(tensor)
-            if owner is not None:
-                owners[id(owner)] = owner
+    """Build class summaries and one grouped detail line per final bank name."""
+    if isinstance(banks, HugepageLoadScope):
+        named_sources = {
+            name: [
+                tensor for tensor in tensors
+                if not getattr(
+                    _tensor_host_bank(tensor), "_hugepage_status", {}
+                ).get("transient", False)
+            ]
+            for name, tensors in banks.sources.items()
+        }
+        owners: dict[int, object] = {}
+        for tensors in named_sources.values():
+            for tensor in tensors:
+                owner = _tensor_host_bank(tensor)
+                if owner is not None:
+                    owners[id(owner)] = owner
+        # PLE HMM banks are not expert-bank sources, but their registered ranges
+        # belong in the UVM class summary. Other unnamed allocations are staging.
+        for key, owner in banks.banks.items():
+            status = owner._hugepage_status
+            if (
+                not status.get("transient", False)
+                and status.get("uvm_registration") is not None
+            ):
+                owners[key] = owner
+    else:
+        owners: dict[int, object] = {}
+        named_sources = banks.sources
+        for tensors in named_sources.values():
+            for tensor in tensors:
+                owner = _tensor_host_bank(tensor)
+                if owner is not None:
+                    owners[id(owner)] = owner
     observed_by_owner = _mappings_huge_kib([
         (key, owner._mapping_addr, owner._mapping_length)
         for key, owner in owners.items()
     ])
-    details: list[str] = []
-    for name, tensors in banks.sources.items():
-        grouped: dict[str, list[int]] = {}
+    deltas = {
+        key: _meminfo_delta(key, before, after)
+        for key in ("AnonHugePages", "ShmemHugePages", "FileHugePages")
+    }
+
+    classes: dict[str, list[object]] = {"anonymous": [], "file": [], "uvm": []}
+    for owner in owners.values():
+        if getattr(owner, "_uvm_registered", False):
+            classes["uvm"].append(owner)
+        elif owner._hugepage_status["backing"] == "file":
+            classes["file"].append(owner)
+        else:
+            classes["anonymous"].append(owner)
+
+    lines: list[str] = []
+    for bank_class in ("anonymous", "file", "uvm"):
+        class_owners = classes[bank_class]
+        advised = sum(
+            int(owner._hugepage_status.get("advised_bytes", 0))
+            for owner in class_owners
+        )
+        excluded = sum(
+            int(owner._hugepage_status.get("uvm_excluded_bytes", 0))
+            for owner in class_owners
+        )
+        registered = [
+            owner for owner in class_owners
+            if owner._hugepage_status.get("uvm_registration") is not None
+        ]
+        registered_bytes = sum(owner.nbytes for owner in registered)
+        modes = sorted({
+            str(owner._hugepage_status["reason"]) for owner in class_owners
+        })
+        thp_mode = "none" if not modes else " | ".join(modes)
         observed_kib = 0
         observed_available = False
-        seen_owners: set[int] = set()
+        for owner in class_owners:
+            status = owner._hugepage_status
+            observed = None
+            if observed_by_owner is not None:
+                observed = observed_by_owner.get(id(owner))
+            if observed is None:
+                continue
+            observed_available = True
+            if bank_class == "file":
+                observed_kib += observed["FilePmdMapped"] + observed["ShmemPmdMapped"]
+            elif bank_class == "uvm":
+                observed_kib += (
+                    observed["AnonHugePages"]
+                    + observed["FilePmdMapped"]
+                    + observed["ShmemPmdMapped"]
+                )
+            else:
+                observed_kib += observed["AnonHugePages"]
+        if bank_class == "file":
+            smaps = (
+                f"smaps_thp={observed_kib}KiB (at load, before touch)"
+                if observed_available
+                else "smaps_thp=unavailable (at load, before touch)"
+            )
+            if any(getattr(owner, "_tmpfs_backed", False) for owner in class_owners):
+                headline = _format_counter_delta(
+                    "tmpfs_thp", deltas["ShmemHugePages"],
+                )
+                observed_text = f"{headline} (ShmemHugePages meminfo delta); {smaps}"
+            else:
+                observed_text = smaps
+        else:
+            observed_text = (
+                f"observed_thp={observed_kib}KiB"
+                if observed_available else "observed_thp=unavailable"
+            )
+        lines.append(
+            f"MoE bank hugepages [{bank_class}]: policy={mode} thp={thp_mode}; "
+            f"banks={len(class_owners)} bytes_advised={advised} "
+            f"bytes_excluded_uvm={excluded} registered_uvm_ranges={len(registered)} "
+            f"registered_uvm_bytes={registered_bytes}; {observed_text}"
+        )
+    for name, tensors in named_sources.items():
+        grouped: dict[tuple[str, ...], list[tuple[int, object]]] = {}
         for layer_id, tensor in enumerate(tensors):
             owner = _tensor_host_bank(tensor)
             if owner is None:
-                description = "unmanaged tensor"
+                key = ("unmanaged tensor",)
             else:
                 status = owner._hugepage_status
-                if id(owner) not in seen_owners:
-                    seen_owners.add(id(owner))
-                    observed = status.get("pin_after_kib")
-                    if observed is None and observed_by_owner is not None:
-                        observed = observed_by_owner.get(id(owner))
-                    if observed is not None:
-                        observed_available = True
-                        if status["backing"] == "file":
-                            observed_kib += (
-                                observed["FilePmdMapped"]
-                                + observed["ShmemPmdMapped"]
-                            )
-                        else:
-                            observed_kib += (
-                                observed["AnonHugePages"]
-                                + observed["ShmemPmdMapped"]
-                            )
-                mapping_alignment = (
-                    "base=2MiB" if owner._mapping_addr % _HUGEPAGE == 0
-                    else f"base-offset={owner._mapping_addr % _HUGEPAGE}"
+                key = (
+                    str(status["backing"]),
+                    str(status["filesystem"]),
+                    str(status["reason"]),
+                    _pin_outcome(status),
                 )
-                row_stride = int(tensor.stride(0) * tensor.element_size())
-                alignment = hugepage_row_alignment(
-                    row_stride, int(tensor.data_ptr()) % _HUGEPAGE
+            grouped.setdefault(key, []).append((layer_id, owner))
+        groups = []
+        for key, entries in grouped.items():
+            layer_ids = [layer_id for layer_id, _owner in entries]
+            if len(key) == 1:
+                description = key[0]
+            else:
+                group_owners = [owner for _layer_id, owner in entries]
+                aligned = sum(
+                    owner._mapping_addr % _HUGEPAGE == 0
+                    for owner in group_owners
                 )
-                if alignment is None:
-                    rows = "rows=none-aligned"
-                elif alignment[1] == 1:
-                    rows = "rows=all-aligned"
-                else:
-                    rows = f"rows={alignment[0]}+every-{alignment[1]}"
-                if status["advised"] and status.get("alignment_error"):
-                    state = "advised-with-unaligned-fallback"
-                else:
-                    state = "advised" if status["advised"] else status["reason"]
+                offsets = [_row_offset(owner) for owner in group_owners]
+                rows_aligned = sum(offset == 0 for offset in offsets)
                 description = (
-                    f"{status['backing']}/{status['filesystem']} {state} "
-                    f"{mapping_alignment} {rows} stride={row_stride}B "
-                    f"{_pin_measurement(status)}"
+                    f"{key[0]}/{key[1]} {key[2]}; "
+                    f"{_pin_summary(group_owners)}, "
+                    f"base: 2MiB-aligned {aligned}/{len(group_owners)}, "
+                    f"rows: 2MiB-aligned {rows_aligned}/{len(group_owners)}"
                 )
-            grouped.setdefault(description, []).append(layer_id)
-        groups = [
-            f"L{_layer_ranges(layer_ids)} {description}"
-            for description, layer_ids in grouped.items()
-        ]
-        observed_text = (
-            f"observed-thp={observed_kib}KiB"
-            if observed_available else "observed-thp=unavailable"
+            groups.append(f"L{_layer_ranges(layer_ids)} {description}")
+        lines.append(
+            f"MoE bank hugepages [{name}]: "
+            + (", ".join(groups) if groups else "no layers")
         )
-        details.append(f"{name}: " + ", ".join(groups) + f" {observed_text}")
-    if before is None or after is None:
-        delta = "AnonHugePages/FileHugePages delta=unavailable"
-    else:
-        delta = (
-            "meminfo delta "
-            f"AnonHugePages={after['AnonHugePages'] - before['AnonHugePages']:+d}KiB "
-            f"FileHugePages={after['FileHugePages'] - before['FileHugePages']:+d}KiB"
+    lines.append(
+        "MoE bank hugepages [meminfo delta]: "
+        + " ".join(
+            _format_counter_delta(key, deltas[key])
+            for key in ("AnonHugePages", "ShmemHugePages", "FileHugePages")
         )
-    mapping_list = "; ".join(details) if details else "no bank mappings"
-    return (
-        f"MoE bank hugepages: mode={mode}; {mapping_list}; {delta}; "
-        "fault counts are kernel fault events (one event may cover 4KiB or 2MiB)"
     )
+    return "\n".join(lines)
 
 
 _os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
@@ -1250,18 +1793,30 @@ def read_range_into(buf: memoryview | mmap.mmap, path: str, *, file_offset: int,
 
 
 __all__ = [
+    "HugepageLoadScope",
     "HostBank",
     "HostResidency",
     "LayerCompletionTracker",
     "PinPipeline",
+    "TmpfsMirrorSource",
     "alloc_banks",
     "alloc_layer_banks",
     "alloc_pinned_row_staging",
     "born_pinned_default",
     "coalesced_page_ranges",
     "coalesced_row_ranges",
+    "current_hugepage_scope",
+    "format_hugepage_status",
+    "hugepages_enabled",
+    "hugepages_supported",
     "pin_banks",
+    "prepare_tmpfs_bank_mirrors",
     "read_file_into",
+    "read_meminfo_hugepages",
     "read_range_into",
+    "require_tmpfs_capacity",
     "requested_residency",
+    "requested_hugepages",
+    "tmpfs_capacity_arithmetic",
+    "tmpfs_huge_mode",
 ]
