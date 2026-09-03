@@ -792,6 +792,9 @@ class Engine:
                 moe_prefill_hot_split=getattr(
                     config, "moe_prefill_hot_split", "on"
                 ),
+                moe_prefill_split_kernel=getattr(
+                    config, "moe_prefill_split_kernel", "grouped"
+                ),
                 moe_disk_decode=config.moe_disk_decode,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
@@ -852,6 +855,10 @@ class Engine:
                     cache.moe_prefill_hot_split = getattr(
                         config, "moe_prefill_hot_split", "on"
                     )
+                if hasattr(cache, "moe_prefill_split_kernel"):
+                    cache.moe_prefill_split_kernel = getattr(
+                        config, "moe_prefill_split_kernel", "grouped"
+                    )
                 try:
                     cache.moe_disk_decode = config.moe_disk_decode
                 except AttributeError as exc:
@@ -868,6 +875,10 @@ class Engine:
                 if hasattr(cache, "moe_prefill_hot_split"):
                     cache.moe_prefill_hot_split = getattr(
                         config, "moe_prefill_hot_split", "on"
+                    )
+                if hasattr(cache, "moe_prefill_split_kernel"):
+                    cache.moe_prefill_split_kernel = getattr(
+                        config, "moe_prefill_split_kernel", "grouped"
                     )
                 if hasattr(cache, "moe_disk_decode"):
                     cache.moe_disk_decode = config.moe_disk_decode
@@ -2262,6 +2273,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_prefill": "cpu",
     "moe_prefill_coalesce": "populate",
     "moe_prefill_hot_split": "on",
+    "moe_prefill_split_kernel": "grouped",
     "moe_cpu_prefill_batch": "on",
     "moe_disk_decode": "cpu",
     "moe_disk_pager": "madvise",

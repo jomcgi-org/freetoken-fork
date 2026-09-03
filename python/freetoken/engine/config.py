@@ -83,6 +83,9 @@ class EngineConfig:
     moe_prefill_coalesce: str = "populate"
     # Split DISK prefill routes across protected HOT slots and the CPU executor.
     moe_prefill_hot_split: str = "on"
+    # GPU kernel for the protected HOT partial. Grouped reuses each resident row
+    # across the chunk; decode retains the route-at-a-time A/B baseline.
+    moe_prefill_split_kernel: str = "grouped"
     # Group CPU-prefill routes by expert and use the native row-batched NVFP4
     # W4A8 kernel. Unsupported formats or setup failures retain the serial path.
     moe_cpu_prefill_batch: str = "on"
@@ -221,6 +224,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-prefill-hot-split must be 'on' or 'off', got "
                 f"{self.moe_prefill_hot_split!r}"
+            )
+        if self.moe_prefill_split_kernel not in ("grouped", "decode"):
+            raise ValueError(
+                "--moe-prefill-split-kernel must be 'grouped' or 'decode', got "
+                f"{self.moe_prefill_split_kernel!r}"
             )
         if self.moe_cpu_prefill_batch not in ("on", "off"):
             raise ValueError(

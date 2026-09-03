@@ -167,6 +167,7 @@ class OffloadMoeCache:
     moe_disk_prefill: str = "cpu"
     moe_prefill_coalesce: str = "populate"
     moe_prefill_hot_split: str = "on"
+    moe_prefill_split_kernel: str = "grouped"
     # DISK-only decode policy. gpufetch keeps the mmap as the authoritative host
     # bank but fills LRU misses through a bounded pinned staging ring.
     moe_disk_decode: str = "cpu"
@@ -208,6 +209,9 @@ class OffloadMoeCache:
             "populate", "on", "off"
         ), self.moe_prefill_coalesce
         assert self.moe_prefill_hot_split in ("on", "off"), self.moe_prefill_hot_split
+        assert self.moe_prefill_split_kernel in (
+            "grouped", "decode"
+        ), self.moe_prefill_split_kernel
         assert self.moe_disk_decode in ("cpu", "gpufetch"), self.moe_disk_decode
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
@@ -1705,6 +1709,29 @@ class OffloadMoeCache:
         lo = layer_id * self.num_experts
         hi = lo + self.num_experts
         return self.gate_up_alpha[lo:hi], self.down_alpha[lo:hi]
+
+    def prefill_slot_tables(
+        self, layer_id: int,
+    ) -> tuple[
+        tuple[torch.Tensor, ...],
+        tuple[torch.Tensor, torch.Tensor] | None,
+        int,
+    ]:
+        """Protected-slot tables, per-slot alphas, and their shared row count."""
+        views = self.bank_views()
+        alphas = self.alphas_for_slots(layer_id)
+        assert views, "grouped prefill requires at least one expert table"
+        row_count = views[0].shape[0]
+        for name, table in zip(self.bank_schema, views):
+            assert table.shape[0] == row_count, (
+                f"expert table {name} has {table.shape[0]} rows, expected {row_count}"
+            )
+        if alphas is not None:
+            for name, table in zip(("gate_up_alpha", "down_alpha"), alphas):
+                assert table.shape[0] == row_count, (
+                    f"alpha table {name} has {table.shape[0]} rows, expected {row_count}"
+                )
+        return views, alphas, row_count
 
     def bank_views(self, n: int | None = None) -> tuple[torch.Tensor, ...]:
         """Per-bank cache views in registration order: the full ``[S]`` slot cache

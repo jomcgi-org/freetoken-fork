@@ -844,6 +844,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-prefill-split-kernel",
+        choices=["grouped", "decode"],
+        default=ServerArgs.moe_prefill_split_kernel,
+        help=(
+            "GPU kernel for protected HOT routes during DISK prefill: 'grouped' "
+            "uses the chunk GEMM (default). After a grouped-path CUDA fault, "
+            "restarting with 'decode' is the only recovery; it uses the "
+            "route-at-a-time kernel and can also support A/B measurements."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-prefill-batch",
         choices=["on", "off"],
         default=ServerArgs.moe_cpu_prefill_batch,

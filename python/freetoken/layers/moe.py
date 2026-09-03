@@ -7,7 +7,7 @@ from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_backend
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
-from freetoken.utils import div_even
+from freetoken.utils import div_even, init_logger
 
 from .base import BaseOP
 
@@ -24,6 +24,8 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+
+logger = init_logger(__name__)
 
 
 def _split_hot_cold_routes(
@@ -607,23 +609,68 @@ class OffloadMoELayer(MoELayer):
         try:
             # Keep the original activations intact for the cold CPU partial and
             # for the full-CPU OOM fallback.
-            gpu_hidden_states = hidden_states.clone()
-            views = cache.bank_views()
-            _assert_route_ids_in_bank_bounds(gpu_slots, views)
-            # HOT weights remain in arbitrary protected cache slots. Mapping these
-            # routes back to expert ids would make grouped prefill kernels read the
-            # unrelated rows at those expert-id positions, so use the established
-            # slot-indexed decode kernels for this partial.
-            gpu_routed = self._expert_gemm(
-                cache,
-                gpu_hidden_states,
-                gpu_weights,
-                gpu_slots,
-                views=views,
-                n=None,
-                alphas=cache.alphas_for_slots(self.layer_id),
-                is_prefill=False,
+            original_views = cache.bank_views()
+            original_alphas = cache.alphas_for_slots(self.layer_id)
+            split_kernel = getattr(cache, "moe_prefill_split_kernel", "grouped")
+            use_grouped = (
+                split_kernel == "grouped"
+                and getattr(cache, "quant_format", "nvfp4") == "nvfp4"
+                and not getattr(self, "_prefill_split_grouped_disabled", False)
             )
+            if use_grouped:
+                try:
+                    grouped_views = original_views
+                    grouped_alphas = original_alphas
+                    slot_tables = getattr(cache, "prefill_slot_tables", None)
+                    if slot_tables is not None:
+                        grouped_views, grouped_alphas, row_count = slot_tables(
+                            self.layer_id
+                        )
+                    else:
+                        assert original_views, "grouped prefill requires expert tables"
+                        row_count = original_views[0].shape[0]
+                        for table in (
+                            *original_views,
+                            *(original_alphas or ()),
+                        ):
+                            assert table.shape[0] == row_count, (
+                                "grouped prefill tables must share one row id space"
+                            )
+                    gpu_routed = self._expert_gemm(
+                        cache,
+                        hidden_states.clone(),
+                        gpu_weights,
+                        gpu_slots,
+                        views=grouped_views,
+                        n=row_count,
+                        alphas=grouped_alphas,
+                        is_prefill=True,
+                    )
+                except AssertionError as exc:
+                    if not getattr(
+                        cache, "_prefill_split_grouped_fallback_warned", False
+                    ):
+                        logger.warning(
+                            "Grouped HOT prefill is unsupported for layer %d (%s); "
+                            "using the decode kernel for this layer.",
+                            self.layer_id,
+                            exc,
+                        )
+                        cache._prefill_split_grouped_fallback_warned = True
+                    self._prefill_split_grouped_disabled = True
+                    use_grouped = False
+            if not use_grouped:
+                _assert_route_ids_in_bank_bounds(gpu_slots, original_views)
+                gpu_routed = self._expert_gemm(
+                    cache,
+                    hidden_states.clone(),
+                    gpu_weights,
+                    gpu_slots,
+                    views=original_views,
+                    n=None,
+                    alphas=original_alphas,
+                    is_prefill=False,
+                )
         except (MemoryError, RuntimeError) as exc:
             if not _is_oom_error(exc):
                 raise

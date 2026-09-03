@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 
 from freetoken.kernel import moe_sum_reduce_triton
+from freetoken.kernel.backend import is_sgl_kernel_installed
 from freetoken.kernel.triton.e4m3_compat import e4m3_kernel_view
 from freetoken.kernel.triton.nvfp4_fused_moe import (
     _decode_nvfp4_marlin_kernel,
@@ -72,6 +73,12 @@ _DECODE_MARLIN_WARPS = 4
 _DECODE_MARLIN_DEEPK_BLOCK_N = 8
 _DECODE_MARLIN_DEEPK_BLOCK_KW = 128
 _DECODE_MARLIN_DEEPK_THRESHOLD = 2048
+
+# The working diagnosis is that the installed sgl alignment kernel has one
+# 1024-entry padded expert-bin table. The pending node-4 CUDA run still needs to
+# confirm that diagnosis. Keep its effective expert count below that suspected
+# limit. Slot ids can be much larger, so prefill compacts active slots first.
+_SGL_ALIGN_MAX_ACTIVE_SLOTS = 992
 
 
 def _tl_dtype(dt: torch.dtype):
@@ -269,6 +276,59 @@ def _prefill_config(M: int) -> Dict[str, int]:
                 GROUP_SIZE_M=8, num_warps=8, num_stages=4)
 
 
+def _assert_prefill_table_bounds(
+    topk_ids: torch.Tensor,
+    num_rows: int,
+    tables: tuple[tuple[str, torch.Tensor], ...],
+) -> None:
+    """Require route ids and every NVFP4 table to share one row id space."""
+    assert num_rows > 0, f"NVFP4 prefill table row count must be positive, got {num_rows}"
+    assert topk_ids.numel(), "NVFP4 prefill route ids must not be empty"
+    min_id, max_id = torch.aminmax(topk_ids)
+    lo, hi = int(min_id.item()), int(max_id.item())
+    assert lo >= 0, f"NVFP4 prefill route id {lo} is negative"
+    assert hi < num_rows, (
+        f"NVFP4 prefill route id {hi} exceeds table row count {num_rows}"
+    )
+    for name, table in tables:
+        assert table.shape[0] == num_rows, (
+            f"NVFP4 prefill {name} has {table.shape[0]} rows, expected {num_rows}"
+        )
+
+
+def _align_active_slots(
+    topk_ids: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Align compact active-slot bins, then restore slot ids for the GEMM.
+
+    The grouped kernel reads full protected-slot tables, so its expert block table
+    must contain the original slot ids. The alignment kernel only needs dense bin
+    ids. The working diagnosis is that compacting avoids indexing a fixed 1024-bin
+    CUDA scratch table with a slot such as 2563 when only about 55 slots are active.
+    That diagnosis remains pending confirmation by the node-4 CUDA run.
+    """
+    active_slots, inverse = torch.unique(
+        topk_ids.reshape(-1), sorted=True, return_inverse=True
+    )
+    active_count = active_slots.shape[0]
+    assert active_count > 0, "NVFP4 grouped prefill requires an active slot"
+    if is_sgl_kernel_installed():
+        assert active_count <= _SGL_ALIGN_MAX_ACTIVE_SLOTS, (
+            f"NVFP4 grouped prefill has {active_count} active slots, but the installed "
+            f"alignment kernel supports at most {_SGL_ALIGN_MAX_ACTIVE_SLOTS}"
+        )
+    dense_ids = inverse.reshape_as(topk_ids).to(torch.int32).contiguous()
+    sorted_ids, dense_expert_ids, ntpp = moe_align_block_size(
+        dense_ids, block_size, active_count
+    )
+    # Only the prefix selected by ntpp is consumed. Clamp the uninitialized capacity
+    # tail before the vectorized gather so it cannot index active_slots itself.
+    safe_dense_ids = dense_expert_ids.clamp(0, active_count - 1).long()
+    expert_slot_ids = active_slots[safe_dense_ids].to(torch.int32)
+    return sorted_ids, expert_slot_ids, ntpp
+
+
 def _prefill_gemm(
     a: torch.Tensor,
     packed: torch.Tensor,
@@ -325,9 +385,12 @@ def fused_experts_nvfp4(
     act_alpha: float = 1.702,
     act_limit: float = 7.0,
 ) -> torch.Tensor:
-    """Prefill inline-NVFP4 MoE. ``topk_ids`` index rows of the bank tensors in
-    ``[0, num_experts)``: full-layer banks with position == expert id (the
-    materialized ``[:E]`` slot view or the overlap double buffer), raw ids."""
+    """Prefill inline-NVFP4 MoE over any consistently slot-indexed table views.
+
+    ``topk_ids`` index rows in ``[0, num_experts)``. This covers full-layer views
+    where row position equals expert id and protected cache views where ids are
+    arbitrary resident slots.
+    """
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up_packed.shape[1]
@@ -335,7 +398,23 @@ def fused_experts_nvfp4(
     dev, dt = hidden_states.device, hidden_states.dtype
     cfg = _prefill_config(M)
 
-    sorted_ids, expert_ids, ntpp = moe_align_block_size(topk_ids, cfg["BLOCK_SIZE_M"], num_experts)
+    if num_experts <= _SGL_ALIGN_MAX_ACTIVE_SLOTS:
+        sorted_ids, expert_ids, ntpp = moe_align_block_size(
+            topk_ids, cfg["BLOCK_SIZE_M"], num_experts
+        )
+    else:
+        tables = (
+            ("gate_up_packed", gate_up_packed),
+            ("gate_up_scale", gate_up_scale),
+            ("gate_up_global", gate_up_global),
+            ("down_packed", down_packed),
+            ("down_scale", down_scale),
+            ("down_global", down_global),
+        )
+        _assert_prefill_table_bounds(topk_ids, num_experts, tables)
+        sorted_ids, expert_ids, ntpp = _align_active_slots(
+            topk_ids, cfg["BLOCK_SIZE_M"]
+        )
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
