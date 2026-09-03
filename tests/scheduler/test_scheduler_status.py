@@ -249,6 +249,11 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
         "gpu_mid_us": 2000,
         "cpu_tail_us": 3000,
         "overlap_us": 400,
+        "cpu_wake_us": 100,
+        "cpu_compute_us": 1800,
+        "cpu_signal_us": 40,
+        "cpu_layers_per_step": 27,
+        "cpu_expert_bytes_per_step": 10_000,
     }
     second = _decode_batch(1)
     second.moe_step_timing = {
@@ -256,6 +261,11 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
         "gpu_mid_us": 2400,
         "cpu_tail_us": 3600,
         "overlap_us": 600,
+        "cpu_wake_us": 140,
+        "cpu_compute_us": 2200,
+        "cpu_signal_us": 60,
+        "cpu_layers_per_step": 29,
+        "cpu_expert_bytes_per_step": 14_000,
     }
     clock["t"] = 1.0
     rep.report_batch(first, running_reqs=1, queue_reqs=0,
@@ -269,6 +279,11 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
     assert "gpu_mid_us: 2200" in line
     assert "cpu_tail_us: 3300" in line
     assert "overlap_us: 500" in line
+    assert "cpu_wake_us: 120" in line
+    assert "cpu_compute_us: 2000" in line
+    assert "cpu_signal_us: 50" in line
+    assert "cpu_layers_per_step: 28" in line
+    assert "cpu_expert_bytes_per_step: 12000" in line
 
 
 def test_decode_line_omits_moe_step_timing_when_disabled():
@@ -276,7 +291,16 @@ def test_decode_line_omits_moe_step_timing_when_disabled():
     clock["t"] = 1.0
     rep.report_batch(_decode_batch(1), running_reqs=1, queue_reqs=0,
                      kv_used_pages=1, kv_total_pages=2, page_size=1)
-    assert "cpu_head_us" not in logs[-1]
+    line = logs[-1]
+    for field in (
+        "cpu_head_us",
+        "cpu_wake_us",
+        "cpu_compute_us",
+        "cpu_signal_us",
+        "cpu_layers_per_step",
+        "cpu_expert_bytes_per_step",
+    ):
+        assert field not in line
 
 
 def test_guided_decoding_stats_accumulate_and_reset_per_interval():

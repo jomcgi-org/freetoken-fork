@@ -62,13 +62,38 @@ def test_step_timing_resolves_phase_boundaries_and_overlap_without_cuda():
     executor.num_layers = 48
     executor._disk_banks = {8: (), 39: ()}
     executor._step_timing_events = {
-        (8, 1): _StepTimingEvents(Mark(1), Mark(2), Mark(5), Mark(6), Mark(10)),
-        (39, 1): _StepTimingEvents(Mark(30), Mark(31), Mark(36), Mark(39), Mark(40)),
+        (8, 1): _StepTimingEvents(
+            Mark(1), Mark(1.5), Mark(2), Mark(5), Mark(6), Mark(10)
+        ),
+        (39, 1): _StepTimingEvents(
+            Mark(30), Mark(30.5), Mark(31), Mark(36), Mark(39), Mark(40)
+        ),
     }
     executor._step_timing_hot_keys = {(8, 1), (39, 1)}
     executor._tasks = {(8, 1): 108, (39, 1): 139}
     native_ns = {108: 4_000_000, 139: 8_000_000}
-    executor._ext = SimpleNamespace(task_last_run_ns=native_ns.__getitem__)
+    executor._step_timing = True
+    executor._ext = SimpleNamespace(
+        task_last_run_ns=native_ns.__getitem__,
+        step_timing_snapshot_and_reset=lambda: {
+            8: {
+                "wake_us": 100,
+                "compute_us": 3900,
+                "signal_us": 20,
+                "tasks": 1,
+                "experts": 4,
+                "bytes": 4000,
+            },
+            39: {
+                "wake_us": 300,
+                "compute_us": 7700,
+                "signal_us": 60,
+                "tasks": 1,
+                "experts": 6,
+                "bytes": 6000,
+            },
+        },
+    )
 
     timing = executor.resolve_step_timing(1, Mark(0), Mark(44))
 
@@ -78,6 +103,11 @@ def test_step_timing_resolves_phase_boundaries_and_overlap_without_cuda():
         "cpu_tail_us": 14_000,
         # min(cpu, hot GPU span): min(4ms, 3ms) + min(8ms, 5ms)
         "overlap_us": 8_000,
+        "cpu_wake_us": 200,
+        "cpu_compute_us": 5800,
+        "cpu_signal_us": 40,
+        "cpu_layers_per_step": 2,
+        "cpu_expert_bytes_per_step": 10_000,
     }
 
 

@@ -1423,8 +1423,26 @@ struct MoeTask {
   bf16_t* y;           // [num_tokens, H]
   // Native doorbell-to-completion span for optional per-step diagnostics. Atomics
   // let Python read the last completed replay after synchronizing its CUDA fence.
-  std::atomic<int64_t> timing_started_ns{0};
+  std::atomic<int64_t> t_doorbell_ns{0};
   std::atomic<int64_t> timing_last_run_ns{0};
+  std::atomic<int64_t> t_first_worker_ns{0};
+  std::atomic<int64_t> t_compute_done_ns{0};
+  std::atomic<int64_t> t_signalled_ns{0};
+  bool timing_active = false;
+  uint64_t timing_experts = 0;
+  uint64_t timing_bytes = 0;
+};
+
+struct StepTimingAccum {
+  int64_t wake_ns = 0;
+  int64_t compute_ns = 0;
+  int64_t signal_ns = 0;
+  int64_t wake_max_ns = 0;
+  int64_t compute_max_ns = 0;
+  int64_t signal_max_ns = 0;
+  uint64_t tasks = 0;
+  uint64_t experts = 0;
+  uint64_t bytes = 0;
 };
 
 // One graph-stable DISK -> pinned staging task. The GPU copies num_rows and the
@@ -1626,7 +1644,8 @@ struct CpuMoeExecutor {
   // it to a captured GPU elementwise kernel removes it while keeping the official
   // W4A8 numerics bit-exact. Set via set_input_prequant (see cpu_executor.py).
   bool input_prequant = false;
-  bool task_timing_enabled = false;
+  std::atomic<bool> task_timing_enabled{false};
+  bool timed_worker_mode = false;
   // Q4_0 packed-row byte strides (H/32*18 for gate_up over K=H, I/32*18 for down over K=I).
   int q4_gu_row_bytes = 0, q4_dn_row_bytes = 0;
   float e2m1_lut[16];
@@ -1688,6 +1707,10 @@ struct CpuMoeExecutor {
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
 
+  std::mutex step_timing_mtx;
+  std::vector<StepTimingAccum> step_timing;
+  std::atomic<uint64_t> step_timing_inflight{0};
+
   std::vector<MoeTask*> owned_tasks;  // persistent task descriptors (graph-stable)
   std::vector<GpuFetchTask*> owned_gpufetch_tasks;
   std::vector<int> core_ids;          // worker tid -> logical CPU to pin to (may be empty)
@@ -1748,7 +1771,7 @@ struct CpuMoeExecutor {
                  uintptr_t gate_up_global_ptr, uintptr_t down_scale_ptr,
                  uintptr_t down_global_ptr, uintptr_t gate_up_bias_ptr,
                  uintptr_t down_bias_ptr, double swiglu_alpha_, double swiglu_limit_,
-                 std::vector<int> core_ids_)
+                 std::vector<int> core_ids_, bool task_timing_enabled_ = false)
       : num_threads(num_threads_ > 0 ? num_threads_ : 1),
         num_layers(num_layers_),
         num_experts(num_experts_),
@@ -1768,6 +1791,9 @@ struct CpuMoeExecutor {
         dn_bias_tbl(reinterpret_cast<const uint64_t*>(down_bias_ptr)),
         swiglu_alpha(static_cast<float>(swiglu_alpha_)),
         swiglu_limit(static_cast<float>(swiglu_limit_)),
+        task_timing_enabled(task_timing_enabled_),
+        timed_worker_mode(task_timing_enabled_),
+        step_timing(static_cast<size_t>(num_layers_)),
         core_ids(std::move(core_ids_)) {
     DotChoice c = select_dot();
     dot = c.fn;
@@ -1830,8 +1856,12 @@ struct CpuMoeExecutor {
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
     }
-    for (int t = 0; t < num_threads; ++t)
-      workers.emplace_back([this, t] { worker_loop(t); });
+    for (int t = 0; t < num_threads; ++t) {
+      if (timed_worker_mode)
+        workers.emplace_back([this, t] { timed_worker_loop(t); });
+      else
+        workers.emplace_back([this, t] { worker_loop(t); });
+    }
   }
 
   // Quantize a bf16 activation row to Q8_0 (llama.cpp): per-32-block symmetric int8 in
@@ -2673,6 +2703,48 @@ struct CpuMoeExecutor {
     }
   }
 
+  static int64_t steady_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void timed_worker_loop(int tid) {
+    pin_self(tid);
+    uint64_t my_gen = 0;
+    for (;;) {
+      MoeTask* t;
+      {
+        std::unique_lock<std::mutex> lk(task_mtx);
+        task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
+        if (stop) return;
+        my_gen = cur_gen;
+        t = cur_task;
+      }
+      if (t->timing_active) {
+        int64_t expected = 0;
+        if (t->t_first_worker_ns.compare_exchange_strong(
+                expected, -1, std::memory_order_acq_rel)) {
+          t->t_first_worker_ns.store(steady_now_ns(), std::memory_order_release);
+        }
+      }
+      run_task_body(t);
+      if (done_count.fetch_add(1) + 1 == num_threads) {
+        if (t->timing_active)
+          t->t_compute_done_ns.store(steady_now_ns(), std::memory_order_release);
+        completed.store(my_gen, std::memory_order_release);
+        if (t->timing_active) {
+          t->t_signalled_ns.store(
+              steady_now_ns(), std::memory_order_release);
+        }
+        {
+          std::lock_guard<std::mutex> lk(sync_mtx);
+        }
+        sync_cv.notify_all();
+      }
+    }
+  }
+
   void build_decode_groups(const MoeTask* t) {
     std::fill(expert_offsets.begin(), expert_offsets.end(), 0);
     const int routes = t->num_tokens * top_k;
@@ -2701,14 +2773,98 @@ struct CpuMoeExecutor {
     }
   }
 
+  uint64_t expert_weight_bytes() const {
+    const uint64_t h = static_cast<uint64_t>(H);
+    const uint64_t i = static_cast<uint64_t>(I);
+    const uint64_t hi = h * i;
+    switch (fmt) {
+      case WF_BF16:
+        return 6 * hi;
+      case WF_NVFP4:
+        return (3 * hi) / 2 + (3 * hi) / 16 + 4 * i + 2 * h;
+      case WF_MXFP4:
+        return (3 * hi) / 2 + (3 * hi) / 32 + 4 * i + 2 * h;
+      case WF_DSFP4:
+        return (3 * hi) / 2 + (3 * hi) / 32;
+      case WF_Q4_0:
+        return (54 * hi) / 32;
+      default:
+        return 0;
+    }
+  }
+
+  void finish_task_timing(MoeTask* t, int64_t signalled_ns) {
+    if (!t->timing_active) return;
+    const int64_t doorbell_ns = t->t_doorbell_ns.load(std::memory_order_acquire);
+    const int64_t first_worker_ns =
+        t->t_first_worker_ns.load(std::memory_order_acquire);
+    const int64_t compute_done_ns =
+        t->t_compute_done_ns.load(std::memory_order_acquire);
+    t->t_signalled_ns.store(signalled_ns, std::memory_order_release);
+    const int64_t wake_ns = std::max<int64_t>(0, first_worker_ns - doorbell_ns);
+    const int64_t compute_ns = std::max<int64_t>(0, compute_done_ns - first_worker_ns);
+    const int64_t signal_ns = std::max<int64_t>(0, signalled_ns - compute_done_ns);
+    t->timing_last_run_ns.store(
+        std::max<int64_t>(0, signalled_ns - doorbell_ns), std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lk(step_timing_mtx);
+      StepTimingAccum& row = step_timing.at(static_cast<size_t>(t->layer_id));
+      row.wake_ns += wake_ns;
+      row.compute_ns += compute_ns;
+      row.signal_ns += signal_ns;
+      row.wake_max_ns = std::max(row.wake_max_ns, wake_ns);
+      row.compute_max_ns = std::max(row.compute_max_ns, compute_ns);
+      row.signal_max_ns = std::max(row.signal_max_ns, signal_ns);
+      ++row.tasks;
+      row.experts += t->timing_experts;
+      row.bytes += t->timing_bytes;
+    }
+    t->timing_active = false;
+    step_timing_inflight.fetch_sub(1, std::memory_order_release);
+  }
+
+  pybind11::dict step_timing_snapshot_and_reset() {
+    pybind11::dict result;
+    while (step_timing_inflight.load(std::memory_order_acquire) != 0)
+      std::this_thread::yield();
+    std::lock_guard<std::mutex> lk(step_timing_mtx);
+    for (int layer_id = 0; layer_id < num_layers; ++layer_id) {
+      StepTimingAccum& row = step_timing[static_cast<size_t>(layer_id)];
+      if (row.tasks == 0) continue;
+      pybind11::dict values;
+      values["wake_us"] = static_cast<double>(row.wake_ns) / 1000.0;
+      values["compute_us"] = static_cast<double>(row.compute_ns) / 1000.0;
+      values["signal_us"] = static_cast<double>(row.signal_ns) / 1000.0;
+      values["wake_max_us"] = static_cast<double>(row.wake_max_ns) / 1000.0;
+      values["compute_max_us"] = static_cast<double>(row.compute_max_ns) / 1000.0;
+      values["signal_max_us"] = static_cast<double>(row.signal_max_ns) / 1000.0;
+      values["tasks"] = row.tasks;
+      values["experts"] = row.experts;
+      values["bytes"] = row.bytes;
+      result[pybind11::int_(layer_id)] = std::move(values);
+      row = StepTimingAccum{};
+    }
+    return result;
+  }
+
   void submit(MoeTask* t, bool run_pre_callback = true) {
-    if (task_timing_enabled) {
-      const auto timing_started = std::chrono::steady_clock::now().time_since_epoch();
-      t->timing_started_ns.store(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(timing_started).count(),
-          std::memory_order_release);
+    // Persistent group_routes tasks are decode tasks. Prefill remains outside the
+    // per-step snapshot even when diagnostics are enabled.
+    const bool time_task = t->group_routes &&
+        task_timing_enabled.load(std::memory_order_relaxed);
+    if (time_task) {
+      t->timing_active = true;
+      t->t_doorbell_ns.store(steady_now_ns(), std::memory_order_release);
+      t->t_first_worker_ns.store(0, std::memory_order_relaxed);
+      t->t_compute_done_ns.store(0, std::memory_order_relaxed);
+      t->t_signalled_ns.store(0, std::memory_order_relaxed);
     }
     if (t->group_routes || t->prefill_batch) build_decode_groups(t);
+    if (time_task) {
+      // Each valid route applies one expert and streams that expert's weights once.
+      t->timing_experts = static_cast<uint64_t>(grouped_routes.size());
+      t->timing_bytes = t->timing_experts * expert_weight_bytes();
+    }
     if (run_pre_callback && pre_run_callback) {
       pybind11::gil_scoped_acquire gil;
       if (t->group_routes || t->prefill_batch) {
@@ -2808,6 +2964,7 @@ struct CpuMoeExecutor {
         quant_q8_0(t->x + (size_t)tok * H, H, xi8_scratch.data() + (size_t)tok * H,
                    xas_scratch.data() + (size_t)tok * (H / 32));
     }
+    if (time_task) step_timing_inflight.fetch_add(1, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lk(task_mtx);
       cur_task = t;
@@ -2821,16 +2978,7 @@ struct CpuMoeExecutor {
     const uint64_t target = submitted.load(std::memory_order_acquire);
     std::unique_lock<std::mutex> lk(sync_mtx);
     sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
-    lk.unlock();
-    if (task_timing_enabled && timing_task != nullptr) {
-      const int64_t started =
-          timing_task->timing_started_ns.load(std::memory_order_acquire);
-      const auto now = std::chrono::steady_clock::now().time_since_epoch();
-      const int64_t ended =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
-      timing_task->timing_last_run_ns.store(
-          std::max<int64_t>(0, ended - started), std::memory_order_release);
-    }
+    (void)timing_task;
   }
 
   void submit_with_cuda_stream(uintptr_t stream, uintptr_t task) {
@@ -2934,6 +3082,8 @@ struct CpuMoeExecutor {
           }
           // Release: the workers' y stores are visible before the GPU sees done.
           flag_store_release(&done_flags[L], 1);
+          if (t != nullptr && t->timing_active)
+            finish_task_timing(t, steady_now_ns());
           if (L < static_cast<int>(flag_served.size())) ++flag_served[L];
           any = true;
         }
@@ -2977,6 +3127,10 @@ struct CpuMoeExecutor {
     MoeTask* t = reinterpret_cast<MoeTask*>(task);
     submit(t);
     sync(t);
+    if (t->timing_active) {
+      finish_task_timing(
+          t, t->t_signalled_ns.load(std::memory_order_acquire));
+    }
   }
 
   // Synchronous task whose descriptor lives only for this call. Prefill uses one
@@ -2996,6 +3150,10 @@ struct CpuMoeExecutor {
                  reinterpret_cast<bf16_t*>(y_ptr)};
     submit(&task, run_pre_callback);
     sync(&task);
+    if (task.timing_active) {
+      finish_task_timing(
+          &task, task.t_signalled_ns.load(std::memory_order_acquire));
+    }
   }
 
   std::vector<int64_t> run_prefill_batch_sync(
@@ -3014,6 +3172,10 @@ struct CpuMoeExecutor {
                  reinterpret_cast<bf16_t*>(y_ptr)};
     submit(&task, false);
     sync(&task);
+    if (task.timing_active) {
+      finish_task_timing(
+          &task, task.t_signalled_ns.load(std::memory_order_acquire));
+    }
     scatter_prefill_batch(&task);
     // Logical GEMMs: one fused gate_up projection and one down projection for each
     // non-empty expert group. Activation is fused between them.
@@ -3026,7 +3188,11 @@ struct CpuMoeExecutor {
     return t->timing_last_run_ns.load(std::memory_order_acquire);
   }
 
-  void set_task_timing(bool enabled) { task_timing_enabled = enabled; }
+  void set_task_timing(bool enabled) {
+    if (enabled && !timed_worker_mode)
+      throw std::runtime_error("task timing must be enabled when the executor is created");
+    task_timing_enabled.store(enabled, std::memory_order_relaxed);
+  }
 
   void set_pre_run_callback(pybind11::function callback) {
     pre_run_callback = std::move(callback);
@@ -3056,6 +3222,10 @@ struct CpuMoeExecutor {
   static void CUDART_CB sync_cb(void* ud) {
     MoeTask* t = reinterpret_cast<MoeTask*>(ud);
     t->exec->sync(t);
+    if (t->timing_active) {
+      t->exec->finish_task_timing(
+          t, t->t_signalled_ns.load(std::memory_order_acquire));
+    }
   }
   static void CUDART_CB gpufetch_cb(void* ud) {
     GpuFetchTask* t = reinterpret_cast<GpuFetchTask*>(ud);
@@ -3070,7 +3240,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CpuMoeExecutor>(m, "CpuMoeExecutor")
       .def(py::init<int, int, int, int, int, int, int, int, int, int, uintptr_t, uintptr_t,
                     uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
-                    double, double, std::vector<int>>(),
+                    double, double, std::vector<int>, bool>(),
            py::arg("num_threads"), py::arg("num_layers"), py::arg("num_experts"),
            py::arg("top_k"), py::arg("hidden_size"), py::arg("inter_size"),
            py::arg("max_tokens"), py::arg("activation_id"),
@@ -3079,7 +3249,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("gate_up_global_ptr"), py::arg("down_scale_ptr"),
            py::arg("down_global_ptr"), py::arg("gate_up_bias_ptr"),
            py::arg("down_bias_ptr"), py::arg("swiglu_alpha"), py::arg("swiglu_limit"),
-           py::arg("core_ids"))
+           py::arg("core_ids"), py::arg("task_timing_enabled") = false)
       .def("create_task", &CpuMoeExecutor::create_task, py::arg("layer_id"),
            py::arg("num_tokens"), py::arg("x_ptr"), py::arg("ids_ptr"), py::arg("w_ptr"),
            py::arg("y_ptr"))
@@ -3115,6 +3285,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("flag_served_count", &CpuMoeExecutor::flag_served_count, py::arg("slot"))
       .def("task_last_run_ns", &CpuMoeExecutor::task_last_run_ns, py::arg("task"))
       .def("set_task_timing", &CpuMoeExecutor::set_task_timing, py::arg("enabled"))
+      .def("step_timing_snapshot_and_reset",
+           &CpuMoeExecutor::step_timing_snapshot_and_reset)
       .def("gpufetch_stats", &CpuMoeExecutor::gpufetch_stats, py::arg("reset"))
       .def("gpufetch_error_code", &CpuMoeExecutor::gpufetch_error_code)
       .def("start_flag_coordinator", &CpuMoeExecutor::start_flag_coordinator,

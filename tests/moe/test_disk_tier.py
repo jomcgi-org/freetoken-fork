@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import io
 import threading
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+
+def test_process_faults_parses_minor_and_major_from_procfs(monkeypatch):
+    import freetoken.moe.cpu_executor as cpu_executor
+
+    stat = "123 (worker with spaces) S 1 2 3 4 5 6 42 8 7 0 0"
+    monkeypatch.setattr("builtins.open", lambda *args, **kwargs: io.StringIO(stat))
+
+    assert cpu_executor._process_faults() == (42, 7)
 
 
 def _write_bf16_ftw(path, layers: list[tuple[torch.Tensor, torch.Tensor]]):
@@ -436,7 +446,7 @@ def test_disk_prefill_release_marks_only_selected_page_ranges_noreuse(
     assert calls == [(4096, 4096, 5)]
 
 
-def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
+def test_disk_prefetch_stats_are_per_layer_and_flush_process_faults(monkeypatch):
     import freetoken.moe.cpu_executor as cpu_executor
 
     executor = cpu_executor.CpuMoeExecutor.__new__(cpu_executor.CpuMoeExecutor)
@@ -458,9 +468,10 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     executor._prefill_release_skipped_tmpfs_bytes = 610_000_000
     executor._prefill_batch_rows = 20_480
     executor._prefill_batch_gemms = 420
+    executor._disk_minor_fault_base = 100
     executor._disk_major_fault_base = 10
     executor._gpufetch_tasks = {}
-    monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 16)
+    monkeypatch.setattr(cpu_executor, "_process_faults", lambda: (118, 16))
 
     stats = executor.disk_prefetch_stats(reset=True)
     assert stats["prefetch_calls"] == 6
@@ -468,6 +479,9 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert stats["major_faults"] == 6
     assert stats["major_faults_unit"] == "kernel_events_4KiB_or_2MiB"
     assert stats["major_faults_per_decode_step"] == 2.0
+    assert stats["minor_faults"] == 18
+    assert stats["minor_faults_unit"] == "kernel_events_4KiB_or_2MiB"
+    assert stats["minor_faults_per_decode_step"] == 6.0
     assert stats["distinct_experts_per_step"] == 5.0
     assert stats["dedup_ratio"] == 1.6
     assert stats["moe_prefill_coalesce_experts"] == 9
@@ -502,6 +516,7 @@ def test_disk_prefetch_stats_are_per_layer_and_flush_major_faults(monkeypatch):
     assert executor._prefill_release_pages == 0
     assert executor._prefill_release_skipped_tmpfs_bytes == 0
     assert executor._disk_major_fault_base == 16
+    assert executor._disk_minor_fault_base == 118
 
 
 def test_gpufetch_staging_capacity_tracks_max_distinct_decode_routes():
@@ -559,16 +574,18 @@ def test_gpufetch_stats_are_reported_per_decode_step(monkeypatch):
     executor._disk_decode_steps = 0
     executor._disk_route_pairs = 0
     executor._disk_distinct_experts = 0
+    executor._disk_minor_fault_base = 20
     executor._disk_major_fault_base = 5
     executor._gpufetch_tasks = {1: (10, 1), 2: (11, 2)}
     executor._ext = Extension()
-    monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 11)
+    monkeypatch.setattr(cpu_executor, "_process_faults", lambda: (32, 11))
 
     stats = executor.disk_prefetch_stats(reset=True)
 
     assert stats["gpufetch_fills_per_step"] == 4.0
     assert stats["gpufetch_fill_us"] == 300.0
     assert stats["major_faults_per_decode_step"] == 2.0
+    assert stats["minor_faults_per_decode_step"] == 4.0
 
 
 def test_gpufetch_decode_uses_lru_gpu_path_even_for_hybrid_cache():
@@ -1825,8 +1842,9 @@ def test_uffd_stats_are_merged_into_disk_telemetry(monkeypatch):
     executor._disk_decode_steps = 1
     executor._disk_route_pairs = 0
     executor._disk_distinct_experts = 0
+    executor._disk_minor_fault_base = 20
     executor._disk_major_fault_base = 10
-    monkeypatch.setattr(cpu_executor, "_major_faults", lambda: 10)
+    monkeypatch.setattr(cpu_executor, "_process_faults", lambda: (20, 10))
 
     stats = executor.disk_prefetch_stats(reset=True)
     assert stats["pager_backend"] == "uffd"
