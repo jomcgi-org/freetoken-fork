@@ -806,3 +806,77 @@ are ported; #332 (GLM-5.3-Flash, upstream's own implementation), #329
 (exact Triton sampling), #336 (safetensors index download), #343
 (mixed-precision NVFP4 detection) and #319 (Triton router) are not.
 Reconcile GLM against #332 before any upstream PR.
+
+## GLM 5.3 Flash on Blackwell (2026-09-03, GCE g4-standard-48 spot, RTX PRO 6000 96 GB, 180 GB RAM)
+
+Model: RedHatAI/GLM-5.3-Flash-NVFP4 (45 layers, 288 routed + 1 shared experts,
+top-8; about 160 GB of expert banks, 177 GiB FTW). Bench recipe: FTW and venv
+from gs://h0melab-glm-ftw, tier branch on the box, `ft probe-prefill` 2k cold
+prompts plus a 300-token essay and `load.sh` x4 per rung, quality via the
+thinking-aware `quality2.sh` (thinking off at 768 tokens, thinking on at 2048).
+Raw logs: ~/repos/ft-worktrees/tools/evidence-0903/ (g4-rungs.log, rungs.log,
+diag*.log, g4-journals.tgz).
+
+### The prefill bug that invalidated the first rungs
+
+The first two rungs (R1 pin 112 / hot 48, R2 pin 64 under a 128 GB cap) ran
+with fluent decode and a broken prompt: with thinking off the model answered
+the codeword prompt as if it had seen only "ZEPHYR", not the digits or the
+counting instruction, and the word-list prompt as if no list had been given.
+Isolation arms (hot split off, batched CPU prefill off) failed identically on
+40-token prompts that barely touch the CPU path, which pointed above the
+experts. Cause: `glm5_next/linear.py` computed the KDA per-channel forget gate
+`[1, T, H, D]` and handed it to `chunk_gated_delta_rule`, whose contract is one
+gate per head `[B, T, H]`; the wrapper asserts only beta's shape. Decode uses
+`fused_sigmoid_gating_delta_rule_update(is_kda=True)` in-kernel and was right,
+which is why throughput looked normal. Fix (e029865, f47f5b2, merged 8ba441e):
+upstream's KDA chunk kernels vendored verbatim from a2538a4 and the prefill
+branch rewired to `chunk_kda_with_fused_gate` (gathered initial state in,
+final state scattered back). Four prompt-fidelity probes (repeat-exactly,
+codeword recall, list lookup, short) pass after the fix. Lesson recorded: run a
+prompt-fidelity probe before any throughput rung on a new model family; the
+five-check quality script missed it because thinking consumed `max_tokens`.
+
+### Numbers on the fixed build
+
+| rung | config | 2k cold prefill | decode x1 | x4 aggregate | quality |
+|---|---|---:|---:|---:|---|
+| F1 | 112 GB pinned, 48 GB hot, no cap | 257 tok/s (settled; 28 and 49 during the hot-set fill) | 11 to 12 tok/s | 19.3 tok/s | 8/8 (thinking off and on) |
+| F3 | 35 GB pinned, 48 GB hot, cgroup MemoryMax 64 GB | probe timed out (0.06 to 7.6 tok/s per chunk) | 0.03 to 0.04 tok/s, 140,835 major faults per step | not run | not run |
+| R2 (pre-fix, decode only valid) | 64 GB pinned, 48 GB hot, cap 128 GB | (invalid) | ~14 tok/s | 10.0 tok/s | (invalid) |
+
+Reading F1 correctly: with 112 GB pinned, 29 layers are PINNED and stream
+experts over PCIe through a 17 GB LRU every step (4,904 slots, 3,580 of them
+protected hot rows), so the ~70 ms step is PCIe streaming, not GPU compute.
+"Everything resident" is not available on a 96 GB card for a 160 GB expert
+set; GLM inherits the same decode shape as Qwen on the 4090, a cold tail off
+the GPU. F3 is the honest 64 GB-box answer for this model with this method:
+unusable. The 48 GB hot set starts cold and needs about 5k routed tokens to
+fill at 0.5 GiB per tick, so a 1,500-token probe warmup measures the fill; the
+later rung scripts use 8,000.
+
+### Not measured (issue #12 on the fork)
+
+- All 42 MoE layers on the DISK path with the cold tail fetched over PCIe
+  (`--moe-disk-decode gpufetch`, no hot budget): was mid CUDA-graph capture
+  (bs=4 capture took 159 s) when the window was closed.
+- The same with the cold tail on the CPU (pin 8, hot 60): the server got
+  SIGKILL about 10 s after uvicorn started, twice, no OOM in dmesg.
+- bf16 versus NVFP4 activations on sm_120: the bucket FTW predates the
+  sidecar support, and reconversion on a CPU host writes a bf16 file with no
+  sidecars because `ft checkpoint` resolves the activation policy against the
+  converting host (issue #11); gate and up input scales in the source are
+  identical, so the checkpoint itself is usable. Convert with `--gpu 0` on an
+  sm_120 host.
+- Step timing on the F1 config.
+
+### Cost and ops
+
+About 13 hours of g4-standard-48 spot across six sessions since 1 September
+(roughly 25 to 35 GBP), 3.7 hours of n2 convert VMs, bucket about 6 GBP a
+month. Traps hit: `pkill -f "ft serve"` inside a gcloud ssh command kills the
+ssh session itself (bracket the pattern); a git bundle whose base the box
+lacks fails to fetch (push the branch, `git fetch origin`); systemd-run scripts
+need /snap/bin on PATH for gcloud; `--moe-hot-expert-budget-gib` requires
+`--moe-disk-decode cpu`; the io_uring extension needs `<linux/time_types.h>`
+on 22.04 headers (aa818cb).
