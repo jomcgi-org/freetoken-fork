@@ -186,28 +186,55 @@ class Glm5NextKimiDeltaAttention(BaseOP):
                 safe_gate_lower_bound=self.safe_gate_lower_bound,
             )[0]
         else:
-            from freetoken.kernel.fla import chunk_gated_delta_rule
+            from freetoken.kernel.fla import chunk_kda_with_fused_gate
 
-            g, beta = self._gate_params(hidden_states)
+            # KDA's forget gate is per channel. The Qwen chunk kernel takes one
+            # gate per head, so prefill runs the vendored KDA chunk kernels, which
+            # apply the same gate math the decode kernel applies in-kernel. The
+            # kernel takes a gathered initial state and returns the final state;
+            # the scatter back into the pool is ours.
+            raw_g = self.f_b_proj.forward(self.f_a_proj.forward(hidden_states))
+            beta = self.b_proj.forward(hidden_states).float().sigmoid()
+            rec = pool.recurrent_states[li]
             if fla.fresh_state_indices is not None:
-                pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
+                rec.index_fill_(0, fla.fresh_state_indices, 0.0)
+            slot_ids = fla.cache_indices.long()
+            initial = rec.index_select(0, slot_ids)
             track = fla.track_dst is not None
-            core, _, h = chunk_gated_delta_rule(
+            raw_g = raw_g.view(1, total, self.num_heads, self.head_dim)
+            # The kernel validates nothing about the gate layout; this is the seam
+            # that let a per-channel gate reach a per-head kernel unnoticed.
+            assert raw_g.shape[-2:] == (self.num_heads, self.head_dim), raw_g.shape
+            # v is a strided view of the conv output, so the kernel copies it before
+            # writing its output into the copy; nothing reads mixed or v afterwards.
+            result = chunk_kda_with_fused_gate(
                 q=q,
                 k=k,
                 v=v,
-                g=g.view(1, total, self.num_heads, self.head_dim),
+                raw_g=raw_g,
                 beta=beta.view(1, total, self.num_heads),
+                A_log=self.A_log,
+                g_bias=self.dt_bias,
                 scale=self.head_dim**-0.5,
-                initial_state=pool.recurrent_states[li],
-                initial_state_indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens,
-                head_first=False,
+                initial_state=initial,
+                output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
+                cu_seqlens=fla.cu_seqlens,
+                safe_gate=self.safe_gate_lower_bound is not None,
+                lower_bound=(
+                    self.safe_gate_lower_bound
+                    if self.safe_gate_lower_bound is not None
+                    else -5.0
+                ),
+                return_h=track,
             )
-            core = core[0]
             if track:
+                core, final_state, h = result
                 self._write_track_snapshot(pool, li, conv_in, h, fla)
+            else:
+                core, final_state = result
+            rec.index_copy_(0, slot_ids, final_state.to(rec.dtype))
+            core = core[0]
 
         gate = self.g_b_proj.forward(self.g_a_proj.forward(hidden_states)).view(
             -1, self.head_dim
