@@ -331,6 +331,10 @@ def test_fused_hash_capture_owns_indices_after_eager_cache_eviction(monkeypatch)
         )
     assert eager_key not in embedding._token_index_cache
     assert all(tensor.is_cuda for tensor in captured_index)
+    # Captured kernels do not run during capture; the indices exist only
+    # after a replay, which is also what production does before reading.
+    graph.replay()
+    torch.cuda.synchronize()
     assert captured_index[0].tolist() == [0, 1, 2, 3]
     assert captured_index[1].tolist() == [0, 0, 0, 0]
 
