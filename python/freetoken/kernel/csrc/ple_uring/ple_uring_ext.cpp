@@ -19,6 +19,7 @@
 
 #include <fcntl.h>
 #include <linux/io_uring.h>
+#include <linux/time_types.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
