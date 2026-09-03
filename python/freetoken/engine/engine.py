@@ -23,7 +23,15 @@ from freetoken.moe.offload_cache import (
     attach_offload_moe_cache,
     hot_dynamic_slot_reserve,
 )
-from freetoken.utils import align_ceil, init_logger, is_sm90_family, is_sm100_family, mem_GB, torch_dtype
+from freetoken.utils import (
+    align_ceil,
+    div_ceil,
+    init_logger,
+    is_sm90_family,
+    is_sm100_family,
+    mem_GB,
+    torch_dtype,
+)
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
@@ -610,7 +618,52 @@ class Engine:
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
+        reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+        from freetoken.scheduler.kv_ladder import (
+            DEFAULT_KV_LADDER_STEP_TOKENS,
+            kv_ladder_eligibility,
+        )
+
+        ladder_on = kv_ladder_eligibility(config).enabled
+        cap_pages = config.num_page_override if ladder_on else None
+        cap_tokens = None
+        if ladder_on:
+            cap_tokens = (
+                min(config.max_seq_len, cap_pages * page_tokens)
+                if cap_pages is not None
+                else config.max_seq_len
+            )
+            minimum_floor = 2 * DEFAULT_KV_LADDER_STEP_TOKENS
+            requested_floor = max(reserve_tokens, minimum_floor)
+            reserve_tokens = max(min(requested_floor, cap_tokens), min_reserve)
+            object.__setattr__(config, "kv_ladder_cap_tokens", cap_tokens)
+            object.__setattr__(config, "kv_ladder_floor_tokens", reserve_tokens)
+            object.__setattr__(config, "kv_ladder_explicit_cap", cap_pages is not None)
+            if reserve_tokens > max(config.kv_reserve_tokens, min_reserve):
+                logger.info_rank0(
+                    "KV ladder raised floor from %d to %d tokens: floor must be at "
+                    "least 2 x %d-token growth step",
+                    max(config.kv_reserve_tokens, min_reserve),
+                    reserve_tokens,
+                    DEFAULT_KV_LADDER_STEP_TOKENS,
+                )
+            if min_reserve > cap_tokens:
+                logger.warning_rank0(
+                    "KV cache pool minimum %d tokens is above KV ladder cap %d; "
+                    "startup pool uses the required pool minimum",
+                    min_reserve,
+                    cap_tokens,
+                )
+            elif requested_floor > cap_tokens:
+                logger.warning_rank0(
+                    "KV ladder floor request %d tokens is above cap %d; startup "
+                    "pool is capped at %d tokens",
+                    requested_floor,
+                    cap_tokens,
+                    cap_tokens,
+                )
+
+        result = resolve_moe_cache_auto(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
@@ -620,10 +673,18 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
+            kv_reserve_tokens=reserve_tokens,
             page_size=page_tokens,
             quant_format=banks.quant_format,
         )
+        if not ladder_on:
+            return result
+        size, pages, overlap = result
+        assert cap_tokens is not None
+        # A hard pool minimum wins when a configured ladder cap is too low to
+        # construct a valid pool. The warning above makes that override visible.
+        cap_pool_pages = div_ceil(max(cap_tokens, min_reserve), page_tokens)
+        return size, min(pages, cap_pool_pages), overlap
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
@@ -802,18 +863,18 @@ class Engine:
                     )
                 object.__setattr__(config, "moe_cache_size", size)
                 object.__setattr__(config, "moe_prefill_overlap", overlap)
-                if config.num_page_override is None:
-                    # Honor the plan's KV half too: MoE slots and KV pages were solved
-                    # against ONE budget (ratio x baseline - weights), so both must come
-                    # from it. Re-solving pages later from a fresh free-memory reading
-                    # double-counts everything allocated since the weights measurement
-                    # (this expert cache, the CPU-executor GPU buffers, allocator
-                    # slack) and goes negative whenever the expert fill is exact --
-                    # a greedy fill leaves no headroom for the measurement delta.
-                    object.__setattr__(config, "num_page_override", pages)
+                # Honor the plan's KV half too: MoE slots and KV pages were solved
+                # against ONE budget (ratio x baseline - weights), so both must come
+                # from it. Re-solving pages later from a fresh free-memory reading
+                # double-counts everything allocated since the weights measurement
+                # (this expert cache, the CPU-executor GPU buffers, allocator
+                # slack) and goes negative whenever the expert fill is exact --
+                # a greedy fill leaves no headroom for the measurement delta. With
+                # the ladder active an explicit page count is the cap, not this floor.
+                _install_auto_moe_cache_pages(config, pages)
                 logger.info_rank0(
                     f"--moe-cache-auto resolved moe_cache_size={size} "
-                    f"num_pages={pages} (prefill_overlap={overlap})"
+                    f"num_pages={pages} (+1 dummy page; prefill_overlap={overlap})"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
             hot_expert_ids, hot_expert_capacity, hot_expert_bytes = (
@@ -1107,6 +1168,78 @@ class Engine:
         )
         return target_moe, per_expert_bytes
 
+    def _validate_hot_slot_owners(
+        self,
+        owners: dict[int, tuple[int | None, ...]],
+        target_moe: int,
+    ) -> None:
+        """Validate a ladder-requested reduction of permanent HOT rows."""
+        cache = self.moe_offload_cache
+        if cache is None:
+            raise CacheRebuildRejected("HOT slot ownership requested without an MoE cache")
+        from freetoken.moe.offload_cache import hot_dynamic_slot_reserve
+
+        for layer_id, layer_owners in owners.items():
+            if not 0 <= layer_id < cache.num_layers:
+                raise CacheRebuildRejected(f"HOT layer id {layer_id} is out of range")
+            if len(layer_owners) > cache.num_experts:
+                raise CacheRebuildRejected(
+                    f"HOT layer {layer_id} has {len(layer_owners)} rows, maximum is "
+                    f"{cache.num_experts}"
+                )
+            experts = [expert for expert in layer_owners if expert is not None]
+            if len(experts) != len(set(experts)) or any(
+                expert < 0 or expert >= cache.num_experts for expert in experts
+            ):
+                raise CacheRebuildRejected(
+                    f"HOT layer {layer_id} has duplicate or out-of-range expert owners"
+                )
+        protected = sum(len(layer_owners) for layer_owners in owners.values())
+        dynamic = hot_dynamic_slot_reserve(
+            target_moe, cache.num_experts, cache.prefill_overlap
+        )
+        if protected + dynamic > target_moe:
+            raise CacheRebuildRejected(
+                f"HOT residency needs {protected} protected slots plus {dynamic} "
+                f"dynamic/prefill slots, but moe_cache_size={target_moe}"
+            )
+
+    @staticmethod
+    def _drain_hot_adaptation_for_rebuild(cache) -> None:
+        """Resolve in-flight HOT work before changing its protected row geometry."""
+        future = getattr(cache, "_hot_adapt_future", None)
+        if future is None:
+            return
+        if not future.cancel():
+            future.result()
+        cache._hot_adapt_future = None
+        cache._hot_adapt_phase = None
+        cache._hot_adapt_swaps_pending = ()
+        cache._hot_adapt_worker_installs = False
+
+    @staticmethod
+    def _apply_hot_slot_owners(cache, owners: dict[int, tuple[int | None, ...]]) -> None:
+        """Install a validated HOT row geometry immediately before cache allocation."""
+        cache.hot_expert_capacity = {
+            layer_id: len(layer_owners)
+            for layer_id, layer_owners in owners.items()
+            if layer_owners
+        }
+        cache._hot_slot_owners = {
+            layer_id: list(layer_owners)
+            for layer_id, layer_owners in owners.items()
+            if layer_owners
+        }
+        cache._hot_slot_for_row = {}
+        cache.hot_expert_ids = {
+            layer_id: tuple(sorted(expert for expert in layer_owners if expert is not None))
+            for layer_id, layer_owners in cache._hot_slot_owners.items()
+        }
+        if getattr(cache, "hot_adapt_expert_bytes", 0):
+            cache.hot_adapt_hot_budget_bytes = (
+                sum(cache.hot_expert_capacity.values()) * cache.hot_adapt_expert_bytes
+            )
+
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
         # IN-PLACE, identity-preserving: the CacheManager's swa_pool reference, ctx.kv_cache and
         # the model's per-access pool property all keep pointing at THIS pool, which frees its old
@@ -1142,6 +1275,7 @@ class Engine:
         num_pages: int | None = None,
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
+        hot_slot_owners: dict[int, tuple[int | None, ...]] | None = None,
     ) -> None:
         """Idle-only in-place resize of the MoE slot cache, KV page pool, GDN (mamba) state pool,
         and/or the window pool (num_swa_pages: an absolute pinned window), followed by CUDA-graph
@@ -1150,7 +1284,7 @@ class Engine:
         """
         config = self.config
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
-                and num_swa_pages is None):
+                and num_swa_pages is None and hot_slot_owners is None):
             return
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
@@ -1167,6 +1301,12 @@ class Engine:
                 self.moe_offload_cache.validate_rebuild(moe_cache_size)
             except ValueError as e:
                 raise CacheRebuildRejected(str(e)) from e
+        if hot_slot_owners is not None:
+            if moe_cache_size is None:
+                raise CacheRebuildRejected(
+                    "HOT slot ownership can change only with moe_cache_size"
+                )
+            self._validate_hot_slot_owners(hot_slot_owners, moe_cache_size)
         if num_pages is not None and num_pages <= 0:
             raise CacheRebuildRejected(f"num_pages must be positive, got {num_pages}")
         if num_mamba_slots is not None:
@@ -1222,6 +1362,10 @@ class Engine:
             ),
         )
 
+        if hot_slot_owners is not None:
+            assert self.moe_offload_cache is not None
+            self._drain_hot_adaptation_for_rebuild(self.moe_offload_cache)
+
         torch.cuda.synchronize(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
         # off free memory, which is far smaller now that the caches are resident (post-cache
@@ -1245,6 +1389,8 @@ class Engine:
             object.__setattr__(config, "swa_num_pages_override", num_swa_pages)
         if moe_cache_size is not None:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
+            if hot_slot_owners is not None:
+                self._apply_hot_slot_owners(self.moe_offload_cache, hot_slot_owners)
             self.moe_offload_cache.rebuild(moe_cache_size)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
@@ -2421,6 +2567,14 @@ def _validate_disk_prefill_task_size(config, cache) -> None:
     )
 
 
+def _install_auto_moe_cache_pages(config, pages: int) -> None:
+    """Install auto-planned pages when auto sizing owns the startup geometry."""
+    from freetoken.scheduler.kv_ladder import kv_ladder_eligibility
+
+    if config.num_page_override is None or kv_ladder_eligibility(config).enabled:
+        object.__setattr__(config, "num_page_override", pages)
+
+
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
@@ -2672,6 +2826,22 @@ def _adjust_config(config: EngineConfig):
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
                 f"auto-selected backend {config.moe_backend!r}"
             )
+
+    # EngineConfig can only reject this combination when the parser already knows that
+    # auto sizing is active. With --moe-backend auto, both the concrete offload backend
+    # and its default --moe-cache-auto are resolved above, so repeat the explicit flag
+    # check here before any weights are loaded.
+    if (
+        is_moe
+        and getattr(config, "kv_ladder", "off") == "on"
+        and getattr(config, "kv_ladder_explicit", False)
+        and is_offload_moe_backend(config.moe_backend)
+        and getattr(config, "moe_cache_auto", False)
+        and config.max_running_req != 1
+    ):
+        raise ValueError(
+            "explicit --kv-ladder on requires --max-running-requests 1"
+        )
 
     if is_moe and config.moe_backend == "fused":
         # An explicit 'fused' keeps the experts resident, so there is no slot cache to size. The

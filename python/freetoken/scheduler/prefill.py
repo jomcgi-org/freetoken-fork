@@ -8,7 +8,7 @@ import torch
 from freetoken.core import Batch, Req
 from freetoken.utils import align_down, div_ceil, init_logger
 
-from .utils import PendingReq, order_pending_requests, priority_queue_stats
+from .utils import PendingReq, order_pending_requests
 
 if TYPE_CHECKING:
     from freetoken.kvcache import BaseCacheHandle
@@ -369,9 +369,6 @@ class PrefillManager:
                 self.cache_manager.abort_pending_expert_profile(uid)
                 return req.chunked_req
         return None
-
-    def queue_stats(self) -> tuple[dict[str, int], float]:
-        return priority_queue_stats(self.pending_list, now=self.clock())
 
     @property
     def runnable(self) -> bool:

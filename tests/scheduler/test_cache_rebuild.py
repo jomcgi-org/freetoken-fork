@@ -45,6 +45,35 @@ def test_cache_manager_rebuild_resets_pages_and_prefix():
     cm.check_integrity()  # must pass: free_pages(20) + cache_pages(0) == num_pages(20)
 
 
+def test_cache_manager_rebuild_keeps_disk_restore_lane_and_new_page_table():
+    from types import SimpleNamespace
+
+    from freetoken.scheduler.cache import CacheManager
+
+    disk_store = object()
+    reclaimed = []
+    cm = CacheManager.__new__(CacheManager)
+    cm.page_size = 2
+    cm.cache_type = "hybrid_radix"
+    cm.is_hybrid = True
+    cm.disk_prefix_store = disk_store
+    cm.linear_state_pool = SimpleNamespace(
+        reclaim_all_slots=lambda: reclaimed.append(True)
+    )
+    cm._queue_disk_node = lambda node: None
+    new_prefix = SimpleNamespace(on_evict=None)
+    cm._make_prefix_cache = lambda device, page_size, cache_type: new_prefix
+    new_table = _page_table(1, 64)
+
+    cm.rebuild(num_pages=16, page_table=new_table)
+
+    assert cm.disk_prefix_store is disk_store
+    assert cm.page_table is new_table
+    assert cm.prefix_cache is new_prefix
+    assert cm.prefix_cache.on_evict is cm._queue_disk_node
+    assert reclaimed == [True]
+
+
 def test_table_manager_rebuild_reallocs_token_pool_and_frees_slots():
     from freetoken.scheduler.table import TableManager
 

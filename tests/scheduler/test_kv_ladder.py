@@ -1,0 +1,821 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from freetoken.core import SamplingParams
+from freetoken.message import UserMsg
+from freetoken.scheduler.kv_ladder import (
+    KVLadderCapacityError,
+    KVLadderPolicy,
+    kv_ladder_requested,
+)
+
+
+def _policy(*, kv_bytes_per_page: int, budget: int, protected=(), overlap=False):
+    return KVLadderPolicy(
+        step_tokens=32,
+        max_context_tokens=256,
+        page_size=1,
+        pool_budget_bytes=budget,
+        kv_bytes_per_page=kv_bytes_per_page,
+        moe_bytes_per_slot=100,
+        min_moe_slots=4,
+        prefill_overlap=overlap,
+        protected_rows_by_layer=protected,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "current_slots", "target_slots"),
+    [("bf16", 93, 87), ("fp8_e4m3", 96, 93)],
+    ids=["bf16-pool", "fp8-pool"],
+)
+def test_ladder_prices_the_pool_storage_dtype(
+    kv_cache_dtype, current_slots, target_slots
+):
+    from freetoken.models.config import KVCacheGroupSpec
+    from freetoken.kvcache.mha_pool import MHAKVCache
+
+    spec = KVCacheGroupSpec(
+        name="full",
+        layer_ids=(0,),
+        num_kv_heads=1,
+        head_dim=5,
+        sliding_window=None,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(kv_cache_group_specs=lambda: (spec,)),
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        page_size=1,
+        tp_info=SimpleNamespace(size=1),
+    )
+    kv_bytes_per_page, _, _, _ = MHAKVCache.kv_cost(config)
+    plan = _policy(kv_bytes_per_page=kv_bytes_per_page, budget=10_000).plan(
+        current_pages=32,
+        current_moe_slots=current_slots,
+        input_tokens=33,
+        max_output_tokens=1,
+    )
+    assert plan is not None
+    assert plan.target_pages == 64
+    assert plan.target_moe_slots == target_slots
+
+
+def test_growth_triggers_only_when_request_exceeds_current_pool():
+    policy = _policy(kv_bytes_per_page=10, budget=10_000)
+    assert policy.plan(
+        current_pages=32,
+        current_moe_slots=96,
+        input_tokens=16,
+        max_output_tokens=16,
+    ) is None
+    plan = policy.plan(
+        current_pages=32,
+        current_moe_slots=96,
+        input_tokens=16,
+        max_output_tokens=17,
+    )
+    assert plan is not None
+    assert plan.target_tokens == 64
+
+
+def test_next_growth_stays_aligned_when_startup_charged_a_dummy_page():
+    policy = _policy(kv_bytes_per_page=10, budget=10_000)
+    plan = policy.plan(
+        current_pages=33,
+        current_moe_slots=96,
+        input_tokens=34,
+        max_output_tokens=1,
+    )
+    assert plan is not None
+    assert plan.current_tokens == 33
+    assert plan.target_tokens == 64
+
+
+def test_ladder_budget_includes_the_dummy_page():
+    policy = _policy(kv_bytes_per_page=10, budget=1_049)
+    with pytest.raises(KVLadderCapacityError, match="minimum 4 MoE slots"):
+        policy.plan(
+            current_pages=32,
+            current_moe_slots=4,
+            input_tokens=33,
+            max_output_tokens=1,
+        )
+
+
+def test_protected_rows_are_preserved_when_the_target_has_room():
+    plan = _policy(
+        kv_bytes_per_page=10,
+        budget=1_950,
+        protected=((3, 4), (7, 4)),
+    ).plan(
+        current_pages=32,
+        current_moe_slots=20,
+        input_tokens=33,
+        max_output_tokens=1,
+    )
+    assert plan is not None
+    assert plan.target_moe_slots == 13
+    assert plan.protected_rows_after == ((3, 4), (7, 4))
+    assert plan.lost_protected_rows == ()
+
+
+def test_protected_rows_are_reduced_per_layer_only_when_required():
+    plan = _policy(
+        kv_bytes_per_page=10,
+        budget=1_650,
+        protected=((3, 4), (7, 4)),
+    ).plan(
+        current_pages=32,
+        current_moe_slots=20,
+        input_tokens=33,
+        max_output_tokens=1,
+    )
+    assert plan is not None
+    assert plan.target_moe_slots == 10
+    assert plan.protected_rows_after == ((3, 3), (7, 3))
+    assert plan.lost_protected_rows == ((3, 1), (7, 1))
+
+
+def test_protected_row_reduction_keeps_populated_owners_before_empty_rows():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.engine = SimpleNamespace(
+        moe_offload_cache=SimpleNamespace(
+            _hot_slot_owners={3: [None, 7, 2], 7: [5, None]},
+        )
+    )
+    plan = SimpleNamespace(
+        lost_protected_rows=((3, 1), (7, 1)),
+        protected_rows_after=((3, 2), (7, 1)),
+    )
+
+    assert Scheduler._hot_slot_owners_for_plan(scheduler, plan) == {
+        3: (7, 2),
+        7: (5,),
+    }
+
+
+def test_flag_and_auto_sizing_gate_the_policy():
+    def config(**overrides):
+        values = dict(
+            kv_ladder="on",
+            moe_cache_auto=True,
+            moe_cache_size=0,
+            moe_cache_rate=None,
+            max_running_req=1,
+            tp_info=SimpleNamespace(size=1),
+            moe_backend="offload",
+            model_config=SimpleNamespace(dsv4_args=None, is_moe=True),
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    assert kv_ladder_requested(config())
+    assert not kv_ladder_requested(
+        config(max_running_req=4)
+    )
+    assert not kv_ladder_requested(config(kv_ladder="off"))
+    assert not kv_ladder_requested(config(moe_cache_auto=False))
+    assert not kv_ladder_requested(config(tp_info=SimpleNamespace(size=2)))
+    assert not kv_ladder_requested(
+        config(model_config=SimpleNamespace(dsv4_args=object(), is_moe=True))
+    )
+    assert not kv_ladder_requested(config(moe_backend="fused"))
+
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(kv_ladder="off", moe_cache_auto=True)
+    assert Scheduler._make_kv_ladder_policy(scheduler) is None
+
+
+def test_hot_adaptation_is_drained_before_protected_geometry_changes():
+    from freetoken.engine.engine import Engine
+
+    events = []
+
+    class Future:
+        def cancel(self):
+            events.append("cancel")
+            return False
+
+        def result(self):
+            events.append("drain")
+
+    cache = SimpleNamespace(
+        _hot_adapt_future=Future(),
+        _hot_adapt_phase="copy",
+        _hot_adapt_swaps_pending=(object(),),
+        _hot_adapt_worker_installs=True,
+    )
+
+    Engine._drain_hot_adaptation_for_rebuild(cache)
+
+    assert events == ["cancel", "drain"]
+    assert cache._hot_adapt_future is None
+    assert cache._hot_adapt_phase is None
+    assert cache._hot_adapt_swaps_pending == ()
+    assert cache._hot_adapt_worker_installs is False
+
+
+def test_scheduler_holds_growth_request_before_admission():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kv_ladder = _policy(kv_bytes_per_page=10, budget=10_000)
+    scheduler._kv_ladder_waiting = []
+    scheduler._abort_tombstones = {}
+    scheduler.engine = SimpleNamespace(
+        num_pages=32,
+        max_seq_len=32,
+        moe_offload_cache=SimpleNamespace(
+            cache_size=96,
+            hot_expert_capacity={},
+            prefill_overlap=False,
+        ),
+    )
+    admitted = []
+    scheduler.prefill_manager = SimpleNamespace(add_one_req=admitted.append)
+    msg = UserMsg(
+        uid=5,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=17),
+    )
+
+    Scheduler._process_one_msg(scheduler, msg)
+
+    assert admitted == []
+    assert scheduler._kv_ladder_waiting == [msg]
+
+
+def test_non_growing_request_bypasses_parked_ladder_request():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kv_ladder = _policy(kv_bytes_per_page=10, budget=10_000)
+    parked = UserMsg(
+        uid=1,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=17),
+    )
+    scheduler._kv_ladder_waiting = [parked]
+    scheduler.engine = SimpleNamespace(
+        num_pages=32,
+        moe_offload_cache=SimpleNamespace(
+            cache_size=96,
+            hot_expert_capacity={},
+            prefill_overlap=False,
+        ),
+    )
+    scheduler.prefill_manager = SimpleNamespace()
+    fitting = UserMsg(
+        uid=2,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=16),
+        priority=5,
+    )
+
+    assert not Scheduler._queue_for_kv_ladder(scheduler, fitting)
+    assert scheduler._kv_ladder_waiting == [parked]
+
+
+def test_higher_priority_growth_request_overtakes_parked_request():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kv_ladder = _policy(kv_bytes_per_page=10, budget=10_000)
+    scheduler._kv_ladder_waiting = []
+    scheduler.engine = SimpleNamespace(
+        num_pages=32,
+        moe_offload_cache=SimpleNamespace(
+            cache_size=96,
+            hot_expert_capacity={},
+            prefill_overlap=False,
+        ),
+    )
+    scheduler.prefill_manager = SimpleNamespace(
+        clock=lambda: 20.0,
+        priority_aging_seconds=30.0,
+    )
+    low = UserMsg(
+        uid=1,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=17),
+        priority=0,
+        arrival_time=10.0,
+    )
+    high = UserMsg(
+        uid=2,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=49),
+        priority=5,
+        arrival_time=20.0,
+    )
+
+    assert Scheduler._queue_for_kv_ladder(scheduler, low)
+    assert Scheduler._queue_for_kv_ladder(scheduler, high)
+    assert scheduler._kv_ladder_waiting == [high, low]
+
+
+def test_starvation_bound_holds_new_admissions_and_drains_aged_waiter_first(
+    monkeypatch,
+):
+    from freetoken.scheduler import scheduler as scheduler_module
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kv_ladder = _policy(kv_bytes_per_page=10, budget=10_000)
+    scheduler._kv_ladder_starvation_uid = None
+    scheduler._abort_tombstones = {}
+    aged = UserMsg(
+        uid=1,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=17),
+        priority=-100,
+        arrival_time=0.0,
+    )
+    newcomer = UserMsg(
+        uid=2,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=16),
+        priority=100,
+        arrival_time=31.0,
+    )
+    scheduler._kv_ladder_waiting = [aged]
+    moe = SimpleNamespace(
+        cache_size=96,
+        hot_expert_capacity={},
+        prefill_overlap=False,
+        _hot_slot_owners={},
+    )
+    scheduler.engine = SimpleNamespace(
+        num_pages=32,
+        max_seq_len=32,
+        moe_offload_cache=moe,
+    )
+    events = []
+    scheduler.prefill_manager = SimpleNamespace(
+        runnable=False,
+        pending_list=[],
+        priority_aging_seconds=30.0,
+        clock=lambda: 31.0,
+        add_one_req=lambda request: events.append(("admit", request.uid)),
+    )
+    scheduler.decode_manager = SimpleNamespace(runnable=False)
+    scheduler.cache_manager = SimpleNamespace(supports_runtime_rebuild=True)
+
+    def execute(**kwargs):
+        events.append(("rebuild", scheduler._pending_rebuild.num_pages))
+        scheduler.engine.num_pages = scheduler._pending_rebuild.num_pages
+        scheduler.engine.max_seq_len = scheduler._pending_rebuild.num_pages
+        moe.cache_size = scheduler._pending_rebuild.moe_cache_size
+        scheduler._pending_rebuild = None
+        return "ok"
+
+    scheduler._execute_pending_rebuild = execute
+    logs = []
+    monkeypatch.setattr(
+        scheduler_module.logger,
+        "warning_rank0",
+        lambda message, *args: logs.append(message % args),
+    )
+
+    Scheduler._process_one_msg(scheduler, newcomer)
+
+    assert events == []
+    assert scheduler._kv_ladder_waiting == [newcomer, aged]
+    assert logs == [
+        "KV ladder starvation bound reached: request 1 waited 31.0s "
+        "(limit 30.0s); pausing new admissions until it is grown and admitted"
+    ]
+
+    Scheduler._drain_kv_ladder_waiting(scheduler)
+
+    assert events == [("rebuild", 64), ("admit", 1)]
+    assert scheduler._kv_ladder_waiting == [newcomer]
+    assert scheduler._kv_ladder_starvation_uid is None
+
+
+def test_queue_stats_include_ladder_waiters():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.prefill_manager = SimpleNamespace(
+        pending_list=[SimpleNamespace(priority=0, arrival_time=90.0)],
+        clock=lambda: 100.0,
+    )
+    scheduler._kv_ladder_waiting = [
+        SimpleNamespace(priority=4, arrival_time=80.0),
+    ]
+
+    depth, bands, max_wait = Scheduler._queue_stats(scheduler)
+
+    assert depth == 2
+    assert bands == {"negative": 0, "zero": 1, "positive": 1}
+    assert max_wait == 20.0
+
+
+def test_scheduler_clamps_default_output_budget_to_the_ladder_cap():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kv_ladder = _policy(kv_bytes_per_page=10, budget=10_000)
+    scheduler.engine = SimpleNamespace(
+        num_pages=224,
+        moe_offload_cache=SimpleNamespace(
+            cache_size=70,
+            hot_expert_capacity={},
+            prefill_overlap=False,
+        ),
+    )
+    msg = UserMsg(
+        uid=7,
+        input_ids=torch.arange(240, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=32_768),
+    )
+
+    plan = Scheduler._kv_ladder_plan(scheduler, msg)
+
+    assert plan is not None
+    assert plan.required_tokens == 256
+    assert plan.target_tokens == 256
+
+
+def test_default_output_budget_does_not_grow_the_64k_floor_for_a_short_prompt():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kv_ladder = KVLadderPolicy(
+        step_tokens=32_768,
+        max_context_tokens=100_352,
+        page_size=64,
+        pool_budget_bytes=1_000_000,
+        kv_bytes_per_page=10,
+        moe_bytes_per_slot=100,
+        min_moe_slots=4,
+        prefill_overlap=False,
+    )
+    scheduler.engine = SimpleNamespace(
+        num_pages=1025,
+        moe_offload_cache=SimpleNamespace(
+            cache_size=100,
+            hot_expert_capacity={},
+            prefill_overlap=False,
+        ),
+    )
+    msg = UserMsg(
+        uid=8,
+        input_ids=torch.arange(64, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=32_768),
+    )
+
+    assert Scheduler._kv_ladder_plan(scheduler, msg) is None
+
+
+def _scheduler_for_ladder_gate(parsed):
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(
+        kv_ladder=parsed.kv_ladder,
+        kv_ladder_explicit=parsed.kv_ladder_explicit,
+        moe_cache_auto=parsed.moe_cache_auto,
+        moe_cache_size=parsed.moe_cache_size,
+        moe_cache_rate=parsed.moe_cache_rate,
+        max_running_req=parsed.max_running_req,
+        tp_info=SimpleNamespace(size=1),
+        moe_backend=parsed.moe_backend,
+        model_config=SimpleNamespace(dsv4_args=None, is_moe=True),
+    )
+    scheduler.cache_manager = SimpleNamespace(supports_runtime_rebuild=True)
+    scheduler.engine = SimpleNamespace(moe_offload_cache=SimpleNamespace())
+    return scheduler
+
+
+def test_default_ladder_with_default_concurrency_is_inert_not_fatal(monkeypatch):
+    from freetoken.scheduler import scheduler as scheduler_module
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.server.args import parse_args
+
+    parsed, _ = parse_args(
+        ["--model", "/models/anon", "--dtype", "bfloat16", "--moe-backend", "offload"]
+    )
+    assert parsed.kv_ladder == "on"
+    assert parsed.kv_ladder_explicit is False
+    assert parsed.moe_cache_auto is True
+    assert parsed.max_running_req == 4
+    logs = []
+    monkeypatch.setattr(scheduler_module.logger, "warning_rank0", logs.append)
+
+    assert Scheduler._make_kv_ladder_policy(_scheduler_for_ladder_gate(parsed)) is None
+    assert logs == ["KV ladder inactive: --max-running-requests must be 1"]
+
+
+def test_ladder_policy_consults_cache_manager_rebuild_gate(monkeypatch):
+    from freetoken.scheduler import scheduler as scheduler_module
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(
+        kv_ladder="on",
+        moe_cache_auto=True,
+        moe_cache_size=0,
+        moe_cache_rate=None,
+        max_running_req=1,
+        tp_info=SimpleNamespace(size=1),
+        moe_backend="offload",
+        model_config=SimpleNamespace(dsv4_args=None, is_moe=True),
+    )
+    scheduler.cache_manager = SimpleNamespace(supports_runtime_rebuild=False)
+    logs = []
+    monkeypatch.setattr(scheduler_module.logger, "warning_rank0", logs.append)
+
+    assert Scheduler._make_kv_ladder_policy(scheduler) is None
+    assert logs == [
+        "KV ladder inactive: this model's cache does not support runtime rebuild"
+    ]
+
+
+def test_explicit_ladder_rejects_default_concurrency_during_argument_parsing():
+    from freetoken.server.args import parse_args
+
+    with pytest.raises(ValueError, match="requires --max-running-requests 1"):
+        parse_args(
+            [
+                "--model",
+                "/models/anon",
+                "--dtype",
+                "bfloat16",
+                "--moe-backend",
+                "offload",
+                "--kv-ladder",
+                "on",
+            ]
+        )
+
+
+def test_explicit_ladder_with_fixed_cache_is_inert_not_fatal(monkeypatch):
+    from freetoken.scheduler import scheduler as scheduler_module
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.server.args import parse_args
+
+    parsed, _ = parse_args(
+        [
+            "--model",
+            "/models/anon",
+            "--dtype",
+            "bfloat16",
+            "--moe-backend",
+            "offload",
+            "--moe-cache-size",
+            "512",
+            "--kv-ladder",
+            "on",
+        ]
+    )
+    logs = []
+    monkeypatch.setattr(scheduler_module.logger, "warning_rank0", logs.append)
+
+    assert Scheduler._make_kv_ladder_policy(_scheduler_for_ladder_gate(parsed)) is None
+    assert "--moe-cache-auto is required" in logs[0]
+
+
+@pytest.mark.parametrize(
+    ("cache_flag", "sizing_flag"),
+    [
+        (("--moe-cache-size", "512"), "--moe-cache-size"),
+        (("--moe-cache-rate", "0.5"), "--moe-cache-rate"),
+    ],
+)
+def test_default_ladder_logs_fixed_cache_sizing_as_inert(
+    monkeypatch, cache_flag, sizing_flag
+):
+    from freetoken.scheduler import scheduler as scheduler_module
+    from freetoken.scheduler.scheduler import Scheduler
+    from freetoken.server.args import parse_args
+
+    parsed, _ = parse_args(
+        [
+            "--model",
+            "/models/anon",
+            "--dtype",
+            "bfloat16",
+            "--moe-backend",
+            "offload",
+            "--max-running-requests",
+            "1",
+            *cache_flag,
+        ]
+    )
+    logs = []
+    monkeypatch.setattr(scheduler_module.logger, "warning_rank0", logs.append)
+
+    assert Scheduler._make_kv_ladder_policy(_scheduler_for_ladder_gate(parsed)) is None
+    assert logs == [
+        f"KV ladder inactive: MoE cache sizing uses {sizing_flag}; "
+        "--moe-cache-auto is required"
+    ]
+
+
+def test_ladder_logs_inert_pool_and_dummy_page(monkeypatch):
+    from freetoken.scheduler import scheduler as scheduler_module
+    from freetoken.scheduler.scheduler import Scheduler
+
+    class KVPool:
+        @staticmethod
+        def kv_cost(config):
+            return 10, 0, 1, 0
+
+    logs = []
+    monkeypatch.setattr(
+        scheduler_module.logger,
+        "info_rank0",
+        lambda message, *args: logs.append(message % args),
+    )
+    monkeypatch.setattr(
+        scheduler_module.logger,
+        "warning_rank0",
+        lambda message, *args: logs.append(message % args),
+    )
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.config = SimpleNamespace(
+        kv_ladder="on",
+        moe_cache_auto=True,
+        max_running_req=1,
+        tp_info=SimpleNamespace(size=1),
+        moe_backend="offload",
+        model_config=SimpleNamespace(
+            dsv4_args=None,
+            is_moe=True,
+            num_experts=4,
+            linear_attention_group=lambda: None,
+            slot_states=(),
+        ),
+        max_seq_len=256,
+        kv_ladder_cap_tokens=32,
+        kv_ladder_floor_tokens=32,
+        kv_ladder_explicit_cap=True,
+        kv_reserve_tokens=8,
+        memory_ratio=1.0,
+    )
+    scheduler.cache_manager = SimpleNamespace(supports_runtime_rebuild=True)
+    scheduler.engine = SimpleNamespace(
+        kv_cache=KVPool(),
+        linear_state_pool=None,
+        num_pages=32,
+        _baseline_free=10_000,
+        _weights_bytes=0,
+        moe_offload_cache=SimpleNamespace(
+            cache_size=90,
+            hot_expert_capacity={},
+            prefill_overlap=False,
+            bank_sources={
+                "gate_up": [torch.zeros(1, 25, dtype=torch.float32)],
+            },
+        ),
+    )
+
+    Scheduler._make_kv_ladder_policy(scheduler)
+
+    assert any("+1 dummy page" in line for line in logs)
+    assert any("expert_slots_at_startup=90" in line for line in logs)
+    assert not any("expert_slots_at_floor" in line for line in logs)
+    assert any(
+        "ladder inert: pool already at cap 32" in line
+        and "configured --num-pages/--num-tokens cap" in line
+        for line in logs
+    )
+
+
+def test_idle_drain_rebuilds_before_admitting_the_request():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kv_ladder = _policy(kv_bytes_per_page=10, budget=10_000)
+    msg = UserMsg(
+        uid=6,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=17),
+    )
+    scheduler._kv_ladder_waiting = [msg]
+    moe = SimpleNamespace(
+        cache_size=96,
+        hot_expert_capacity={},
+        prefill_overlap=False,
+        _hot_slot_owners={},
+    )
+    scheduler.engine = SimpleNamespace(
+        num_pages=32,
+        max_seq_len=32,
+        moe_offload_cache=moe,
+    )
+    events = []
+    scheduler.prefill_manager = SimpleNamespace(
+        runnable=False,
+        add_one_req=lambda request: events.append(("admit", request.uid)),
+    )
+    scheduler.decode_manager = SimpleNamespace(runnable=False)
+    scheduler.cache_manager = SimpleNamespace(supports_runtime_rebuild=True)
+
+    def execute(**kwargs):
+        events.append(("rebuild", scheduler._pending_rebuild.num_pages))
+        scheduler.engine.num_pages = scheduler._pending_rebuild.num_pages
+        scheduler.engine.max_seq_len = scheduler._pending_rebuild.num_pages
+        moe.cache_size = scheduler._pending_rebuild.moe_cache_size
+        scheduler._pending_rebuild = None
+        return "ok"
+
+    scheduler._execute_pending_rebuild = execute
+
+    Scheduler._drain_kv_ladder_waiting(scheduler)
+
+    assert events == [("rebuild", 64), ("admit", 6)]
+    assert scheduler._kv_ladder_waiting == []
+
+
+def test_idle_drain_rechecks_cache_manager_rebuild_gate():
+    from freetoken.scheduler.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._kv_ladder = _policy(kv_bytes_per_page=10, budget=10_000)
+    msg = UserMsg(
+        uid=6,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(max_tokens=17),
+    )
+    scheduler._kv_ladder_waiting = [msg]
+    scheduler.engine = SimpleNamespace(
+        num_pages=32,
+        max_seq_len=32,
+        moe_offload_cache=SimpleNamespace(
+            cache_size=96,
+            hot_expert_capacity={},
+            prefill_overlap=False,
+        ),
+    )
+    events = []
+    scheduler.prefill_manager = SimpleNamespace(
+        runnable=False,
+        add_one_req=lambda request: events.append(("admit", request.uid)),
+    )
+    scheduler.decode_manager = SimpleNamespace(runnable=False)
+    scheduler.cache_manager = SimpleNamespace(supports_runtime_rebuild=False)
+    scheduler._execute_pending_rebuild = lambda **kwargs: events.append(("rebuild", None))
+
+    Scheduler._drain_kv_ladder_waiting(scheduler)
+
+    assert events == [("admit", 6)]
+    assert scheduler._kv_ladder_waiting == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_rebuild_reloads_surviving_protected_hot_rows():
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.engine.engine import Engine
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    if try_get_tp_info() is None:
+        set_tp_info(rank=0, size=1)
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cuda"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    sources = {
+        "gate_up": [torch.arange(4 * 8 * 4).view(4, 8, 4)],
+        "down": [torch.arange(4 * 4 * 2).view(4, 4, 2)],
+    }
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (1, 3)},
+    )
+    row_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size()
+        for bank in sources.values()
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps=0,
+        max_swap_bytes=row_bytes,
+        expert_bytes=row_bytes,
+    )
+
+    Engine._apply_hot_slot_owners(cache, {0: (1,)})
+    cache.rebuild(6)
+
+    slot = int(cache.slot_for_id[0, 1].item())
+    assert slot >= 0
+    assert torch.equal(cache.bank_caches["gate_up"][slot].cpu(), sources["gate_up"][0][1])
+    assert cache.slot_for_id[0, 3].item() == -1

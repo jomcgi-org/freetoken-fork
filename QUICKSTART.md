@@ -97,7 +97,7 @@ ft serve \
   --moe-hot-adapt-interval-steps auto \
   --moe-collect-stats \
   --max-running-requests 1 --linear-state-cache-ratio 4.0 \
-  --num-pages 1568 --max-seq-len-override 100352 --kv-reserve-tokens 163840 --max-extend-length 2048 \
+  --num-pages 1568 --max-seq-len-override 100352 --max-extend-length 2048 \
   --kv-disk-cache-dir prefix-cache --kv-disk-cache-gib 500 \
   --host 127.0.0.1 --port 8090
 ```
@@ -128,10 +128,15 @@ What each line does:
   `--moe-disk-layer-profile <json>` seeds it from a captured profile if you
   have one.
 - The KV block: 100,352 tokens of context on a single lane. KV is 64 KB a
-  token on this model, so this is close to the 24 GB ceiling; for throughput
-  instead of context, drop the four KV flags and set
+  token on this model, so this is close to the 24 GB ceiling. The KV ladder
+  starts the pool at its floor, then grows it on demand to this cap. For
+  throughput instead of context, drop the three KV flags and set
   `--max-running-requests 8`, which is where the 37 tokens a second aggregate
   comes from.
+- `--kv-ladder`: default on when `--moe-cache-auto` is on; it turns
+  `--num-pages` into a growth cap. Growth is one-way until restart: expert
+  slots surrendered to reach the cap do not return, so one long conversation
+  lowers the slot count for later short requests.
 - `--kv-disk-cache-dir`: prefix and recurrent state parked on the NVMe,
   fingerprint keyed, so a restart is nearly free and a returning conversation
   prefills only its new tokens.

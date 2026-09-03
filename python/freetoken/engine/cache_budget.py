@@ -41,8 +41,8 @@ def net_cache_budget_bytes(
 def required_bytes(
     moe_cache_size: int, num_pages: int, per_expert_bytes: int, cache_per_page: int
 ) -> int:
-    """GPU bytes a ``(moe_cache_size, num_pages)`` geometry occupies (MoE slots + KV pages)."""
-    return moe_cache_size * per_expert_bytes + num_pages * cache_per_page
+    """GPU bytes for MoE slots plus ``num_pages`` usable KV pages and one dummy."""
+    return moe_cache_size * per_expert_bytes + (num_pages + 1) * cache_per_page
 
 
 def plan_cache_budget(
@@ -59,7 +59,8 @@ def plan_cache_budget(
 
     ``budget_bytes`` is the net pool for MoE cache + KV cache (caller already subtracted
     weights + fixed_cache_size; the (1-memory_ratio) remainder is the graph headroom).
-    Experts greedily fill the budget after reserving ``kv_reserve_pages`` for KV, clamped
+    ``kv_reserve_pages`` and the returned ``num_pages`` are usable pages. The physical
+    dummy page is charged in addition. Experts fill the budget after that reservation, clamped
     to ``[floor, min(total_experts, max_slots)]`` (floor is ``2*num_experts`` when prefill
     overlap is feasible else ``num_experts``); KV pages take whatever remains.
     """
@@ -73,7 +74,7 @@ def plan_cache_budget(
     lo = 2 * num_experts if overlap else num_experts
     assert hi >= lo, f"slot cap {hi} below the minimum {lo} slots"
 
-    kv_reserve_bytes = kv_reserve_pages * cache_per_page
+    kv_reserve_bytes = (kv_reserve_pages + 1) * cache_per_page
     # MoE-priority: reserve KV first, then experts greedily take the remaining budget.
     raw = (budget_bytes - kv_reserve_bytes) // per_expert_bytes
     moe_cache_size = max(lo, min(raw, hi))
@@ -81,17 +82,19 @@ def plan_cache_budget(
     overlap = overlap and moe_cache_size >= 2 * num_experts
 
     remaining = budget_bytes - moe_cache_size * per_expert_bytes
-    num_pages = max(remaining // cache_per_page, kv_reserve_pages)
+    num_pages = max(remaining // cache_per_page - 1, kv_reserve_pages)
     # A tiny budget can floor num_pages at kv_reserve_pages even when ``remaining`` is below
     # the reserve (or negative), yielding a plan that exceeds budget_bytes. Reject here so
     # --moe-cache-auto fails in arithmetic instead of OOMing in a later CUDA allocation.
-    total = moe_cache_size * per_expert_bytes + num_pages * cache_per_page
+    total = required_bytes(
+        moe_cache_size, num_pages, per_expert_bytes, cache_per_page
+    )
     assert total <= budget_bytes, (
         f"cache budget too small: minimum plan (moe={moe_cache_size} slots, "
         f"kv={num_pages} pages) needs {total} B > budget {budget_bytes} B "
         "(raise memory_ratio, lower kv_reserve_tokens, or free GPU memory)"
     )
-    assert num_pages > 1, "not enough memory for KV cache after MoE allocation"
+    assert num_pages > 0, "not enough memory for KV cache after MoE allocation"
     return moe_cache_size, num_pages, overlap
 
 
