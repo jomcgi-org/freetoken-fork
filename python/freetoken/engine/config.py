@@ -134,6 +134,9 @@ class EngineConfig:
     # Diagnostic decode instrumentation. Records CUDA phase boundaries and native
     # CPU task spans, then emits interval-averaged per-step timings on the decode log.
     moe_step_timing: bool = False
+    # DISK grouped decode callback order. "before" preserves the existing critical
+    # path; "after" notifies CPU workers before issuing advisory expert prefetch.
+    moe_cpu_precb: str = "before"
     # Host expert-tier budgets are resolved together at engine startup. The pin
     # budget is internal; its explicit input remains FREETOKEN_PIN_BUDGET_GB.
     host_cache_reserve_gib: float | None = None
@@ -325,6 +328,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-cpu-prefill-batch must be 'on' or 'off', got "
                 f"{self.moe_cpu_prefill_batch!r}"
+            )
+        if self.moe_cpu_precb not in ("before", "after"):
+            raise ValueError(
+                "--moe-cpu-precb must be 'before' or 'after', got "
+                f"{self.moe_cpu_precb!r}"
             )
         if self.moe_disk_decode not in ("cpu", "gpufetch"):
             raise ValueError(

@@ -1153,6 +1153,7 @@ class Engine:
             swiglu_limit=getattr(sample, "swiglu_limit", None),
             disk_lookahead=config.moe_disk_lookahead == "on",
             step_timing=config.moe_step_timing,
+            moe_cpu_precb=config.moe_cpu_precb,
             prefill_coalesce=(
                 getattr(config, "moe_prefill_coalesce", "populate")
                 if config.moe_disk_prefill == "cpu"
@@ -2625,6 +2626,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_pager": "madvise",
     "moe_disk_lookahead": "on",
     "moe_step_timing": False,
+    "moe_cpu_precb": "before",
     "host_cache_reserve_gib": None,
     "moe_pager_budget_gib": None,
     "moe_cpu_threads": 0,

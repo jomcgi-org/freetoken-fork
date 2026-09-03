@@ -128,6 +128,37 @@ def test_kv_cache_dtype_cli_default_is_auto():
     assert args.kv_cache_dtype == "auto"
 
 
+def test_moe_cpu_precb_defaults_to_before_and_accepts_after():
+    default, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    after, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-cpu-precb",
+            "after",
+        ]
+    )
+
+    assert default.moe_cpu_precb == "before"
+    assert after.moe_cpu_precb == "after"
+
+
+def test_moe_cpu_precb_rejects_unknown_mode():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--dtype",
+                "bfloat16",
+                "--moe-cpu-precb",
+                "during",
+            ]
+        )
+
+
 def test_repeated_harness_prefix_flags_replace_defaults():
     args, _ = parse_args(
         [

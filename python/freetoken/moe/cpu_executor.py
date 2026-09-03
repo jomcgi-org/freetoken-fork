@@ -328,6 +328,7 @@ class CpuMoeExecutor:
         swiglu_limit: float | None = None,
         disk_lookahead: bool = True,
         step_timing: bool = False,
+        moe_cpu_precb: str = "before",
         prefill_coalesce: str | bool = "populate",
         prefill_coalesce_budget_bytes: int = 40 << 30,
         prefill_batch: str | bool = "on",
@@ -366,6 +367,11 @@ class CpuMoeExecutor:
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self._step_timing = bool(step_timing)
+        if moe_cpu_precb not in ("before", "after"):
+            raise ValueError(
+                "moe_cpu_precb must be 'before' or 'after', got "
+                f"{moe_cpu_precb!r}"
+            )
         timing_methods = ("task_last_run_ns", "step_timing_snapshot_and_reset")
         if self._step_timing and not all(
             hasattr(_cpu_moe.CpuMoeExecutor, name) for name in timing_methods
@@ -508,6 +514,7 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        self._configure_pre_run_callback_mode(moe_cpu_precb)
         self._configure_prefill_batch()
         if self._disk_banks:
             self._disk_callback = partial(_disk_prefetch_callback, weakref.ref(self))
@@ -611,6 +618,10 @@ class CpuMoeExecutor:
                 f"expert limits={self._prefill_coalesce_limits}, "
                 f"populate scratch={self._prefill_populate_scratch_bytes / 2**20:.0f} MiB"
             )
+
+    def _configure_pre_run_callback_mode(self, mode: str) -> None:
+        if mode == "after":
+            self._ext.set_pre_run_callback_mode(1)
 
     def _configure_prefill_batch(self) -> None:
         if not self._prefill_batch_requested:
@@ -864,9 +875,20 @@ class CpuMoeExecutor:
         return timing
 
     def step_timing_breakdown(self, bs: int | None = None) -> dict:
-        """Return and reset native per-layer decode timings since the prior call."""
+        """Return and reset native per-layer decode timings since the prior call.
+
+        With ``moe_cpu_precb="after"``, ``precb_us`` overlaps CPU compute and is
+        reported separately rather than as part of ``wake_us``.
+        """
         zero_total = {
             "wake_us": 0.0,
+            "groups_us": 0.0,
+            "gil_us": 0.0,
+            "precb_us": 0.0,
+            "notify_us": 0.0,
+            "coord_pre_us": 0.0,
+            "coord_post_us": 0.0,
+            "h2d_us": 0.0,
             "compute_us": 0.0,
             "signal_us": 0.0,
             "total_tasks": 0,
@@ -886,14 +908,25 @@ class CpuMoeExecutor:
         for raw_layer_id, raw in snapshot.items():
             layer_id = int(raw_layer_id)
             d2h_us = 0.0
+            h2d_us = 0.0
             if bs is not None:
                 timing = getattr(self, "_step_timing_events", {}).get((layer_id, bs))
                 if timing is not None:
                     d2h_us = float(
                         timing.d2h_start.elapsed_time(timing.overlap_start) * 1000.0
                     )
+                    h2d_us = float(
+                        timing.wait_done.elapsed_time(timing.layer_end) * 1000.0
+                    )
             per_layer[layer_id] = {
                 "wake_us": float(raw.get("wake_us", 0.0)),
+                "groups_us": float(raw.get("groups_us", 0.0)),
+                "gil_us": float(raw.get("gil_us", 0.0)),
+                "precb_us": float(raw.get("precb_us", 0.0)),
+                "notify_us": float(raw.get("notify_us", 0.0)),
+                "coord_pre_us": float(raw.get("coord_pre_us", 0.0)),
+                "coord_post_us": float(raw.get("coord_post_us", 0.0)),
+                "h2d_us": max(0.0, h2d_us),
                 "compute_us": float(raw.get("compute_us", 0.0)),
                 "signal_us": float(raw.get("signal_us", 0.0)),
                 "tasks": int(raw.get("tasks", 0)),
@@ -905,6 +938,13 @@ class CpuMoeExecutor:
         total = dict(zero_total)
         for row in per_layer.values():
             total["wake_us"] += row["wake_us"]
+            total["groups_us"] += row["groups_us"]
+            total["gil_us"] += row["gil_us"]
+            total["precb_us"] += row["precb_us"]
+            total["notify_us"] += row["notify_us"]
+            total["coord_pre_us"] += row["coord_pre_us"]
+            total["coord_post_us"] += row["coord_post_us"]
+            total["h2d_us"] += row["h2d_us"]
             total["compute_us"] += row["compute_us"]
             total["signal_us"] += row["signal_us"]
             total["total_tasks"] += row["tasks"]
@@ -972,6 +1012,23 @@ class CpuMoeExecutor:
             "cpu_tail_us": max(0.0, cpu_tail_us),
             "overlap_us": max(0.0, overlap_us),
             "cpu_wake_us": native["wake_us"] / cpu_layers if cpu_layers else 0.0,
+            "cpu_groups_us": (
+                native["groups_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_gil_us": native["gil_us"] / cpu_layers if cpu_layers else 0.0,
+            "cpu_precb_us": (
+                native["precb_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_notify_us": (
+                native["notify_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_coord_us": (
+                (native["coord_pre_us"] + native["coord_post_us"]) / cpu_layers
+                if cpu_layers
+                else 0.0
+            ),
+            "cpu_d2h_us": breakdown["submit_d2h_us"]["total"],
+            "cpu_h2d_us": native["h2d_us"],
             "cpu_compute_us": (
                 native["compute_us"] / cpu_layers if cpu_layers else 0.0
             ),

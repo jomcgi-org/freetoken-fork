@@ -1100,6 +1100,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-cpu-precb",
+        choices=["before", "after"],
+        default=ServerArgs.moe_cpu_precb,
+        help=(
+            "Run the DISK decode expert-prefetch callback before or after notifying "
+            "CPU workers (default: before)."
+        ),
+    )
+
+    parser.add_argument(
         "--host-cache-reserve-gib",
         type=_nonnegative_float,
         default=ServerArgs.host_cache_reserve_gib,
