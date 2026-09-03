@@ -632,7 +632,11 @@ def _real_slot_nvfp4_banks(device):
         table = torch.empty(
             (REAL_CACHE_SIZE, *source.shape[1:]), dtype=source.dtype, device=device
         )
-        table.index_copy_(0, slots.to(device), source.to(device))
+        # index_copy_ is not implemented for float8 on CUDA; the byte view
+        # keeps the row axis and copies every dtype the same way.
+        table.view(torch.uint8).index_copy_(
+            0, slots.to(device), source.to(device).view(torch.uint8)
+        )
         full.append(table)
     return slots, compact, tuple(full)
 
