@@ -144,9 +144,20 @@ class SchedulerStatusReporter:
         timing = getattr(batch, "moe_step_timing", None)
         if timing is not None:
             self._decode_timing_count += 1
-            for name in ("cpu_head_us", "gpu_mid_us", "cpu_tail_us", "overlap_us"):
+            for name in (
+                "cpu_head_us",
+                "gpu_mid_us",
+                "cpu_tail_us",
+                "overlap_us",
+                "cpu_wake_us",
+                "cpu_compute_us",
+                "cpu_signal_us",
+                "cpu_layers_per_step",
+                "cpu_expert_bytes_per_step",
+            ):
                 self._decode_timing_totals[name] = (
-                    self._decode_timing_totals.get(name, 0.0) + float(timing[name])
+                    self._decode_timing_totals.get(name, 0.0)
+                    + float(timing.get(name, 0.0))
                 )
         if getattr(batch, "mtp_drafted", 0):
             self.log(
@@ -179,7 +190,17 @@ class SchedulerStatusReporter:
             count = self._decode_timing_count
             timing_msg = "".join(
                 f", {name}: {self._decode_timing_totals.get(name, 0.0) / count:.0f}"
-                for name in ("cpu_head_us", "gpu_mid_us", "cpu_tail_us", "overlap_us")
+                for name in (
+                    "cpu_head_us",
+                    "gpu_mid_us",
+                    "cpu_tail_us",
+                    "overlap_us",
+                    "cpu_wake_us",
+                    "cpu_compute_us",
+                    "cpu_signal_us",
+                    "cpu_layers_per_step",
+                    "cpu_expert_bytes_per_step",
+                )
             )
         self._decode_timing_count = 0
         self._decode_timing_totals.clear()

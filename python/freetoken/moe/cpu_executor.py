@@ -66,6 +66,7 @@ _PREFILL_GEMM_WEIGHT_ROWS = 32
 @dataclass(frozen=True)
 class _StepTimingEvents:
     layer_start: torch.cuda.Event
+    d2h_start: torch.cuda.Event
     overlap_start: torch.cuda.Event
     hot_done: torch.cuda.Event
     wait_done: torch.cuda.Event
@@ -142,14 +143,15 @@ _ACT_IDS = {
 _WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
 
 
-def _major_faults() -> int | None:
-    """Linux major-fault events, whose granularity may be 4 KiB or one THP."""
+def _process_faults() -> tuple[int | None, int | None]:
+    """Linux process minor/major fault events from one procfs read."""
     try:
         with open("/proc/self/stat", encoding="utf-8") as f:
             tail = f.read().rpartition(") ")[2].split()
-        return int(tail[9])  # field 12 (majflt); tail[0] is field 3 (state)
+        # minflt is field 10 and majflt is field 12; tail[0] is field 3 (state).
+        return int(tail[7]), int(tail[9])
     except (OSError, ValueError, IndexError):
-        return None
+        return None, None
 
 
 def _dedupe_decode_routes(expert_ids, num_experts: int) -> tuple[list[int], int]:
@@ -364,7 +366,7 @@ class CpuMoeExecutor:
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self._step_timing = bool(step_timing)
-        timing_methods = ("task_last_run_ns", "set_task_timing")
+        timing_methods = ("task_last_run_ns", "step_timing_snapshot_and_reset")
         if self._step_timing and not all(
             hasattr(_cpu_moe.CpuMoeExecutor, name) for name in timing_methods
         ):
@@ -385,9 +387,11 @@ class CpuMoeExecutor:
         self._disk_lookahead_hits = 0
         self._disk_lookahead_routes = 0
         self._disk_delta_pages = 0
-        self._disk_major_fault_base = _major_faults()
+        self._disk_minor_fault_base, self._disk_major_fault_base = _process_faults()
         self._disk_prefetch_error: BaseException | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
+        if self._step_timing:
+            ptrs["task_timing_enabled"] = True
         if isinstance(prefill_coalesce, bool):
             prefill_coalesce = "on" if prefill_coalesce else "off"
         if prefill_coalesce not in ("populate", "on", "off"):
@@ -505,8 +509,6 @@ class CpuMoeExecutor:
             **ptrs,
         )
         self._configure_prefill_batch()
-        if self._step_timing:
-            self._ext.set_task_timing(True)
         if self._disk_banks:
             self._disk_callback = partial(_disk_prefetch_callback, weakref.ref(self))
             self._ext.set_pre_run_callback(self._disk_callback)
@@ -855,9 +857,67 @@ class CpuMoeExecutor:
             def event() -> torch.cuda.Event:
                 return torch.cuda.Event(enable_timing=True, external=True)
 
-            timing = _StepTimingEvents(event(), event(), event(), event(), event())
+            timing = _StepTimingEvents(
+                event(), event(), event(), event(), event(), event()
+            )
             self._step_timing_events[key] = timing
         return timing
+
+    def step_timing_breakdown(self, bs: int | None = None) -> dict:
+        """Return and reset native per-layer decode timings since the prior call."""
+        zero_total = {
+            "wake_us": 0.0,
+            "compute_us": 0.0,
+            "signal_us": 0.0,
+            "total_tasks": 0,
+            "total_experts": 0,
+            "total_bytes": 0,
+        }
+        if not getattr(self, "_step_timing", False):
+            return {
+                "per_layer": {},
+                "total": zero_total,
+                "submit_d2h_us": {"per_layer": {}, "total": 0.0},
+            }
+
+        snapshot = self._ext.step_timing_snapshot_and_reset()
+        per_layer = {}
+        d2h_per_layer = {}
+        for raw_layer_id, raw in snapshot.items():
+            layer_id = int(raw_layer_id)
+            d2h_us = 0.0
+            if bs is not None:
+                timing = getattr(self, "_step_timing_events", {}).get((layer_id, bs))
+                if timing is not None:
+                    d2h_us = float(
+                        timing.d2h_start.elapsed_time(timing.overlap_start) * 1000.0
+                    )
+            per_layer[layer_id] = {
+                "wake_us": float(raw.get("wake_us", 0.0)),
+                "compute_us": float(raw.get("compute_us", 0.0)),
+                "signal_us": float(raw.get("signal_us", 0.0)),
+                "tasks": int(raw.get("tasks", 0)),
+                "experts": int(raw.get("experts", 0)),
+                "bytes": int(raw.get("bytes", 0)),
+            }
+            d2h_per_layer[layer_id] = max(0.0, d2h_us)
+
+        total = dict(zero_total)
+        for row in per_layer.values():
+            total["wake_us"] += row["wake_us"]
+            total["compute_us"] += row["compute_us"]
+            total["signal_us"] += row["signal_us"]
+            total["total_tasks"] += row["tasks"]
+            total["total_experts"] += row["experts"]
+            total["total_bytes"] += row["bytes"]
+        return {
+            "per_layer": per_layer,
+            "total": total,
+            "submit_d2h_us": {
+                "per_layer": d2h_per_layer,
+                "total": sum(d2h_per_layer.values()),
+            },
+        }
 
     def resolve_step_timing(
         self,
@@ -903,11 +963,23 @@ class CpuMoeExecutor:
             # doorbell marker; otherwise its whole native span overlapped hot work.
             cpu_delay_us = max(0.0, branch_us - cpu_us) if branch_us > hot_us else 0.0
             overlap_us += max(0.0, min(cpu_us, hot_us - cpu_delay_us))
+        breakdown = self.step_timing_breakdown(bs)
+        native = breakdown["total"]
+        cpu_layers = len(breakdown["per_layer"])
         return {
             "cpu_head_us": max(0.0, cpu_head_us),
             "gpu_mid_us": max(0.0, gpu_mid_us),
             "cpu_tail_us": max(0.0, cpu_tail_us),
             "overlap_us": max(0.0, overlap_us),
+            "cpu_wake_us": native["wake_us"] / cpu_layers if cpu_layers else 0.0,
+            "cpu_compute_us": (
+                native["compute_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_signal_us": (
+                native["signal_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_layers_per_step": cpu_layers,
+            "cpu_expert_bytes_per_step": native["total_bytes"],
         }
 
     def register_gpufetch_layer(
@@ -1407,7 +1479,7 @@ class CpuMoeExecutor:
         self._prefill_batch_rows = 0
         self._prefill_batch_gemms = 0
         self._prefill_batch_degrades = 0
-        self._disk_major_fault_base = _major_faults()
+        self._disk_minor_fault_base, self._disk_major_fault_base = _process_faults()
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
             self._ext.gpufetch_stats(True)
         for pager in getattr(self, "_disk_pagers", ()):
@@ -1423,9 +1495,13 @@ class CpuMoeExecutor:
             }
             for layer_id in sorted(self._disk_banks)
         ]
-        now = _major_faults()
-        major_faults = None if now is None or self._disk_major_fault_base is None else (
-            now - self._disk_major_fault_base
+        minor_now, major_now = _process_faults()
+        minor_base = getattr(self, "_disk_minor_fault_base", None)
+        minor_faults = None if minor_now is None or minor_base is None else (
+            minor_now - minor_base
+        )
+        major_faults = None if major_now is None or self._disk_major_fault_base is None else (
+            major_now - self._disk_major_fault_base
         )
         gpufetch_fills = gpufetch_steps = gpufetch_ns = 0
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
@@ -1446,6 +1522,12 @@ class CpuMoeExecutor:
             "major_faults_per_decode_step": (
                 major_faults / decode_steps
                 if major_faults is not None and decode_steps else 0.0
+            ),
+            "minor_faults": minor_faults,
+            "minor_faults_unit": "kernel_events_4KiB_or_2MiB",
+            "minor_faults_per_decode_step": (
+                minor_faults / decode_steps
+                if minor_faults is not None and decode_steps else 0.0
             ),
             "distinct_experts_per_step": (
                 self._disk_distinct_experts / self._disk_decode_steps
@@ -1566,7 +1648,8 @@ class CpuMoeExecutor:
             self._prefill_batch_rows = 0
             self._prefill_batch_gemms = 0
             self._prefill_batch_degrades = 0
-            self._disk_major_fault_base = now
+            self._disk_minor_fault_base = minor_now
+            self._disk_major_fault_base = major_now
         return result
 
     def decode(
@@ -1681,6 +1764,8 @@ class CpuMoeExecutor:
             hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
 
         # D2H: ship this step's activations + routing to pinned host memory.
+        if timing is not None:
+            timing.d2h_start.record(torch.cuda.current_stream())
         io["x"].copy_(hidden_states, non_blocking=True)
         io["ids"].copy_(topk_ids.to(torch.int32), non_blocking=True)
         io["w"].copy_(topk_weights.to(torch.float32), non_blocking=True)

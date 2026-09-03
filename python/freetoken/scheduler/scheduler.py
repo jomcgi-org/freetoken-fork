@@ -231,6 +231,8 @@ class Scheduler(SchedulerIOMixin):
                     f"disk major faults: {disk['major_faults']}, "
                     f"disk major faults/decode step: "
                     f"{disk['major_faults_per_decode_step']:.2f}, "
+                    f"disk minor faults/decode step: "
+                    f"{disk.get('minor_faults_per_decode_step', 0.0):.2f}, "
                     f"moe_prefill_coalesce_experts: "
                     f"{disk.get('moe_prefill_coalesce_experts', 0)}, "
                     f"moe_prefill_coalesce_ms: "
