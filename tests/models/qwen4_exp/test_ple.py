@@ -17,10 +17,12 @@ import numpy as np
 import pytest
 import torch
 
+import freetoken.models.qwen4_exp.ple as ple_module
 from freetoken.models.config import ModelConfig
 from freetoken.models.qwen4_exp.config import parse_config
 from freetoken.models.qwen4_exp.ple import (
     GpuResidentTable,
+    NGramEmbedding,
     PinnedUVATable,
     PLELayer,
     PLEMetadata,
@@ -173,6 +175,207 @@ def test_decode_hash_matches_prefill_hash():
         )
         for i in range(len(sequences)):
             assert torch.equal(got[i], prefill[i * len(sequences[0]) + step])
+
+
+_FUSED_HASH_SEQS = [[3, 4, EOS, 5, 6, 8], [2, EOS, 11, 12, 13, 14], [7]]
+_FUSED_HASH_CTX = [[EOS, EOS], [21, 22], [31, EOS]]
+
+
+def _make_hash_embedding(*, device="cpu"):
+    args = _config().qwen4_args
+    with torch.device(device):
+        embedding = NGramEmbedding(args)
+    multipliers, sizes, offsets = hash_constants(args)
+    embedding.layer_multipliers.copy_(multipliers.to(device))
+    embedding.ngram_heads_vocab_sizes.copy_(sizes.to(device))
+    embedding.ngram_heads_offsets.copy_(offsets.to(device))
+    return embedding
+
+
+def test_token_index_addresses_the_same_window_as_the_packed_build():
+    embedding = _make_hash_embedding()
+    meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX)
+    packed, select = embedding._window(meta)
+    req, local = embedding._token_index(meta)
+    ctx_len = embedding.ngram_size - 1
+    assert torch.equal(packed[req.long(), local.long() + ctx_len], meta.input_ids)
+    assert torch.equal(select(packed), meta.input_ids)
+
+
+def test_token_index_cache_is_keyed_by_shape_and_phase():
+    embedding = _make_hash_embedding()
+    meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX)
+    first = embedding._token_index(meta)
+    assert embedding._token_index(meta)[0] is first[0]
+    other = _meta([[3, 4]], [[EOS, EOS]])
+    assert embedding._token_index(other)[0] is not first[0]
+
+    tokens = [5, 6, 7]
+    contexts = [[EOS, EOS], [21, 22], [31, EOS]]
+    decode_req, decode_local = embedding._token_index(
+        _meta([[token] for token in tokens], contexts, decode=True)
+    )
+    prefill_req, prefill_local = embedding._token_index(
+        _meta([tokens], contexts[:1])
+    )
+    assert decode_req.tolist() == [0, 1, 2]
+    assert decode_local.tolist() == [0, 0, 0]
+    assert prefill_req.tolist() == [0, 0, 0]
+    assert prefill_local.tolist() == [0, 1, 2]
+
+
+def test_token_index_cache_is_bounded():
+    embedding = _make_hash_embedding()
+    for length in range(4 * ple_module._TOKEN_INDEX_CACHE_SIZE):
+        embedding._token_index(
+            _meta([list(range(length + 1))], [[EOS, EOS]])
+        )
+    assert len(embedding._token_index_cache) == ple_module._TOKEN_INDEX_CACHE_SIZE
+
+
+def test_fused_hash_is_off_on_cpu():
+    embedding = _make_hash_embedding()
+    meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX)
+    assert not embedding._use_fused_row_ids(meta)
+    assert torch.equal(embedding.row_ids(meta), embedding.row_ids_reference(meta))
+
+
+def test_fused_hash_requires_triton_even_for_a_cuda_device(monkeypatch):
+    device = torch.device("cuda")
+    embedding = object.__new__(NGramEmbedding)
+    embedding.layer_multipliers = SimpleNamespace(device=device)
+    embedding.ngram_heads_vocab_sizes = SimpleNamespace(device=device)
+    embedding.ngram_heads_offsets = SimpleNamespace(device=device)
+    meta = SimpleNamespace(
+        input_ids=SimpleNamespace(device=device),
+        ngram_context=SimpleNamespace(device=device),
+    )
+    monkeypatch.setattr(
+        "freetoken.kernel.backend.is_triton_installed", lambda: False
+    )
+    assert not embedding._use_fused_row_ids(meta)
+
+
+@requires_cuda
+@pytest.mark.parametrize("decode", [False, True])
+def test_fused_hash_matches_the_torch_reference(decode):
+    embedding = _make_hash_embedding(device="cuda")
+    meta = (
+        _meta(
+            [[sequence[0]] for sequence in _FUSED_HASH_SEQS],
+            _FUSED_HASH_CTX,
+            device="cuda",
+            decode=True,
+        )
+        if decode
+        else _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX, device="cuda")
+    )
+    assert embedding._use_fused_row_ids(meta)
+    assert torch.equal(embedding.row_ids(meta), embedding.row_ids_reference(meta))
+
+
+@requires_cuda
+def test_fused_hash_capture_owns_indices_after_eager_cache_eviction(monkeypatch):
+    from freetoken.kernel.triton import ple_hash
+
+    embedding = _make_hash_embedding(device="cuda")
+    ids = torch.randint(0, VOCAB, (4,), dtype=torch.int64, device="cuda")
+    context = torch.randint(
+        0,
+        VOCAB,
+        (4, embedding.ngram_size - 1),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    meta = PLEMetadata(
+        input_ids=ids,
+        cu_seqlens=torch.arange(5, dtype=torch.int32, device="cuda"),
+        seq_lens=(1,) * 4,
+        ngram_context=context,
+        state_slots=torch.arange(4, dtype=torch.int64, device="cuda"),
+        fresh_slots=None,
+        is_decode=True,
+    )
+    embedding.row_ids(meta)
+    eager_index = embedding._token_index(meta)
+    eager_key = (True, (ids.numel(),), str(ids.device))
+    assert eager_key in embedding._token_index_cache
+
+    captured_index = None
+    original_ple_row_ids = ple_hash.ple_row_ids
+
+    def record_indices(*args, **kwargs):
+        nonlocal captured_index
+        captured_index = args[2:4]
+        return original_ple_row_ids(*args, **kwargs)
+
+    monkeypatch.setattr(ple_hash, "ple_row_ids", record_indices)
+
+    graph = torch.cuda.CUDAGraph()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        embedding.row_ids(meta)
+    torch.cuda.current_stream().wait_stream(side)
+    with torch.cuda.graph(graph):
+        out = embedding.row_ids(meta)
+
+    assert captured_index is not None
+    assert captured_index[0] is not eager_index[0]
+    assert captured_index[1] is not eager_index[1]
+
+    del eager_index
+    for length in range(1, ple_module._TOKEN_INDEX_CACHE_SIZE + 1):
+        embedding._token_index(
+            _meta([list(range(length))], [[EOS, EOS]], device="cuda")
+        )
+    assert eager_key not in embedding._token_index_cache
+    assert all(tensor.is_cuda for tensor in captured_index)
+    assert captured_index[0].tolist() == [0, 1, 2, 3]
+    assert captured_index[1].tolist() == [0, 0, 0, 0]
+
+    for seed in range(3):
+        torch.manual_seed(seed)
+        ids.copy_(torch.randint(0, VOCAB, (4,), dtype=torch.int64, device="cuda"))
+        context.copy_(
+            torch.randint(0, VOCAB, context.shape, dtype=torch.int64, device="cuda")
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, embedding.row_ids_reference(meta)), seed
+
+
+@requires_cuda
+def test_fused_hash_env_switch_restores_the_torch_path(monkeypatch):
+    embedding = _make_hash_embedding(device="cuda")
+    meta = _meta(_FUSED_HASH_SEQS, _FUSED_HASH_CTX, device="cuda")
+    monkeypatch.setenv("FREETOKEN_PLE_FUSED_HASH", "0")
+    assert not embedding._use_fused_row_ids(meta)
+    assert torch.equal(embedding.row_ids(meta), embedding.row_ids_reference(meta))
+
+
+@pytest.mark.parametrize(
+    "ctx_len, heads_per_ngram, message",
+    [(1, 8, "context"), (2, 5, "heads")],
+)
+def test_the_fused_hash_refuses_invalid_geometry(
+    ctx_len, heads_per_ngram, message
+):
+    from freetoken.kernel.triton.ple_hash import ple_row_ids
+
+    tokens = 3
+    with pytest.raises(ValueError, match=message):
+        ple_row_ids(
+            torch.arange(tokens, dtype=torch.int64),
+            torch.zeros(1, ctx_len, dtype=torch.int64),
+            torch.zeros(tokens, dtype=torch.int32),
+            torch.arange(tokens, dtype=torch.int32),
+            torch.tensor([3, 5, 7], dtype=torch.int64),
+            torch.full((16,), 11, dtype=torch.int64),
+            torch.arange(16, dtype=torch.int64) * 11,
+            eos_token_id=EOS,
+            heads_per_ngram=heads_per_ngram,
+        )
 
 
 def test_host_decode_hash_matches_device_reference_for_random_histories():

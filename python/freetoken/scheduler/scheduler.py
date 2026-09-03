@@ -50,6 +50,16 @@ def _gib(n_bytes: int) -> str:
     return f"{n_bytes / (1 << 30):.2f} GiB"
 
 
+def _moe_oracle_status_fragment(disk: dict) -> str:
+    """Format protected-slot oracle coverage when collection is enabled."""
+    if "oracle_hit" not in disk:
+        return ""
+    return (
+        f", disk oracle_hit: {disk['oracle_hit']:.2%} "
+        f"vs realized: {disk['realized_hit']:.2%}"
+    )
+
+
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
     batch: Batch
@@ -265,6 +275,7 @@ class Scheduler(SchedulerIOMixin):
                     f"{disk.get('resume_warmup_ratio', 0.0):.3f}, "
                     f"protected_experts: {disk.get('protected_experts', 0)}"
                 )
+                message += _moe_oracle_status_fragment(disk)
                 if disk.get("pager_backend") == "uffd":
                     message += (
                         f", uffd fills: {disk['fills']} "

@@ -848,7 +848,8 @@ def parse_args(
         action="store_true",
         default=ServerArgs.moe_collect_stats,
         help=(
-            "Collect per-layer realized decode traffic for GET /v1/moe-layer-profile."
+            "Collect per-layer realized decode traffic for GET /v1/moe-layer-profile "
+            "and report protected-slot oracle versus realized route coverage on status lines."
         ),
     )
 

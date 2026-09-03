@@ -26,12 +26,17 @@ class FLAMetadata:
       fresh_state_indices prefill only: the state-pool slots whose sequence is fresh
                           (cached_len == 0) and must be zeroed before the chunk kernel
                           reads them in place. None if there are none / for decode.
+      max_seq_len         prefill only: the longest extend_len as a host int. It reaches
+                          only the Triton fallback, where it sizes the varlen convolution
+                          launch without a device-to-host sync, and is ignored when
+                          sgl_kernel is installed.
     """
 
     cu_seqlens: torch.Tensor
     cache_indices: torch.Tensor
     has_initial_state: torch.Tensor | None = None
     fresh_state_indices: torch.Tensor | None = None
+    max_seq_len: int | None = None
 
     # --- hybrid-radix track-checkpoint (extra_buffer) fields; all None when not caching ---
     # For each request crossing a chunk-aligned (×CHUNK) boundary this forward, snapshot its
@@ -87,6 +92,7 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
         fresh_state_indices=(
             fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
         ),
+        max_seq_len=max(lens),
         **track,
     )
 

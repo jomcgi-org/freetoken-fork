@@ -32,6 +32,12 @@ def is_sgl_kernel_installed() -> bool:
 
 
 @functools.cache
+def is_triton_installed() -> bool:
+    """Whether the Triton runtime used by ``freetoken.kernel.triton`` is available."""
+    return _importable("triton")
+
+
+@functools.cache
 def is_triton_kernels_installed() -> bool:
     """OpenAI's ``triton_kernels`` (the fused MoE router used by ``moe.fused.fused_topk``).
 
