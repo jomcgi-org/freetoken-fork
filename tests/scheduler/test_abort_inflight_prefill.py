@@ -12,7 +12,7 @@ batch); otherwise it just sets ``req.aborted`` and _process_last_data frees the 
 when the batch drains, after copy_done.synchronize(). A ``table_idx != -1`` sentinel on
 the prefix-commit remains as defense-in-depth.
 
-Tests drive the real (unbound) Scheduler methods against CPU-built hybrid managers.
+Tests drive the real Scheduler methods against CPU-built hybrid managers.
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def _pool(num_slots=16):
 
 
 def _setup():
-    """Hybrid managers + a stub Scheduler `self` for the real unbound methods."""
+    """Hybrid managers plus an uninitialized Scheduler with test-owned collaborators."""
     pool = _pool()
     pt = torch.zeros(4, 64, dtype=torch.int32)
     cm = CacheManager(64, 1, pt, "hybrid_radix", linear_state_pool=pool)
@@ -52,7 +52,8 @@ def _setup():
     dm = DecodeManager(page_size=1)
     pm = PrefillManager(cm, tm, dm)
     sent = []
-    stub = SimpleNamespace(
+    stub = Scheduler.__new__(Scheduler)
+    stub.__dict__.update(
         cache_manager=cm,
         table_manager=tm,
         decode_manager=dm,

@@ -476,8 +476,10 @@ def parse_args(
         type=_nonnegative_float,
         default=ServerArgs.priority_aging_seconds,
         help=(
-            "Seconds a waiting request needs to gain one effective priority point "
-            "(default: 30; 0 disables aging)."
+            "Seconds a waiting request needs to gain one effective priority point. "
+            "For parked KV-ladder requests, this is also the starvation bound: once "
+            "the oldest waiter passes it, that waiter is admitted ahead of priority "
+            "ordering and new admissions pause (default: 30; 0 disables both)."
         ),
     )
 
@@ -752,7 +754,27 @@ def parse_args(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
-        help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+        help=(
+            "Usable KV-cache token floor reserved before --moe-cache-auto fills experts "
+            "(default 8192; the internal dummy page is additional). With --kv-ladder "
+            "the effective floor is at least two 32768-token growth steps, or the "
+            "configured growth cap when that cap is lower."
+        ),
+    )
+
+    kv_ladder_unspecified = object()
+    parser.add_argument(
+        "--kv-ladder",
+        choices=["on", "off"],
+        default=kv_ladder_unspecified,
+        help=(
+            "Grow KV at request boundaries by shrinking the auto-sized MoE expert cache "
+            "(default: on). It is inactive unless --moe-cache-auto and a supported "
+            "offload cache are in use, and unless --max-running-requests is 1. An explicit "
+            "'--kv-ladder on' rejects higher concurrency. With the "
+            "ladder active, --num-pages or --num-tokens sets the growth cap instead of "
+            "the startup pool size. 'off' keeps the startup reservation fixed."
+        ),
     )
 
     parser.add_argument(
@@ -1165,6 +1187,9 @@ def parse_args(
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
+    kwargs["kv_ladder_explicit"] = kwargs["kv_ladder"] is not kv_ladder_unspecified
+    if not kwargs["kv_ladder_explicit"]:
+        kwargs["kv_ladder"] = ServerArgs.kv_ladder
 
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):

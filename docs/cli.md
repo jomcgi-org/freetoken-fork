@@ -47,7 +47,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
-| `--priority-aging-seconds` | 30 | Waiting seconds per effective priority point; `0` disables aging |
+| `--priority-aging-seconds` | 30 | Waiting seconds per effective priority point and the parked KV-ladder starvation bound; once the oldest waiter passes it, that waiter is admitted ahead of priority ordering and new admissions pause; `0` disables both |
 
 ### Choosing a GPU
 
@@ -69,7 +69,7 @@ ft serve --model ... --gpu GPU-9e8d7c6b  # the same card by UUID (a unique prefi
 | Flag | Default | Meaning |
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
-| `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
+| `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive); with `--kv-ladder on`, this is the growth cap and the startup pool uses the effective floor |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |
 | `--lazy-restore` | on | Demand-load page-indexed QSA KV from disk; `off` restores all KV before decode |
@@ -83,7 +83,8 @@ See [models.md](models.md#moe-backends) for what each backend does.
 |---|---|---|
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
-| `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
+| `--kv-reserve-tokens` | 8192 | Usable KV token floor reserved before `--moe-cache-auto` fills experts; the internal dummy page is additional |
+| `--kv-ladder` | on | With one running request and `--moe-cache-auto`, grow KV in 32768-token request-boundary steps by taking expert slots; the effective floor is at least 65536 tokens, or the configured growth cap when that cap is lower. The default is inert at higher concurrency, while explicit `on` rejects it; `off` keeps startup sizing fixed. Growth is one-way until restart: expert slots surrendered to reach the cap do not return, so one long conversation lowers the slot count for later short requests |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-disk-layers` | none | FTW MoE layers kept in the DISK tier and computed on CPU |

@@ -267,7 +267,7 @@ def test_node4_fp8_savings_become_726_more_nvfp4_hot_slots():
     fp8_slots, _, _ = resolve_moe_cache_auto(
         cache_per_page=fp8_per_page, **common
     )
-    assert (bf16_slots, fp8_slots) == (1_000, 1_726)
+    assert (bf16_slots, fp8_slots) == (999, 1_725)
 
 
 def test_kv_cost_prices_ring_and_scratch_as_fixed():

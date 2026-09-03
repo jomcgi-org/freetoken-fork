@@ -50,6 +50,14 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Automatic request-boundary KV growth funded by shrinking --moe-cache-auto.
+    kv_ladder: str = "on"
+    # Parser provenance used to distinguish an explicit request from the default-on policy.
+    kv_ladder_explicit: bool = False
+    # Startup geometry derived after the KV pool cost and final page size are known.
+    kv_ladder_floor_tokens: int | None = field(default=None, init=False)
+    kv_ladder_cap_tokens: int | None = field(default=None, init=False)
+    kv_ladder_explicit_cap: bool = field(default=False, init=False)
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Automatic host residency reserves these pinned layers for the GPU prefill
@@ -191,6 +199,19 @@ class EngineConfig:
     num_token_override: int | None = None
 
     def __post_init__(self) -> None:
+        if self.kv_ladder not in ("on", "off"):
+            raise ValueError(
+                f"--kv-ladder must be 'on' or 'off', got {self.kv_ladder!r}"
+            )
+        if (
+            self.kv_ladder == "on"
+            and self.kv_ladder_explicit
+            and self.moe_cache_auto
+            and self.max_running_req != 1
+        ):
+            raise ValueError(
+                "explicit --kv-ladder on requires --max-running-requests 1"
+            )
         if self.moe_activation_dtype not in ("auto", "bf16", "nvfp4"):
             raise ValueError(
                 "--moe-activation-dtype must be 'auto', 'bf16', or 'nvfp4', got "

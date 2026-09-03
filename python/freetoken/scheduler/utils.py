@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, List, Protocol, Sequence, TypeVar
 
 import torch
 
@@ -38,7 +38,12 @@ class ScheduleResult:
     output_indices: List[torch.Tensor]
 
 
-_PriorityReq = TypeVar("_PriorityReq", bound=PendingReq)
+class _PriorityReqLike(Protocol):
+    priority: int
+    arrival_time: float
+
+
+_PriorityReq = TypeVar("_PriorityReq", bound=_PriorityReqLike)
 
 
 def effective_priority(
@@ -78,7 +83,7 @@ def order_pending_requests(
 
 
 def priority_queue_stats(
-    pending: Sequence[PendingReq], *, now: float
+    pending: Sequence[_PriorityReqLike], *, now: float
 ) -> tuple[dict[str, int], float]:
     """Current queue depth in requested-priority bands and oldest wait."""
     bands = {"negative": 0, "zero": 0, "positive": 0}

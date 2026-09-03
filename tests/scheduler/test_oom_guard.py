@@ -343,7 +343,6 @@ def test_client_abort_of_inflight_request_releases_owned_slots(monkeypatch):
     sched._mamba_slot_usage = lambda: None
     sched._swa_token_usage = lambda: None
     sched._gpu_mem_bytes = lambda: 0
-    sched.prefill_manager.queue_stats = lambda: ({}, 0.0)
     sched.status_reporter.report_batch = lambda *args, **kwargs: None
     sched.config = SimpleNamespace(page_size=1)
 

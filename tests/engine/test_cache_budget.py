@@ -7,7 +7,12 @@ import torch
 
 import os
 
-from freetoken.engine.cache_budget import expert_bytes_per_slot, plan_cache_budget, resolve_moe_cache_auto
+from freetoken.engine.cache_budget import (
+    expert_bytes_per_slot,
+    plan_cache_budget,
+    required_bytes,
+    resolve_moe_cache_auto,
+)
 from freetoken.engine.engine import _pin_budget_bytes
 
 
@@ -20,20 +25,20 @@ def test_moe_priority_fills_experts_up_to_total():
         kv_reserve_pages=5, max_slots=8,
     )
     assert size == 8  # capped at full residency
-    assert pages == (2000 - 8 * 100) // 10  # == 120, remainder to KV
+    assert pages == (2000 - 8 * 100) // 10 - 1  # one physical page is the dummy
     assert overlap is True
 
 
 def test_offload_case_experts_take_most_kv_gets_reserve_floor():
     # budget too small for full residency: experts take what they can, KV keeps its floor.
     size, pages, overlap = plan_cache_budget(
-        budget_bytes=1000, per_expert_bytes=100, cache_per_page=10,
+        budget_bytes=910, per_expert_bytes=100, cache_per_page=10,
         num_experts=2, total_experts=50, prefill_overlap=True,
         kv_reserve_pages=10, max_slots=50,
     )
-    # raw = (1000 - 10*10) // 100 = 9 ; clamped to [4, 50] -> 9
-    assert size == 9
-    assert pages == max((1000 - 9 * 100) // 10, 10)  # remainder 10 pages, == floor
+    # The 10-page usable floor also charges one dummy: raw = (910 - 11*10) // 100 = 8.
+    assert size == 8
+    assert pages == 10
     assert overlap is True
 
 
@@ -45,7 +50,7 @@ def test_marlin_cap_clamps_count_and_rolls_bytes_to_kv():
         kv_reserve_pages=0, max_slots=992,
     )
     assert size == 992
-    assert pages == (200_000 - 992 * 100) // 10
+    assert pages == (200_000 - 992 * 100) // 10 - 1
 
 
 def test_small_cache_disables_prefill_overlap():
@@ -77,7 +82,16 @@ def test_budget_too_small_for_min_moe_plus_reserve_raises():
             budget_bytes=300, per_expert_bytes=100, cache_per_page=10,
             num_experts=4, total_experts=4, prefill_overlap=False,
             kv_reserve_pages=10, max_slots=4,
-        )  # min moe = 4 slots (400 B) + reserve (10 pages = 100 B) = 500 B > 300 B budget
+        )  # min moe = 400 B + 10 usable pages and one dummy = 510 B
+
+
+def test_required_bytes_charges_one_dummy_beyond_reported_usable_pages():
+    assert required_bytes(
+        moe_cache_size=8,
+        num_pages=10,
+        per_expert_bytes=100,
+        cache_per_page=10,
+    ) == 910
 
 
 def test_prefill_overlap_false_is_honored():
@@ -89,7 +103,7 @@ def test_prefill_overlap_false_is_honored():
     )
     assert size == 8
     assert overlap is False
-    assert pages == (2000 - 8 * 100) // 10
+    assert pages == (2000 - 8 * 100) // 10 - 1
 
 
 def test_expert_bytes_per_slot_sums_row_bytes_over_banks():
@@ -108,8 +122,28 @@ def test_resolve_auto_applies_ratio_once_and_marlin_cap():
         num_experts=4, total_experts=8, prefill_overlap=True,
         kv_reserve_tokens=0, page_size=1, quant_format="bf16",
     )
-    # budget 800: experts cap at 8 -> 400 bytes; KV = 400//10 = 40 pages
-    assert size == 8 and pages == 40 and overlap is True
+    # budget 800: experts cap at 8 -> 400 bytes; KV = 39 usable pages + 1 dummy.
+    assert size == 8 and pages == 39 and overlap is True
+
+
+def test_resolve_auto_reserves_usable_tokens_beyond_the_dummy_page():
+    size, pages, overlap = resolve_moe_cache_auto(
+        baseline_free=940,
+        weights_bytes=0,
+        memory_ratio=1.0,
+        cache_per_page=10,
+        fixed_cache_size=0,
+        per_expert_bytes=100,
+        num_experts=2,
+        total_experts=50,
+        prefill_overlap=False,
+        kv_reserve_tokens=256,
+        page_size=64,
+        quant_format="bf16",
+    )
+    assert overlap is False
+    assert pages * 64 >= 256
+    assert size == 8 and pages == 13
 
 
 def test_resident_mtp_head_is_charged_before_expert_cache_and_kv_planning():
@@ -163,6 +197,70 @@ def test_resolve_auto_marlin_caps_slots():
     assert size == 992
 
 
+def test_qwen_flash_next_fp8_ladder_reference_geometry_is_consistent():
+    from freetoken.attention import AttnType
+    from freetoken.kernel.aot_models import expert_bank_row_bytes
+    from freetoken.kvcache.qsa_pool import QSAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
+    from freetoken.scheduler.kv_ladder import KVLadderPolicy
+
+    page_size = 64
+    spec = KVCacheGroupSpec(
+        name="full",
+        layer_ids=tuple(range(12)),
+        num_kv_heads=2,
+        head_dim=256,
+        sliding_window=None,
+        index_head_dim=128,
+        num_index_layers=12,
+        index_ratio=4,
+        attn_type=AttnType.QSA,
+    )
+    config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        kv_cache_dtype="fp8_e4m3",
+        page_size=page_size,
+        max_running_req=1,
+        speculative_mtp="off",
+        tp_info=SimpleNamespace(size=1),
+        model_config=SimpleNamespace(kv_cache_group_specs=lambda: (spec,)),
+    )
+    kv_bytes_per_page, _, _, _ = QSAKVCache.kv_cost(config)
+    expert_bytes = sum(expert_bank_row_bytes("nvfp4", 2560, 640).values())
+    assert expert_bytes == 2_772_480
+    assert kv_bytes_per_page == 13_056 * page_size == 835_584
+
+    # Calibrate the otherwise unknown measured pool budget to the reported 3,753-slot
+    # floor. This same budget reproduces the older 3,290-slot, 163,840-token reference.
+    floor_tokens = 65_536
+    floor_slots = 3_753
+    budget = required_bytes(
+        floor_slots,
+        floor_tokens // page_size,
+        expert_bytes,
+        kv_bytes_per_page,
+    )
+    policy = KVLadderPolicy(
+        step_tokens=32_768,
+        max_context_tokens=100_352,
+        page_size=page_size,
+        pool_budget_bytes=budget,
+        kv_bytes_per_page=kv_bytes_per_page,
+        moe_bytes_per_slot=expert_bytes,
+        min_moe_slots=1_024,
+        prefill_overlap=True,
+    )
+    assert {
+        tokens: policy.moe_slots_at_tokens(tokens, floor_slots)
+        for tokens in (65_536, 98_304, 100_352, 163_840)
+    } == {
+        65_536: 3_753,
+        98_304: 3_598,
+        100_352: 3_589,
+        163_840: 3_290,
+    }
+
+
 def _dsv4_adjust_cfg(**over):
     # A DSV4 _adjust_config stub mirroring the real checkpoint (ds_fp4 experts, dsv4_sparse
     # attention, offload MoE backend).
@@ -188,6 +286,7 @@ def _dsv4_adjust_cfg(**over):
         moe_cpu_layers = None
         moe_disk_layers = None
         nvfp4_backend = "auto"
+        moe_activation_dtype = "auto"
         num_page_override = None
         num_token_override = None
 
@@ -243,6 +342,9 @@ def test_adjust_config_resolves_num_tokens_generic():
     # Generic model keeps its page_size (1 here): tokens map 1:1 onto pages.
     from types import SimpleNamespace
 
+    # Keep this fixture pinned to fi. Never select auto or another backend to make
+    # a machine without FlashInfer pass; dependency absence is an explicit skip.
+    pytest.importorskip("flashinfer")
     from freetoken.engine.engine import _adjust_config
 
     model_config = SimpleNamespace(
@@ -262,6 +364,7 @@ def test_adjust_config_resolves_num_tokens_generic():
         page_size = 1
         attention_backend = "fi"
         nvfp4_backend = "auto"
+        moe_activation_dtype = "auto"
         num_page_override = None
         num_token_override = 5000
 
@@ -376,15 +479,168 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
     assert (size, pages, overlap) == expected
 
 
+def test_ladder_auto_plan_uses_two_steps_as_floor_and_explicit_pages_as_cap(
+    monkeypatch,
+):
+    from freetoken.engine import cache_budget, engine as engine_module
+    from freetoken.engine.engine import Engine
+
+    class Pool:
+        @staticmethod
+        def kv_cost(config):
+            return 10, 0, 64, 0
+
+    class ModelConfig:
+        dsv4_args = None
+        is_moe = True
+        num_experts = 128
+        num_moe_layers = 64
+        slot_states = ()
+
+        @staticmethod
+        def linear_attention_group():
+            return None
+
+    config = SimpleNamespace(
+        kv_ladder="on",
+        moe_cache_auto=True,
+        moe_cache_size=0,
+        moe_cache_rate=None,
+        moe_backend="offload",
+        max_running_req=1,
+        tp_info=SimpleNamespace(size=1),
+        num_page_override=1568,
+        max_seq_len=100_352,
+        kv_reserve_tokens=8192,
+        memory_ratio=0.9,
+        moe_prefill_overlap=True,
+        model_config=ModelConfig(),
+    )
+    banks = SimpleNamespace(
+        quant_format="bf16",
+        sources={"gate_up": [torch.zeros(1, 25, dtype=torch.float32)]},
+    )
+    captured = {}
+
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 3907, 2000, True
+
+    logs = []
+    monkeypatch.setattr(cache_budget, "resolve_moe_cache_auto", fake_resolve)
+    monkeypatch.setattr(
+        engine_module.logger,
+        "info_rank0",
+        lambda message, *args: logs.append(message % args),
+    )
+    engine = Engine.__new__(Engine)
+    engine._pool_cls = Pool
+    engine._baseline_free = 10_000
+    engine._weights_bytes = 100
+
+    size, pages, overlap = engine._resolve_auto_moe_cache_size(config, banks)
+
+    assert (size, pages, overlap) == (3907, 1568, True)
+    assert captured["kv_reserve_tokens"] == 65_536
+    assert config.kv_ladder_floor_tokens == 65_536
+    assert config.kv_ladder_cap_tokens == 100_352
+    assert config.kv_ladder_explicit_cap is True
+    assert any("raised floor from 8192 to 65536 tokens" in line for line in logs)
+
+
+def test_ladder_warns_and_preserves_pool_minimum_above_cap(monkeypatch):
+    from freetoken.engine import cache_budget, engine as engine_module
+    from freetoken.engine.engine import Engine
+
+    pool_minimum = 131_072
+
+    class Pool:
+        @staticmethod
+        def kv_cost(config):
+            return 10, 0, 64, pool_minimum
+
+    config = SimpleNamespace(
+        kv_ladder="on",
+        moe_cache_auto=True,
+        moe_cache_size=0,
+        moe_cache_rate=None,
+        moe_backend="offload",
+        max_running_req=1,
+        tp_info=SimpleNamespace(size=1),
+        num_page_override=1568,
+        max_seq_len=100_352,
+        kv_reserve_tokens=8192,
+        memory_ratio=0.9,
+        moe_prefill_overlap=True,
+        model_config=SimpleNamespace(
+            dsv4_args=None,
+            is_moe=True,
+            num_experts=128,
+            num_moe_layers=64,
+            slot_states=(),
+            linear_attention_group=lambda: None,
+        ),
+    )
+    banks = SimpleNamespace(
+        quant_format="bf16",
+        sources={"gate_up": [torch.zeros(1, 25, dtype=torch.float32)]},
+    )
+    captured = {}
+    warnings = []
+
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 3907, 3000, True
+
+    monkeypatch.setattr(cache_budget, "resolve_moe_cache_auto", fake_resolve)
+    monkeypatch.setattr(
+        engine_module.logger,
+        "warning_rank0",
+        lambda message, *args: warnings.append(message % args),
+    )
+    engine = Engine.__new__(Engine)
+    engine._pool_cls = Pool
+    engine._baseline_free = 10_000
+    engine._weights_bytes = 100
+
+    size, pages, overlap = engine._resolve_auto_moe_cache_size(config, banks)
+
+    assert (size, pages, overlap) == (3907, pool_minimum // 64, True)
+    assert captured["kv_reserve_tokens"] == pool_minimum
+    assert config.kv_ladder_floor_tokens == pool_minimum
+    assert any(
+        "pool minimum 131072 tokens is above KV ladder cap 100352" in line
+        for line in warnings
+    )
+
+
 # ---------------------------------------------------------------------------
 # offload-cache sizing guard + auto-resolution (_require_offload_cache_size / _adjust_config),
 # the floor rule compute_cache_floors documents above.
 # ---------------------------------------------------------------------------
 
 
+def test_engine_config_declares_derived_ladder_geometry_fields():
+    from dataclasses import fields
+
+    from freetoken.engine.config import EngineConfig
+
+    ladder_fields = {
+        item.name: item
+        for item in fields(EngineConfig)
+        if item.name.startswith("kv_ladder_")
+    }
+    assert ladder_fields["kv_ladder_floor_tokens"].init is False
+    assert ladder_fields["kv_ladder_cap_tokens"].init is False
+    assert ladder_fields["kv_ladder_explicit_cap"].init is False
+
+
 def _offload_engine_config(**overrides):
     """A frozen EngineConfig for a quantized-experts MoE checkpoint in the bare-invocation state
-    (moe_backend="auto") unless overridden — the shared fixture for the _adjust_config tests."""
+    (moe_backend="auto") unless overridden, shared by the _adjust_config tests."""
+    # Keep this fixture pinned to fi. Never select auto or another backend to make
+    # a machine without FlashInfer pass; dependency absence is an explicit skip.
+    pytest.importorskip("flashinfer")
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
 
@@ -452,6 +708,157 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
 
 
+def test_adjust_config_rejects_explicit_ladder_after_auto_backend_resolution():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _offload_engine_config(
+        kv_ladder="on",
+        kv_ladder_explicit=True,
+        max_running_req=4,
+    )
+    assert config.moe_backend == "auto"
+    assert config.moe_cache_auto is False
+
+    with pytest.raises(ValueError, match="requires --max-running-requests 1"):
+        _adjust_config(config)
+
+
+def test_auto_pages_replace_explicit_override_only_for_active_ladder():
+    from freetoken.engine.engine import _install_auto_moe_cache_pages
+
+    model_config = SimpleNamespace(dsv4_args=None, is_moe=True)
+    active = SimpleNamespace(
+        num_page_override=1568,
+        kv_ladder="on",
+        moe_cache_auto=True,
+        moe_cache_size=0,
+        moe_cache_rate=None,
+        moe_backend="offload",
+        max_running_req=1,
+        tp_info=SimpleNamespace(size=1),
+        model_config=model_config,
+    )
+    fixed = SimpleNamespace(
+        num_page_override=1568,
+        kv_ladder="off",
+        moe_cache_auto=True,
+    )
+
+    _install_auto_moe_cache_pages(active, 1025)
+    _install_auto_moe_cache_pages(fixed, 1025)
+
+    assert active.num_page_override == 1025
+    assert fixed.num_page_override == 1568
+
+
+def test_ineligible_tp_ladder_keeps_explicit_pages_and_fixed_reserve(monkeypatch):
+    from freetoken.engine import cache_budget
+    from freetoken.engine.engine import Engine, _install_auto_moe_cache_pages
+
+    class Pool:
+        @staticmethod
+        def kv_cost(config):
+            return 10, 0, 64, 0
+
+    config = SimpleNamespace(
+        kv_ladder="on",
+        moe_cache_auto=True,
+        moe_cache_size=0,
+        moe_cache_rate=None,
+        moe_backend="offload",
+        max_running_req=1,
+        tp_info=SimpleNamespace(size=2),
+        num_page_override=1568,
+        max_seq_len=100_352,
+        kv_reserve_tokens=8192,
+        memory_ratio=0.9,
+        moe_prefill_overlap=True,
+        model_config=SimpleNamespace(
+            dsv4_args=None,
+            is_moe=True,
+            num_experts=128,
+            num_moe_layers=64,
+            slot_states=(),
+            linear_attention_group=lambda: None,
+        ),
+    )
+    banks = SimpleNamespace(
+        quant_format="bf16",
+        sources={"gate_up": [torch.zeros(1, 25, dtype=torch.float32)]},
+    )
+    captured = {}
+
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 3907, 1025, True
+
+    monkeypatch.setattr(cache_budget, "resolve_moe_cache_auto", fake_resolve)
+    engine = Engine.__new__(Engine)
+    engine._pool_cls = Pool
+    engine._baseline_free = 10_000
+    engine._weights_bytes = 100
+
+    assert engine._resolve_auto_moe_cache_size(config, banks) == (3907, 1025, True)
+    assert captured["kv_reserve_tokens"] == 8192
+    assert not hasattr(config, "kv_ladder_cap_tokens")
+
+    _install_auto_moe_cache_pages(config, 1025)
+    assert config.num_page_override == 1568
+
+
+def test_ineligible_dsv4_ladder_preserves_pool_minimum_reserve(monkeypatch):
+    from freetoken.engine import cache_budget
+    from freetoken.engine.engine import Engine
+
+    class Pool:
+        @staticmethod
+        def kv_cost(config):
+            return 10, 0, 128, 131_072
+
+    config = SimpleNamespace(
+        kv_ladder="on",
+        moe_cache_auto=True,
+        moe_cache_size=0,
+        moe_cache_rate=None,
+        moe_backend="offload",
+        max_running_req=1,
+        tp_info=SimpleNamespace(size=1),
+        num_page_override=8,
+        max_seq_len=100_352,
+        kv_reserve_tokens=8192,
+        memory_ratio=0.9,
+        moe_prefill_overlap=True,
+        model_config=SimpleNamespace(
+            dsv4_args=object(),
+            is_moe=True,
+            num_experts=128,
+            num_moe_layers=64,
+            slot_states=(),
+            linear_attention_group=lambda: None,
+        ),
+    )
+    banks = SimpleNamespace(
+        quant_format="bf16",
+        sources={"gate_up": [torch.zeros(1, 25, dtype=torch.float32)]},
+    )
+    captured = {}
+
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return 3907, 1025, True
+
+    monkeypatch.setattr(cache_budget, "resolve_moe_cache_auto", fake_resolve)
+    engine = Engine.__new__(Engine)
+    engine._pool_cls = Pool
+    engine._baseline_free = 10_000
+    engine._weights_bytes = 100
+
+    engine._resolve_auto_moe_cache_size(config, banks)
+
+    assert captured["kv_reserve_tokens"] == 131_072
+    assert not hasattr(config, "kv_ladder_cap_tokens")
+
+
 def test_page_table_width_covers_whole_trailing_pages():
     # _write_page_table writes WHOLE trailing pages, so the width must reach the last
     # page's end, not just the next multiple of 32 (DSV4's P=128 exposed the gap).
@@ -489,6 +896,7 @@ def _generic_rotary_cfg(max_position, override):
         page_size = 1
         attention_backend = "triton"
         nvfp4_backend = "auto"
+        moe_activation_dtype = "auto"
         num_page_override = None
         num_token_override = None
         max_seq_len_override = None
