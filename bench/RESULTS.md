@@ -641,3 +641,168 @@ Rerun queued serial on the finished stack.
 - Ops: repeated 1Password locks mid-pipeline; the dedicated node-4 key
   carried everything except GitHub pushes (queued). git bundles over scp
   bridged code to node-4 during the lock.
+
+## Prefill program and the serving profile (2026-09-01 evening to 09-03)
+
+RESULTS.md stopped at the session-prefetch round; this section covers the
+commits after it (0b367d6..10dc8e2), measured on node-4's serving unit
+unless stated. The "PROGRAM CLOSED" line above described the decode
+program. The prefill path was rebuilt afterwards because the 100k-context,
+single-lane serving profile made novel long prompts the dominant wait: a
+25k-token prompt ran at 30 to 60 tok/s (7 to 14 minutes), and the first
+request after every restart ran at ~15% hot coverage and 54 to 64 tok/s.
+
+Probe of record: `ft probe-prefill` (41436b1): seeded, per-run unique
+prompts sized in tokens, TTFT from the first delta, median of 3, and the
+engine's own prefill line beside it. Client tok/s = prompt tokens / TTFT;
+engine tok/s is the scheduler's input-throughput line. 2,012-token cold
+prompts unless stated. Raw outputs: `~/repos/ft-worktrees/tools/evidence-0903/`
+on the Mac, node-4 `/tmp/*.out`.
+
+### What shipped (commit, mechanism, measured motivation)
+
+- 5b05e97 chunk-ahead staged PLE gather: prefill n-gram ids are known from
+  the input tokens, so each chunk dedupes its rows host-side and ships one
+  H2D copy instead of millions of HMM faults (6.27M measured per prefill;
+  idealised 49 -> ~133 tok/s).
+- d5f819f, 1d5465a, 723c316: per-layer coalesced expert sweep, then
+  populate-read (preadv into a bounded scratch) replacing advisory
+  MADV_WILLNEED, which the kernel throttled on ~590 MB scattered sets. The
+  ~3M demand faults per 2,048-token chunk became minor faults.
+- e0d5b04: eager per-layer page release made opt-in. Consecutive chunks
+  share most experts; releasing after each layer sent the next chunk back
+  to disk: 5-11 tok/s live vs 56 inert (it had been a silent no-op behind a
+  stale extension).
+- c872e12, d228c81, 04e4c3d: one row-batched nvfp4-w4a8 GEMM per expert per
+  chunk replacing ~1M per-token GEMVs; the batched entry had silently
+  dispatched to the scalar kernel (96.5% of cycles) until the ISA fix;
+  row-blocked tiles cut per-expert calls 3,840 -> 120, and a background
+  thread populates the next chunk's layer-0 union behind tail-layer compute.
+- 21d4b42, 61e5b43: one host-memory governor (page-cache reserve, pin and
+  pager budgets fitted inside MemAvailable, oversubscription refuses
+  startup) and GPU prefill layers reserved before the disk tier takes the
+  rest (a 35G budget had pinned zero GPU layers; now 7 layers, 26.6G).
+- 9b13711, 2821a71: hot rows hold protected GPU slots; the full pinned host
+  mirror is gone (a 48G hot set had cost 47G of shmem on the 176G cloud
+  box); the HOT plan is bounded by GPU slots, not the pin budget.
+- 81163b2, 5e04cac, c7a667a, ee68166, ee48dfc: hot/cold split for
+  DISK-layer prefill. Routes whose expert sits in a protected slot run the
+  GPU expert GEMM (grouped prefill kernel after the moe_align 1,024-bin
+  fix), cold routes stay on the CPU batched path. Motivation: 87% hot-pair
+  at the decode plateau while prefill used none of it. Three correctness
+  rounds on the way: the bf16 GPU kernel wrote over its input so the CPU
+  partial consumed the GPU output; slot-count vs slot-index geometry
+  (illegal memory access); cold routes clamped to slot 0 reading unwritten
+  e4m3 scales as NaN.
+- 02f7498, 355c2b0, abd2056: adaptation ticks on routed tokens including
+  prefill (32-token answers had left prefill coverage at 9%, 250-token
+  answers reached 55%); interval derived from the allocation (20 for a 48G
+  set, 166 for 6G, the two values found by hand).
+- 059057f, d2c684f: FP8 e4m3 KV cache on the QSA layers; freed VRAM becomes
+  expert slots under cache-auto; disk prefix entries carry the dtype.
+- eb1b923, 42fc950: abort on client disconnect (three timed-out prefills
+  had held the single lane for 2.5 h); the ASGI cycle completes on
+  disconnect.
+- f36169f, b522bc1, b19413d: transparent hugepages on bank mappings, then
+  the fair-test rework (advise before fill, never on UVM-registered ranges,
+  tmpfs mirror arm for file-backed banks, grouped startup report).
+- fb0007d: hot plan persisted across restarts (versioned file, atomic,
+  every N minutes and on shutdown; seeds protected slots and counters when
+  the FTW identity matches; bounded shutdown).
+- ebd0cab: upstream ports (#342 lm_head rows, #339 GDN conv sync, #338
+  Triton PLE hash, #231 routing-oracle stat). #89 skipped (tile table
+  mismatch with the NVFP4 kernel).
+- de3bf0b: `--ple-backend uring`, port of upstream #311: row reads from the
+  quantized table through a native io_uring reader into governor-charged
+  pinned staging, O_DIRECT with bounce buffers, strict failure, ring
+  drained before teardown.
+- a5e6f41: idle-time adaptation (after 500 ms idle, one bounded tick,
+  repeated while swapping; an arriving request wakes the scheduler).
+- 057ce31: KV ladder, port of upstream #300 with the #340 floor fix: the
+  pool starts at a floor and grows in 32,768-token steps from expert slots
+  at request boundaries; an explicit --num-pages becomes the cap.
+- 7a61335: NVFP4 activations for the sm_120 expert GEMMs
+  (--moe-activation-dtype auto = nvfp4 on Blackwell when every expert
+  carries an input scale). Unmeasured; needs the G4 window.
+
+### Numbers of record (node-4 serving unit, 2,012-token cold unique prompts)
+
+| arm (09-03) | client tok/s min / median / max | engine tok/s | prefill hot-route | decode x1 (batches) |
+|---|---|---|---|---|
+| tier with `--ple-backend cached` (04:08) | 58 / 68 / 73 | 47-53 | 69-90% | 1.4-6.4 |
+| `--ple-backend disk` + chunk-ahead gather (04:12) | 276 / 359 / 371 | 152-202 | 93-96% | 4.3-10.9 |
+| KV reservation 163,840 -> 65,536, pre-ladder (05:26) | 132 / 365 / 374 | 93-235 | 93-96% | |
+| hot plan persistence, first two requests after a restart (06:17) | 351, 391 (unseeded: 267, 333) | 172-195 | 96.3% (unseeded 93.1%) | |
+| `--ple-backend uring` (07:57) | 316 / 371 / 402 | 196-283 | 91-93% | 5.4-12.8 |
+| 10dc8e2, KV ladder + idle ticks (09:14) | 231 / 413 / 426 | 168-294 | 92-94% | 7.0-14.2 |
+| THP on the pinned banks, 27.7 GB backed (09:29) | 174 / 296 / 341 | 137-229 | 93% | 5.4-12.5 |
+
+26,812-token novel prompt (05:28, pre-ladder): TTFT 77.4 s, 85.3 s wall,
+346 tok/s; the first 2,048-token chunk ran at 107 tok/s and the rest at
+320 to 450. The same prompt shape was 7 to 14 minutes on 09-01.
+
+Decode did not move in any arm: 9 to 14 tok/s single-stream once warm. A
+40-token chat turn is 4.6 to 6.1 s wall at 10dc8e2 (deploy2, which by
+accident measured the pre-ladder code, saw 9.4 s for the first turn and
+~5 s after). Chat is decode-bound now. The 21 tok/s x1 of the adaptation
+round was the MRR-8 load profile with a 32k KV pool; the 100k-context
+profile spends those expert slots on KV (3,290 at a fixed 163,840-token
+reservation, 3,753 with the ladder's 65,536-token floor, ~3,590 once grown
+to the 100,352 cap).
+
+### Verdicts
+
+- PLE off the pinned budget is the single biggest prefill lever on this
+  box: cached -> disk was 68 -> 359 tok/s on the same code, because the
+  chunk-ahead gather feeds prefill in one batched read and the 8 GiB pin
+  goes back to expert banks.
+- Hot plan persistence: the cold first request is gone (351 vs 267 tok/s,
+  96% coverage from the first prompt). One test fix on node-4 (fa1b11e:
+  a captured graph must replay before its indices are read).
+- io_uring PLE: +3% client-side and +24% engine-side over the mmap disk
+  backend, 0.47 ms gather per decode step, 0 major faults, no UVM in the
+  path. The extension must be built on the host (setup.py build_ext
+  --inplace in the served worktree): the first deploy crashed at load
+  because it was not (uringab1).
+- KV ladder: +14% expert slots at startup for the 100k profile with no
+  ceiling change; a 2k prompt with the default 32k output budget needs no
+  growth.
+- Idle ticks fire between chat turns (hot_adapt_ticks_idle: 2 in a
+  four-turn test); the hot set assembles while the GPU would otherwise idle.
+- THP, fair test: -28% client-side and -18 to -44% engine-side prefill,
+  decode unchanged. Off stays default. The tmpfs mirror arm for file-backed
+  banks needs RAM headroom a 64 GB box does not have; the wiring stays for
+  hosts with file THP or more RAM.
+- MTP with the resident draft head (flash-e2m1-mtp.ftw, K=1): 52 to 78%
+  acceptance on 40-draft windows, yet 300-token essays took 37 to 48 s with
+  the head on vs 19 to 31 s off (decode batches 10-14 vs 15-23). Still net
+  negative: the verify pass runs outside CUDA graphs. The open lever is
+  graphs under MTP, then batched verify at K=2-4. The first attempt crashed
+  at load because the MTP FTW directory lacked the PLE shard links.
+- HMM PLE retired on node-4: two UVM oopses on 09-02 traced to the HMM PLE
+  backend itself, not THP (dmesg captures in node-4
+  freetoken/dmesg-uvm-oops-*.txt). The blog's section 5.2 recommendation
+  is superseded by the uring backend.
+- Deploy trap: a git bundle whose base commit the target lacks fails to
+  fetch, and the deploy script measured the old code (deploy2, 08:54).
+  Read the target's log before cutting a bundle.
+
+### GLM 5.3 Flash on the tier (09-01/09-02, GCE G4 box, us-central1-b)
+
+dfd6cc8, 5408598, 766b889, a712aae, dd11d99, 0a58702, 7832c52: the 45-layer
+hybrid (KDA linear layers plus MLA/DSA, 288 routed + 1 shared experts,
+sigmoid noaux_tc) loads through the unified offload layer with disk-tier
+support; CPU-streaming FTW conversion for the NVFP4 W4A4 layout; nope-only
+MLA kernels (the first decode step died on tl.arange(0, 0)); the pooled
+DSA index for checkpoint fidelity; nine real Linux-suite failures fixed on
+the first RTX PRO 6000 run. Instances `glm-convert` and `glm-flash-test`
+(pytorch-2-9-cu129 image family) were deleted on 09-02. No throughput
+numbers were recorded: that is the pending G4 window, together with the
+sm_120 NVFP4 activation path.
+
+Fork state: feat/moe-disk-tier 10dc8e2, 166 commits on upstream 58f4b9e.
+Upstream has 8 commits since: #311 (PLE from disk) and #342/#339/#338/#231
+are ported; #332 (GLM-5.3-Flash, upstream's own implementation), #329
+(exact Triton sampling), #336 (safetensors index download), #343
+(mixed-precision NVFP4 detection) and #319 (Triton router) are not.
+Reconcile GLM against #332 before any upstream PR.
