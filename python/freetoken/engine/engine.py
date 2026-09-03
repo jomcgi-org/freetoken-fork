@@ -1255,6 +1255,10 @@ class Engine:
     @staticmethod
     def _drain_hot_adaptation_for_rebuild(cache) -> None:
         """Resolve in-flight HOT work before changing its protected row geometry."""
+        drain = getattr(cache, "drain_hot_adaptation_for_rebuild", None)
+        if drain is not None:
+            drain()
+            return
         future = getattr(cache, "_hot_adapt_future", None)
         if future is None:
             return
@@ -1287,6 +1291,16 @@ class Engine:
             cache.hot_adapt_hot_budget_bytes = (
                 sum(cache.hot_expert_capacity.values()) * cache.hot_adapt_expert_bytes
             )
+
+    @staticmethod
+    def _ple_uring_staging_registration(model) -> tuple:
+        """Snapshot the pinned PLE uring registrations that rebuild must not replace."""
+        backends = getattr(model, "_ple_disk_backends", ())
+        return tuple(
+            backend.pinned_staging_registration()
+            for backend in backends
+            if hasattr(backend, "pinned_staging_registration")
+        )
 
     def _resize_kv_pool(self, config, num_pages: int, num_swa_pages: int | None) -> None:
         # IN-PLACE, identity-preserving: the CacheManager's swa_pool reference, ctx.kv_cache and
@@ -1324,6 +1338,7 @@ class Engine:
         num_mamba_slots: int | None = None,
         num_swa_pages: int | None = None,
         hot_slot_owners: dict[int, tuple[int | None, ...]] | None = None,
+        preserve_hot_state: bool = False,
     ) -> None:
         """Idle-only in-place resize of the MoE slot cache, KV page pool, GDN (mamba) state pool,
         and/or the window pool (num_swa_pages: an absolute pinned window), followed by CUDA-graph
@@ -1355,6 +1370,16 @@ class Engine:
                     "HOT slot ownership can change only with moe_cache_size"
                 )
             self._validate_hot_slot_owners(hot_slot_owners, moe_cache_size)
+        if preserve_hot_state:
+            if moe_cache_size is None or self.moe_offload_cache is None:
+                raise CacheRebuildRejected(
+                    "preserving HOT state requires an MoE cache resize"
+                )
+            protected = sum(self.moe_offload_cache.hot_expert_capacity.values())
+            if not protected:
+                raise CacheRebuildRejected(
+                    "preserving HOT state requires protected HOT rows"
+                )
         if num_pages is not None and num_pages <= 0:
             raise CacheRebuildRejected(f"num_pages must be positive, got {num_pages}")
         if num_mamba_slots is not None:
@@ -1413,6 +1438,14 @@ class Engine:
         if hot_slot_owners is not None:
             assert self.moe_offload_cache is not None
             self._drain_hot_adaptation_for_rebuild(self.moe_offload_cache)
+        elif preserve_hot_state:
+            assert self.moe_offload_cache is not None
+            self._drain_hot_adaptation_for_rebuild(self.moe_offload_cache)
+
+        ple_uring_registration = (
+            self._ple_uring_staging_registration(self.model)
+            if preserve_hot_state else ()
+        )
 
         torch.cuda.synchronize(self.device)
         # Preserve the CUDA-graph batch-size set resolved at startup. The auto heuristic keys
@@ -1439,7 +1472,12 @@ class Engine:
             assert self.moe_offload_cache is not None, "no MoE offload cache to resize"
             if hot_slot_owners is not None:
                 self._apply_hot_slot_owners(self.moe_offload_cache, hot_slot_owners)
-            self.moe_offload_cache.rebuild(moe_cache_size)
+            if preserve_hot_state:
+                self.moe_offload_cache.rebuild(
+                    moe_cache_size, preserve_hot_state=True
+                )
+            else:
+                self.moe_offload_cache.rebuild(moe_cache_size)
         if num_pages is not None:
             # sets self.num_pages (rebuilds KV + window)
             self._resize_kv_pool(config, num_pages, num_swa_pages)
@@ -1473,6 +1511,13 @@ class Engine:
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
         )
+        if preserve_hot_state and (
+            self._ple_uring_staging_registration(self.model)
+            != ple_uring_registration
+        ):
+            raise RuntimeError(
+                "runtime cache rebuild replaced PLE uring pinned staging registration"
+            )
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream

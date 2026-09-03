@@ -401,6 +401,21 @@ class UringTable:
             result += self._global_scales.nbytes
         return result
 
+    def pinned_staging_registration(self) -> tuple:
+        """Stable identities and pointers for the CUDA-mapped staging registration."""
+        banks = [self._stage_bank, self._local_ids_bank]
+        if self._stage_scale_bank is not None:
+            banks.append(self._stage_scale_bank)
+        return (
+            tuple(
+                (id(bank), bank.tensor.data_ptr(), bool(bank._pinned))
+                for bank in banks
+            ),
+            self._local_ids_ptr,
+            None if self._uva is None else self._uva._table_ptr,
+            None if self._uva is None else self._uva._scale_ptr,
+        )
+
     @property
     def prefetch_pages(self) -> int:
         return 0

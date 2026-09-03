@@ -875,14 +875,22 @@ class OffloadMoeCache:
                 "1024); reduce moe_cache_size or force --nvfp4-backend triton"
             )
 
-    def rebuild(self, cache_size: int) -> None:
+    def drain_hot_adaptation_for_rebuild(self) -> None:
+        """Publish every in-flight HOT phase before replacing slot storage."""
+        while self._hot_adapt_future is not None:
+            self._hot_adapt_future.result()
+            self._poll_hot_adaptation()
+
+    def rebuild(self, cache_size: int, *, preserve_hot_state: bool = False) -> None:
         """Resize the GPU slot cache + bookkeeping to ``cache_size`` IN PLACE.
 
         Keeps the CPU/pinned ``bank_sources`` and the GPU-resident alphas; never
         reloads banks. Tears down prefill-overlap buffers first (their views alias
         the old ``bank_caches``), frees the old GPU tensors, then reallocates. Slots
-        cold-start after rebuild. Object identity is preserved so attached layers and
-        ``ctx.moe_offload_cache`` stay valid.
+        cold-start after rebuild. Protected HOT rows are reloaded into their new fixed
+        slots. Object identity is preserved so attached layers and
+        ``ctx.moe_offload_cache`` stay valid. ``preserve_hot_state`` additionally keeps
+        the current realized-hit window used by ladder growth diagnostics.
         """
         assert self.bank_sources, "set_bank_sources must run before rebuild"
         self.validate_rebuild(cache_size)
@@ -895,18 +903,15 @@ class OffloadMoeCache:
                 f"HOT residency needs {total_hot_rows} protected slots plus "
                 f"{dynamic_reserve} dynamic/prefill slots, but moe_cache_size={cache_size}"
             )
-        # Catch-up copies can install rows from their worker thread. Resolve or
-        # cancel that work while the old slot tensors and row map are still valid,
-        # then discard its publication state. The final _reload_hot_slots call
-        # restores every authoritative owner into the newly allocated cache.
-        future = self._hot_adapt_future
-        if future is not None:
-            if not future.cancel():
-                future.result()
-            self._hot_adapt_future = None
-            self._hot_adapt_phase = None
-            self._hot_adapt_swaps_pending = ()
-            self._hot_adapt_worker_installs = False
+        if preserve_hot_state and total_hot_rows and not self._hot_staging:
+            raise ValueError(
+                "protected HOT rows cannot survive rebuild without their pinned staging bank"
+            )
+        # Catch-up copies can install rows from their worker thread. Finish their
+        # normal publication path while the old slot tensors and row map are still
+        # valid. Clearing a completed future directly would retain its retired None
+        # owners and silently drop those protected rows at the rebuild boundary.
+        self.drain_hot_adaptation_for_rebuild()
         # 1. Tear down prefill-overlap (its buffer views alias the old bank_caches).
         self.prefill_bank_buffers = []
         self.prefill_copy_stream = None
@@ -967,13 +972,17 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
-        self.stat_hot_pairs.zero_()
-        self.stat_hot_total_pairs.zero_()
-        self._prefill_hot_pairs = 0
-        self._prefill_route_pairs = 0
-        self._prefill_cpu_experts = 0
-        self.decode_freq.zero_()
-        self._protected_route_baseline = None
+        if not preserve_hot_state:
+            self.stat_hot_pairs.zero_()
+            self.stat_hot_total_pairs.zero_()
+            self._prefill_hot_pairs = 0
+            self._prefill_route_pairs = 0
+            self._prefill_cpu_experts = 0
+            self.decode_freq.zero_()
+            self._protected_route_baseline = None
+        # Ladder growth preserves the adaptation controller, decayed counters,
+        # published owner plan, and plan persistence state in place. Only the
+        # cache-size-shaped LRU metadata above is cold-started.
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable

@@ -1140,10 +1140,16 @@ def test_rebuild_drains_hot_adaptation_before_replacing_bank_caches(monkeypatch)
         def cancel(self):
             return False
 
+        def done(self):
+            return True
+
         def result(self):
             drain_started.set()
             assert release.wait(timeout=5)
             assert cache.bank_caches is old_bank_caches
+            for bank_id, name in enumerate(cache.bank_schema):
+                cache._hot_staging[bank_id][0].copy_(sources[name][0][1])
+            return {(0, 0)}, 0.0
 
     cache._hot_adapt_future = ControlledFuture()
     cache._hot_adapt_phase = "copy"
@@ -1171,6 +1177,83 @@ def test_rebuild_drains_hot_adaptation_before_replacing_bank_caches(monkeypatch)
             )
     finally:
         release.set()
+        cache.shutdown_hot_adaptation()
+
+
+def test_ladder_rebuild_preserves_hot_mapping_counters_and_plan(monkeypatch):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    sources = {
+        "gate_up": [torch.arange(4 * 3, dtype=torch.int32).view(4, 3)],
+        "down": [torch.arange(4 * 2, dtype=torch.int32).view(4, 2) + 100],
+    }
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size()
+        for bank in sources.values()
+    )
+    cache = OffloadMoeCache(
+        num_layers=1,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value],
+        hot_expert_ids={0: (1, 3)},
+    )
+    cache.configure_hot_adaptation(
+        half_life_steps=2,
+        interval_steps=0,
+        max_swap_bytes=expert_bytes,
+        expert_bytes=expert_bytes,
+    )
+    try:
+        cache.stat_hot_pairs.fill_(94)
+        cache.stat_hot_total_pairs.fill_(100)
+        cache.decayed_decode_freq.copy_(torch.tensor([[1.0, 7.0, 2.0, 9.0]]))
+        cache.decode_freq.copy_(
+            torch.tensor([[1, 7, 2, 9]], dtype=torch.int64)
+        )
+        cache._protected_route_baseline = [[0, 3, 0, 4]]
+        owners_before = {
+            layer_id: tuple(owners)
+            for layer_id, owners in cache._hot_slot_owners.items()
+        }
+        plan_before = dict(cache._hot_plan_last_published_owners)
+        decayed_before = cache.decayed_decode_freq.clone()
+        decode_before = cache.decode_freq.clone()
+
+        cache.rebuild(6, preserve_hot_state=True)
+
+        assert {
+            layer_id: tuple(owners)
+            for layer_id, owners in cache._hot_slot_owners.items()
+        } == owners_before
+        for expert in (1, 3):
+            slot = int(cache.slot_for_id[0, expert].item())
+            assert slot >= 0
+            for name in cache.bank_schema:
+                assert torch.equal(
+                    cache.bank_caches[name][slot],
+                    sources[name][0][expert],
+                )
+        assert int(cache.stat_hot_pairs.item()) == 94
+        assert int(cache.stat_hot_total_pairs.item()) == 100
+        assert int(cache.stat_hot_pairs.item()) / int(
+            cache.stat_hot_total_pairs.item()
+        ) == 0.94
+        assert torch.equal(cache.decayed_decode_freq, decayed_before)
+        assert torch.equal(cache.decode_freq, decode_before)
+        assert cache._protected_route_baseline == [[0, 3, 0, 4]]
+        assert cache._hot_plan_last_published_owners == plan_before
+    finally:
         cache.shutdown_hot_adaptation()
 
 
