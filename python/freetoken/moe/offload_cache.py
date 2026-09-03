@@ -392,6 +392,10 @@ class OffloadMoeCache:
         self.decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
         )
+        # Host snapshot used only by periodic status reporting. Device route counts keep
+        # accumulating without a per-step sync; each report subtracts this baseline to
+        # compare the current protected set with the best set of the same per-layer size.
+        self._protected_route_baseline: list[list[int]] | None = None
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -897,6 +901,7 @@ class OffloadMoeCache:
         self._prefill_route_pairs = 0
         self._prefill_cpu_experts = 0
         self.decode_freq.zero_()
+        self._protected_route_baseline = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
@@ -1789,6 +1794,13 @@ class OffloadMoeCache:
         result["hot_pair_rate"] = hot_pairs / total_pairs if total_pairs else 0.0
         result["hot_pairs"] = hot_pairs
         result["routed_pairs"] = total_pairs
+        result.update(
+            self.protected_routing_stats(
+                realized_hits=hot_pairs,
+                routed_pairs=total_pairs,
+                reset=reset,
+            )
+        )
         result["prefill_hot_route_frac"] = (
             self._prefill_hot_pairs / self._prefill_route_pairs
             if self._prefill_route_pairs else 0.0
@@ -1822,6 +1834,50 @@ class OffloadMoeCache:
             self._hot_adapt_ticks_decode_reported = self.hot_adapt_ticks_decode
             self._hot_adapt_swaps_reported = self.hot_adapt_swaps
         return result
+
+    def protected_routing_stats(
+        self,
+        *,
+        realized_hits: int,
+        routed_pairs: int,
+        reset: bool = False,
+    ) -> dict:
+        """Compare protected-slot coverage with a same-capacity routing oracle.
+
+        Route frequencies accumulate on the device under ``--moe-collect-stats``.
+        This method is called only by the periodic status reporter, where one host
+        read is acceptable. For each protected layer, the oracle takes the C most
+        routed experts, where C is that layer's protected-slot capacity. Both oracle
+        and realized hit rates use the exact routed-pair count as their denominator.
+        """
+        if not self.collect_stats or not self.hot_expert_capacity or routed_pairs <= 0:
+            return {}
+
+        snapshot = self.decode_freq.tolist()
+        baseline = self._protected_route_baseline
+        if baseline is None:
+            baseline = [
+                [0] * self.num_experts for _ in range(self.num_layers)
+            ]
+
+        oracle_hits = 0
+        for layer_id, capacity in self.hot_expert_capacity.items():
+            counts = [
+                max(0, current - previous)
+                for current, previous in zip(
+                    snapshot[layer_id], baseline[layer_id], strict=True
+                )
+            ]
+            oracle_hits += sum(sorted(counts, reverse=True)[:capacity])
+
+        if reset:
+            self._protected_route_baseline = snapshot
+        return {
+            "oracle_hit": oracle_hits / routed_pairs,
+            "realized_hit": realized_hits / routed_pairs,
+            "oracle_hits": oracle_hits,
+            "oracle_routed_pairs": routed_pairs,
+        }
 
     def record_prefill_hot_split(
         self, raw_ids: torch.Tensor, hot_mask: torch.Tensor

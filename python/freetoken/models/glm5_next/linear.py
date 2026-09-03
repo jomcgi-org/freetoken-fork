@@ -102,6 +102,7 @@ class Glm5NextKimiDeltaAttention(BaseOP):
             fla.cu_seqlens,
             fla.cache_indices,
             fla.has_initial_state,
+            max_seq_len=fla.max_seq_len,
         )
         return out.transpose(0, 1)
 

@@ -1,0 +1,105 @@
+"""Protected-slot routing oracle reporting under --moe-collect-stats."""
+
+import contextlib
+import io
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from freetoken.moe.offload_cache import OffloadMoeCache
+from freetoken.scheduler.scheduler import _moe_oracle_status_fragment
+from freetoken.server.args import ServerArgs, parse_args
+
+
+def test_flag_is_registered_and_defaults_off():
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.suppress(SystemExit):
+        parse_args(["--help"])
+    assert "--moe-collect-stats" in output.getvalue()
+    assert ServerArgs.moe_collect_stats is False
+
+
+def _cache(*, collect_stats: bool) -> OffloadMoeCache:
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=8,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+    )
+    cache.cpu_executor = SimpleNamespace(
+        disk_prefetch_stats=lambda reset=False: {},
+        reset_disk_lookahead=lambda: None,
+    )
+    cache.hot_expert_capacity = {0: 1, 1: 2}
+    cache.collect_stats = collect_stats
+    return cache
+
+
+def test_protected_oracle_uses_routed_pairs_and_resets_its_window():
+    cache = _cache(collect_stats=True)
+    cache.decode_freq.copy_(
+        torch.tensor([[5, 3, 2, 0], [4, 4, 1, 1]], dtype=torch.int64)
+    )
+    cache.stat_hot_pairs.fill_(9)
+    cache.stat_hot_total_pairs.fill_(20)
+
+    stats = cache.disk_prefetch_stats(reset=True)
+
+    # Same-capacity oracle: top 1 from layer 0 plus top 2 from layer 1.
+    assert stats["oracle_hits"] == 13
+    assert stats["oracle_routed_pairs"] == 20
+    assert stats["oracle_hit"] == pytest.approx(13 / 20)
+    assert stats["realized_hit"] == pytest.approx(9 / 20)
+
+    cache.decode_freq.add_(
+        torch.tensor([[0, 2, 0, 0], [0, 0, 3, 1]], dtype=torch.int64)
+    )
+    cache.stat_hot_pairs.fill_(2)
+    cache.stat_hot_total_pairs.fill_(6)
+    next_stats = cache.disk_prefetch_stats(reset=True)
+    assert next_stats["oracle_hits"] == 6
+    assert next_stats["oracle_hit"] == pytest.approx(1.0)
+    assert next_stats["realized_hit"] == pytest.approx(2 / 6)
+
+
+def test_protected_oracle_is_gated_by_moe_collect_stats():
+    cache = _cache(collect_stats=False)
+    cache.stat_hot_pairs.fill_(3)
+    cache.stat_hot_total_pairs.fill_(4)
+    stats = cache.disk_prefetch_stats(reset=True)
+    assert "oracle_hit" not in stats
+    assert "realized_hit" not in stats
+
+
+def test_rebuild_clears_the_protected_oracle_baseline():
+    cache = _cache(collect_stats=True)
+    cache.set_bank_sources(
+        {
+            "gate_up": [torch.randn(4, 8, 4) for _ in range(2)],
+            "down": [torch.randn(4, 4, 8) for _ in range(2)],
+        }
+    )
+    cache.hot_expert_capacity = {0: 1, 1: 2}
+    cache.decode_freq.fill_(10)
+    cache.protected_routing_stats(realized_hits=0, routed_pairs=80, reset=True)
+
+    cache.rebuild(8)
+    cache.decode_freq.copy_(
+        torch.tensor([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=torch.int64)
+    )
+    stats = cache.protected_routing_stats(
+        realized_hits=2, routed_pairs=2, reset=True
+    )
+
+    assert stats["oracle_hits"] >= 2
+    assert stats["oracle_hit"] >= stats["realized_hit"]
+
+
+def test_stats_line_reports_oracle_against_realized_coverage():
+    fragment = _moe_oracle_status_fragment(
+        {"oracle_hit": 0.8125, "realized_hit": 0.6875}
+    )
+    assert fragment == ", disk oracle_hit: 81.25% vs realized: 68.75%"
+    assert _moe_oracle_status_fragment({"hot_pair_rate": 0.5}) == ""
