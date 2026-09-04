@@ -1105,4 +1105,5 @@ Deploy 2 (tier 6aa3922 with both flags in the unit) aborted twice on one
 test, `test_disk_hot_cold_split_matches_pure_cpu_decode`, which passes alone
 and in the hot-adapt subset and fails only after `test_step_timing` and
 `test_cpu_moe` have run in the same session (issue #18). The gate now runs the
-subset; the deploy landed on the third attempt.
+subset; the third attempt is queued behind the thread-count arms as this is
+written (result in the production section below when it lands).
