@@ -225,7 +225,7 @@ def test_qsa_verify_steps_keep_distinct_persistent_lengths():
     assert metadata[0].block_table.tolist() == [[3, 4, 5]]
 
 
-def test_e2m1_dequant_does_not_construct_a_host_lookup(monkeypatch):
+def test_capture_paths_generate_constants_on_device(monkeypatch):
     import importlib.util
     import sys
     from pathlib import Path
@@ -284,8 +284,11 @@ def test_e2m1_dequant_does_not_construct_a_host_lookup(monkeypatch):
 
     monkeypatch.setattr(torch, "tensor", reject_host_tensor)
     values = ple_module.dequantize_ple_rows(data, scales, "e2m1g16")
+    ple_module._MTP_FUSED_INDPTR.clear()
+    indptr = ple_module._mtp_fused_cu_seqlens(torch.device("cpu"), 2)
 
     assert torch.equal(values, expected)
+    assert indptr.tolist() == [0, 2]
 
 
 def _mtp_graph_batch(width=2):
