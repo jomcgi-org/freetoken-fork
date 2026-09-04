@@ -14,10 +14,11 @@ on one stream and about 37 across eight, with the GPU averaging 138 W.
 - Linux x86_64, an NVIDIA GPU with 24 GB, 64 GB of RAM, and about 250 GB free
   on an NVMe (the raw checkpoint is 126 GB, the quantized lookup table 27 GB,
   the converted weights 73 GB; the raw checkpoint can go after conversion).
-- The NVIDIA **open** kernel modules, not the proprietary ones. The lookup
-  table is read by the GPU straight out of the file mapping through Linux HMM,
-  and HMM needs the open modules. Check with `modinfo nvidia | grep -i license`
-  (open modules report a dual MIT/GPL license).
+- Any NVIDIA kernel modules for the `uring` PLE backend of record. Only the
+  retired `--ple-backend hmm` (the GPU reading the lookup table straight out
+  of the file mapping) needs the **open** modules; check with
+  `modinfo nvidia | grep -i license` (open modules report a dual MIT/GPL
+  license) if you try it.
 - A CUDA 13 toolkit with `nvcc` on PATH, Python 3.12, `uv`, and `ninja`.
 
 ## 2. Install the fork
