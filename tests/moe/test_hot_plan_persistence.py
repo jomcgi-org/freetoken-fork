@@ -54,7 +54,7 @@ def test_checkpoint_identity_hashes_index_and_stats_shards(tmp_path):
 
 
 def _document(
-    *, layers=(0, 1), budget=400, capacity_policy="equal", written_at=1000.0
+    *, layers=(0, 1), budget=400, capacity_policy="equal", written_at=1000.0, prefill_counters=None
 ):
     counters = {
         0: (1.0, 9.0, 8.0, 2.0),
@@ -70,6 +70,11 @@ def _document(
         tier_commit="tier-old",
         protected_slots={layer: ((0, 3) if layer == 0 else (2, 1)) for layer in layers},
         decayed_counters={layer: counters[layer] for layer in layers},
+        decayed_prefill_counters=(
+            {layer: prefill_counters[layer] for layer in layers}
+            if prefill_counters is not None
+            else None
+        ),
         written_at=written_at,
     )
 
@@ -108,6 +113,40 @@ def test_hot_plan_round_trip_preserves_slot_order_counters_and_metadata(tmp_path
     assert seed.capacity_policy == "equal"
     assert seed.tier_commit == "tier-old"
     assert seed.tier_mismatch
+    assert seed.prefill_counters == {}
+
+
+def test_hot_plan_round_trip_preserves_optional_prefill_counters(tmp_path):
+    path = tmp_path / HOT_PLAN_FILENAME
+    prefill = {
+        0: (10.0, 20.0, 30.0, 40.0),
+        1: (4.0, 3.0, 2.0, 1.0),
+    }
+    document = _document(prefill_counters=prefill)
+    assert document is not None
+    assert "decayed_prefill_counters" in document
+    atomic_write_hot_plan(str(path), document)
+
+    seed = _load(path)
+
+    assert seed.prefill_counters[0] == pytest.approx(prefill[0])
+    assert seed.prefill_counters[1] == pytest.approx(prefill[1])
+
+
+def test_older_hot_plan_without_prefill_section_seeds_prefill_as_zero(tmp_path):
+    path = tmp_path / HOT_PLAN_FILENAME
+    document = _document()
+    assert document is not None
+    assert "decayed_prefill_counters" not in document
+    atomic_write_hot_plan(str(path), document)
+
+    seed = _load(path)
+    prefill_seed = {
+        layer_id: seed.prefill_counters.get(layer_id, (0.0,) * 4)
+        for layer_id in seed.seeded_layers
+    }
+
+    assert prefill_seed == {0: (0.0,) * 4, 1: (0.0,) * 4}
 
 
 def test_hot_plan_identity_mismatch_is_ignored_by_loader(tmp_path):

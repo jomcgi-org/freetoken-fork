@@ -146,6 +146,14 @@ What each line does:
   repeated idle adaptation ticks. The default is 2000 milliseconds.
 - `--moe-hot-adapt-prefill-weight N`: scales prefill route counts before they
   update HOT adaptation counters. The default is 1.0.
+- `--moe-hot-adapt-histories {shared,split}`: keeps prefill and decode route
+  histories together or in separate counters. The default is `shared`, which
+  preserves the original ranking behavior.
+- `--moe-hot-adapt-prefill-blend N`: ranks split histories as decode plus this
+  fraction of prefill history. The default is 0.25.
+- `--moe-hot-adapt-prefill-normalize {off,tokens}`: with split histories,
+  optionally divides each prefill invocation's route counts by its token count.
+  The default is `off`.
 - `--moe-hot-adapt-prefill-run-cap-frac N`: caps total row swaps across one
   consecutive prefill run as a fraction of the HOT budget. The default is 0,
   which disables the run cap.

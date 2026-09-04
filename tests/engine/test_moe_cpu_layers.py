@@ -777,6 +777,9 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_hot_adapt_max_swap_gib == 0.5
     assert config.moe_hot_adapt_boundary_cap_frac == 0.5
     assert config.moe_hot_adapt_prefill_weight == 1.0
+    assert config.moe_hot_adapt_histories == "shared"
+    assert config.moe_hot_adapt_prefill_blend == 0.25
+    assert config.moe_hot_adapt_prefill_normalize == "off"
     assert config.moe_hot_adapt_prefill_run_cap_frac == 0.0
     assert config.moe_hot_adapt_post_prefill_tick is False
     assert config.moe_hot_plan_persist == "auto"
@@ -911,6 +914,54 @@ def test_engine_config_rejects_invalid_hot_adapt_prefill_weight(weight):
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_hot_adapt_prefill_weight=weight,
+        )
+
+
+@pytest.mark.parametrize("histories", ["combined", "decode", ""])
+def test_engine_config_rejects_invalid_hot_adapt_histories(histories):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-histories"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_histories=histories,
+        )
+
+
+@pytest.mark.parametrize("blend", [-0.1, 1.5, float("inf"), float("nan"), True])
+def test_engine_config_rejects_invalid_hot_adapt_prefill_blend(blend):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-prefill-blend"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_prefill_blend=blend,
+        )
+
+
+@pytest.mark.parametrize("normalize", ["token", "on", ""])
+def test_engine_config_rejects_invalid_hot_adapt_prefill_normalize(normalize):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-prefill-normalize"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_prefill_normalize=normalize,
         )
 
 

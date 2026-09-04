@@ -1019,6 +1019,13 @@ class Engine:
                 prefill_weight=getattr(
                     config, "moe_hot_adapt_prefill_weight", 1.0
                 ),
+                histories=getattr(config, "moe_hot_adapt_histories", "shared"),
+                prefill_blend=getattr(
+                    config, "moe_hot_adapt_prefill_blend", 0.25
+                ),
+                prefill_normalize=getattr(
+                    config, "moe_hot_adapt_prefill_normalize", "off"
+                ),
                 prefill_run_cap_frac=getattr(
                     config, "moe_hot_adapt_prefill_run_cap_frac", 0.0
                 ),
@@ -1027,6 +1034,12 @@ class Engine:
                 ),
                 persisted_counter_seed=(
                     hot_plan_seed.counters if hot_plan_seed is not None else None
+                ),
+                persisted_prefill_counter_seed=(
+                    getattr(hot_plan_seed, "prefill_counters", None)
+                    if hot_plan_seed is not None
+                    and getattr(config, "moe_hot_adapt_histories", "shared") == "split"
+                    else None
                 ),
                 persisted_seeded_layers=(
                     hot_plan_seed.seeded_layers
@@ -2464,6 +2477,13 @@ def _resolve_persisted_hot_plan(
             f"MoE HOT persisted plan tier_commit={seed.tier_commit} differs from "
             f"serving tier_commit={tier_commit}; loading it because checkpoint identity matches"
         )
+    if (
+        getattr(seed, "prefill_counters", None)
+        and getattr(config, "moe_hot_adapt_histories", "shared") == "shared"
+    ):
+        logger.info_rank0(
+            "MoE HOT persisted prefill counters ignored because histories=shared"
+        )
     logger.info_rank0(
         f"MoE HOT plan source: persisted file {path!r}, age={seed.age_seconds:.0f}s, "
         f"layers_seeded={len(seed.seeded_layers)}/{len(disk_layer_ids)}, "
@@ -2772,6 +2792,9 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_max_swap_gib": 0.5,
     "moe_hot_adapt_boundary_cap_frac": 0.5,
     "moe_hot_adapt_prefill_weight": 1.0,
+    "moe_hot_adapt_histories": "shared",
+    "moe_hot_adapt_prefill_blend": 0.25,
+    "moe_hot_adapt_prefill_normalize": "off",
     "moe_hot_adapt_prefill_run_cap_frac": 0.0,
     "moe_hot_adapt_post_prefill_tick": False,
     "moe_hot_plan_persist": "auto",

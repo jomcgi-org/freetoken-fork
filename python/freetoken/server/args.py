@@ -965,6 +965,33 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-adapt-histories",
+        choices=["shared", "split"],
+        default=ServerArgs.moe_hot_adapt_histories,
+        help="HOT adaptation route histories (default: shared).",
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-prefill-blend",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_prefill_blend,
+        help=(
+            "Prefill history weight used for split-history HOT ranking "
+            "(default: 0.25)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-prefill-normalize",
+        choices=["off", "tokens"],
+        default=ServerArgs.moe_hot_adapt_prefill_normalize,
+        help=(
+            "Normalize each prefill invocation's route counts by its token count "
+            "(default: off)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-prefill-run-cap-frac",
         type=float,
         default=ServerArgs.moe_hot_adapt_prefill_run_cap_frac,

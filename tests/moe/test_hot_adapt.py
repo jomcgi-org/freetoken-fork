@@ -19,6 +19,7 @@ from freetoken.moe.hot_adapt import (
     HotAdaptTokenClock,
     HotSwap,
     allocate_hot_capacity,
+    blend_histories,
     finish_hot_swaps,
     hot_boundary_interval_tokens,
     hot_catchup_swap_bytes,
@@ -428,6 +429,124 @@ def test_hot_cpu_counter_route_weight_and_default(monkeypatch):
     assert default.decayed_decode_freq[0].tolist() == pytest.approx(
         [2.0, 3.0, 1.0, 2.0]
     )
+
+
+def test_blend_histories_endpoints_and_shape_validation():
+    decode = {0: (1.0, 4.0), 1: (3.0, 2.0)}
+    prefill = {0: (10.0, 2.0), 1: (1.0, 8.0)}
+
+    assert blend_histories(decode, prefill, 0.0) == decode
+    assert blend_histories(decode, prefill, 1.0) == {
+        0: (11.0, 6.0),
+        1: (4.0, 10.0),
+    }
+    with pytest.raises(ValueError, match="layers must match"):
+        blend_histories(decode, {0: (1.0, 2.0)}, 0.25)
+    with pytest.raises(ValueError, match="shapes differ"):
+        blend_histories(decode, {0: (1.0,), 1: (1.0, 2.0)}, 0.25)
+
+
+def test_split_cpu_counters_keep_prefill_and_decode_independent(monkeypatch):
+    import torch
+
+    kernels = _offload_kernels_without_triton(monkeypatch)
+    cache = SimpleNamespace(
+        num_experts=2,
+        cache_size=2,
+        hot_row_for_expert=torch.tensor([[0, 1]], dtype=torch.int32),
+        slot_for_id=torch.tensor([[0, 1]], dtype=torch.int32),
+        id_of_slot=torch.tensor([0, 1], dtype=torch.int32),
+        usage=torch.zeros(2, dtype=torch.int64),
+        step=torch.zeros((), dtype=torch.int64),
+        active_mask=torch.zeros(2, dtype=torch.int32),
+        evict_slots=torch.empty(2, dtype=torch.int32),
+        src_indices=torch.empty(2, dtype=torch.int32),
+        num_indices=torch.zeros(1, dtype=torch.int64),
+        num_missing_full=torch.zeros(1, dtype=torch.int64),
+        stat_hot_pairs=torch.zeros((), dtype=torch.int64),
+        stat_hot_total_pairs=torch.zeros((), dtype=torch.int64),
+        hot_adapt_enabled=True,
+        _hot_decay_factor=1.0,
+        decayed_decode_freq=torch.zeros((1, 2)),
+        decayed_prefill_freq=torch.zeros((1, 2)),
+    )
+    kernels.ensure_experts_hot(
+        cache, 0, torch.tensor([[0, 0]], dtype=torch.int32), history="prefill"
+    )
+    assert cache.decayed_prefill_freq[0].tolist() == [2.0, 0.0]
+    assert cache.decayed_decode_freq[0].tolist() == [0.0, 0.0]
+
+    kernels.ensure_experts_hot(
+        cache, 0, torch.tensor([[1, 1]], dtype=torch.int32)
+    )
+    assert cache.decayed_prefill_freq[0].tolist() == [2.0, 0.0]
+    assert cache.decayed_decode_freq[0].tolist() == [0.0, 2.0]
+
+
+def test_prefill_token_normalization_scales_one_invocation_to_top_k(monkeypatch):
+    import torch
+
+    kernels = _offload_kernels_without_triton(monkeypatch)
+    tokens = 2048
+    top_k = 10
+    cache = SimpleNamespace(
+        num_experts=1,
+        cache_size=1,
+        hot_row_for_expert=torch.tensor([[0]], dtype=torch.int32),
+        slot_for_id=torch.tensor([[0]], dtype=torch.int32),
+        id_of_slot=torch.tensor([0], dtype=torch.int32),
+        usage=torch.zeros(1, dtype=torch.int64),
+        step=torch.zeros((), dtype=torch.int64),
+        active_mask=torch.zeros(1, dtype=torch.int32),
+        evict_slots=torch.empty(1, dtype=torch.int32),
+        src_indices=torch.empty(1, dtype=torch.int32),
+        num_indices=torch.zeros(1, dtype=torch.int64),
+        num_missing_full=torch.zeros(1, dtype=torch.int64),
+        stat_hot_pairs=torch.zeros((), dtype=torch.int64),
+        stat_hot_total_pairs=torch.zeros((), dtype=torch.int64),
+        hot_adapt_enabled=True,
+        _hot_decay_factor=1.0,
+        decayed_decode_freq=torch.zeros((1, 1)),
+        decayed_prefill_freq=torch.zeros((1, 1)),
+    )
+    kernels.ensure_experts_hot(
+        cache,
+        0,
+        torch.zeros((tokens, top_k), dtype=torch.int32),
+        route_weight=1.0 / tokens,
+        history="prefill",
+    )
+    assert cache.decayed_prefill_freq[0, 0].item() == pytest.approx(top_k)
+
+
+def test_split_blend_keeps_decode_heavy_experts_ranked_first():
+    counts = blend_histories(
+        {0: (0.0, 0.0, 40.0, 35.0)},
+        {0: (100.0, 80.0, 0.0, 0.0)},
+        0.25,
+    )
+    assert recompute_hot_partition(
+        counts,
+        frozenset({0}),
+        budget_bytes=2,
+        expert_bytes=1,
+        num_experts=4,
+    ) == {0: (2, 3)}
+
+
+def test_decayed_hot_pair_rate_uses_split_history_blend(monkeypatch):
+    import torch
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.hot_adapt_enabled = True
+    cache.num_layers = 1
+    cache.hot_adapt_prefill_blend = 0.25
+    cache.decayed_decode_freq = torch.tensor([[0.0, 8.0, 0.0, 2.0]])
+    cache.decayed_prefill_freq = torch.tensor([[100.0, 0.0, 0.0, 0.0]])
+    cache._hot_slot_owners = {0: [1]}
+
+    assert cache.decayed_hot_pair_rate() == pytest.approx(8.0 / 35.0)
 
 
 def test_boundary_routing_counts_prefill_decode_and_deferred_ticks(monkeypatch):
@@ -1621,11 +1740,13 @@ def test_ladder_rebuild_preserves_hot_mapping_counters_and_plan(monkeypatch):
         interval_steps=0,
         max_swap_bytes=expert_bytes,
         expert_bytes=expert_bytes,
+        histories="split",
     )
     try:
         cache.stat_hot_pairs.fill_(94)
         cache.stat_hot_total_pairs.fill_(100)
         cache.decayed_decode_freq.copy_(torch.tensor([[1.0, 7.0, 2.0, 9.0]]))
+        cache.decayed_prefill_freq.copy_(torch.tensor([[8.0, 2.0, 6.0, 4.0]]))
         cache.decode_freq.copy_(
             torch.tensor([[1, 7, 2, 9]], dtype=torch.int64)
         )
@@ -1636,6 +1757,7 @@ def test_ladder_rebuild_preserves_hot_mapping_counters_and_plan(monkeypatch):
         }
         plan_before = dict(cache._hot_plan_last_published_owners)
         decayed_before = cache.decayed_decode_freq.clone()
+        prefill_before = cache.decayed_prefill_freq.clone()
         decode_before = cache.decode_freq.clone()
 
         cache.rebuild(6, preserve_hot_state=True)
@@ -1658,6 +1780,7 @@ def test_ladder_rebuild_preserves_hot_mapping_counters_and_plan(monkeypatch):
             cache.stat_hot_total_pairs.item()
         ) == 0.94
         assert torch.equal(cache.decayed_decode_freq, decayed_before)
+        assert torch.equal(cache.decayed_prefill_freq, prefill_before)
         assert torch.equal(cache.decode_freq, decode_before)
         assert cache._protected_route_baseline == [[0, 3, 0, 4]]
         assert cache._hot_plan_last_published_owners == plan_before
@@ -1676,7 +1799,9 @@ def test_persisted_counter_seed_survives_reset(monkeypatch):
     cache = OffloadMoeCache.__new__(OffloadMoeCache)
     cache.device = torch.device("cpu")
     cache.decayed_decode_freq = torch.full((2, 3), 99.0)
+    cache.decayed_prefill_freq = torch.full((2, 3), 88.0)
     cache._hot_plan_counter_seed = {0: (1.0, 2.0, 3.0)}
+    cache._hot_plan_prefill_counter_seed = {0: (4.0, 5.0, 6.0)}
     cache._restore_hot_slot_metadata = lambda: None
     cache.expert_recency = torch.zeros((2, 3), dtype=torch.int64)
     cache.session_profile_ids = None
@@ -1686,6 +1811,8 @@ def test_persisted_counter_seed_survives_reset(monkeypatch):
 
     assert cache.decayed_decode_freq[0].tolist() == [1.0, 2.0, 3.0]
     assert cache.decayed_decode_freq[1].tolist() == [0.0, 0.0, 0.0]
+    assert cache.decayed_prefill_freq[0].tolist() == [4.0, 5.0, 6.0]
+    assert cache.decayed_prefill_freq[1].tolist() == [0.0, 0.0, 0.0]
 
 
 def test_fully_persisted_seed_starts_fill_complete(monkeypatch):
@@ -1721,6 +1848,7 @@ def test_fully_persisted_seed_starts_fill_complete(monkeypatch):
         interval_steps="auto",
         max_swap_bytes=expert_bytes,
         expert_bytes=expert_bytes,
+        histories="split",
         persisted_counter_seed={0: (1.0, 9.0, 2.0, 8.0)},
         persisted_seeded_layers=frozenset({0}),
     )
@@ -1728,6 +1856,7 @@ def test_fully_persisted_seed_starts_fill_complete(monkeypatch):
         assert cache._hot_adapt_interval_controller.fill_complete
         assert cache.hot_adapt_interval_steps == 1000
         assert cache.decayed_decode_freq[0].tolist() == [1.0, 9.0, 2.0, 8.0]
+        assert cache.decayed_prefill_freq[0].tolist() == [0.0] * 4
     finally:
         cache.shutdown_hot_adaptation()
 
@@ -1819,6 +1948,7 @@ def test_periodic_plan_snapshot_writes_from_background_worker(monkeypatch, tmp_p
         interval_steps="auto",
         max_swap_bytes=expert_bytes,
         expert_bytes=expert_bytes,
+        histories="split",
         hot_plan_path=str(path),
         hot_plan_identity=identity,
         hot_plan_tier_commit="tier-test",
@@ -1827,6 +1957,7 @@ def test_periodic_plan_snapshot_writes_from_background_worker(monkeypatch, tmp_p
     )
     try:
         cache.decayed_decode_freq[0].copy_(torch.tensor([1.0, 9.0, 2.0, 8.0]))
+        cache.decayed_prefill_freq[0].copy_(torch.tensor([8.0, 2.0, 6.0, 4.0]))
         future = cache.snapshot_hot_plan(force=True)
         assert future is not None
         assert future.result(timeout=5)
@@ -1835,6 +1966,7 @@ def test_periodic_plan_snapshot_writes_from_background_worker(monkeypatch, tmp_p
         document = json.loads(path.read_text())
         assert document["protected_slots"] == {"0": [1, 3]}
         assert document["counter_dtype"] == "float32"
+        assert "decayed_prefill_counters" in document
         assert document["tier_commit"] == "tier-test"
     finally:
         cache.shutdown_hot_adaptation()

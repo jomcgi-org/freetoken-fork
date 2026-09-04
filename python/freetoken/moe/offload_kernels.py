@@ -69,6 +69,7 @@ def ensure_experts_hot(
     *,
     record_stats: bool = True,
     route_weight: float = 1.0,
+    history: str = "decode",
 ) -> None:
     """Current HOT/COLD split for a file-backed DISK layer.
 
@@ -79,6 +80,13 @@ def ensure_experts_hot(
     counts remain unnormalized, so large prefill observations retain their
     proportional traffic weight.
     """
+    if history not in ("decode", "prefill"):
+        raise ValueError("HOT adaptation history must be 'decode' or 'prefill'")
+    decayed_freq = (
+        cache.decayed_prefill_freq
+        if history == "prefill" and cache.decayed_prefill_freq is not None
+        else cache.decayed_decode_freq
+    )
     if not expert_ids.is_cuda:
         return _ensure_experts_hot_cpu(
             cache,
@@ -86,6 +94,7 @@ def ensure_experts_hot(
             expert_ids,
             record_stats=record_stats,
             route_weight=route_weight,
+            decayed_freq=decayed_freq,
         )
     _ensure_experts_hot_gpu(
         cache,
@@ -93,6 +102,7 @@ def ensure_experts_hot(
         expert_ids,
         record_stats=record_stats,
         route_weight=route_weight,
+        decayed_freq=decayed_freq,
     )
 
 
@@ -246,13 +256,14 @@ def _ensure_experts_hot_gpu(
     *,
     record_stats: bool,
     route_weight: float,
+    decayed_freq: torch.Tensor,
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     _ensure_experts_hot_kernel[(1,)](
         expert_ids,
         cache.hot_row_for_expert,
-        cache.decayed_decode_freq,
+        decayed_freq,
         cache.slot_for_id,
         cache.id_of_slot,
         cache.usage,
@@ -349,6 +360,7 @@ def _ensure_experts_hot_cpu(
     *,
     record_stats: bool = True,
     route_weight: float = 1.0,
+    decayed_freq: torch.Tensor | None = None,
 ) -> None:
     """CPU reference for the invocation-based HOT/COLD decay and routing rule.
 
@@ -405,7 +417,9 @@ def _ensure_experts_hot_cpu(
         ).to(torch.float32)
         if route_weight != 1.0:
             counts.mul_(route_weight)
-        cache.decayed_decode_freq[layer_id].mul_(cache._hot_decay_factor).add_(counts)
+        if decayed_freq is None:
+            decayed_freq = cache.decayed_decode_freq
+        decayed_freq[layer_id].mul_(cache._hot_decay_factor).add_(counts)
     if record_stats:
         cache.stat_hot_pairs += hot_pairs
         cache.stat_hot_total_pairs += len(raw)
