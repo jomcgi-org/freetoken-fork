@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from freetoken.scheduler.scheduler import _all_hot_layers_status_fragment
 from freetoken.scheduler.status import SchedulerStatusReporter, _usage_ratio
 
 
@@ -379,6 +380,12 @@ def test_usage_ratio_guard():
     assert _usage_ratio(0, 0) == 0.0
     assert _usage_ratio(5, 0) == 0.0
     assert _usage_ratio(5, 10) == 0.5
+
+
+def test_disk_status_formats_all_hot_layers_per_step():
+    assert _all_hot_layers_status_fragment(
+        {"all_hot_layers_per_decode_step": 2.375}
+    ) == "all-hot layers/step: 2.38, "
 
 
 def test_disk_status_includes_harness_anchor_counters():

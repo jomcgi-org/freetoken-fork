@@ -140,6 +140,8 @@ class EngineConfig:
     # DISK grouped decode callback order. "before" preserves the existing critical
     # path; "after" notifies CPU workers before issuing advisory expert prefetch.
     moe_cpu_precb: str = "before"
+    # Skip coordinator-side CPU work when a HOT/COLD split has no valid CPU routes.
+    moe_cpu_empty_skip: str = "off"
     # Optionally suppress repeat WILLNEED advice for recently computed DISK experts.
     moe_cpu_willneed: str = "always"
     moe_cpu_willneed_recent_steps: int = 256
@@ -340,6 +342,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-cpu-precb must be 'before' or 'after', got "
                 f"{self.moe_cpu_precb!r}"
+            )
+        if self.moe_cpu_empty_skip not in ("off", "on"):
+            raise ValueError(
+                "--moe-cpu-empty-skip must be 'off' or 'on', got "
+                f"{self.moe_cpu_empty_skip!r}"
             )
         if self.moe_cpu_willneed not in ("always", "recent"):
             raise ValueError(

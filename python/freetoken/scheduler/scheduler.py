@@ -62,6 +62,14 @@ def _moe_oracle_status_fragment(disk: dict) -> str:
     )
 
 
+def _all_hot_layers_status_fragment(disk: dict) -> str:
+    """Format the captured count of DISK layers with no CPU routes."""
+    return (
+        f"all-hot layers/step: "
+        f"{disk.get('all_hot_layers_per_decode_step', 0.0):.2f}, "
+    )
+
+
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
     batch: Batch
@@ -231,6 +239,7 @@ class Scheduler(SchedulerIOMixin):
                     f"disk major faults: {disk['major_faults']}, "
                     f"disk major faults/decode step: "
                     f"{disk['major_faults_per_decode_step']:.2f}, "
+                    f"{_all_hot_layers_status_fragment(disk)}"
                     f"willneed_skipped/advised: "
                     f"{disk.get('willneed_skipped_experts', 0)}/"
                     f"{disk.get('willneed_advised_experts', 0)}, "

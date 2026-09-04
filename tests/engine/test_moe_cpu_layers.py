@@ -966,6 +966,24 @@ def test_engine_config_validates_cpu_willneed_settings():
         EngineConfig(**base, moe_cpu_willneed_fault_ceiling=0)
 
 
+def test_engine_config_validates_cpu_empty_skip():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    base = {
+        "model_path": "/tmp/model",
+        "tp_info": DistributedInfo(0, 1),
+        "dtype": torch.bfloat16,
+    }
+    assert EngineConfig(**base).moe_cpu_empty_skip == "off"
+    enabled = EngineConfig(**base, moe_cpu_empty_skip="on")
+    assert enabled.moe_cpu_empty_skip == "on"
+    with pytest.raises(ValueError, match="--moe-cpu-empty-skip.*off.*on"):
+        EngineConfig(**base, moe_cpu_empty_skip="auto")
+
+
 @pytest.mark.parametrize("pager", ["madvise", "uffd"])
 def test_engine_config_accepts_disk_pagers(pager):
     import torch

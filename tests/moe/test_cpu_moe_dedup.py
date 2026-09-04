@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+
+def _wait_for_coordinator(done: torch.Tensor) -> None:
+    deadline = time.monotonic() + 3.0
+    while int(done[0]) == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert int(done[0]) == 1
 
 
 def _make_bf16_cache(experts: int, hidden: int, intermediate: int):
@@ -104,3 +112,76 @@ def test_grouped_decode_skips_invalid_routes_like_ungrouped_reference():
     ungrouped = executor.prefill(0, hidden, weights, ids)
 
     assert torch.equal(grouped, ungrouped)
+
+
+def test_coordinator_empty_skip_zeros_partial_and_preserves_routed_tasks():
+    try:
+        from freetoken.kernel import _cpu_moe
+    except (ImportError, OSError) as exc:
+        pytest.skip(f"CPU MoE extension is not built: {exc}")
+    if not hasattr(_cpu_moe.CpuMoeExecutor, "set_empty_skip"):
+        pytest.skip("CPU MoE extension needs rebuilding for empty-skip coverage")
+
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(1311)
+    experts, hidden_size, intermediate, top_k, batch = 8, 64, 64, 4, 2
+    cache = _make_bf16_cache(experts, hidden_size, intermediate)
+    executor = CpuMoeExecutor(
+        cache,
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=2,
+        max_tokens=batch,
+        device=torch.device("cpu"),
+        step_timing=True,
+        moe_cpu_empty_skip="on",
+    )
+    hidden = torch.randn(batch, hidden_size, dtype=torch.bfloat16)
+    weights = torch.rand(batch, top_k, dtype=torch.float32)
+    valid_ids = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.int32)
+    reference = executor.prefill(0, hidden, weights, valid_ids)
+
+    io = executor._io_for(batch)
+    task = executor._task_for(0, batch)
+    callback_calls = []
+
+    def callback(*args):
+        callback_calls.append(args)
+
+    executor._ext.set_pre_run_callback(callback)
+    ready = torch.zeros(1, dtype=torch.int64)
+    done = torch.zeros(1, dtype=torch.int64)
+    executor._ext.register_flag_task(0, task)
+    executor._ext.start_flag_coordinator(
+        ready.data_ptr(), done.data_ptr(), 1, -1
+    )
+
+    io["x"].copy_(hidden)
+    io["w"].copy_(weights)
+    io["ids"].fill_(-1)
+    io["y"].fill_(7)
+    ready[0] = 1
+    _wait_for_coordinator(done)
+
+    assert torch.count_nonzero(io["y"]) == 0
+    assert callback_calls == []
+    empty_timing = executor._ext.step_timing_snapshot_and_reset()[0]
+    assert empty_timing["tasks"] == 1
+    assert empty_timing["empty_tasks"] == 1
+    assert empty_timing["empty_us"] >= 0
+    assert empty_timing["wake_us"] == 0
+    assert empty_timing["compute_us"] == 0
+    assert empty_timing["signal_us"] == 0
+
+    done[0] = 0
+    io["ids"].copy_(valid_ids)
+    ready[0] = 1
+    _wait_for_coordinator(done)
+
+    assert torch.equal(io["y"], reference)
+    assert len(callback_calls) == 1
+    routed_timing = executor._ext.step_timing_snapshot_and_reset()[0]
+    assert routed_timing["tasks"] == 1
+    assert routed_timing["empty_tasks"] == 0

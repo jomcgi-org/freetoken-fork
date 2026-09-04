@@ -159,6 +159,37 @@ def test_moe_cpu_precb_rejects_unknown_mode():
         )
 
 
+def test_moe_cpu_empty_skip_defaults_off_and_accepts_on():
+    default, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    enabled, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-cpu-empty-skip",
+            "on",
+        ]
+    )
+
+    assert default.moe_cpu_empty_skip == "off"
+    assert enabled.moe_cpu_empty_skip == "on"
+
+
+def test_moe_cpu_empty_skip_rejects_unknown_mode():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--dtype",
+                "bfloat16",
+                "--moe-cpu-empty-skip",
+                "auto",
+            ]
+        )
+
+
 def test_moe_cpu_willneed_defaults_and_accepts_recent():
     default, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
     recent, _ = parse_args(

@@ -1156,6 +1156,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-cpu-empty-skip",
+        choices=["off", "on"],
+        default=ServerArgs.moe_cpu_empty_skip,
+        help=(
+            "Skip the CPU callback, worker notify, and barriers when a DISK decode "
+            "layer has no valid CPU routes (default: off)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-willneed",
         choices=["always", "recent"],
         default=ServerArgs.moe_cpu_willneed,
