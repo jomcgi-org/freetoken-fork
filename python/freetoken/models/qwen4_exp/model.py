@@ -183,6 +183,12 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             return 0
 
         backend = getattr(engine_config, "ple_backend", "pinned")
+        mtp_verify_width = (
+            int(getattr(engine_config, "mtp_draft_tokens", 1)) + 1
+            if getattr(engine_config, "speculative_mtp", "off") == "on"
+            and getattr(engine_config, "mtp_verify_graph", "on") == "on"
+            else 1
+        )
         if backend == "uring":
             from .ple import process_major_faults
             from .ple_uring import UringTable, resolve_uring_source
@@ -196,6 +202,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
             max_tokens = max(
                 max_decode_batch_size,
+                mtp_verify_width,
                 int(
                     getattr(
                         engine_config,
@@ -221,6 +228,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 max_decode_batch_size, dtype=torch.int64, pin_memory=pin
             )
             self._ple_waited_events = [None] * max_decode_batch_size
+            self._init_mtp_verify_ple_staging(args, mtp_verify_width)
             reserved = 0
             staging_mib = int(
                 getattr(engine_config, "ple_uring_staging_mib", 64)
@@ -230,7 +238,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                     source,
                     staging_mib,
                     int(getattr(engine_config, "ple_uring_queue_depth", 64)),
-                    max_decode_batch_size=max_decode_batch_size,
+                    max_decode_batch_size=max(
+                        max_decode_batch_size, mtp_verify_width
+                    ),
                     rows_per_token=args.num_ngram_heads,
                     required_capacity_rows=required_capacity,
                 )
@@ -238,7 +248,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 self._ple_disk_backends.append(streamed)
                 ple.ple_embedding.attach_table(streamed)
                 ple.ple_embedding.snapshot_host_hash_constants(
-                    max_decode_batch_size
+                    max(max_decode_batch_size, mtp_verify_width)
                 )
             logger.info_rank0(
                 f"PLE startup: layers={len(ple_layers)}, "
@@ -318,11 +328,15 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             )
             max_tokens = max(
                 max_decode_batch_size,
+                mtp_verify_width,
                 int(engine_config.max_forward_len),
             )
             source_capacity = max_tokens * args.num_ngram_heads
             capacity = ple_cache_capacity_rows(engine_config.ple_cache_gib, table)
-            decode_rows = max_decode_batch_size * args.num_ngram_heads
+            decode_rows = (
+                max(max_decode_batch_size, mtp_verify_width)
+                * args.num_ngram_heads
+            )
             if capacity < decode_rows:
                 raise ValueError(
                     f"--ple-cache-gib {engine_config.ple_cache_gib} holds {capacity} rows, "
@@ -347,6 +361,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 max_decode_batch_size, dtype=torch.int64, pin_memory=pin
             )
             self._ple_waited_events = [None] * max_decode_batch_size
+            self._init_mtp_verify_ple_staging(args, mtp_verify_width)
             reserved = 0
             warmed = 0
             for ple in ple_layers:
@@ -354,7 +369,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                     table,
                     capacity,
                     source_capacity,
-                    max_decode_batch_size=max_decode_batch_size,
+                    max_decode_batch_size=max(
+                        max_decode_batch_size, mtp_verify_width
+                    ),
                     rows_per_token=args.num_ngram_heads,
                     collect_profile=bool(profile_out),
                 )
@@ -363,7 +380,9 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 reserved += cached.cache_nbytes
                 self._ple_disk_backends.append(cached)
                 ple.ple_embedding.attach_table(cached)
-                ple.ple_embedding.snapshot_host_hash_constants(max_decode_batch_size)
+                ple.ple_embedding.snapshot_host_hash_constants(
+                    max(max_decode_batch_size, mtp_verify_width)
+                )
             self._ple_disk_decode = tuple(zip(ple_layers, self._ple_disk_backends))
             logger.info_rank0(
                 f"PLE cache: {capacity} rows, {reserved / 2**30:.2f} GiB pinned, "
@@ -387,6 +406,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             # must not depend on that incidental property.
             max_tokens = max(
                 max_decode_batch_size,
+                mtp_verify_width,
                 int(engine_config.max_forward_len),
             )
             capacity = max_tokens * args.num_ngram_heads
@@ -405,16 +425,21 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self._ple_waited_events: list[torch.cuda.Event | None] = [
                 None
             ] * max_decode_batch_size
+            self._init_mtp_verify_ple_staging(args, mtp_verify_width)
             for ple in ple_layers:
                 staged = DiskStagedTable(
                     table,
                     capacity,
-                    max_decode_batch_size=max_decode_batch_size,
+                    max_decode_batch_size=max(
+                        max_decode_batch_size, mtp_verify_width
+                    ),
                     rows_per_token=args.num_ngram_heads,
                 )
                 self._ple_disk_backends.append(staged)
                 ple.ple_embedding.attach_table(staged)
-                ple.ple_embedding.snapshot_host_hash_constants(max_decode_batch_size)
+                ple.ple_embedding.snapshot_host_hash_constants(
+                    max(max_decode_batch_size, mtp_verify_width)
+                )
             self._ple_disk_decode = tuple(zip(ple_layers, self._ple_disk_backends))
             return 0
 
@@ -425,6 +450,16 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         return table.bank.nbytes + (
             0 if table.scale_bank is None else table.scale_bank.nbytes
         )
+
+    def _init_mtp_verify_ple_staging(self, args, width: int) -> None:
+        if width <= 1:
+            return
+        from freetoken.spec_decode import MTPVerifyHostStaging
+
+        self._ple_mtp_host_staging = MTPVerifyHostStaging.init(
+            width, args.ngram_size - 1
+        )
+        self._ple_mtp_staging_ready = False
 
     def ple_disk_stats(self, *, reset: bool = False) -> dict:
         """Aggregate mapped PLE prefetch and procfs major-fault counters.
@@ -623,6 +658,60 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         for ple, backend in decode_layers:
             backend.prepare_decode(ple.ple_embedding.host_decode_row_ids(contexts, current_ids))
         self._ple_staging_ns += time.perf_counter_ns() - started
+
+    def prepare_mtp_verify_cuda_graph_replay(self, batch: Batch) -> bool:
+        """Stage a fused verify window before its CUDA graph replay."""
+        backends = getattr(self, "_ple_disk_backends", None)
+        if not backends:
+            return True
+        self._ple_mtp_staging_ready = False
+        try:
+            started = time.perf_counter_ns()
+            args = self._config.qwen4_args
+            contexts, current_ids = self._ple_mtp_host_staging.prepare(
+                batch, args.ngram_boundary_token_id
+            )
+
+            decode_layers = getattr(self, "_ple_disk_decode", None)
+            if decode_layers is None:
+                decode_layers = tuple(zip(self.model.ple_layers, backends))
+            assert len(decode_layers) == len(backends)
+            for ple, backend in decode_layers:
+                row_ids = ple.ple_embedding.host_decode_row_ids(
+                    contexts, current_ids
+                )
+                backend.prepare_decode(row_ids)
+                if getattr(backend, "_decode_shape", None) != row_ids.shape:
+                    raise RuntimeError("PLE backend did not complete MTP verify staging")
+            self._ple_staging_ns += time.perf_counter_ns() - started
+            self._ple_mtp_staging_ready = True
+            return True
+        except (MemoryError, OSError, RuntimeError, ValueError) as exc:
+            for backend in backends:
+                backend.finish_decode(record_event=False)
+            if not getattr(self, "_ple_mtp_fallback_logged", False):
+                logger.warning_rank0(
+                    f"MTP verify PLE staging failed; using eager verification: {exc}"
+                )
+                self._ple_mtp_fallback_logged = True
+            return False
+
+    def mtp_verify_cuda_graph_ready(self, batch: Batch) -> bool:
+        backends = getattr(self, "_ple_disk_backends", None)
+        if not backends:
+            return True
+        expected = torch.Size(
+            (batch.input_ids.numel(), self._config.qwen4_args.num_ngram_heads)
+        )
+        return self._ple_mtp_staging_ready and all(
+            getattr(backend, "_decode_shape", None) == expected
+            for backend in backends
+        )
+
+    def finish_mtp_verify_cuda_graph_replay(self, *, record_event: bool) -> None:
+        self.finish_cuda_graph_replay(record_event=record_event)
+        if getattr(self, "_ple_disk_backends", None):
+            self._ple_mtp_staging_ready = False
 
     def finish_cuda_graph_replay(self, *, record_event: bool) -> None:
         """Fence fixed host-buffer reuse after a submitted graph or eager warmup."""

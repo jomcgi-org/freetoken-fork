@@ -1624,6 +1624,8 @@ class Engine:
         self.attn_backend.prepare_metadata(batch)
         if self.graph_runner.can_use_mtp_verify_graph(batch, width):
             logits = self.graph_runner.replay_mtp_verify(batch, width)
+            if logits is None:
+                logits = self.model.forward(select_last=False)
         else:
             logits = self.model.forward(select_last=False)
         full_hidden = self.model.model._last_hc_hidden

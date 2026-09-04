@@ -11,6 +11,7 @@ from freetoken.distributed import DistributedInfo
 from freetoken.engine.config import EngineConfig
 from freetoken.engine.graph import GraphCaptureBuffer, GraphRunner
 from freetoken.spec_decode import (
+    MTPVerifyHostStaging,
     configure_mtp_decode_step,
     configure_mtp_fused_step,
     reserve_mtp_window,
@@ -193,6 +194,33 @@ def test_mtp_verify_graph_eligibility_is_width_keyed_and_requires_mtp():
     assert not runner.can_use_mtp_verify_graph(batch, 2)
 
 
+@pytest.mark.parametrize("backend", ["cached", "disk", "uring"])
+def test_staged_ple_backends_remain_eligible_for_mtp_verify_capture(
+    monkeypatch, backend
+):
+    monkeypatch.setattr(GraphRunner, "_capture_graphs", lambda *args: None)
+    model = SimpleNamespace(
+        _ple_disk_backends=[SimpleNamespace(name=backend)]
+    )
+
+    runner = GraphRunner(
+        stream=None,
+        device=torch.device("cpu"),
+        model=model,
+        attn_backend=SimpleNamespace(),
+        cuda_graph_bs=[1],
+        cuda_graph_max_bs=None,
+        free_memory=0,
+        max_seq_len=1,
+        vocab_size=5,
+        dummy_req=SimpleNamespace(),
+        mtp_enabled=True,
+        mtp_verify_widths=[2],
+    )
+
+    assert runner.mtp_verify_widths == [2]
+
+
 def test_mtp_verify_replay_restores_the_captured_hidden_storage():
     runner = GraphRunner.__new__(GraphRunner)
     runner.mtp_enabled = True
@@ -221,6 +249,140 @@ def test_mtp_verify_replay_restores_the_captured_hidden_storage():
     assert buffer.request_table_idx[0].item() == 4
     assert model_core._last_hc_hidden is captured_hidden
     assert torch.equal(model_core._last_hc_hidden, torch.full((2, 3), 7.0))
+
+
+def _staged_mtp_replay(*, fail_staging=False):
+    order = []
+    captured = []
+
+    class _Embedding:
+        def host_decode_row_ids(self, contexts, input_ids):
+            order.append("metadata")
+            captured.append((contexts.clone(), input_ids.clone()))
+            return input_ids.view(-1, 1).expand(-1, 4).clone()
+
+    class _Backend:
+        def __init__(self):
+            self._decode_shape = None
+            self.staging = torch.empty(8, dtype=torch.bfloat16)
+
+        def prepare_decode(self, row_ids):
+            order.append("prefetch")
+            if fail_staging:
+                raise RuntimeError("staging unavailable")
+            self.staging[: row_ids.numel()].fill_(1)
+            order.append("await")
+            self._decode_shape = row_ids.shape
+
+        def finish_decode(self, *, record_event):
+            order.append("finish")
+            self._decode_shape = None
+
+    backend = _Backend()
+    embedding = _Embedding()
+
+    class _Model:
+        def __init__(self):
+            self.model = SimpleNamespace(_last_hc_hidden=torch.zeros(2, 3))
+            self.host_staging = MTPVerifyHostStaging.init(2, 2)
+            self.staging_ready = False
+
+        def prepare_mtp_verify_cuda_graph_replay(self, batch):
+            self.staging_ready = False
+            try:
+                contexts, input_ids = self.host_staging.prepare(batch, 2)
+                row_ids = embedding.host_decode_row_ids(contexts, input_ids)
+                backend.prepare_decode(row_ids)
+            except RuntimeError:
+                backend.finish_decode(record_event=False)
+                return False
+            self.staging_ready = True
+            return True
+
+        def mtp_verify_cuda_graph_ready(self, batch):
+            return self.staging_ready and backend._decode_shape == (2, 4)
+
+        def finish_cuda_graph_replay(self, *, record_event):
+            backend.finish_decode(record_event=record_event)
+            self.staging_ready = False
+
+    model = _Model()
+
+    req = SimpleNamespace(
+        uid=1,
+        cached_len=2,
+        input_ids=torch.tensor([10, 11, 12], dtype=torch.int32),
+        pending_token_cpu=None,
+        sample_copy_done=None,
+        lazy_kv_restore=None,
+    )
+    batch = _Batch(
+        reqs=[req],
+        padded_reqs=[req],
+        phase="decode",
+        mtp_fused=True,
+        input_ids=torch.tensor([12, 13], dtype=torch.int32),
+        positions=torch.tensor([2, 3], dtype=torch.int32),
+        out_loc=torch.tensor([4, 5], dtype=torch.int32),
+        linear_table_idx=torch.tensor([0], dtype=torch.int32),
+        active_table_idx=torch.tensor([0], dtype=torch.int32),
+        lazy_restore_pending=False,
+    )
+    runner = GraphRunner.__new__(GraphRunner)
+    runner.mtp_enabled = True
+    runner.model = model
+    runner.attn_backend = SimpleNamespace(
+        prepare_for_replay=lambda batch: order.append("attention")
+    )
+    runner.moe_offload_cache = None
+    runner.mtp_hidden_map = {2: model.model._last_hc_hidden}
+    runner.mtp_buffer_map = {
+        2: GraphCaptureBuffer.init(1, 5, torch.device("cpu"), width=2)
+    }
+
+    class _Graph:
+        def replay(self):
+            assert model.mtp_verify_cuda_graph_ready(batch)
+            order.append("replay")
+
+    runner.mtp_graph_map = {2: _Graph()}
+    return runner, model, backend, batch, order, captured
+
+
+def test_staged_mtp_verify_reuses_buffers_and_completes_before_replay():
+    runner, model, backend, batch, order, captured = _staged_mtp_replay()
+    pointers = (
+        model.host_staging.contexts.data_ptr(),
+        model.host_staging.input_ids.data_ptr(),
+        model.host_staging.draft_token.data_ptr(),
+        backend.staging.data_ptr(),
+    )
+
+    assert runner.replay_mtp_verify(batch, 2) is not None
+    assert order == ["metadata", "prefetch", "await", "attention", "replay", "finish"]
+    assert captured[0][0].tolist() == [[10, 11], [11, 12]]
+    assert captured[0][1].tolist() == [12, 13]
+
+    order.clear()
+    batch.input_ids = torch.tensor([12, 14], dtype=torch.int32)
+    assert runner.replay_mtp_verify(batch, 2) is not None
+    assert order == ["metadata", "prefetch", "await", "attention", "replay", "finish"]
+    assert captured[1][1].tolist() == [12, 14]
+    assert pointers == (
+        model.host_staging.contexts.data_ptr(),
+        model.host_staging.input_ids.data_ptr(),
+        model.host_staging.draft_token.data_ptr(),
+        backend.staging.data_ptr(),
+    )
+
+
+def test_staged_mtp_verify_falls_back_when_staging_cannot_complete():
+    runner, _model, _backend, batch, order, _captured = _staged_mtp_replay(
+        fail_staging=True
+    )
+
+    assert runner.replay_mtp_verify(batch, 2) is None
+    assert order == ["metadata", "prefetch", "finish"]
 
 
 def test_engine_config_disk_prefix_cache_defaults_off_and_requires_directory():

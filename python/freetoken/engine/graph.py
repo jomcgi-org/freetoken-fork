@@ -143,12 +143,6 @@ class GraphRunner:
         self.mtp_verify_widths = (
             sorted(set(mtp_verify_widths or ())) if mtp_enabled else []
         )
-        if self.mtp_verify_widths and getattr(model, "_ple_disk_backends", None):
-            logger.warning_rank0(
-                "MTP verify CUDA graph is unavailable with staged PLE; "
-                "using eager verification"
-            )
-            self.mtp_verify_widths = []
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _prepare_model_replay(self, batch: Batch) -> None:
@@ -159,6 +153,28 @@ class GraphRunner:
     def _finish_model_replay(self, *, record_event: bool) -> None:
         finish = getattr(self.model, "finish_cuda_graph_replay", None)
         if finish is not None:
+            finish(record_event=record_event)
+
+    def _prepare_mtp_model_replay(self, batch: Batch) -> bool:
+        prepare = getattr(
+            self.model, "prepare_mtp_verify_cuda_graph_replay", None
+        )
+        if prepare is None:
+            self._prepare_model_replay(batch)
+            return True
+        return prepare(batch)
+
+    def _mtp_model_replay_ready(self, batch: Batch) -> bool:
+        ready = getattr(self.model, "mtp_verify_cuda_graph_ready", None)
+        return True if ready is None else ready(batch)
+
+    def _finish_mtp_model_replay(self, *, record_event: bool) -> None:
+        finish = getattr(
+            self.model, "finish_mtp_verify_cuda_graph_replay", None
+        )
+        if finish is None:
+            self._finish_model_replay(record_event=record_event)
+        else:
             finish(record_event=record_event)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -260,13 +276,28 @@ class GraphRunner:
             )
             buffer.table_idx[0].fill_(dummy_slot)
             with get_global_ctx().forward_batch(batch):
-                self._prepare_model_replay(batch)
+                if not self._prepare_mtp_model_replay(batch):
+                    logger.warning_rank0(
+                        f"Skipping MTP verify CUDA graph width {width}: "
+                        "PLE staging could not be prepared"
+                    )
+                    self._reset_moe_offload_cache()
+                    continue
                 buffer.logits[:width] = model.forward(select_last=False)
-                self._finish_model_replay(record_event=True)
-                self._prepare_model_replay(batch)
+                self._finish_mtp_model_replay(record_event=True)
+                if not self._prepare_mtp_model_replay(batch):
+                    logger.warning_rank0(
+                        f"Skipping MTP verify CUDA graph width {width}: "
+                        "PLE staging could not be prepared"
+                    )
+                    self._reset_moe_offload_cache()
+                    continue
+                assert self._mtp_model_replay_ready(batch), (
+                    "MTP verify CUDA graph capture requires completed PLE staging"
+                )
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                     buffer.logits[:width] = model.forward(select_last=False)
-                self._finish_model_replay(record_event=False)
+                self._finish_mtp_model_replay(record_event=False)
                 self._reset_moe_offload_cache()
             model_core = getattr(model, "model", None)
             assert getattr(model_core, "_capture_mtp_hidden", False), (
@@ -329,17 +360,21 @@ class GraphRunner:
             and not lazy_restore_pending
         )
 
-    def replay_mtp_verify(self, batch: Batch, width: int) -> torch.Tensor:
+    def replay_mtp_verify(self, batch: Batch, width: int) -> torch.Tensor | None:
         assert self.can_use_mtp_verify_graph(batch, width)
+        if not self._prepare_mtp_model_replay(batch):
+            return None
+        assert self._mtp_model_replay_ready(batch), (
+            "MTP verify CUDA graph replay requires completed PLE staging"
+        )
         buffer = self.mtp_buffer_map[width]
         buffer.copy_from(batch)
-        self._prepare_model_replay(batch)
         self.attn_backend.prepare_for_replay(batch)
         hidden = self.mtp_hidden_map[width]
         self.model.model._last_hc_hidden = hidden
         self.mtp_graph_map[width].replay()
         assert self.model.model._last_hc_hidden is hidden
-        self._finish_model_replay(record_event=True)
+        self._finish_mtp_model_replay(record_event=True)
         return buffer.logits[: batch.size * width]
 
     def pad_batch(self, batch: Batch) -> None:

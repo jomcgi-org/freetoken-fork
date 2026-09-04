@@ -2,9 +2,9 @@
 
 Run these checks on a CUDA system with the Qwen3.8-Flash-Next FTW checkpoint that
 contains MTP tensors. Use one shell for the server and a second shell for requests.
-Use the `pinned` or `hmm` PLE backend for this graph check. The staged `cached`, `disk`,
-and `uring` backends log `MTP verify CUDA graph is unavailable with staged PLE` and
-fall back to eager verification.
+Use the production `uring` PLE backend for this graph check. The verify replay copies
+the GPU draft token into its persistent pinned host buffer, completes uring staging,
+and then submits the captured graph.
 
 Set the checkpoint once in both shells:
 
@@ -17,7 +17,7 @@ MTP_MODEL=/path/to/qwen3.8-flash-next-ftw
 Start the server:
 
 ```bash
-ft serve --model "$MTP_MODEL" --gpu 0 --max-running-requests 1 --ple-backend pinned \
+ft serve --model "$MTP_MODEL" --gpu 0 --max-running-requests 1 --ple-backend uring \
   --cuda-graph-max-bs 1 --speculative-mtp on --mtp-verify-graph on \
   --decode-log-interval 20 2>&1 | tee mtp-graph-on.log
 ```
@@ -31,6 +31,9 @@ Start capturing CUDA graphs with sizes: [1]
 Start capturing MTP verify CUDA graphs with widths: [2]
 Captured MTP verify CUDA graph: bs=1, width=2
 ```
+
+The final line is the proof that staged uring PLE did not skip the verify graph.
+The log must not contain `MTP verify PLE staging failed; using eager verification`.
 
 After the ready message, run one untimed warmup and then three measured 300-token
 requests. `--ignore-eos` keeps the output count fixed at 300.
@@ -58,7 +61,7 @@ Save the `real` time from each command. Also save the final decode status lines 
 Stop the first server, then start the eager verification control:
 
 ```bash
-ft serve --model "$MTP_MODEL" --gpu 0 --max-running-requests 1 --ple-backend pinned \
+ft serve --model "$MTP_MODEL" --gpu 0 --max-running-requests 1 --ple-backend uring \
   --cuda-graph-max-bs 1 --speculative-mtp on --mtp-verify-graph off \
   --decode-log-interval 20 2>&1 | tee mtp-graph-off.log
 ```
@@ -73,7 +76,7 @@ changing the output filenames to `mtp-graph-off-1.txt` through
 Stop the second server, then start the non-MTP baseline:
 
 ```bash
-ft serve --model "$MTP_MODEL" --gpu 0 --max-running-requests 1 --ple-backend pinned \
+ft serve --model "$MTP_MODEL" --gpu 0 --max-running-requests 1 --ple-backend uring \
   --cuda-graph-max-bs 1 --speculative-mtp off --decode-log-interval 20 \
   2>&1 | tee mtp-disabled.log
 ```

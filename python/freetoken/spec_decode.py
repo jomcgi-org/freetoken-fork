@@ -2,10 +2,80 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 
 MTP_DRAFT_STEPS = 1
+
+
+@dataclass
+class MTPVerifyHostStaging:
+    contexts: torch.Tensor
+    input_ids: torch.Tensor
+    draft_token: torch.Tensor
+    copy_done: torch.cuda.Event | None
+
+    @classmethod
+    def init(cls, width: int, context_len: int) -> MTPVerifyHostStaging:
+        pin = torch.cuda.is_available()
+        return cls(
+            contexts=torch.empty(
+                (width, context_len), dtype=torch.int64, pin_memory=pin
+            ),
+            input_ids=torch.empty(width, dtype=torch.int64, pin_memory=pin),
+            draft_token=torch.empty(1, dtype=torch.int32, pin_memory=pin),
+            copy_done=torch.cuda.Event() if pin else None,
+        )
+
+    def prepare(self, batch, boundary_token_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        width = batch.input_ids.numel()
+        if width != self.input_ids.numel() or len(batch.padded_reqs) != 1:
+            raise ValueError(
+                f"MTP verify PLE staging expected one request and width "
+                f"{self.input_ids.numel()}, got {len(batch.padded_reqs)} and {width}"
+            )
+
+        self.draft_token.copy_(batch.input_ids[-1:], non_blocking=True)
+        if self.copy_done is not None and batch.input_ids.device.type == "cuda":
+            self.copy_done.record(torch.cuda.current_stream(batch.input_ids.device))
+            self.copy_done.synchronize()
+
+        req = batch.padded_reqs[0]
+        cached_len = int(req.cached_len)
+        history = req.input_ids
+        if history.numel() < cached_len:
+            raise RuntimeError(
+                f"request {req.uid} host history ends before cached_len={cached_len}"
+            )
+        if cached_len < history.numel():
+            self.input_ids[:1].copy_(history[cached_len : cached_len + 1])
+        else:
+            token = req.pending_token_cpu
+            done = req.sample_copy_done
+            if token is None or done is None:
+                if req.uid != -1 or not history.numel():
+                    raise RuntimeError(
+                        f"decode token for request {req.uid} is not available on the host"
+                    )
+                self.input_ids[:1].copy_(history[-1:])
+            else:
+                done.synchronize()
+                self.input_ids[0].copy_(token)
+        self.input_ids[1:].copy_(self.draft_token)
+
+        context_len = self.contexts.shape[1]
+        self.contexts.fill_(boundary_token_id)
+        prior_len = min(context_len, cached_len)
+        if prior_len:
+            self.contexts[0, context_len - prior_len :].copy_(
+                history[cached_len - prior_len : cached_len]
+            )
+        if context_len:
+            self.contexts[1:, :-1].copy_(self.contexts[:-1, 1:])
+            self.contexts[1:, -1].copy_(self.input_ids[:-1])
+        return self.contexts, self.input_ids
 
 
 def reserve_mtp_window(batch, width: int) -> None:
