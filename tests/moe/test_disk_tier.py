@@ -2268,6 +2268,7 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
     split_out = layer._decode_routed(x, weights, ids.clone()).float()
     torch.cuda.synchronize()
 
+    # At H=I=128, 2e-2 covers bf16 rounding across the split GPU and CPU partials.
     torch.testing.assert_close(split_out, cpu_out, rtol=2e-2, atol=2e-2)
     stats = cache.disk_prefetch_stats(reset=True)
     assert stats["hot_pair_rate"] == pytest.approx(0.5)

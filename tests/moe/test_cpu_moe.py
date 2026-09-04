@@ -20,6 +20,19 @@ import torch.nn.functional as Fn
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+@pytest.fixture(autouse=True)
+def _restore_current_cuda_stream():
+    """Keep graph tests from leaking their private stream to later modules."""
+    if not torch.cuda.is_available():
+        yield
+        return
+    stream = torch.cuda.current_stream()
+    try:
+        yield
+    finally:
+        torch.cuda.set_stream(stream)
+
+
 def _make_cache(L, E, H, I, scale=0.1):
     from freetoken.kernel.pinned import alloc_pinned_tensor
 
