@@ -61,7 +61,9 @@ class GraphCaptureBuffer:
         batch.out_loc = self.out_loc[token_slice]
         batch.positions = self.positions[token_slice]
         batch.linear_table_idx = self.table_idx[request_slice]
-        batch.active_table_idx = self.request_table_idx[request_slice]
+        # Route collection is per token, unlike the GDN slot map which is per
+        # request, so this one follows the token slice at verify width.
+        batch.active_table_idx = self.request_table_idx[token_slice]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
@@ -80,7 +82,7 @@ class GraphCaptureBuffer:
         if batch.linear_table_idx is not None:
             self.table_idx[request_slice] = batch.linear_table_idx
         if batch.active_table_idx is not None:
-            self.request_table_idx[request_slice] = batch.active_table_idx
+            self.request_table_idx[token_slice] = batch.active_table_idx
 
 
 def _determine_cuda_graph_bs(
