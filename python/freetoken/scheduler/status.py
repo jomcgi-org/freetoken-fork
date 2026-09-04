@@ -7,6 +7,14 @@ from typing import Callable
 from freetoken.core import Batch
 
 
+def _hot_adapt_history_status_fragment(disk: dict) -> str:
+    """Format the HOT ranking history mode and prefill share."""
+    return (
+        f"hot_adapt_histories: {disk.get('hot_adapt_histories', 'shared')}, "
+        f"decayed_prefill_share: {disk.get('decayed_prefill_share', 0.0):.2%}"
+    )
+
+
 @dataclass
 class SchedulerStatusReporter:
     log: Callable[[str], None]

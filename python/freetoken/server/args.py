@@ -897,6 +897,27 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-capacity-policy",
+        choices=("equal", "coverage"),
+        default=ServerArgs.moe_hot_capacity_policy,
+        help=(
+            "Fixed startup allocation of protected HOT rows across DISK layers. "
+            "'equal' preserves the historical split; 'coverage' uses persisted "
+            "counters first, then profile route counts (default: equal)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-capacity-floor",
+        type=_positive_int,
+        default=ServerArgs.moe_hot_capacity_floor,
+        help=(
+            "Minimum protected rows per DISK layer under the coverage policy, "
+            "subject to the total row budget and expert count (default: 8)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-halflife-steps",
         type=int,
         default=ServerArgs.moe_hot_adapt_halflife_steps,
@@ -947,6 +968,40 @@ def parse_args(
         help=(
             "Weight applied to prefill route counts during HOT adaptation "
             "(default: 1.0)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-histories",
+        choices=["shared", "split"],
+        default=ServerArgs.moe_hot_adapt_histories,
+        help="HOT adaptation route histories (default: shared).",
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-aim",
+        choices=["blend", "phase"],
+        default=ServerArgs.moe_hot_adapt_aim,
+        help="HOT adaptation history aim (default: blend).",
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-prefill-blend",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_prefill_blend,
+        help=(
+            "Prefill history weight used for split-history HOT ranking "
+            "(default: 0.25)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-prefill-normalize",
+        choices=["off", "tokens"],
+        default=ServerArgs.moe_hot_adapt_prefill_normalize,
+        help=(
+            "Normalize each prefill invocation's route counts by its token count "
+            "(default: off)."
         ),
     )
 
@@ -1159,6 +1214,16 @@ def parse_args(
         help=(
             "Run the DISK decode expert-prefetch callback before or after notifying "
             "CPU workers (default: before)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-empty-skip",
+        choices=["off", "on"],
+        default=ServerArgs.moe_cpu_empty_skip,
+        help=(
+            "Skip the CPU callback, worker notify, and barriers when a DISK decode "
+            "layer has no valid CPU routes (default: off)."
         ),
     )
 

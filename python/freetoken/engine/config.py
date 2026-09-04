@@ -88,6 +88,10 @@ class EngineConfig:
     # Protected GPU HOT row capacity for DISK layers. A profile seeds the rows;
     # without one, online adaptation starts the fixed partition all-cold.
     moe_hot_expert_budget_gib: float = 0.0
+    # Equal preserves the historical per-layer split. Coverage assigns the same
+    # total rows by normalized marginal route coverage at startup.
+    moe_hot_capacity_policy: str = "equal"
+    moe_hot_capacity_floor: int = 8
     # Online HOT-set adaptation. "auto" derives the fill cadence from the HOT
     # allocation and swap bound; an integer retains a fixed cadence, with 0 off.
     moe_hot_adapt_halflife_steps: int = 2000
@@ -95,6 +99,10 @@ class EngineConfig:
     moe_hot_adapt_max_swap_gib: float = 0.5
     moe_hot_adapt_boundary_cap_frac: float = 0.5
     moe_hot_adapt_prefill_weight: float = 1.0
+    moe_hot_adapt_histories: str = "shared"
+    moe_hot_adapt_aim: str = "blend"
+    moe_hot_adapt_prefill_blend: float = 0.25
+    moe_hot_adapt_prefill_normalize: str = "off"
     moe_hot_adapt_prefill_run_cap_frac: float = 0.0
     moe_hot_adapt_post_prefill_tick: bool = False
     # Persist the adapted protected-slot assignment and its decayed routing counts.
@@ -140,6 +148,8 @@ class EngineConfig:
     # DISK grouped decode callback order. "before" preserves the existing critical
     # path; "after" notifies CPU workers before issuing advisory expert prefetch.
     moe_cpu_precb: str = "before"
+    # Skip coordinator-side CPU work when a HOT/COLD split has no valid CPU routes.
+    moe_cpu_empty_skip: str = "off"
     # Optionally suppress repeat WILLNEED advice for recently computed DISK experts.
     moe_cpu_willneed: str = "always"
     moe_cpu_willneed_recent_steps: int = 256
@@ -345,6 +355,11 @@ class EngineConfig:
                 "--moe-cpu-precb must be 'before' or 'after', got "
                 f"{self.moe_cpu_precb!r}"
             )
+        if self.moe_cpu_empty_skip not in ("off", "on"):
+            raise ValueError(
+                "--moe-cpu-empty-skip must be 'off' or 'on', got "
+                f"{self.moe_cpu_empty_skip!r}"
+            )
         if self.moe_cpu_willneed not in ("always", "recent"):
             raise ValueError(
                 "--moe-cpu-willneed must be 'always' or 'recent', got "
@@ -369,6 +384,17 @@ class EngineConfig:
             raise ValueError(
                 "--moe-hot-expert-budget-gib must be a finite non-negative number"
             )
+        if self.moe_hot_capacity_policy not in ("equal", "coverage"):
+            raise ValueError(
+                "--moe-hot-capacity-policy must be 'equal' or 'coverage', got "
+                f"{self.moe_hot_capacity_policy!r}"
+            )
+        if (
+            isinstance(self.moe_hot_capacity_floor, bool)
+            or not isinstance(self.moe_hot_capacity_floor, int)
+            or self.moe_hot_capacity_floor < 1
+        ):
+            raise ValueError("--moe-hot-capacity-floor must be a positive integer")
         if (
             isinstance(self.moe_hot_adapt_halflife_steps, bool)
             or not isinstance(self.moe_hot_adapt_halflife_steps, int)
@@ -404,6 +430,29 @@ class EngineConfig:
         ):
             raise ValueError(
                 "--moe-hot-adapt-prefill-weight must be finite and in [0, 1]"
+            )
+        if self.moe_hot_adapt_histories not in ("shared", "split"):
+            raise ValueError(
+                "--moe-hot-adapt-histories must be 'shared' or 'split', got "
+                f"{self.moe_hot_adapt_histories!r}"
+            )
+        if self.moe_hot_adapt_aim not in ("blend", "phase"):
+            raise ValueError(
+                "--moe-hot-adapt-aim must be 'blend' or 'phase', got "
+                f"{self.moe_hot_adapt_aim!r}"
+            )
+        if (
+            isinstance(self.moe_hot_adapt_prefill_blend, bool)
+            or not math.isfinite(float(self.moe_hot_adapt_prefill_blend))
+            or not 0 <= self.moe_hot_adapt_prefill_blend <= 1
+        ):
+            raise ValueError(
+                "--moe-hot-adapt-prefill-blend must be finite and in [0, 1]"
+            )
+        if self.moe_hot_adapt_prefill_normalize not in ("off", "tokens"):
+            raise ValueError(
+                "--moe-hot-adapt-prefill-normalize must be 'off' or 'tokens', got "
+                f"{self.moe_hot_adapt_prefill_normalize!r}"
             )
         if (
             isinstance(self.moe_hot_adapt_prefill_run_cap_frac, bool)

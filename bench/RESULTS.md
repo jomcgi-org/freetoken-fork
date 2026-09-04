@@ -1164,3 +1164,121 @@ goes into the unit. The floor for this layer shape is about 360 to 400 us of
 compute for under three experts on a warm cache, and the lever left in the
 DISK window is faults during compute, which the willneed skip trades against
 its own saving.
+
+### Round three, early 2026-09-04: the harness was the bug
+
+Four more knobs measured neutral before the round produced anything, and the
+reason turned out to be the harness rather than the knobs.
+
+**The A/B arms never let the hot adapter tick.** Every arm reported
+`adapt_ticks_prefill: 0, adapt_ticks_decode: 0, adapt_ticks_idle: 0` for a whole
+real-text arm, and 0 or 1 for an essay arm. `moe_hot_adapt_interval_steps='auto'`
+resolves to 1000 decode steps while an arm runs about 600 (real-text, three
+post-document turns) to 1800 (essays). Each arm also restores the hot plan from
+a pre-arm backup, so it starts from a plan adapted to production traffic and
+never re-aims. `realized_hit` in an arm was therefore a property of a stale
+mismatched plan:
+
+| window | oracle_hit | realized_hit | gap |
+|---|---|---|---|
+| essay arm | 92 to 96% | 59 to 69% | ~28 points |
+| post-76k-document arm | 87 to 95% | 43 to 49% | ~47 points |
+| long-running production | 84 to 97% | 78 to 93% | ~5 points |
+
+Production, left alone long enough for idle ticks to fire, sits within about 5
+points of the hindsight-optimal hot set. The adapter was healthy the whole time.
+Any knob that changes what the adapter aims at (the prefill weight, the capacity
+policy, the history split) could not possibly show an effect at the default
+interval, which is exactly what the previous two rounds kept measuring. Fork
+issue #23; the fix is `--moe-hot-adapt-interval-steps 150` on both arms.
+
+**The essay harness cannot resolve a small effect either.** The empty-skip arms
+ran ABBA (control, knob, knob, control) so a monotone page-cache trend cancels.
+Arm medians came out 23.8, 29.4, 25.9, 29.1 tok/s, with positions 2 and 3 the
+same arm, so neither the knob nor warming explains the pattern. That puts the
+noise floor somewhere around 10 to 20 percent, and every knob in rounds two and
+three was contesting 1 to 5 percent.
+
+**Split prefill and decode histories (#21): the round's one real win.** Once the
+adapter actually ticked, the long-document arm moved a long way. Both arms at
+`--moe-hot-adapt-interval-steps 150`, 76,596 real tokens with a nonce defeating
+the KV prefix cache, then three 200-token turns:
+
+| | control (shared) | split histories |
+|---|---|---|
+| post-document decode, 3 turns | 12.5 tok/s | 17.4 tok/s |
+| decode batches, mean of 9 | 19.4 | 26.4 |
+| disk major faults / decode step | 471.7 | 125.9 |
+| realized hot_pair_rate | 47.0% | 67.2% |
+| PLE major faults | 14,696 | 7,003 |
+| long prompt prefill wall | 664 s | 817 s |
+
+The control ran first and position 2 is systematically faster here, so
+throughput alone would not settle it. `hot_pair_rate` does: it is a hot-set
+property, order-independent, and 47 to 67 percent is far outside anything
+positional, with the 3.7x fault collapse as its mechanical consequence. A shared
+history lets a 76k prefill flood the decayed counters so the hot set re-aims at a
+distribution the following decode does not use. The cost is real and belongs
+next to the win: prefill is 23 percent slower. Read a document once and discuss
+it over many turns and the trade is clearly right; prefill and emit twenty
+tokens and it is clearly wrong.
+
+A position-swapped confirmation (split first, control second) was still running
+when this was written, so treat the decode figures as one ordering until it
+lands. The pair-rate argument above does not depend on it.
+
+**Capacity policy (#20): neutral, with its own ceiling as the evidence.** The
+planner prints `profiled hot_pair_rate equal=73.9%, chosen=74.4%`, so its
+predicted gain over `equal` is half a point before any measurement; live
+cumulative came in at 72.6 against 72.5. Capacity was genuinely redistributed
+(`min/median/max=59/82/104` against a flat 82, `layers_at_floor=0`), so the
+mechanism works and the model simply does not have the per-layer skew for it to
+exploit. Not deployed; the flag defaults to `equal`.
+
+**Empty-skip (#19): neutral.** All-hot layers measured 2.9 to 3.5 of 28 DISK
+layers, bounding the saving at a fraction of a millisecond against 16 to 19 ms
+of CPU windows. Pooled means say +5.9 percent and pooled medians say -1.3
+percent; when they disagree in sign there is nothing there. Not deployed.
+
+### Deployed: split histories with phase-aware aim (04 Sep, 07:17 UTC)
+
+Tier c5c7dfb on the serving worktree, unit carrying
+`--moe-hot-adapt-histories split --moe-hot-adapt-aim phase`. Normalisation left
+at its default of off, which is the whole point: `--moe-hot-adapt-prefill-
+normalize tokens` divides the prefill route weight by the batch token count, so
+with `--moe-hot-adapt-prefill-weight 0.1` a 2048-token chunk accrued about
+0.1/2048 per token against decode's 1.0. The prefill history was roughly
+20,000x under-weighted, which made the hot set ignore prefill and made
+phase-aware aim a no-op. That one bug produced three consecutive null results
+before it was found: the swap cap in both directions, and phase aim itself.
+
+Position-matched arms, all at position 1:
+
+| | shared | split + normalize | split + phase, no normalize |
+|---|---|---|---|
+| long prompt prefill wall | 664 s | 885 s | 652 s |
+| prefill hot coverage, mean | 30.4% | 17.8% | 37.6% |
+| realised hot_pair_rate | 47.0% | 67.9% | 64.2% |
+| decode batches, mean of 9 | 19.37 | 23.87 | 21.88 |
+| post-document turns | 12.5 tok/s | 19.2 tok/s | 14.6 tok/s |
+| `decayed_prefill_share` | 0.00 | 0.13 | 69.15 |
+
+The normalize variant buys more decode and costs 33 percent of prefill; the
+no-normalize variant buys less and costs nothing. Production prefill sizes
+sampled from the journal reach p90 8,192 and max 30,912 tokens, so the prefill
+penalty is a real cost there and the smaller decode win is the right side of the
+trade.
+
+Post-deploy, warm: 23.0, 19.0, 22.4 tok/s single stream, batch mean 25.7,
+cumulative hot_pair_rate 73.9 percent, `hot_adapt_histories: split` and
+`aim=phase` confirmed in the production journal. That is parity with the
+pre-deploy essay numbers, which is the expected result: essays are not the
+workload this helps. The gain is on the long-document path measured above.
+
+The deploy gate deselects
+`test_disk_hot_cold_split_matches_pure_cpu_decode`, which is order-dependent and
+fails on the tier as well as on any branch after `test_cpu_moe.py` has run. A
+bisect on 04 Sep exonerated `test_step_timing.py` and confirmed `test_cpu_moe.py`
+as the polluter, while the CUDA-stream restore fixture was active, so the leak is
+not the stream. Retained CUDA graph memory pools are the leading candidate. Fork
+issue #18; 461 of 462 tier tests pass.

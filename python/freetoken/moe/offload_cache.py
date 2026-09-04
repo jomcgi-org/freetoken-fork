@@ -338,6 +338,10 @@ class OffloadMoeCache:
         self.hot_adapt_hot_budget_bytes = 0
         self.hot_adapt_boundary_cap_frac = 0.5
         self.hot_adapt_prefill_weight = 1.0
+        self.hot_adapt_histories = "shared"
+        self.hot_adapt_aim = "blend"
+        self.hot_adapt_prefill_blend = 0.25
+        self.hot_adapt_prefill_normalize = "off"
         self.hot_adapt_prefill_run_cap_frac = 0.0
         self.hot_adapt_post_prefill_tick = False
         self._hot_adapt_prefill_run_swapped_bytes = 0
@@ -364,6 +368,7 @@ class OffloadMoeCache:
         self.decayed_decode_freq = torch.zeros(
             (self.num_layers, self.num_experts), dtype=torch.float32, device=self.device
         )
+        self.decayed_prefill_freq: torch.Tensor | None = None
         # Session profiles are configured by Engine before graph capture. The fixed
         # table-indexed sketch is address-stable, so decode collection is capturable;
         # admission prefetch and protection updates remain outside graph capture.
@@ -395,6 +400,9 @@ class OffloadMoeCache:
         self._hot_adapt_swaps_pending = ()
         self._hot_adapt_worker_installs = False
         self._hot_adapt_snapshot_host: torch.Tensor | None = None
+        self._hot_adapt_prefill_snapshot_host: torch.Tensor | None = None
+        self._hot_adapt_snapshot_device: torch.Tensor | None = None
+        self._hot_adapt_prefill_snapshot_device: torch.Tensor | None = None
         self._hot_adapt_snapshot_ready = None
         self._hot_adapt_copy_stream: torch.cuda.Stream | None = None
         self._hot_adapt_tick_interval_tokens = 0
@@ -410,9 +418,11 @@ class OffloadMoeCache:
         # Persisted HOT plan state. The adaptation and persistence executors are
         # separate so JSON encoding and fsync never occupy the rerank worker.
         self._hot_plan_counter_seed: dict[int, tuple[float, ...]] = {}
+        self._hot_plan_prefill_counter_seed: dict[int, tuple[float, ...]] = {}
         self._hot_plan_path: str | None = None
         self._hot_plan_identity = None
         self._hot_plan_tier_commit = ""
+        self._hot_capacity_policy = "equal"
         self._hot_plan_write_enabled = False
         self._hot_plan_interval_seconds = 600.0
         self._hot_plan_last_snapshot = 0.0
@@ -1124,13 +1134,19 @@ class OffloadMoeCache:
         expert_bytes: int,
         boundary_cap_frac: float = 0.5,
         prefill_weight: float = 1.0,
+        histories: str = "shared",
+        aim: str = "blend",
+        prefill_blend: float = 0.25,
+        prefill_normalize: str = "off",
         prefill_run_cap_frac: float = 0.0,
         post_prefill_tick: bool = False,
         persisted_counter_seed: Mapping[int, tuple[float, ...]] | None = None,
+        persisted_prefill_counter_seed: Mapping[int, tuple[float, ...]] | None = None,
         persisted_seeded_layers: frozenset[int] = frozenset(),
         hot_plan_path: str | None = None,
         hot_plan_identity=None,
         hot_plan_tier_commit: str = "",
+        hot_capacity_policy: str = "equal",
         hot_plan_write_enabled: bool = False,
         hot_plan_interval_seconds: float = 600.0,
         idle_ms: int = 500,
@@ -1138,6 +1154,9 @@ class OffloadMoeCache:
         tp_size: int = 1,
     ) -> None:
         """Allocate bounded staging, load seeds, and arm online adaptation."""
+        if hot_capacity_policy not in ("equal", "coverage"):
+            raise ValueError("HOT capacity policy must be 'equal' or 'coverage'")
+        self._hot_capacity_policy = hot_capacity_policy
         if not self.hot_expert_capacity:
             return
         if half_life_steps <= 0:
@@ -1156,6 +1175,18 @@ class OffloadMoeCache:
             or not 0 <= prefill_weight <= 1
         ):
             raise ValueError("HOT prefill weight must be finite and in [0, 1]")
+        if histories not in ("shared", "split"):
+            raise ValueError("HOT adaptation histories must be 'shared' or 'split'")
+        if aim not in ("blend", "phase"):
+            raise ValueError("HOT adaptation aim must be 'blend' or 'phase'")
+        if (
+            isinstance(prefill_blend, bool)
+            or not math.isfinite(prefill_blend)
+            or not 0 <= prefill_blend <= 1
+        ):
+            raise ValueError("HOT prefill blend must be finite and in [0, 1]")
+        if prefill_normalize not in ("off", "tokens"):
+            raise ValueError("HOT prefill normalization must be 'off' or 'tokens'")
         if (
             isinstance(prefill_run_cap_frac, bool)
             or not math.isfinite(prefill_run_cap_frac)
@@ -1197,6 +1228,15 @@ class OffloadMoeCache:
         )
         self.hot_adapt_boundary_cap_frac = float(boundary_cap_frac)
         self.hot_adapt_prefill_weight = float(prefill_weight)
+        self.hot_adapt_histories = histories
+        self.hot_adapt_aim = aim
+        self.hot_adapt_prefill_blend = float(prefill_blend)
+        self.hot_adapt_prefill_normalize = prefill_normalize
+        self.decayed_prefill_freq = (
+            torch.zeros_like(self.decayed_decode_freq)
+            if histories == "split"
+            else None
+        )
         self.hot_adapt_prefill_run_cap_frac = float(prefill_run_cap_frac)
         self.hot_adapt_post_prefill_tick = post_prefill_tick
         self._hot_adapt_prefill_run_swapped_bytes = 0
@@ -1218,6 +1258,16 @@ class OffloadMoeCache:
             if layer_id not in self.hot_expert_capacity or len(row) != self.num_experts:
                 raise ValueError(f"persisted HOT counter layer {layer_id} has invalid geometry")
         self._hot_plan_counter_seed = seed
+        prefill_seed = {
+            int(layer_id): tuple(float(value) for value in row)
+            for layer_id, row in (persisted_prefill_counter_seed or {}).items()
+        }
+        for layer_id, row in prefill_seed.items():
+            if layer_id not in self.hot_expert_capacity or len(row) != self.num_experts:
+                raise ValueError(
+                    f"persisted HOT prefill counter layer {layer_id} has invalid geometry"
+                )
+        self._hot_plan_prefill_counter_seed = prefill_seed
         self._apply_hot_plan_counter_seed()
         fully_seeded = (
             bool(self.hot_expert_capacity)
@@ -1287,9 +1337,13 @@ class OffloadMoeCache:
             )
         self._reload_hot_slots()
         self._checkpoint_published_hot_slot_owners()
+        capacity_rows = sorted(self.hot_expert_capacity.values())
         logger.info_rank0(
             f"MoE HOT expert residency: {sum(self.hot_expert_capacity.values())} "
             f"protected GPU rows across {len(self.hot_expert_capacity)} DISK layers, "
+            f"hot_capacity_policy={self._hot_capacity_policy}, "
+            f"hot_capacity_rows_min={capacity_rows[0]}, "
+            f"hot_capacity_rows_max={capacity_rows[-1]}, "
             f"hot_staging_gib={self.hot_staging_bytes / 2**30:.2f}, "
             f"hot_staging_rows={self._hot_staging_rows}"
         )
@@ -1302,6 +1356,7 @@ class OffloadMoeCache:
             idle = f"{idle_ms} ms"
         logger.info_rank0(
             f"MoE HOT adaptation intervals: mode={mode}, "
+            f"aim={self.hot_adapt_aim}, "
             f"unit=routed_tokens, "
             f"hot_budget_gib={self.hot_adapt_hot_budget_bytes / 2**30:.2f}, "
             f"max_swap_gib={self.hot_adapt_max_swap_bytes / 2**30:.2f}, "
@@ -1322,6 +1377,16 @@ class OffloadMoeCache:
             device="cpu", pin_memory=pin,
         )
         self._hot_adapt_snapshot_device = torch.empty_like(self.decayed_decode_freq)
+        if self.decayed_prefill_freq is not None:
+            self._hot_adapt_prefill_snapshot_host = torch.empty(
+                (self.num_layers, self.num_experts),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=pin,
+            )
+            self._hot_adapt_prefill_snapshot_device = torch.empty_like(
+                self.decayed_prefill_freq
+            )
         if self.device.type == "cuda":
             self._hot_adapt_copy_stream = torch.cuda.Stream(device=self.device)
             self._hot_adapt_snapshot_ready = torch.cuda.Event()
@@ -1332,6 +1397,13 @@ class OffloadMoeCache:
             self.decayed_decode_freq[layer_id].copy_(
                 torch.tensor(row, dtype=torch.float32, device=self.device)
             )
+        if getattr(self, "decayed_prefill_freq", None) is not None:
+            for layer_id, row in getattr(
+                self, "_hot_plan_prefill_counter_seed", {}
+            ).items():
+                self.decayed_prefill_freq[layer_id].copy_(
+                    torch.tensor(row, dtype=torch.float32, device=self.device)
+                )
 
     def _protect_hot_slots(self) -> None:
         """Keep permanent HOT rows outside every ordinary LRU victim set."""
@@ -1714,6 +1786,7 @@ class OffloadMoeCache:
             ready.synchronize()
         assert self._hot_adapt_snapshot_host is not None
         from freetoken.moe.hot_adapt import (
+            blend_histories,
             hot_catchup_swap_bytes,
             plan_hot_swaps,
             recompute_hot_partition,
@@ -1723,6 +1796,32 @@ class OffloadMoeCache:
             layer_id: tuple(float(value) for value in self._hot_adapt_snapshot_host[layer_id])
             for layer_id in self.hot_expert_capacity
         }
+        if getattr(self, "hot_adapt_histories", "shared") == "split":
+            assert self._hot_adapt_prefill_snapshot_host is not None
+            prefill_counts = {
+                layer_id: tuple(
+                    float(value)
+                    for value in self._hot_adapt_prefill_snapshot_host[layer_id]
+                )
+                for layer_id in self.hot_expert_capacity
+            }
+            if getattr(self, "hot_adapt_aim", "blend") == "phase":
+                if boundary == "prefill":
+                    # Keep the active prefill covered while still retaining bounded
+                    # evidence from the decode history.
+                    counts = blend_histories(
+                        prefill_counts,
+                        counts,
+                        getattr(self, "hot_adapt_prefill_blend", 0.25),
+                    )
+                else:
+                    counts = blend_histories(counts, prefill_counts, 0)
+            else:
+                counts = blend_histories(
+                    counts,
+                    prefill_counts,
+                    getattr(self, "hot_adapt_prefill_blend", 0.25),
+                )
         budget_bytes = sum(self.hot_expert_capacity.values()) * self.hot_adapt_expert_bytes
         desired = recompute_hot_partition(
             counts,
@@ -1730,6 +1829,7 @@ class OffloadMoeCache:
             budget_bytes=budget_bytes,
             expert_bytes=self.hot_adapt_expert_bytes,
             num_experts=self.num_experts,
+            capacities=self.hot_expert_capacity,
         )
         owners = {layer_id: tuple(rows) for layer_id, rows in self._hot_slot_owners.items()}
         if swap_budget_bytes is None:
@@ -1972,6 +2072,7 @@ class OffloadMoeCache:
         self,
         owners,
         counters: torch.Tensor,
+        prefill_counters: torch.Tensor | None,
         fence: _HotPlanWriteFence,
     ) -> bool:
         from freetoken.moe.hot_adapt import atomic_write_hot_plan, make_hot_plan_document
@@ -1988,6 +2089,26 @@ class OffloadMoeCache:
                 layer_id: counters[layer_id].tolist()
                 for layer_id in sorted(self.hot_expert_capacity)
             },
+            capacity_policy=getattr(self, "_hot_capacity_policy", "equal"),
+            decayed_prefill_counters=(
+                {
+                    layer_id: prefill_counters[layer_id].tolist()
+                    for layer_id in sorted(self.hot_expert_capacity)
+                }
+                if prefill_counters is not None
+                else None
+            ),
+            ranking_counters=(
+                {
+                    layer_id: (
+                        counters[layer_id]
+                        + self.hot_adapt_prefill_blend * prefill_counters[layer_id]
+                    ).tolist()
+                    for layer_id in sorted(self.hot_expert_capacity)
+                }
+                if prefill_counters is not None
+                else None
+            ),
         )
         if document is None:
             if not self._hot_plan_zero_logged:
@@ -2041,11 +2162,21 @@ class OffloadMoeCache:
         owner_source = self._hot_slot_owners if snapshot_at is None else snapshot_at
         owners = {layer_id: tuple(rows) for layer_id, rows in owner_source.items()}
         counters = self.decayed_decode_freq.detach().to("cpu", copy=True)
+        decayed_prefill_freq = getattr(self, "decayed_prefill_freq", None)
+        prefill_counters = (
+            decayed_prefill_freq.detach().to("cpu", copy=True)
+            if decayed_prefill_freq is not None
+            else None
+        )
         self._hot_plan_last_snapshot = now
         fence = _HotPlanWriteFence()
         self._hot_plan_write_fence = fence
         self._hot_plan_future = self._hot_plan_executor.submit(
-            self._write_hot_plan_snapshot, owners, counters, fence
+            self._write_hot_plan_snapshot,
+            owners,
+            counters,
+            prefill_counters,
+            fence,
         )
         return self._hot_plan_future
 
@@ -2097,6 +2228,9 @@ class OffloadMoeCache:
                 return
         assert self._hot_adapt_snapshot_host is not None
         self._hot_adapt_snapshot_device.copy_(self.decayed_decode_freq)
+        if getattr(self, "decayed_prefill_freq", None) is not None:
+            assert self._hot_adapt_prefill_snapshot_device is not None
+            self._hot_adapt_prefill_snapshot_device.copy_(self.decayed_prefill_freq)
         ready = None
         if self.device.type == "cuda":
             assert self._hot_adapt_copy_stream is not None
@@ -2108,10 +2242,23 @@ class OffloadMoeCache:
                 self._hot_adapt_snapshot_host.copy_(
                     self._hot_adapt_snapshot_device, non_blocking=True
                 )
+                if getattr(self, "decayed_prefill_freq", None) is not None:
+                    assert self._hot_adapt_prefill_snapshot_host is not None
+                    assert self._hot_adapt_prefill_snapshot_device is not None
+                    self._hot_adapt_prefill_snapshot_host.copy_(
+                        self._hot_adapt_prefill_snapshot_device,
+                        non_blocking=True,
+                    )
                 self._hot_adapt_snapshot_ready.record(self._hot_adapt_copy_stream)
             ready = self._hot_adapt_snapshot_ready
         else:
             self._hot_adapt_snapshot_host.copy_(self._hot_adapt_snapshot_device)
+            if getattr(self, "decayed_prefill_freq", None) is not None:
+                assert self._hot_adapt_prefill_snapshot_host is not None
+                assert self._hot_adapt_prefill_snapshot_device is not None
+                self._hot_adapt_prefill_snapshot_host.copy_(
+                    self._hot_adapt_prefill_snapshot_device
+                )
         assert self._hot_adapt_executor is not None
         self._hot_adapt_phase = "plan"
         self._hot_adapt_future = self._hot_adapt_executor.submit(
@@ -2348,6 +2495,27 @@ class OffloadMoeCache:
         if not self.hot_adapt_enabled:
             return 0.0
         counts = self.decayed_decode_freq.tolist()
+        if getattr(self, "decayed_prefill_freq", None) is not None:
+            from freetoken.moe.hot_adapt import blend_histories
+
+            decode_counts = dict(enumerate(counts))
+            prefill_counts = dict(enumerate(self.decayed_prefill_freq.tolist()))
+            if getattr(self, "hot_adapt_aim", "blend") == "phase":
+                if getattr(self, "_hot_adapt_tick_boundary", None) == "prefill":
+                    blended = blend_histories(
+                        prefill_counts,
+                        decode_counts,
+                        getattr(self, "hot_adapt_prefill_blend", 0.25),
+                    )
+                else:
+                    blended = blend_histories(decode_counts, prefill_counts, 0)
+            else:
+                blended = blend_histories(
+                    decode_counts,
+                    prefill_counts,
+                    getattr(self, "hot_adapt_prefill_blend", 0.25),
+                )
+            counts = [blended[layer_id] for layer_id in range(self.num_layers)]
         total = sum(sum(layer) for layer in counts)
         hot = sum(
             counts[layer_id][expert]
@@ -2753,12 +2921,28 @@ class OffloadMoeCache:
         )
         result["decayed_hot_pair_rate"] = self.decayed_hot_pair_rate()
         result["hot_adapt_interval"] = self.hot_adapt_interval_steps
+        result["hot_adapt_histories"] = getattr(
+            self, "hot_adapt_histories", "shared"
+        )
+        if getattr(self, "decayed_prefill_freq", None) is not None:
+            decode_total = float(self.decayed_decode_freq.sum().item())
+            prefill_total = float(self.decayed_prefill_freq.sum().item())
+            history_total = decode_total + prefill_total
+            result["decayed_prefill_share"] = (
+                prefill_total / history_total if history_total else 0.0
+            )
         result["hot_adapt_ticks_prefill"] = ticks_prefill
         result["hot_adapt_prefill_run_swaps"] = getattr(
             self, "_hot_adapt_prefill_run_swaps", 0
         )
         result["hot_adapt_ticks_decode"] = ticks_decode
         result["hot_adapt_ticks_idle"] = ticks_idle
+        result["hot_capacity_policy"] = getattr(
+            self, "_hot_capacity_policy", "equal"
+        )
+        capacity_rows = tuple(self.hot_expert_capacity.values())
+        result["hot_capacity_rows_min"] = min(capacity_rows, default=0)
+        result["hot_capacity_rows_max"] = max(capacity_rows, default=0)
         result.update(self.session_profile_stats(reset=reset))
         if reset:
             self.stat_hot_pairs.zero_()
@@ -3163,6 +3347,7 @@ class OffloadMoeCache:
         expert_ids: torch.Tensor,
         *,
         route_weight: float = 1.0,
+        history: str = "decode",
     ) -> int:
         """Route only this DISK layer's current HOT experts through the slot cache.
 
@@ -3187,6 +3372,7 @@ class OffloadMoeCache:
             layer_id,
             expert_ids,
             route_weight=route_weight,
+            history=history,
         )
         # The kernel updates hit timestamps for compatibility with ordinary LRU.
         # Restore the permanent sentinel inside graph capture so later layers in
@@ -3229,6 +3415,8 @@ class OffloadMoeCache:
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
         self.decayed_decode_freq.zero_()
+        if getattr(self, "decayed_prefill_freq", None) is not None:
+            self.decayed_prefill_freq.zero_()
         self._apply_hot_plan_counter_seed()
         if self.session_profile_ids is not None:
             self.session_profile_ids.fill_(-1)

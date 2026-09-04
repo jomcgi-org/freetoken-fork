@@ -33,7 +33,7 @@ from .cache import CacheManager
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
-from .status import SchedulerStatusReporter
+from .status import SchedulerStatusReporter, _hot_adapt_history_status_fragment
 from .table import TableManager
 from .utils import order_pending_requests, priority_queue_stats
 
@@ -59,6 +59,14 @@ def _moe_oracle_status_fragment(disk: dict) -> str:
     return (
         f", disk oracle_hit: {disk['oracle_hit']:.2%} "
         f"vs realized: {disk['realized_hit']:.2%}"
+    )
+
+
+def _all_hot_layers_status_fragment(disk: dict) -> str:
+    """Format the captured count of DISK layers with no CPU routes."""
+    return (
+        f"all-hot layers/step: "
+        f"{disk.get('all_hot_layers_per_decode_step', 0.0):.2f}, "
     )
 
 
@@ -231,6 +239,7 @@ class Scheduler(SchedulerIOMixin):
                     f"disk major faults: {disk['major_faults']}, "
                     f"disk major faults/decode step: "
                     f"{disk['major_faults_per_decode_step']:.2f}, "
+                    f"{_all_hot_layers_status_fragment(disk)}"
                     f"willneed_skipped/advised: "
                     f"{disk.get('willneed_skipped_experts', 0)}/"
                     f"{disk.get('willneed_advised_experts', 0)}, "
@@ -274,6 +283,7 @@ class Scheduler(SchedulerIOMixin):
                     f"{disk.get('decayed_hot_pair_rate', 0.0):.2%}, "
                     f"hot_adapt_interval: "
                     f"{disk.get('hot_adapt_interval', 0)}, "
+                    f"{_hot_adapt_history_status_fragment(disk)}, "
                     f"hot_adapt_ticks_prefill: "
                     f"{disk.get('hot_adapt_ticks_prefill', 0)}, "
                     f"hot_adapt_prefill_run_swaps: "
