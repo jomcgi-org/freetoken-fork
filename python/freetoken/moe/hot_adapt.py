@@ -11,7 +11,7 @@ import struct
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -48,6 +48,7 @@ class HotPlanSeed:
     saved_hot_budget_bytes: int
     tier_commit: str
     tier_mismatch: bool
+    prefill_counters: dict[int, tuple[float, ...]] = field(default_factory=dict)
 
 
 def resolve_tier_commit() -> str:
@@ -237,15 +238,19 @@ def load_hot_plan(
         raise ValueError("HOT plan counters are not marked float32")
     protected = raw.get("protected_slots")
     counters_raw = raw.get("decayed_counters")
+    prefill_counters_raw = raw.get("decayed_prefill_counters")
     ranked_raw = raw.get("counter_ranked")
     if not all(isinstance(section, dict) for section in (protected, counters_raw, ranked_raw)):
         raise ValueError("HOT plan layer sections must be objects")
+    if prefill_counters_raw is not None and not isinstance(prefill_counters_raw, dict):
+        raise ValueError("HOT plan prefill counter section must be an object")
 
     selected = {
         layer_id: tuple(int(expert) for expert in static_expert_ids.get(layer_id, ()))
         for layer_id in disk_layer_ids
     }
     counters: dict[int, tuple[float, ...]] = {}
+    prefill_counters: dict[int, tuple[float, ...]] = {}
     seeded_layers: set[int] = set()
     for layer_id in sorted(disk_layer_ids):
         key = str(layer_id)
@@ -282,10 +287,18 @@ def load_hot_plan(
         chosen = tuple(chosen_list)
         selected[layer_id] = chosen
         counters[layer_id] = row
+        if prefill_counters_raw is not None and key in prefill_counters_raw:
+            prefill_counters[layer_id] = _validated_counter_row(
+                prefill_counters_raw.get(key), num_experts, layer_id
+            )
         seeded_layers.add(layer_id)
     if not seeded_layers:
         raise ValueError("HOT plan has no protected layers for this process")
-    if not any(any(value != 0.0 for value in row) for row in counters.values()):
+    if not any(
+        any(value != 0.0 for value in row)
+        for rows in (counters, prefill_counters)
+        for row in rows.values()
+    ):
         raise ValueError("HOT plan counters are all zero")
 
     saved_tier = raw.get("tier_commit")
@@ -300,6 +313,7 @@ def load_hot_plan(
         saved_hot_budget_bytes=saved_budget,
         tier_commit=saved_tier,
         tier_mismatch=saved_tier != tier_commit,
+        prefill_counters=prefill_counters,
     )
 
 
@@ -313,6 +327,8 @@ def make_hot_plan_document(
     tier_commit: str,
     protected_slots: Mapping[int, Sequence[int | None]],
     decayed_counters: Mapping[int, Sequence[float]],
+    decayed_prefill_counters: Mapping[int, Sequence[float]] | None = None,
+    ranking_counters: Mapping[int, Sequence[float]] | None = None,
     written_at: float | None = None,
 ) -> dict[str, Any] | None:
     """Create a compact JSON document, or None for an all-zero snapshot."""
@@ -327,13 +343,51 @@ def make_hot_plan_document(
             )
         if any(not math.isfinite(value) or value < 0 for value in row):
             raise ValueError(f"counter layer {layer_id} has an invalid value")
-    if not any(any(value != 0.0 for value in row) for row in counter_rows.values()):
+    prefill_rows = {
+        int(layer_id): tuple(float(value) for value in row)
+        for layer_id, row in (decayed_prefill_counters or {}).items()
+    }
+    if prefill_rows and set(prefill_rows) != set(counter_rows):
+        raise ValueError("decode and prefill counter layers must match")
+    for layer_id, row in prefill_rows.items():
+        if len(row) != num_experts:
+            raise ValueError(
+                f"prefill counter layer {layer_id} has {len(row)} values, "
+                f"expected {num_experts}"
+            )
+        if any(not math.isfinite(value) or value < 0 for value in row):
+            raise ValueError(f"prefill counter layer {layer_id} has an invalid value")
+    ranked_rows = {
+        int(layer_id): tuple(float(value) for value in row)
+        for layer_id, row in (ranking_counters or counter_rows).items()
+    }
+    if set(ranked_rows) != set(counter_rows):
+        raise ValueError("ranking and persisted counter layers must match")
+    for layer_id, row in ranked_rows.items():
+        if len(row) != num_experts:
+            raise ValueError(
+                f"ranking counter layer {layer_id} has {len(row)} values, "
+                f"expected {num_experts}"
+            )
+        if any(not math.isfinite(value) or value < 0 for value in row):
+            raise ValueError(f"ranking counter layer {layer_id} has an invalid value")
+    if not any(
+        any(value != 0.0 for value in row)
+        for rows in (counter_rows, prefill_rows)
+        for row in rows.values()
+    ):
         return None
     counters = {
         str(layer_id): base64.b64encode(
             struct.pack(f"<{num_experts}f", *row)
         ).decode("ascii")
         for layer_id, row in counter_rows.items()
+    }
+    prefill_counters = {
+        str(layer_id): base64.b64encode(
+            struct.pack(f"<{num_experts}f", *row)
+        ).decode("ascii")
+        for layer_id, row in prefill_rows.items()
     }
     protected: dict[str, list[int]] = {}
     ranked: dict[str, list[int]] = {}
@@ -347,11 +401,11 @@ def make_hot_plan_document(
         ):
             raise ValueError(f"protected layer {layer_id} has invalid expert ids")
         protected[str(layer_id)] = residents
-        row = counter_rows[layer_id]
+        row = ranked_rows[layer_id]
         ranked[str(layer_id)] = sorted(
             residents, key=lambda expert: (-row[expert], expert)
         )
-    return {
+    document = {
         "version": HOT_PLAN_VERSION,
         "written_at": time.time() if written_at is None else float(written_at),
         "ftw_identity": dict(identity),
@@ -366,6 +420,9 @@ def make_hot_plan_document(
         "counter_ranked": ranked,
         "decayed_counters": counters,
     }
+    if prefill_counters:
+        document["decayed_prefill_counters"] = prefill_counters
+    return document
 
 
 def atomic_write_hot_plan(
@@ -743,6 +800,35 @@ def update_decayed_counts(
         raise ValueError("previous and routed counts must have the same length")
     factor = decay_multiplier(half_life_steps, elapsed_steps)
     return tuple(float(old) * factor + float(new) for old, new in zip(previous, routed))
+
+
+def blend_histories(
+    decode_counts: Mapping[int, Sequence[float]],
+    prefill_counts: Mapping[int, Sequence[float]],
+    blend: float,
+) -> dict[int, tuple[float, ...]]:
+    """Combine decode history with a bounded share of prefill history."""
+    if (
+        isinstance(blend, bool)
+        or not math.isfinite(float(blend))
+        or not 0 <= blend <= 1
+    ):
+        raise ValueError("history blend must be finite and in [0, 1]")
+    if set(decode_counts) != set(prefill_counts):
+        raise ValueError("decode and prefill history layers must match")
+    result = {}
+    for layer_id in decode_counts:
+        decode_row = decode_counts[layer_id]
+        prefill_row = prefill_counts[layer_id]
+        if len(decode_row) != len(prefill_row):
+            raise ValueError(
+                f"decode and prefill history shapes differ for layer {layer_id}"
+            )
+        result[layer_id] = tuple(
+            float(decode) + float(blend) * float(prefill)
+            for decode, prefill in zip(decode_row, prefill_row)
+        )
+    return result
 
 
 def recompute_hot_partition(

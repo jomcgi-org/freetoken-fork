@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from freetoken.scheduler.status import SchedulerStatusReporter, _usage_ratio
+from freetoken.scheduler.status import (
+    SchedulerStatusReporter,
+    _hot_adapt_history_status_fragment,
+    _usage_ratio,
+)
 
 
 def _reporter(interval=40):
@@ -379,6 +383,15 @@ def test_usage_ratio_guard():
     assert _usage_ratio(0, 0) == 0.0
     assert _usage_ratio(5, 0) == 0.0
     assert _usage_ratio(5, 10) == 0.5
+
+
+def test_hot_adapt_history_status_fragment():
+    assert _hot_adapt_history_status_fragment(
+        {
+            "hot_adapt_histories": "split",
+            "decayed_prefill_share": 0.625,
+        }
+    ) == "hot_adapt_histories: split, decayed_prefill_share: 62.50%"
 
 
 def test_disk_status_includes_harness_anchor_counters():

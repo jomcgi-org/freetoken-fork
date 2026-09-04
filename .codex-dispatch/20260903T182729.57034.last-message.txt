@@ -1,0 +1,20 @@
+Implemented split prefill and decode hot-adaptation histories end to end.
+
+- Added all three CLI/config flags with defaults, validation, engine plumbing, and dense-model settings.
+- Added split counter allocation, token normalization, host-side blending, blended coverage stats, and rebuild preservation.
+- Extended plan persistence with backward-compatible optional prefill counters.
+- Added stats and scheduler status reporting.
+- Updated QUICKSTART and GPU-free tests across routing, planning, persistence, config, CLI, rebuild, and status.
+- No em-dashes added and no commit created.
+
+Validation:
+
+- Compile checks passed.
+- Ruff checks passed, excluding three pre-existing rule families.
+- `git diff --check` passed.
+- Pure planning and persistence smoke tests passed.
+- The requested pytest suite could not collect locally because the available Python environment lacks `torch` and `huggingface_hub`. All six requested test files stopped during import.
+
+Files changed include [hot_adapt.py](/Users/jomcgi/repos/ft-worktrees/histories/python/freetoken/moe/hot_adapt.py), [offload_cache.py](/Users/jomcgi/repos/ft-worktrees/histories/python/freetoken/moe/offload_cache.py), routing/config/CLI/status modules, QUICKSTART, and the requested test files.
+
+Open questions: none.

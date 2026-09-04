@@ -95,6 +95,9 @@ class EngineConfig:
     moe_hot_adapt_max_swap_gib: float = 0.5
     moe_hot_adapt_boundary_cap_frac: float = 0.5
     moe_hot_adapt_prefill_weight: float = 1.0
+    moe_hot_adapt_histories: str = "shared"
+    moe_hot_adapt_prefill_blend: float = 0.25
+    moe_hot_adapt_prefill_normalize: str = "off"
     moe_hot_adapt_prefill_run_cap_frac: float = 0.0
     moe_hot_adapt_post_prefill_tick: bool = False
     # Persist the adapted protected-slot assignment and its decayed routing counts.
@@ -400,6 +403,24 @@ class EngineConfig:
         ):
             raise ValueError(
                 "--moe-hot-adapt-prefill-weight must be finite and in [0, 1]"
+            )
+        if self.moe_hot_adapt_histories not in ("shared", "split"):
+            raise ValueError(
+                "--moe-hot-adapt-histories must be 'shared' or 'split', got "
+                f"{self.moe_hot_adapt_histories!r}"
+            )
+        if (
+            isinstance(self.moe_hot_adapt_prefill_blend, bool)
+            or not math.isfinite(float(self.moe_hot_adapt_prefill_blend))
+            or not 0 <= self.moe_hot_adapt_prefill_blend <= 1
+        ):
+            raise ValueError(
+                "--moe-hot-adapt-prefill-blend must be finite and in [0, 1]"
+            )
+        if self.moe_hot_adapt_prefill_normalize not in ("off", "tokens"):
+            raise ValueError(
+                "--moe-hot-adapt-prefill-normalize must be 'off' or 'tokens', got "
+                f"{self.moe_hot_adapt_prefill_normalize!r}"
             )
         if (
             isinstance(self.moe_hot_adapt_prefill_run_cap_frac, bool)

@@ -244,6 +244,8 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     assert stats["hot_adapt_idle_swaps_per_tick"] == pytest.approx(1.0)
     assert stats["decayed_hot_pair_rate"] == pytest.approx(0.3)
     assert stats["hot_adapt_interval"] == 17
+    assert stats["hot_adapt_histories"] == "shared"
+    assert "decayed_prefill_share" not in stats
     assert stats["hot_adapt_ticks_prefill"] == 1
     assert stats["hot_adapt_prefill_run_swaps"] == 3
     assert stats["hot_adapt_ticks_decode"] == 1
@@ -254,6 +256,9 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     cache.hot_adapt_ticks += 3
     cache.hot_adapt_ticks_idle += 3
     cache.hot_adapt_idle_swaps += 3
+    cache.hot_adapt_histories = "split"
+    cache.hot_adapt_prefill_blend = 0.25
+    cache.decayed_prefill_freq = torch.tensor([[4.0, 1.0, 3.0, 2.0]])
     stats = cache.disk_prefetch_stats(reset=True)
     assert stats["hot_swaps_per_interval"] == 0.0
     assert stats["hot_adapt_ticks_prefill"] == 0
@@ -261,6 +266,8 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     assert stats["hot_adapt_ticks_decode"] == 0
     assert stats["hot_adapt_ticks_idle"] == 3
     assert stats["hot_adapt_idle_swaps_per_tick"] == 1.0
+    assert stats["hot_adapt_histories"] == "split"
+    assert stats["decayed_prefill_share"] == pytest.approx(0.5)
 
 
 @pytest.mark.cuda
@@ -1303,6 +1310,8 @@ def _prefill_hot_split_fixture(
     unsupported_grouped=False,
     quant_format="nvfp4",
     model_type="qwen4_exp",
+    histories="shared",
+    prefill_normalize="off",
 ):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer
@@ -1345,6 +1354,8 @@ def _prefill_hot_split_fixture(
         moe_disk_prefill="cpu",
         moe_prefill_hot_split=split,
         hot_adapt_prefill_weight=0.25,
+        hot_adapt_histories=histories,
+        hot_adapt_prefill_normalize=prefill_normalize,
         moe_prefill_split_kernel=split_kernel,
         quant_format=quant_format,
         prefill_overlap=False,
@@ -1455,6 +1466,24 @@ def test_prefill_hot_split_populates_and_batches_only_cold_routes(
     stats = next(call for call in calls if call[0] == "stats")
     assert int(stats[2].sum()) == 3
     assert any(call[0] == "slot_tables" for call in calls) is with_slot_tables
+
+
+def test_prefill_hot_split_selects_and_normalizes_prefill_history(monkeypatch):
+    layer, hidden, weights, ids, calls, _cpu_out, _gpu_out = (
+        _prefill_hot_split_fixture(
+            monkeypatch,
+            hot_slots=[7, -1, 9, -1],
+            histories="split",
+            prefill_normalize="tokens",
+        )
+    )
+
+    layer._prefill_routed(hidden, weights, ids)
+
+    assert next(call[2] for call in calls if call[0] == "adapt") == {
+        "route_weight": pytest.approx(0.25 / 3),
+        "history": "prefill",
+    }
 
 
 def test_decode_hot_split_uses_default_route_weight(monkeypatch):
