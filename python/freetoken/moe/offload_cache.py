@@ -413,6 +413,7 @@ class OffloadMoeCache:
         self._hot_plan_path: str | None = None
         self._hot_plan_identity = None
         self._hot_plan_tier_commit = ""
+        self._hot_capacity_policy = "equal"
         self._hot_plan_write_enabled = False
         self._hot_plan_interval_seconds = 600.0
         self._hot_plan_last_snapshot = 0.0
@@ -1131,6 +1132,7 @@ class OffloadMoeCache:
         hot_plan_path: str | None = None,
         hot_plan_identity=None,
         hot_plan_tier_commit: str = "",
+        hot_capacity_policy: str = "equal",
         hot_plan_write_enabled: bool = False,
         hot_plan_interval_seconds: float = 600.0,
         idle_ms: int = 500,
@@ -1138,6 +1140,9 @@ class OffloadMoeCache:
         tp_size: int = 1,
     ) -> None:
         """Allocate bounded staging, load seeds, and arm online adaptation."""
+        if hot_capacity_policy not in ("equal", "coverage"):
+            raise ValueError("HOT capacity policy must be 'equal' or 'coverage'")
+        self._hot_capacity_policy = hot_capacity_policy
         if not self.hot_expert_capacity:
             return
         if half_life_steps <= 0:
@@ -1287,9 +1292,13 @@ class OffloadMoeCache:
             )
         self._reload_hot_slots()
         self._checkpoint_published_hot_slot_owners()
+        capacity_rows = sorted(self.hot_expert_capacity.values())
         logger.info_rank0(
             f"MoE HOT expert residency: {sum(self.hot_expert_capacity.values())} "
             f"protected GPU rows across {len(self.hot_expert_capacity)} DISK layers, "
+            f"hot_capacity_policy={self._hot_capacity_policy}, "
+            f"hot_capacity_rows_min={capacity_rows[0]}, "
+            f"hot_capacity_rows_max={capacity_rows[-1]}, "
             f"hot_staging_gib={self.hot_staging_bytes / 2**30:.2f}, "
             f"hot_staging_rows={self._hot_staging_rows}"
         )
@@ -1730,6 +1739,7 @@ class OffloadMoeCache:
             budget_bytes=budget_bytes,
             expert_bytes=self.hot_adapt_expert_bytes,
             num_experts=self.num_experts,
+            capacities=self.hot_expert_capacity,
         )
         owners = {layer_id: tuple(rows) for layer_id, rows in self._hot_slot_owners.items()}
         if swap_budget_bytes is None:
@@ -1988,6 +1998,7 @@ class OffloadMoeCache:
                 layer_id: counters[layer_id].tolist()
                 for layer_id in sorted(self.hot_expert_capacity)
             },
+            capacity_policy=getattr(self, "_hot_capacity_policy", "equal"),
         )
         if document is None:
             if not self._hot_plan_zero_logged:
@@ -2759,6 +2770,12 @@ class OffloadMoeCache:
         )
         result["hot_adapt_ticks_decode"] = ticks_decode
         result["hot_adapt_ticks_idle"] = ticks_idle
+        result["hot_capacity_policy"] = getattr(
+            self, "_hot_capacity_policy", "equal"
+        )
+        capacity_rows = tuple(self.hot_expert_capacity.values())
+        result["hot_capacity_rows_min"] = min(capacity_rows, default=0)
+        result["hot_capacity_rows_max"] = max(capacity_rows, default=0)
         result.update(self.session_profile_stats(reset=reset))
         if reset:
             self.stat_hot_pairs.zero_()

@@ -115,6 +115,39 @@ def test_hot_adapt_interval_accepts_auto_or_an_explicit_integer(value, expected)
     assert args.moe_hot_adapt_interval_steps == expected
 
 
+def test_hot_capacity_cli_defaults_and_explicit_values():
+    defaults, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    coverage, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-hot-capacity-policy",
+            "coverage",
+            "--moe-hot-capacity-floor",
+            "3",
+        ]
+    )
+
+    assert defaults.moe_hot_capacity_policy == "equal"
+    assert defaults.moe_hot_capacity_floor == 8
+    assert coverage.moe_hot_capacity_policy == "coverage"
+    assert coverage.moe_hot_capacity_floor == 3
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--moe-hot-capacity-policy", "adaptive"],
+        ["--moe-hot-capacity-floor", "0"],
+    ],
+)
+def test_hot_capacity_cli_rejects_invalid_values(args):
+    with pytest.raises(SystemExit):
+        parse_args(["--model", ANON_PATH, "--dtype", "bfloat16", *args])
+
+
 @pytest.mark.parametrize("value", ["auto", "bf16", "fp8_e4m3"])
 def test_kv_cache_dtype_cli_choices(value):
     args, _ = parse_args(

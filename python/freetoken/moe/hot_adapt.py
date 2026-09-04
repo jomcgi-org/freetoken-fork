@@ -44,10 +44,73 @@ class HotPlanSeed:
     expert_ids: dict[int, tuple[int, ...]]
     counters: dict[int, tuple[float, ...]]
     seeded_layers: frozenset[int]
+    partially_seeded_layers: frozenset[int]
     age_seconds: float
     saved_hot_budget_bytes: int
+    capacity_policy: str
     tier_commit: str
     tier_mismatch: bool
+
+
+def allocate_hot_capacity(
+    weights: Mapping[int, Sequence[float]],
+    total_rows: int,
+    *,
+    floor: int,
+    num_experts: int,
+) -> dict[int, int]:
+    """Allocate fixed per-layer rows by normalized marginal route coverage."""
+    if isinstance(total_rows, bool) or not isinstance(total_rows, int) or total_rows < 0:
+        raise ValueError("HOT capacity total_rows must be a non-negative integer")
+    if isinstance(floor, bool) or not isinstance(floor, int) or floor < 1:
+        raise ValueError("HOT capacity floor must be a positive integer")
+    if isinstance(num_experts, bool) or not isinstance(num_experts, int) or num_experts < 1:
+        raise ValueError("HOT capacity num_experts must be a positive integer")
+    if any(isinstance(layer_id, bool) or not isinstance(layer_id, int) for layer_id in weights):
+        raise ValueError("HOT capacity layer ids must be integers")
+    layer_ids = sorted(weights)
+    rows: dict[int, tuple[float, ...]] = {}
+    totals: dict[int, float] = {}
+    for layer_id in layer_ids:
+        row = tuple(float(value) for value in weights[layer_id])
+        if len(row) != num_experts:
+            raise ValueError(
+                f"weights layer {layer_id} has {len(row)} experts, expected {num_experts}"
+            )
+        if any(not math.isfinite(value) or value < 0 for value in row):
+            raise ValueError(f"weights layer {layer_id} has an invalid value")
+        rows[layer_id] = tuple(sorted(row, reverse=True))
+        totals[layer_id] = sum(row)
+        if not math.isfinite(totals[layer_id]):
+            raise ValueError(f"weights layer {layer_id} total is not finite")
+    if not layer_ids:
+        return {}
+
+    target = min(total_rows, len(layer_ids) * num_experts)
+    base = min(floor, num_experts, target // len(layer_ids))
+    capacity = {layer_id: base for layer_id in layer_ids}
+    remaining = target - base * len(layer_ids)
+    while remaining:
+        candidates = [
+            layer_id
+            for layer_id in layer_ids
+            if capacity[layer_id] < num_experts
+        ]
+        if not candidates:
+            break
+
+        def marginal_key(layer_id: int) -> tuple[float, int, int]:
+            index = capacity[layer_id]
+            total = totals[layer_id]
+            share = rows[layer_id][index] / total if total else 0.0
+            # Prefer the strongest next marginal. Equal marginals stay balanced,
+            # then use the lower layer id as the final deterministic tie-break.
+            return (-share, capacity[layer_id], layer_id)
+
+        chosen = min(candidates, key=marginal_key)
+        capacity[chosen] += 1
+        remaining -= 1
+    return capacity
 
 
 def resolve_tier_commit() -> str:
@@ -202,6 +265,7 @@ def load_hot_plan(
     current_hot_budget_bytes: int,
     static_expert_ids: Mapping[int, Sequence[int]],
     tier_commit: str,
+    current_capacity_policy: str = "equal",
     now: float | None = None,
 ) -> HotPlanSeed:
     """Validate and resize one persisted plan for the current protected slots."""
@@ -228,6 +292,11 @@ def load_hot_plan(
     ):
         raise ValueError("invalid current HOT budget")
     budget_grew = current_hot_budget_bytes > saved_budget
+    saved_capacity_policy = raw.get("capacity_policy", "equal")
+    if saved_capacity_policy not in ("equal", "coverage"):
+        raise ValueError("invalid saved HOT capacity policy")
+    if current_capacity_policy not in ("equal", "coverage"):
+        raise ValueError("invalid current HOT capacity policy")
     written_at = raw.get("written_at")
     if isinstance(written_at, bool) or not isinstance(written_at, (int, float)):
         raise ValueError("invalid HOT plan timestamp")
@@ -247,6 +316,7 @@ def load_hot_plan(
     }
     counters: dict[int, tuple[float, ...]] = {}
     seeded_layers: set[int] = set()
+    partially_seeded_layers: set[int] = set()
     for layer_id in sorted(disk_layer_ids):
         key = str(layer_id)
         if key not in protected:
@@ -280,6 +350,8 @@ def load_hot_plan(
             )
             chosen_list.extend(next_ranked[: capacity - len(chosen_list)])
         chosen = tuple(chosen_list)
+        if len(chosen) < capacity:
+            partially_seeded_layers.add(layer_id)
         selected[layer_id] = chosen
         counters[layer_id] = row
         seeded_layers.add(layer_id)
@@ -296,8 +368,10 @@ def load_hot_plan(
         expert_ids=selected,
         counters=counters,
         seeded_layers=frozenset(seeded_layers),
+        partially_seeded_layers=frozenset(partially_seeded_layers),
         age_seconds=max(0.0, (time.time() if now is None else now) - timestamp),
         saved_hot_budget_bytes=saved_budget,
+        capacity_policy=saved_capacity_policy,
         tier_commit=saved_tier,
         tier_mismatch=saved_tier != tier_commit,
     )
@@ -313,9 +387,12 @@ def make_hot_plan_document(
     tier_commit: str,
     protected_slots: Mapping[int, Sequence[int | None]],
     decayed_counters: Mapping[int, Sequence[float]],
+    capacity_policy: str = "equal",
     written_at: float | None = None,
 ) -> dict[str, Any] | None:
     """Create a compact JSON document, or None for an all-zero snapshot."""
+    if capacity_policy not in ("equal", "coverage"):
+        raise ValueError("HOT capacity policy must be 'equal' or 'coverage'")
     counter_rows = {
         int(layer_id): tuple(float(value) for value in decayed_counters[layer_id])
         for layer_id in sorted(decayed_counters)
@@ -359,6 +436,7 @@ def make_hot_plan_document(
         "num_layers": int(num_layers),
         "num_experts": int(num_experts),
         "hot_budget_bytes": int(hot_budget_bytes),
+        "capacity_policy": capacity_policy,
         "tier_commit": str(tier_commit),
         "counter_dtype": "float32",
         "counter_encoding": "base64-le",
@@ -752,8 +830,9 @@ def recompute_hot_partition(
     budget_bytes: int,
     expert_bytes: int,
     num_experts: int,
+    capacities: Mapping[int, int] | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    """Select an equal top-N partition under the configured resident-byte budget."""
+    """Select each layer's top experts under fixed protected-row capacities."""
     if budget_bytes < 0 or expert_bytes <= 0 or num_experts <= 0:
         raise ValueError("HOT planner geometry must be non-negative with positive rows")
     if not disk_layer_ids or budget_bytes == 0:
@@ -761,12 +840,27 @@ def recompute_hot_partition(
     missing = set(disk_layer_ids) - set(expert_counts)
     if missing:
         raise ValueError(f"counts have no entries for DISK layers {sorted(missing)}")
-    top_n = min(
-        num_experts,
-        budget_bytes // (expert_bytes * len(disk_layer_ids)),
-    )
-    if top_n <= 0:
-        return {}
+    if capacities is None:
+        top_n = min(
+            num_experts,
+            budget_bytes // (expert_bytes * len(disk_layer_ids)),
+        )
+        if top_n <= 0:
+            return {}
+        resolved_capacity = {layer_id: top_n for layer_id in disk_layer_ids}
+    else:
+        if set(capacities) != set(disk_layer_ids):
+            raise ValueError("HOT capacities must cover exactly the DISK layers")
+        resolved_capacity = {
+            layer_id: int(capacities[layer_id]) for layer_id in disk_layer_ids
+        }
+        if any(
+            value < 0 or value > num_experts
+            for value in resolved_capacity.values()
+        ):
+            raise ValueError("HOT capacities must be within the expert geometry")
+        if sum(resolved_capacity.values()) * expert_bytes > budget_bytes:
+            raise ValueError("HOT capacities exceed the resident-byte budget")
     result = {}
     for layer_id in sorted(disk_layer_ids):
         counts = expert_counts[layer_id]
@@ -778,7 +872,9 @@ def recompute_hot_partition(
             range(num_experts),
             key=lambda expert_id: (-float(counts[expert_id]), expert_id),
         )
-        result[layer_id] = tuple(sorted(ranked[:top_n]))
+        result[layer_id] = tuple(
+            sorted(ranked[: resolved_capacity[layer_id]])
+        )
     return result
 
 

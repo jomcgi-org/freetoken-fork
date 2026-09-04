@@ -898,23 +898,82 @@ class Engine:
                     f"num_pages={pages} (+1 dummy page; prefill_overlap={overlap})"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
-            hot_expert_ids, hot_expert_capacity, hot_expert_bytes = (
-                _resolve_hot_expert_setup(
-                    config,
-                    disk_layer_ids,
-                    num_moe_layers,
-                )
+            hot_capacity_policy = getattr(
+                config, "moe_hot_capacity_policy", "equal"
             )
-            hot_expert_ids, hot_plan_seed, hot_plan_runtime = (
-                _resolve_persisted_hot_plan(
+            if hot_capacity_policy == "equal":
+                hot_expert_ids, hot_expert_capacity, hot_expert_bytes = (
+                    _resolve_hot_expert_setup(
+                        config,
+                        disk_layer_ids,
+                        num_moe_layers,
+                    )
+                )
+                hot_expert_ids, hot_plan_seed, hot_plan_runtime = (
+                    _resolve_persisted_hot_plan(
+                        config,
+                        disk_layer_ids,
+                        num_moe_layers,
+                        hot_expert_ids,
+                        hot_expert_capacity,
+                        hot_expert_bytes,
+                    )
+                )
+            else:
+                provisional_ids, provisional_capacity, hot_expert_bytes = (
+                    _resolve_hot_expert_setup(
+                        config,
+                        disk_layer_ids,
+                        num_moe_layers,
+                        log_plan=False,
+                    )
+                )
+                _, hot_plan_seed, hot_plan_runtime = _resolve_persisted_hot_plan(
                     config,
                     disk_layer_ids,
                     num_moe_layers,
-                    hot_expert_ids,
-                    hot_expert_capacity,
+                    provisional_ids,
+                    provisional_capacity,
                     hot_expert_bytes,
                 )
-            )
+                persisted_counters = (
+                    hot_plan_seed.counters
+                    if hot_plan_seed is not None
+                    and set(disk_layer_ids).issubset(hot_plan_seed.counters)
+                    else None
+                )
+                hot_expert_ids, hot_expert_capacity, hot_expert_bytes = (
+                    _resolve_hot_expert_setup(
+                        config,
+                        disk_layer_ids,
+                        num_moe_layers,
+                        persisted_counters=persisted_counters,
+                    )
+                )
+                if hot_plan_seed is not None:
+                    from freetoken.moe.hot_adapt import load_hot_plan
+
+                    try:
+                        hot_plan_seed = load_hot_plan(
+                            hot_plan_runtime["path"],
+                            identity=hot_plan_runtime["identity"],
+                            disk_layer_ids=disk_layer_ids,
+                            num_layers=num_moe_layers,
+                            num_experts=config.model_config.num_experts,
+                            current_capacity=hot_expert_capacity,
+                            current_hot_budget_bytes=(
+                                sum(hot_expert_capacity.values()) * hot_expert_bytes
+                            ),
+                            static_expert_ids=hot_expert_ids,
+                            tier_commit=hot_plan_runtime["tier_commit"],
+                            current_capacity_policy=hot_capacity_policy,
+                        )
+                        hot_expert_ids = hot_plan_seed.expert_ids
+                    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                        logger.warning_rank0(
+                            f"MoE HOT persisted plan changed during capacity resolution: {exc}"
+                        )
+                        hot_plan_seed = None
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
@@ -976,6 +1035,7 @@ class Engine:
                 hot_plan_path=hot_plan_runtime["path"],
                 hot_plan_identity=hot_plan_runtime["identity"],
                 hot_plan_tier_commit=hot_plan_runtime["tier_commit"],
+                hot_capacity_policy=hot_capacity_policy,
                 hot_plan_write_enabled=hot_plan_runtime["write_enabled"],
                 hot_plan_interval_seconds=hot_plan_runtime["interval_seconds"],
                 idle_ms=getattr(config, "moe_hot_adapt_idle_ms", 500),
@@ -2250,18 +2310,19 @@ def _load_hot_expert_profile(
 
 
 def _plan_hot_experts(
-    expert_hits: dict[int, tuple[int, ...]],
+    expert_hits: dict[int, tuple[float, ...]],
     disk_layer_ids: frozenset[int],
     *,
     budget_bytes: int,
     expert_bytes: int,
     num_experts: int,
+    capacities: dict[int, int] | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    """Select the same top-N experts in each DISK layer under a byte budget.
+    """Select the requested top experts in each DISK layer under a byte budget.
 
     Counts rank descending with expert id as the stable tie-break. Any remainder
-    smaller than one expert in every DISK layer is deliberately left unused so the
-    partition keeps the documented per-layer top-N shape.
+    smaller than one expert in every DISK layer is deliberately left unused by
+    the historical equal-capacity path.
     """
     from freetoken.moe.hot_adapt import recompute_hot_partition
 
@@ -2271,11 +2332,12 @@ def _plan_hot_experts(
         budget_bytes=budget_bytes,
         expert_bytes=expert_bytes,
         num_experts=num_experts,
+        capacities=capacities,
     )
 
 
 def _profiled_hot_pair_rate(
-    expert_hits: dict[int, tuple[int, ...]],
+    expert_hits: dict[int, tuple[float, ...]],
     hot_expert_ids: dict[int, tuple[int, ...]],
 ) -> float:
     total = sum(sum(expert_hits[layer_id]) for layer_id in hot_expert_ids)
@@ -2376,6 +2438,9 @@ def _resolve_persisted_hot_plan(
                 current_hot_budget_bytes=current_hot_budget_bytes,
                 static_expert_ids=static_plan,
                 tier_commit=tier_commit,
+                current_capacity_policy=getattr(
+                    config, "moe_hot_capacity_policy", "equal"
+                ),
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning_rank0(f"MoE HOT persisted plan ignored: {exc}")
@@ -2405,6 +2470,7 @@ def _resolve_persisted_hot_plan(
         f"counters_seeded={'yes' if seed.counters else 'no'}, "
         f"plan was saved at {seed.saved_hot_budget_bytes} byte budget, "
         f"current is {current_hot_budget_bytes}, "
+        f"capacity_policy={getattr(seed, 'capacity_policy', 'equal')}, "
         f"tier_commit={seed.tier_commit}"
     )
     return seed.expert_ids, seed, runtime
@@ -2416,6 +2482,8 @@ def _resolve_hot_expert_setup(
     num_moe_layers: int,
     *,
     reserved: int = 0,
+    persisted_counters: dict[int, tuple[float, ...]] | None = None,
+    log_plan: bool = True,
 ) -> tuple[dict[int, tuple[int, ...]], dict[int, int], int]:
     """Resolve initial rows, fixed capacity, and logical bytes per HOT row."""
     # Retain the old keyword for compatibility. HOT rows consume GPU slots now,
@@ -2430,9 +2498,20 @@ def _resolve_hot_expert_setup(
         raise ValueError(
             "--moe-hot-expert-budget-gib requires --moe-disk-decode cpu"
         )
+    policy = getattr(config, "moe_hot_capacity_policy", "equal")
     interval = getattr(config, "moe_hot_adapt_interval_steps", "auto")
     adapt_enabled = interval == "auto" or interval > 0
-    if not config.moe_disk_layer_profile and not adapt_enabled:
+    persisted_signal_covers = (
+        persisted_counters is not None
+        and set(disk_layer_ids).issubset(persisted_counters)
+    )
+    persistence_preflight = policy == "coverage" and not log_plan
+    if (
+        not config.moe_disk_layer_profile
+        and not adapt_enabled
+        and not persisted_signal_covers
+        and not persistence_preflight
+    ):
         raise ValueError(
             "static --moe-hot-expert-budget-gib requires --moe-disk-layer-profile; "
             "set --moe-hot-adapt-interval-steps above 0 to warm up from all-cold"
@@ -2512,8 +2591,36 @@ def _resolve_hot_expert_setup(
         logger.warning_rank0(refusal)
         raise ValueError(refusal)
     top_n = min(budget_limit, slot_limit)
-    capacity = {layer_id: top_n for layer_id in sorted(disk_layer_ids)}
-    actual = top_n * len(capacity) * expert_bytes
+    equal_capacity = {layer_id: top_n for layer_id in sorted(disk_layer_ids)}
+    total_rows = top_n * len(equal_capacity)
+    capacity = equal_capacity
+    signal = None
+    signal_source = None
+    if policy == "coverage":
+        if persisted_signal_covers:
+            signal = {
+                layer_id: persisted_counters[layer_id]
+                for layer_id in disk_layer_ids
+            }
+            signal_source = "persisted counters"
+        elif hits is not None:
+            signal = {layer_id: hits[layer_id] for layer_id in disk_layer_ids}
+            signal_source = "static profile"
+        else:
+            if log_plan:
+                logger.info_rank0(
+                    "MoE HOT capacity policy coverage: no per-layer signal, equal capacity"
+                )
+        if signal is not None:
+            from freetoken.moe.hot_adapt import allocate_hot_capacity
+
+            capacity = allocate_hot_capacity(
+                signal,
+                total_rows,
+                floor=getattr(config, "moe_hot_capacity_floor", 8),
+                num_experts=num_experts,
+            )
+    actual = sum(capacity.values()) * expert_bytes
     if budget_limit < slot_limit:
         bound_source = "budget"
     elif slot_limit < budget_limit:
@@ -2524,27 +2631,60 @@ def _resolve_hot_expert_setup(
         f"bound={bound_source} (budget_limit={budget_limit}, "
         f"slot_limit={slot_limit}, slots={num_slots}, fetch_reserve={fetch_reserve})"
     )
-    if hits is None:
+    plan_signal = signal if signal is not None else hits
+    if plan_signal is None:
         plan = {layer_id: () for layer_id in sorted(disk_layer_ids)}
-        logger.info_rank0(
-            f"MoE HOT expert plan: all-cold startup with {top_n}/{num_experts} row "
-            f"capacity in each of {len(plan)} DISK layers, {actual / 2**30:.2f} GiB "
-            f"protected GPU, {bound_log}; online adaptation will warm the partition"
-        )
+        if log_plan:
+            logger.info_rank0(
+                f"MoE HOT expert plan: all-cold startup with {top_n}/{num_experts} row "
+                f"capacity in each of {len(plan)} DISK layers, {actual / 2**30:.2f} GiB "
+                f"protected GPU, {bound_log}; online adaptation will warm the partition"
+            )
     else:
         plan = _plan_hot_experts(
-            hits,
+            plan_signal,
             disk_layer_ids,
             budget_bytes=actual,
             expert_bytes=expert_bytes,
             num_experts=num_experts,
+            capacities=capacity if policy == "coverage" and signal is not None else None,
         )
-        logger.info_rank0(
-            f"MoE HOT expert plan: top {top_n}/{num_experts} experts in each of "
-            f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB protected GPU, "
-            f"{bound_log}, profiled hot_pair_rate="
-            f"{_profiled_hot_pair_rate(hits, plan):.1%}"
-        )
+        if log_plan:
+            if policy == "coverage" and signal is not None:
+                equal_plan = _plan_hot_experts(
+                    plan_signal,
+                    disk_layer_ids,
+                    budget_bytes=actual,
+                    expert_bytes=expert_bytes,
+                    num_experts=num_experts,
+                )
+                ordered = sorted(capacity.values())
+                midpoint = len(ordered) // 2
+                median = (
+                    ordered[midpoint]
+                    if len(ordered) % 2
+                    else (ordered[midpoint - 1] + ordered[midpoint]) / 2
+                )
+                configured_floor = min(
+                    getattr(config, "moe_hot_capacity_floor", 8), num_experts, top_n
+                )
+                at_floor = sum(value == configured_floor for value in ordered)
+                logger.info_rank0(
+                    f"MoE HOT expert plan: policy=coverage, signal={signal_source}, "
+                    f"capacities=min/median/max={ordered[0]}/{median:g}/{ordered[-1]}, "
+                    f"layers_at_floor={at_floor}, total_rows={sum(ordered)}, "
+                    f"{actual / 2**30:.2f} GiB protected GPU, {bound_log}, "
+                    f"profiled hot_pair_rate equal="
+                    f"{_profiled_hot_pair_rate(plan_signal, equal_plan):.1%}, chosen="
+                    f"{_profiled_hot_pair_rate(plan_signal, plan):.1%}"
+                )
+            else:
+                logger.info_rank0(
+                    f"MoE HOT expert plan: top {top_n}/{num_experts} experts in each of "
+                    f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB protected GPU, "
+                    f"{bound_log}, profiled hot_pair_rate="
+                    f"{_profiled_hot_pair_rate(plan_signal, plan):.1%}"
+                )
     return plan, capacity, expert_bytes
 
 
@@ -2625,6 +2765,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_layers": None,
     "moe_disk_layer_profile": None,
     "moe_hot_expert_budget_gib": 0.0,
+    "moe_hot_capacity_policy": "equal",
+    "moe_hot_capacity_floor": 8,
     "moe_hot_adapt_halflife_steps": 2000,
     "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
