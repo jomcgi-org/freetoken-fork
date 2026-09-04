@@ -25,18 +25,37 @@ conversation, where decode improved about 30 percent.
 
 ## 2. Corrections to the post
 
-### 2.1 Speculative decode: the stated reason is wrong
+### 2.1 Speculative decode: the stated reason is right but incomplete
 
 Section 6 lists speculative decode as a loss and explains it as "speculation
 pays when a marginal token is cheap. With part of every step on the CPU tier a
 drafted token costs full price, even at 72% acceptance; 12.6 vs 18.0 tok/s".
 
-That explanation is not what the measurement shows. MTP forces CUDA graphs off
-entirely (`engine.py` built the graph runner with an empty `cuda_graph_bs`
-whenever `speculative_mtp == "on"`), so every verify forward paid full eager
-launch overhead. Acceptance was never the problem: it measured 52 to 78 percent,
-which is comfortably enough to pay. The cost was structural and fixable rather
-than intrinsic to the tier.
+That mechanism is correct, and an earlier draft of this document wrongly called
+it wrong. What the post misses is a second, separable cost: MTP forced CUDA
+graphs off entirely (`engine.py` built the graph runner with an empty
+`cuda_graph_bs` whenever `speculative_mtp == "on"`), so every verify forward
+also paid full eager launch overhead. The two compound.
+
+Splitting the roughly 45 ms step by what a width-2 verify actually amortises
+makes the post's point precise. Dense and attention weight streaming, kernel
+launches and the PLE gather are paid once per forward, about 26 ms. The MoE
+expert fetch and compute, about 18 ms, scales with width, because two tokens
+route to roughly twice the distinct experts. So a width-2 verify costs about
+2 x 18 + 26 = 62 ms against 90 ms for two separate steps: cheaper, but the saving
+is only ever the fixed part.
+
+Then the rejection path decides it. On a miss the engine restores state and
+replays a width-1 decode, so:
+
+    cost per token = (draft + verify + (1 - a) * replay) / (1 + a)
+
+At 52 percent acceptance that is about 53 ms against a 45 ms baseline, at 65
+percent about 50 ms, and only at 78 percent does it reach about 43 ms. Removing
+the graph penalty is necessary, and it is what this fork now does, but it is
+probably not sufficient. What would change the verdict is K of 2 or more, so the
+fixed cost amortises over more tokens, or a rejection path cheaper than a full
+width-1 replay. Both are real work rather than a flag.
 
 The fork now captures a width-keyed verify graph alongside the width-1 decode
 graphs, reusing the existing capture design. The only structural assumption that
