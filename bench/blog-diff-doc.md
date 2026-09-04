@@ -39,9 +39,32 @@ which is comfortably enough to pay. The cost was structural and fixable rather
 than intrinsic to the tier.
 
 The fork now captures a width-keyed verify graph alongside the width-1 decode
-graphs. Whether that turns the loss into a win is being measured; the honest
-status is "the stated reason was wrong and the real one is addressed", not "this
-is now a win".
+graphs, reusing the existing capture design. The only structural assumption that
+did not carry over is query width: the decode capture builds its indptr as
+`arange(bs + 1)`, one query token per request, and a verify of width K+1 needs a
+strided arange, still a constant for a fixed (bs, width).
+
+**It is not yet measured, and that should be stated plainly rather than
+implied.** Getting a captured verify pass to run has cost three separate fixes
+for the same class of problem, host work inside the captured region:
+
+1. PLE metadata built its indptr with `torch.tensor([0, 2], device=cuda)`, which
+   materialises on the host and copies. Cached per device and width.
+2. The fused short conv did the same with `.new_tensor([0, 1])`. Same fix.
+3. The model forward still calls `ple.start_prefetch` unconditionally, and for
+   the staged backends (`cached`, `disk`, `uring`) that reaches host I/O. The
+   staging was hoisted out of the captured region, but the in-forward call was
+   left in place. Unfixed at the time of writing.
+
+Pinned PLE would sidestep the third problem, but it does not fit on a 64 GB
+host: it reserves about 30 GiB and leaves nothing for MoE layer pinning. So the
+measurement is blocked on the staged-backend fix, which is also the
+production-relevant one, since production runs uring.
+
+The honest status is "the reason the post gives is wrong, the real one is
+identified and mostly addressed, and the payoff is unmeasured". Acceptance of 52
+to 78 percent at K=1 means the ceiling is worth pursuing, roughly 1.5x, but a
+ceiling is not a result.
 
 ### 2.2 The 1,000-step adaptation interval makes short experiments blind
 
@@ -78,7 +101,7 @@ zero".
 
 ## 3. What is in the fork but not in the post
 
-### 3.1 Split prefill and decode routing histories
+### 3.1 Split prefill and decode routing histories, with phase-aware aim
 
 The one clear win of the later rounds, and the post predates it.
 
@@ -97,9 +120,32 @@ both positions:
 Shared measures 19.37 and 19.34 decode batches in opposite positions and split's
 pair rate lands at 67.9 and 67.2, so position accounts for none of it.
 
-The cost is real: prefill is about 30 percent slower. It is a decode-versus-
-prefill trade, right for reading a document once and discussing it over many
-turns, wrong for prefilling a large input to emit a short answer.
+That first measurement carried a 30 percent prefill penalty, and the penalty
+turned out to be a bug rather than a trade. `--moe-hot-adapt-prefill-normalize
+tokens` divides the prefill route weight by the batch's token count, and with
+the production `--moe-hot-adapt-prefill-weight 0.1` a 2048-token chunk accrued
+about 0.1/2048 per token against decode's 1.0. The prefill history was roughly
+20,000x under-weighted, so the hot set effectively ignored prefill, and a
+phase-aware aim was a no-op because "prefill plus a quarter of decode" is just
+decode when prefill is four orders of magnitude smaller.
+
+Dropping the normalisation and aiming per phase, all at position 1:
+
+| | shared | split + normalize | split + phase, no normalize |
+|---|---|---|---|
+| long prompt prefill wall | 664 s | 885 s | 652 s |
+| prefill hot coverage, mean | 30.4% | 17.8% | 37.6% |
+| realised hot_pair_rate | 47.0% | 67.9% | 64.2% |
+| decode batches, mean of 9 | 19.37 | 23.87 | 21.88 |
+| post-document turns | 12.5 tok/s | 19.2 tok/s | 14.6 tok/s |
+| `decayed_prefill_share` | 0.00 | 0.13 | 69.15 |
+
+Prefill returns to the shared baseline and its hot coverage ends up better than
+shared. The trade moved rather than vanished: about +13 percent decode batches
+instead of +23, but at no prefill cost instead of a 33 percent one. Deployed as
+`--moe-hot-adapt-histories split --moe-hot-adapt-aim phase`, normalisation left
+off, because production prefills sampled from the journal reach p90 8,192 and
+max 30,912 tokens, where a 30 percent penalty is a real cost.
 
 ### 3.2 Measured neutral, kept behind flags
 
