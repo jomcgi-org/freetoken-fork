@@ -75,10 +75,16 @@ for the same class of problem, host work inside the captured region:
    staging was hoisted out of the captured region, but the in-forward call was
    left in place. Unfixed at the time of writing.
 
-Pinned PLE would sidestep the third problem, but it does not fit on a 64 GB
-host: it reserves about 30 GiB and leaves nothing for MoE layer pinning. So the
-measurement is blocked on the staged-backend fix, which is also the
-production-relevant one, since production runs uring.
+A fourth followed at replay rather than capture: the verify buffer sliced
+`active_table_idx` per request, but route collection is per token, so a width-2
+replay tried to write two values into one slot.
+
+Pinned PLE would have sidestepped the third problem, but it does not fit on a
+64 GB host: it reserves about 30 GiB and leaves nothing for MoE layer pinning.
+So the work had to go through the staged-backend fix, which is the
+production-relevant path anyway, since production runs uring.
+
+Capture itself now succeeds (`MTP verify CUDA graphs with widths: [2]`).
 
 The honest status is "the reason the post gives is wrong, the real one is
 identified and mostly addressed, and the payoff is unmeasured". Acceptance of 52
