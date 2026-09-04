@@ -3090,7 +3090,7 @@ class PLELayer(BaseOP):
             for step in range(2):
                 one = PLEMetadata(
                     input_ids=meta.input_ids[step : step + 1],
-                    cu_seqlens=meta.cu_seqlens.new_tensor([0, 1]),
+                    cu_seqlens=_mtp_fused_cu_seqlens(meta.cu_seqlens.device, 1),
                     seq_lens=(1,),
                     ngram_context=meta.ngram_context,
                     state_slots=meta.state_slots,
