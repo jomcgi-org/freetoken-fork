@@ -165,9 +165,9 @@ class Batch:
     fla_metadata: "FLAMetadata | None" = field(default=None, init=False)
     padded_reqs: List[Req] = field(init=False)
     # DSV4 paged-KV out-locations for this batch (None for non-DSV4 models). Set by the scheduler.
-    # This decode batch's padded per-row page-table rows. Attention backends that must read
-    # positions anywhere in a request's history snapshot those rows before a captured replay
-    # (DSV4), since the next batch's allocate_paged mutates the live table.
+    # Per-token scheduler table rows used by decode route collection. At ordinary width 1 they
+    # are also the per-request page-table rows. Wider verify attention must select the request
+    # row for each query without treating this token-shaped tensor as a request-shaped one.
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)

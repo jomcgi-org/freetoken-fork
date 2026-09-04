@@ -22,13 +22,13 @@ logger = init_logger(__name__)
 @dataclass
 class GraphCaptureBuffer:
     width: int
-    input_ids: torch.Tensor
-    out_loc: torch.Tensor
-    positions: torch.Tensor
-    logits: torch.Tensor
+    input_ids: torch.Tensor  # per token: [bs * width]
+    out_loc: torch.Tensor  # per token: [bs * width]
+    positions: torch.Tensor  # per token: [bs * width]
+    logits: torch.Tensor  # per token: [bs * width, vocab_size]
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
-    request_table_idx: torch.Tensor  # scheduler table rows for session route collection
-    # GDN query indptr is constant for each captured (bs, width), filled once.
+    request_table_idx: torch.Tensor  # per-token rows for session route collection
+    # Per-request boundaries, with values striding by the fixed token width.
     fla_cu_seqlens: torch.Tensor
 
     @classmethod
@@ -44,7 +44,9 @@ class GraphCaptureBuffer:
             out_loc=torch.zeros(rows, dtype=torch.int32, device=device),
             positions=torch.zeros(rows, dtype=torch.int32, device=device),
             logits=torch.empty(rows, vocab_size, dtype=torch.float32, device=device),
-            table_idx=torch.zeros(rows, dtype=torch.int32, device=device),
+            # Recurrent state is keyed once per request, even when verify has multiple tokens.
+            table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
+            # MoE route collection consumes one scheduler table row per query token.
             request_table_idx=torch.zeros(rows, dtype=torch.int32, device=device),
             fla_cu_seqlens=torch.arange(
                 0, (bs + 1) * width, width, dtype=torch.int32, device=device

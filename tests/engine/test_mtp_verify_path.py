@@ -82,9 +82,10 @@ def test_graph_capture_buffer_sizes_rows_and_strides_cu_seqlens(
     assert buffer.input_ids.shape == (rows,)
     assert buffer.positions.shape == (rows,)
     assert buffer.out_loc.shape == (rows,)
-    assert buffer.table_idx.shape == (rows,)
+    assert buffer.table_idx.shape == (bs,)
     assert buffer.request_table_idx.shape == (rows,)
     assert buffer.logits.shape == (rows, vocab_size)
+    assert buffer.fla_cu_seqlens.shape == (bs + 1,)
     assert buffer.fla_cu_seqlens.tolist() == cu_seqlens
 
 
@@ -114,19 +115,70 @@ def test_eager_fla_metadata_matches_fixed_query_width(bs, width, cu_seqlens):
     assert metadata.cache_indices is batch.linear_table_idx
 
 
-def test_verify_buffer_binds_token_and_request_slices_separately():
-    req = SimpleNamespace()
-    batch = _Batch(reqs=[req], padded_reqs=[req], phase="decode")
-    buffer = GraphCaptureBuffer.init(1, 5, torch.device("cpu"), width=2)
+@pytest.mark.parametrize("width", [1, 2])
+def test_graph_buffer_binds_token_and_request_slices_separately(width):
+    reqs = [SimpleNamespace() for _ in range(3)]
+    batch = _Batch(reqs=reqs, padded_reqs=reqs, phase="decode")
+    buffer = GraphCaptureBuffer.init(3, 5, torch.device("cpu"), width=width)
 
     buffer.set_batch(batch)
 
-    assert batch.input_ids.shape == (2,)
-    assert batch.positions.shape == (2,)
-    assert batch.out_loc.shape == (2,)
-    assert batch.linear_table_idx.shape == (1,)
-    assert batch.active_table_idx.shape == (1,)
-    assert batch.fla_metadata.cu_seqlens.tolist() == [0, 2]
+    rows = 3 * width
+    assert batch.input_ids.shape == (rows,)
+    assert batch.positions.shape == (rows,)
+    assert batch.out_loc.shape == (rows,)
+    assert batch.linear_table_idx.shape == (3,)
+    assert batch.active_table_idx.shape == (rows,)
+    assert batch.fla_metadata.cache_indices.shape == (3,)
+    assert batch.fla_metadata.cu_seqlens.shape == (4,)
+    assert batch.fla_metadata.cu_seqlens.tolist() == list(range(0, rows + 1, width))
+
+    supplied = _Batch(
+        reqs=reqs,
+        padded_reqs=reqs,
+        phase="decode",
+        input_ids=torch.arange(rows, dtype=torch.int32),
+        positions=torch.arange(10, 10 + rows, dtype=torch.int32),
+        out_loc=torch.arange(20, 20 + rows, dtype=torch.int32),
+        linear_table_idx=torch.arange(30, 33, dtype=torch.int32),
+        active_table_idx=torch.arange(40, 40 + rows, dtype=torch.int32),
+    )
+    buffer.copy_from(supplied)
+    assert torch.equal(buffer.input_ids, supplied.input_ids)
+    assert torch.equal(buffer.positions, supplied.positions)
+    assert torch.equal(buffer.out_loc, supplied.out_loc)
+    assert torch.equal(buffer.table_idx, supplied.linear_table_idx)
+    assert torch.equal(buffer.request_table_idx, supplied.active_table_idx)
+
+
+def test_qsa_capture_buffers_separate_per_token_and_per_request(monkeypatch):
+    import freetoken.attention.qsa_sparse as qsa_sparse
+
+    backend = QSASparseAttnBackend.__new__(QSASparseAttnBackend)
+    backend.device = torch.device("cpu")
+    backend.page_size = 2
+    backend.cmp_page_size = 1
+    backend.block_topk = 1
+    backend.select_width = 2
+    backend.index_head_dim = 4
+    backend.index_heads = 2
+    backend.dtype = torch.float32
+    backend._block_topk_kernel = None
+    monkeypatch.setattr(
+        qsa_sparse,
+        "get_global_ctx",
+        lambda: SimpleNamespace(page_table=torch.zeros((3, 6), dtype=torch.int32)),
+    )
+
+    backend.init_capture_graph(max_seq_len=6, bs_list=[1, 3])
+
+    assert backend._graph["block_table"].shape == (3, 3)
+    assert backend._graph["kvlen"].shape == (3,)
+    assert backend._graph["table_idx"].shape == (3,)
+    assert backend._graph["token_to_req"].shape == (3,)
+    assert backend._graph["cu_seqlens"].shape == (4,)
+    assert backend._graph["mtp_block_table"].shape == (6, 3)
+    assert backend._graph["mtp_kvlen"].shape == (6,)
 
 
 def test_qsa_verify_steps_keep_distinct_persistent_lengths():
@@ -135,7 +187,9 @@ def test_qsa_verify_steps_keep_distinct_persistent_lengths():
     backend.page_size = 1
     backend._graph = {
         "block_table": torch.zeros(1, 3, dtype=torch.int32),
+        "mtp_block_table": torch.zeros(2, 3, dtype=torch.int32),
         "kvlen": torch.zeros(1, dtype=torch.int32),
+        "mtp_kvlen": torch.zeros(2, dtype=torch.int32),
         "table_idx": torch.zeros(1, dtype=torch.int32),
         "token_to_req": torch.zeros(1, dtype=torch.int32),
         "cu_seqlens": torch.tensor([0, 1], dtype=torch.int32),
@@ -153,15 +207,85 @@ def test_qsa_verify_steps_keep_distinct_persistent_lengths():
         for length in (8, 9)
     ]
 
-    for step, md in enumerate(metadata):
-        backend._stage_mtp_decode(
-            md, step, 1, torch.tensor([1], dtype=torch.int64)
-        )
+    req = SimpleNamespace()
+    batch = _Batch(
+        reqs=[req],
+        padded_reqs=[req],
+        phase="decode",
+        mtp_fused=True,
+        active_table_idx=torch.tensor([1, 1], dtype=torch.int32),
+        mtp_qsa_metadata=tuple(metadata),
+    )
+    backend.prepare_for_replay(batch)
 
     assert metadata[0].seq_lens.tolist() == [8]
     assert metadata[1].seq_lens.tolist() == [9]
     assert metadata[0].seq_lens.data_ptr() != metadata[1].seq_lens.data_ptr()
+    assert metadata[0].block_table.data_ptr() != metadata[1].block_table.data_ptr()
     assert metadata[0].block_table.tolist() == [[3, 4, 5]]
+
+
+def test_e2m1_dequant_does_not_construct_a_host_lookup(monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from types import ModuleType
+
+    package_name = "freetoken.models.qwen4_exp"
+    source_dir = Path(__file__).resolve().parents[2] / "python/freetoken/models/qwen4_exp"
+    package = ModuleType(package_name)
+    package.__path__ = [str(source_dir)]
+    monkeypatch.setitem(sys.modules, package_name, package)
+    config = ModuleType(f"{package_name}.config")
+    config.PLE_CONV_STATE = "ple_conv"
+    config.PLE_NGRAM_STATE = "ple_ngram_ctx"
+    monkeypatch.setitem(sys.modules, config.__name__, config)
+    hc = ModuleType(f"{package_name}.hc")
+    hc.GroupedPlusOneRMSNorm = object
+    monkeypatch.setitem(sys.modules, hc.__name__, hc)
+    module_name = f"{package_name}.ple"
+    spec = importlib.util.spec_from_file_location(module_name, source_dir / "ple.py")
+    assert spec is not None and spec.loader is not None
+    ple_module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, ple_module)
+    spec.loader.exec_module(ple_module)
+
+    data = torch.tensor(
+        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]],
+        dtype=torch.uint8,
+    )
+    scales = torch.ones((1, 1), dtype=torch.float32)
+    expected = torch.tensor(
+        [
+            [
+                0.0,
+                0.5,
+                1.0,
+                1.5,
+                2.0,
+                3.0,
+                4.0,
+                6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ]
+        ],
+        dtype=torch.bfloat16,
+    )
+
+    def reject_host_tensor(*args, **kwargs):
+        raise AssertionError("dequantization must generate constants on the input device")
+
+    monkeypatch.setattr(torch, "tensor", reject_host_tensor)
+    values = ple_module.dequantize_ple_rows(data, scales, "e2m1g16")
+
+    assert torch.equal(values, expected)
 
 
 def _mtp_graph_batch(width=2):

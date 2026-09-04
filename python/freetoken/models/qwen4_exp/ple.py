@@ -136,9 +136,6 @@ class PLETableBackend(Protocol):
     ) -> None: ...
 
 
-_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
 def dequantize_ple_rows(
     data: torch.Tensor,
     scales: torch.Tensor | None,
@@ -176,7 +173,17 @@ def dequantize_ple_rows(
     if table_format == "int4g16":
         values = (codes.to(torch.float32) - 8.0) * group_scales
     else:
-        magnitudes = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=data.device)
+        # Build the tiny lookup on device. A Python-list torch.tensor copy is illegal when
+        # the staged e2m1 PLE decode is recorded inside a CUDA graph.
+        magnitude_codes = torch.arange(8, dtype=torch.int32, device=data.device)
+        exponent = magnitude_codes >> 1
+        mantissa = magnitude_codes & 1
+        magnitudes = torch.where(
+            exponent == 0,
+            mantissa.to(torch.float32) * 0.5,
+            (1.0 + mantissa.to(torch.float32) * 0.5)
+            * torch.pow(2.0, exponent.to(torch.float32) - 1.0),
+        )
         values = magnitudes[(codes & 7).long()]
         values = torch.where((codes & 8).bool(), -values, values)
         values.mul_(group_scales).mul_(float(global_scale))

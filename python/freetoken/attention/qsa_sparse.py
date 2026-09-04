@@ -84,7 +84,7 @@ class QSASparseMetadata(BaseAttnMetadata):
     cu_seqlens:       torch.Tensor | None = None  # [bs+1] int32
     seq_lens:         torch.Tensor | None = None  # [bs] int32, device_len
     ring_slots:       torch.Tensor | None = None  # [bs] int32, Req.table_idx
-    block_table:      torch.Tensor | None = None  # [bs, W//page_size] int32, physical page ids
+    block_table:      torch.Tensor | None = None  # [query rows, W//page_size] int32 page ids
     # Per-forward scatter plans, built once by the first QSA layer and reused by the rest.
     # positions is bound here (not in prepare_metadata) because a capture batch has none yet.
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
@@ -255,22 +255,22 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self, md: QSASparseMetadata, step: int, bs: int, table_idx: torch.Tensor
     ) -> None:
         """Give each sequential verify row a stable length while sharing request addressing."""
-        if "mtp_kvlen" not in self._graph:
-            self._graph["mtp_kvlen"] = torch.empty(
-                (2, self._graph["kvlen"].shape[0]),
-                dtype=torch.int32,
-                device=self.device,
-            )
-        self._graph["block_table"][:bs].copy_(
+        token_slice = slice(step * bs, (step + 1) * bs)
+        # The staged attention table and length are per query. Separate slices keep both
+        # sequential verify launches on stable storage instead of aliasing one request row.
+        self._graph["mtp_block_table"][token_slice].copy_(
             self._block_base_view().index_select(0, table_idx) // self.page_size
         )
-        self._graph["mtp_kvlen"][step, :bs].copy_(
+        self._graph["mtp_kvlen"][token_slice].copy_(
             md.kv_len_cpu.to(self.device, non_blocking=True)
         )
+        # Ring state is keyed by sequence, so this remains one slot per request.
         self._graph["table_idx"][:bs].copy_(table_idx)
-        md.block_table = self._graph["block_table"][:bs]
-        md.seq_lens = self._graph["mtp_kvlen"][step, :bs]
+        md.block_table = self._graph["mtp_block_table"][token_slice]
+        md.seq_lens = self._graph["mtp_kvlen"][token_slice]
         md.ring_slots = self._graph["table_idx"][:bs]
+        # Each width-1 substep has one query per request, so these request-sized views
+        # are also the complete token mapping and indptr for that substep.
         md.token_to_req = self._graph["token_to_req"][:bs]
         md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
 
@@ -587,8 +587,11 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     # ----- CUDA graph (decode) --------------------------------------------------------------
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+        from freetoken.spec_decode import MTP_DRAFT_STEPS
+
         self.capture_bs = sorted(bs_list)
         max_bs = max(bs_list)
+        max_verify_tokens = max_bs * (MTP_DRAFT_STEPS + 1)
         width = get_global_ctx().page_table.shape[1]
         pages = -(-width // self.page_size)
         columns = pages * self.cmp_page_size
@@ -599,9 +602,20 @@ class QSASparseAttnBackend(BaseAttnBackend):
             return torch.empty(shape, dtype=dtype, device=self.device)
 
         self._graph = {
+            # Ordinary decode has one query per request, so its attention table stays at bs.
             "block_table": torch.zeros((max_bs, pages), dtype=torch.int32, device=self.device),
+            # Fused verify records one sequential QSA launch per query and each launch needs
+            # stable token-specific table and length storage for replay.
+            "mtp_block_table": torch.zeros(
+                (max_verify_tokens, pages), dtype=torch.int32, device=self.device
+            ),
+            "mtp_kvlen": torch.zeros(
+                max_verify_tokens, dtype=torch.int32, device=self.device
+            ),
+            # Lengths and ring slots for ordinary decode remain per request.
             "kvlen": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
             "table_idx": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            # A width-1 QSA substep has one token per request and can reuse these mappings.
             "token_to_req": torch.arange(max_bs, dtype=torch.int32, device=self.device),
             "cu_seqlens": torch.arange(max_bs + 1, dtype=torch.int32, device=self.device),
             "logits": empty(chunk, columns, dtype=torch.float32),
@@ -640,8 +654,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 "MTP verify batch is missing its page-table row"
             )
             table_idx = batch.active_table_idx.to(torch.int64)
+            bs = batch.padded_size
             for step, md in enumerate(batch.mtp_qsa_metadata):
-                self._stage_mtp_decode(md, step, batch.padded_size, table_idx)
+                # active_table_idx is per token. Each sequential QSA substep consumes
+                # exactly one request-shaped slice of those query rows.
+                token_slice = slice(step * bs, (step + 1) * bs)
+                self._stage_mtp_decode(md, step, bs, table_idx[token_slice])
             return
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
