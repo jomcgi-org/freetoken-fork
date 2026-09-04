@@ -269,6 +269,59 @@ about ten seconds after start, twice, with nothing in dmesg, which is the
 signature of a cgroup kill and therefore plausibly the same bug the memory
 governor fix addresses.
 
+### 5.2 Measured, 04 September: the technique does not transfer
+
+Run on `g4-standard-48` spot in us-central1-b (RTX PRO 6000 Blackwell 96 GB,
+176 GB RAM, 48 vCPU), the current tier, checkpoint on four local NVMe SSDs in
+RAID 0.
+
+| rung | config | x1 tok/s, mean of 3 | decode batches, mean of 12 | hot_pair_rate | major faults/step |
+|---|---|---|---|---|---|
+| F1 | pin 112, hot 48 | 12.12 | 13.79 | 99.8% | 1458 |
+| F5a | pin 8, hot 60, cold tail on CPU | **9.80** | 11.64 | 82 to 86% | 154 |
+| F1b | F1 plus split histories and phase aim | 12.37 | 14.07 | 99.7% | 678 |
+
+F1 reproduces the 03 September baseline of 11 to 12 tok/s, so the setup is
+sound.
+
+**The CPU-executor path, which is the single thing that makes the 4090 fast, is
+worse here.** It was genuinely engaged: F5a put 40 of 42 MoE layers on the DISK
+path (152 GiB file-backed, 2 pinned) against F1's 13 DISK and 29 pinned. It
+still lost, 9.80 against 12.12.
+
+The reason is the ratio of host RAM to model size, and it inverts cleanly:
+
+- node-4 has 64 GB of RAM against roughly 60 GB of experts, so almost nothing
+  can be pinned. Reading an expert from page cache and computing it on the CPU,
+  returning kilobytes instead of megabytes, beats shipping it over PCIe.
+- The G4 box has 176 GB against 160 GB, so 110 GiB of experts pin in host RAM
+  and stream over PCIe. That bus is faster than 48 vCPU of AVX-512, so the
+  transfer wins and the CPU path is the slow one.
+
+**The hot-set work has no headroom here either.** F1's oracle hit is 100.00
+percent against a realised 99.78, because pinning 29 layers leaves only 13 on
+the DISK path and a 48 GiB hot set covers them almost completely. Split
+histories with phase-aware aim, worth +13 to +17 percent on node-4, moved
+throughput about 2 percent, which is inside the noise. It did halve major faults
+per step, 1458 to 678, so the mechanism works exactly as designed. Faults are
+simply not what limits this box.
+
+### 5.3 What that means
+
+Of the transfer expectations in the table below, written before the measurement,
+the ranking was wrong in an instructive way. The cgroup governor and the
+substrate requirement matter. The CPU executor is actively harmful here. The
+hot-set knobs are neutral for lack of headroom rather than for lack of effect.
+
+The honest summary is that the two systems are bottlenecked on different things.
+node-4 is bound by disk faults and hot-set aim, which is what the 4090 work
+addressed. GLM on a 176 GB box is bound by PCIe bandwidth moving about 3.1 GB
+per token, and nothing in this fork's recent work touches that. Making GLM
+faster means reducing bytes across the bus: a larger hot set, so a bigger card,
+or fewer bytes per expert, so more aggressive quantisation, or fewer experts per
+token, which is where the late-layer expert budget work and hot-biased routing
+would come in.
+
 ### 5.2 The substrate matters: this technique needs local NVMe
 
 Discovered by getting it wrong. The first cloud replication put the 177 GiB
