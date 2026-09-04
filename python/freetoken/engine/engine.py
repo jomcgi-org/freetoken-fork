@@ -541,15 +541,19 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=(
-                [] if config.speculative_mtp == "on" else config.cuda_graph_bs
-            ),
+            cuda_graph_bs=config.cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            mtp_enabled=config.speculative_mtp == "on",
+            mtp_verify_widths=(
+                [config.mtp_draft_tokens + 1]
+                if config.speculative_mtp == "on" and config.mtp_verify_graph == "on"
+                else []
+            ),
         )
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
@@ -1445,6 +1449,12 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
             moe_offload_cache=self.moe_offload_cache,
+            mtp_enabled=config.speculative_mtp == "on",
+            mtp_verify_widths=(
+                [config.mtp_draft_tokens + 1]
+                if config.speculative_mtp == "on" and config.mtp_verify_graph == "on"
+                else []
+            ),
         )
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -1472,8 +1482,7 @@ class Engine:
                 next_tokens_gpu = self._forward_mtp_verify(batch)
                 logits = None
             elif (
-                self.config.speculative_mtp != "on"
-                and self.graph_runner.can_use_cuda_graph(batch)
+                self.graph_runner.can_use_cuda_graph(batch)
             ):
                 logits = self.graph_runner.replay(batch)
             else:
@@ -1613,7 +1622,10 @@ class Engine:
         )
         batch.fla_metadata = build_fla_metadata(batch, self.device)
         self.attn_backend.prepare_metadata(batch)
-        logits = self.model.forward(select_last=False)
+        if self.graph_runner.can_use_mtp_verify_graph(batch, width):
+            logits = self.graph_runner.replay_mtp_verify(batch, width)
+        else:
+            logits = self.model.forward(select_last=False)
         full_hidden = self.model.model._last_hc_hidden
         targets = torch.argmax(logits, dim=-1).to(torch.int32)
         accepted, matched = greedy_accept_prefix(drafts, targets)

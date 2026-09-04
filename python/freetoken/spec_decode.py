@@ -124,6 +124,14 @@ def validate_mtp_draft_tokens(value: int) -> int:
     return value
 
 
+def validate_mtp_verify_graph(value: str) -> str:
+    if value not in ("off", "on"):
+        raise ValueError(
+            "--mtp-verify-graph must be 'off' or 'on', got " f"{value!r}"
+        )
+    return value
+
+
 def greedy_accept_prefix(
     draft_tokens: torch.Tensor,
     target_tokens: torch.Tensor,
@@ -154,5 +162,6 @@ __all__ = [
     "restore_verify_state",
     "snapshot_verify_state",
     "validate_mtp_draft_tokens",
+    "validate_mtp_verify_graph",
     "validate_speculative_mtp",
 ]

@@ -192,31 +192,30 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
             if getattr(batch, "mtp_fused", False):
                 # K=1 target verification is one model forward over two positions,
-                # but recurrence must remain identical to two ordinary decode calls.
-                # Run the established width-1 kernels in order inside this layer.
+                # but the convolution and recurrence must advance in token order.
                 assert total == 2 and fla.cache_indices.numel() == 1
-                pieces = []
+                conv_pieces = []
                 for step in range(2):
-                    mixed = self._conv_decode(
-                        conv_in[step : step + 1], fla.cache_indices, pool
-                    )
-                    qf, kf, vf = torch.split(
-                        mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1
-                    )
-                    q = qf.reshape(1, 1, self.num_k_heads, self.head_k_dim).to(dtype)
-                    k = kf.reshape(1, 1, self.num_k_heads, self.head_k_dim).to(dtype)
-                    v = vf.reshape(1, 1, self.num_v_heads, self.head_v_dim).to(dtype)
-                    pieces.append(
-                        gdn_decode_fla(
-                            q, k, v, a[step : step + 1], b[step : step + 1],
-                            A_log=self.A_log, dt_bias=self.dt_bias,
-                            state_source=pool.recurrent_states[li],
-                            indices=fla.cache_indices,
-                            cu_seqlens=fla.cu_seqlens,
-                            scale=self.head_k_dim ** -0.5,
+                    conv_pieces.append(
+                        self._conv_decode(
+                            conv_in[step : step + 1], fla.cache_indices, pool
                         )
                     )
-                core_out = torch.cat(pieces, dim=1)
+                mixed = torch.cat(conv_pieces, dim=0)
+                qf, kf, vf = torch.split(
+                    mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+                )
+                q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+                k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+                v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+                core_out = gdn_decode_fla(
+                    q, k, v, a, b,
+                    A_log=self.A_log, dt_bias=self.dt_bias,
+                    state_source=pool.recurrent_states[li],
+                    indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens,
+                    scale=self.head_k_dim ** -0.5,
+                )
             else:
                 mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
                 B = mixed.shape[0]

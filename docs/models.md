@@ -171,16 +171,18 @@ batch. Unsupported sampling modes and larger decode batches fall back to ordinar
 one-token decoding. Enabling the feature selects the non-overlapped scheduler loop so
 request-owned recurrent state can be restored safely after a rejected draft.
 
-The target verification forward is eager and remains classified as decode, so target MoE
-experts use the existing decode-routed path for both rows. GDN, PLE convolution, and QSA
-run their established width-one decode operations in order inside that model call. Before
-the call, FreeToken snapshots the request's GDN, PLE, and QSA continuation tensors. A
-rejection restores that snapshot and recomputes only the seed row. This recovery preserves
-bit-identical greedy state without a multi-position recurrent rollback, but reduces the
-benefit of rejected steps. Decode logs report the snapshot copy time as `snapshot_us`.
-CUDA graph capture remains unchanged when the feature is off. It is disabled while MTP is
-enabled because the next draft step consumes target hidden state that is not currently
-exposed by graph replay.
+The target verification forward remains classified as decode, so target MoE experts use
+the existing decode-routed path for both rows. GDN, PLE convolution, and QSA advance both
+positions in order inside that model call. Before the call, FreeToken snapshots the
+request's GDN, PLE, and QSA continuation tensors. A rejection restores that snapshot and
+recomputes only the seed row. This recovery preserves bit-identical greedy state without a
+multi-position recurrent rollback, but reduces the benefit of rejected steps. Decode logs
+report the snapshot copy time as `snapshot_us`. MTP captures ordinary width-one decode
+graphs plus a width-two verification graph by default. Set `--mtp-verify-graph off` to keep
+ordinary decode graphs enabled while running target verification eagerly. The staged
+`cached`, `disk`, and `uring` PLE backends also keep verification eager because the draft
+token is not available to their host row-staging hook before replay. Pinned and HMM PLE
+retain the verification graph path.
 
 Pass `--speculative-mtp on` to `ft checkpoint` to store MTP tensors under a separate
 optional tensor kind. The head is BF16 by default. Add `--mtp-quant nvfp4` to quantize

@@ -210,7 +210,6 @@ class QSASparseAttnBackend(BaseAttnBackend):
                         [original_device_len + step], **_CPU_PINNED
                     ),
                 )
-                self._snapshot_decode(one, batch)
                 mtp_metadata.append(one)
             batch.mtp_qsa_metadata = tuple(mtp_metadata)
             return
@@ -248,6 +247,29 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._graph["table_idx"][:bs].copy_(table_idx)
         md.block_table = self._graph["block_table"][:bs]
         md.seq_lens = self._graph["kvlen"][:bs]
+        md.ring_slots = self._graph["table_idx"][:bs]
+        md.token_to_req = self._graph["token_to_req"][:bs]
+        md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
+
+    def _stage_mtp_decode(
+        self, md: QSASparseMetadata, step: int, bs: int, table_idx: torch.Tensor
+    ) -> None:
+        """Give each sequential verify row a stable length while sharing request addressing."""
+        if "mtp_kvlen" not in self._graph:
+            self._graph["mtp_kvlen"] = torch.empty(
+                (2, self._graph["kvlen"].shape[0]),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        self._graph["block_table"][:bs].copy_(
+            self._block_base_view().index_select(0, table_idx) // self.page_size
+        )
+        self._graph["mtp_kvlen"][step, :bs].copy_(
+            md.kv_len_cpu.to(self.device, non_blocking=True)
+        )
+        self._graph["table_idx"][:bs].copy_(table_idx)
+        md.block_table = self._graph["block_table"][:bs]
+        md.seq_lens = self._graph["mtp_kvlen"][step, :bs]
         md.ring_slots = self._graph["table_idx"][:bs]
         md.token_to_req = self._graph["token_to_req"][:bs]
         md.cu_seqlens = self._graph["cu_seqlens"][: bs + 1]
@@ -595,6 +617,15 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
     def prepare_for_capture(self, batch: Batch) -> None:
         self.prepare_metadata(batch)
+        if getattr(batch, "mtp_fused", False):
+            bs = batch.size
+            dummy = torch.full(
+                (bs,), batch.padded_reqs[0].table_idx,
+                dtype=torch.int64, device=self.device,
+            )
+            for step, md in enumerate(batch.mtp_qsa_metadata):
+                self._stage_mtp_decode(md, step, bs, dummy)
+            return
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         bs = batch.size
@@ -604,6 +635,14 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._stage_decode(md, bs, dummy)
 
     def prepare_for_replay(self, batch: Batch) -> None:
+        if getattr(batch, "mtp_fused", False):
+            assert batch.active_table_idx is not None, (
+                "MTP verify batch is missing its page-table row"
+            )
+            table_idx = batch.active_table_idx.to(torch.int64)
+            for step, md in enumerate(batch.mtp_qsa_metadata):
+                self._stage_mtp_decode(md, step, batch.padded_size, table_idx)
+            return
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         assert batch.active_table_idx is not None, "decode batch is missing its page-table rows"

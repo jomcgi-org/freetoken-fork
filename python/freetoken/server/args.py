@@ -430,6 +430,13 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--mtp-verify-graph",
+        choices=["off", "on"],
+        default=ServerArgs.mtp_verify_graph,
+        help="Capture and replay the fused MTP target verification CUDA graph.",
+    )
+
+    parser.add_argument(
         "--ple-cache-gib",
         type=float,
         default=ServerArgs.ple_cache_gib,

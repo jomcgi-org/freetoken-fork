@@ -46,6 +46,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
+| `--mtp-verify-graph` | on | Capture the width-two target verification graph when `--speculative-mtp on`; `off` keeps verification eager without disabling ordinary decode graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 | `--priority-aging-seconds` | 30 | Waiting seconds per effective priority point and the parked KV-ladder starvation bound; once the oldest waiter passes it, that waiter is admitted ahead of priority ordering and new admissions pause; `0` disables both |
 

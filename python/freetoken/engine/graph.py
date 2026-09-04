@@ -21,53 +21,66 @@ logger = init_logger(__name__)
 
 @dataclass
 class GraphCaptureBuffer:
+    width: int
     input_ids: torch.Tensor
     out_loc: torch.Tensor
     positions: torch.Tensor
     logits: torch.Tensor
     table_idx: torch.Tensor  # per-request slot id for GatedDeltaNet state gather/scatter
     request_table_idx: torch.Tensor  # scheduler table rows for session route collection
-    # Decode GDN query indptr = arange(bs+1); a constant per captured bs, filled once.
+    # GDN query indptr is constant for each captured (bs, width), filled once.
     fla_cu_seqlens: torch.Tensor
 
     @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
+    def init(
+        cls, bs: int, vocab_size: int, device: torch.device, width: int = 1
+    ) -> GraphCaptureBuffer:
+        if width < 1:
+            raise ValueError(f"CUDA graph query width must be positive, got {width}")
+        rows = bs * width
         return GraphCaptureBuffer(
-            input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
-            positions=torch.zeros(bs, dtype=torch.int32, device=device),
-            logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
-            table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
-            request_table_idx=torch.zeros(bs, dtype=torch.int32, device=device),
-            fla_cu_seqlens=torch.arange(bs + 1, dtype=torch.int32, device=device),
+            width=width,
+            input_ids=torch.zeros(rows, dtype=torch.int32, device=device),
+            out_loc=torch.zeros(rows, dtype=torch.int32, device=device),
+            positions=torch.zeros(rows, dtype=torch.int32, device=device),
+            logits=torch.empty(rows, vocab_size, dtype=torch.float32, device=device),
+            table_idx=torch.zeros(rows, dtype=torch.int32, device=device),
+            request_table_idx=torch.zeros(rows, dtype=torch.int32, device=device),
+            fla_cu_seqlens=torch.arange(
+                0, (bs + 1) * width, width, dtype=torch.int32, device=device
+            ),
         )
 
     def set_batch(self, batch: Batch) -> None:
         from freetoken.attention.linear import FLAMetadata
 
-        _slice = slice(batch.padded_size)
         bs = batch.padded_size
-        batch.input_ids = self.input_ids[_slice]
-        batch.out_loc = self.out_loc[_slice]
-        batch.positions = self.positions[_slice]
-        batch.linear_table_idx = self.table_idx[_slice]
-        batch.active_table_idx = self.request_table_idx[_slice]
+        token_slice = slice(bs * self.width)
+        request_slice = slice(bs)
+        batch.input_ids = self.input_ids[token_slice]
+        batch.out_loc = self.out_loc[token_slice]
+        batch.positions = self.positions[token_slice]
+        batch.linear_table_idx = self.table_idx[request_slice]
+        batch.active_table_idx = self.request_table_idx[request_slice]
         # Decode GDN metadata reads the persistent cu_seqlens (constant arange) and the
         # persistent table_idx slot map, so the captured kernels see stable addresses.
         batch.fla_metadata = FLAMetadata(
-            cu_seqlens=self.fla_cu_seqlens[: bs + 1], cache_indices=self.table_idx[_slice]
+            cu_seqlens=self.fla_cu_seqlens[: bs + 1],
+            cache_indices=self.table_idx[request_slice],
         )
 
     def copy_from(self, batch: Batch) -> None:
-        _slice = slice(batch.padded_size)
-        self.input_ids[_slice] = batch.input_ids
+        bs = batch.padded_size
+        token_slice = slice(bs * self.width)
+        request_slice = slice(bs)
+        self.input_ids[token_slice] = batch.input_ids
         if batch.out_loc is not None:
-            self.out_loc[_slice] = batch.out_loc
-        self.positions[_slice] = batch.positions
+            self.out_loc[token_slice] = batch.out_loc
+        self.positions[token_slice] = batch.positions
         if batch.linear_table_idx is not None:
-            self.table_idx[_slice] = batch.linear_table_idx
+            self.table_idx[request_slice] = batch.linear_table_idx
         if batch.active_table_idx is not None:
-            self.request_table_idx[_slice] = batch.active_table_idx
+            self.request_table_idx[request_slice] = batch.active_table_idx
 
 
 def _determine_cuda_graph_bs(
@@ -110,6 +123,8 @@ class GraphRunner:
         vocab_size: int,
         dummy_req: Req,
         moe_offload_cache: OffloadMoeCache | None = None,
+        mtp_enabled: bool = False,
+        mtp_verify_widths: List[int] | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -124,6 +139,16 @@ class GraphRunner:
         self.stream = stream
         self.device = device
         self.model = model
+        self.mtp_enabled = mtp_enabled
+        self.mtp_verify_widths = (
+            sorted(set(mtp_verify_widths or ())) if mtp_enabled else []
+        )
+        if self.mtp_verify_widths and getattr(model, "_ple_disk_backends", None):
+            logger.warning_rank0(
+                "MTP verify CUDA graph is unavailable with staged PLE; "
+                "using eager verification"
+            )
+            self.mtp_verify_widths = []
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _prepare_model_replay(self, batch: Batch) -> None:
@@ -148,10 +173,17 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.graph_hidden_map: Dict[int, torch.Tensor] = {}
+        self.mtp_graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.mtp_buffer_map: Dict[int, GraphCaptureBuffer] = {}
+        self.mtp_hidden_map: Dict[int, torch.Tensor] = {}
         if self.max_graph_bs == 0:
             return logger.info_rank0("CUDA graph is disabled.")
 
-        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
+        capture_bs_list = sorted(
+            set(self.graph_bs_list + ([1] if self.mtp_verify_widths else []))
+        )
+        self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=capture_bs_list)
 
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -202,6 +234,52 @@ class GraphRunner:
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph
+            hidden = getattr(getattr(model, "model", None), "_last_hc_hidden", None)
+            if hidden is not None:
+                self.graph_hidden_map[bs] = hidden
+
+        if self.mtp_verify_widths:
+            logger.info_rank0(
+                "Start capturing MTP verify CUDA graphs with widths: "
+                f"{self.mtp_verify_widths}"
+            )
+        for width in self.mtp_verify_widths:
+            graph = torch.cuda.CUDAGraph()
+            batch = Batch(reqs=[self.dummy_req], phase="decode")
+            batch.padded_reqs = batch.reqs
+            batch.mtp_fused = True
+            batch.mtp_original_cached_len = self.dummy_req.cached_len
+            batch.mtp_original_device_len = self.dummy_req.cached_len + 1
+            self.attn_backend.prepare_for_capture(batch)
+            buffer = GraphCaptureBuffer.init(1, vocab_size, self.device, width=width)
+            buffer.set_batch(batch)
+            dummy_slot = (
+                self.dummy_req.linear_slot_idx
+                if self.dummy_req.linear_slot_idx is not None
+                else self.dummy_req.table_idx
+            )
+            buffer.table_idx[0].fill_(dummy_slot)
+            with get_global_ctx().forward_batch(batch):
+                self._prepare_model_replay(batch)
+                buffer.logits[:width] = model.forward(select_last=False)
+                self._finish_model_replay(record_event=True)
+                self._prepare_model_replay(batch)
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                    buffer.logits[:width] = model.forward(select_last=False)
+                self._finish_model_replay(record_event=False)
+                self._reset_moe_offload_cache()
+            model_core = getattr(model, "model", None)
+            assert getattr(model_core, "_capture_mtp_hidden", False), (
+                "MTP verify CUDA graph capture requires target hidden-state capture"
+            )
+            hidden = getattr(model_core, "_last_hc_hidden", None)
+            assert hidden is not None, "MTP verify CUDA graph did not retain target hidden state"
+            self.mtp_graph_map[width] = graph
+            self.mtp_buffer_map[width] = buffer
+            self.mtp_hidden_map[width] = hidden
+            logger.info_rank0(
+                f"Captured MTP verify CUDA graph: bs=1, width={width}"
+            )
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
@@ -225,9 +303,44 @@ class GraphRunner:
         self._prepare_model_replay(batch)
         g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
+        hidden = self.graph_hidden_map.get(batch.padded_size)
+        if hidden is not None:
+            self.model.model._last_hc_hidden = hidden
         g.replay()
+        if hidden is not None:
+            assert self.model.model._last_hc_hidden is hidden
         self._finish_model_replay(record_event=True)
         return self.buffer.logits[: batch.size]
+
+    def can_use_mtp_verify_graph(self, batch: Batch, width: int) -> bool:
+        lazy_restore_pending = getattr(batch, "lazy_restore_pending", False) or any(
+            getattr(req, "lazy_kv_restore", None) is not None
+            and not req.lazy_kv_restore.complete
+            for req in batch.reqs
+        )
+        return (
+            self.mtp_enabled
+            and width in self.mtp_graph_map
+            and batch.is_decode
+            and batch.size == 1
+            and batch.padded_size == 1
+            and getattr(batch, "mtp_fused", False)
+            and batch.input_ids.numel() == width
+            and not lazy_restore_pending
+        )
+
+    def replay_mtp_verify(self, batch: Batch, width: int) -> torch.Tensor:
+        assert self.can_use_mtp_verify_graph(batch, width)
+        buffer = self.mtp_buffer_map[width]
+        buffer.copy_from(batch)
+        self._prepare_model_replay(batch)
+        self.attn_backend.prepare_for_replay(batch)
+        hidden = self.mtp_hidden_map[width]
+        self.model.model._last_hc_hidden = hidden
+        self.mtp_graph_map[width].replay()
+        assert self.model.model._last_hc_hidden is hidden
+        self._finish_model_replay(record_event=True)
+        return buffer.logits[: batch.size * width]
 
     def pad_batch(self, batch: Batch) -> None:
         if any(
@@ -253,5 +366,9 @@ class GraphRunner:
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
+        self.graph_hidden_map = {}
+        self.mtp_graph_map = {}
+        self.mtp_buffer_map = {}
+        self.mtp_hidden_map = {}
         self.buffer = None
         gc.collect()

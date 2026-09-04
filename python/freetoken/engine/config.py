@@ -175,6 +175,8 @@ class EngineConfig:
     # Patch 11-lite intentionally supports one draft only. Keep the explicit
     # knob so attempts to reuse older K>1 launch commands fail loudly.
     mtp_draft_tokens: int = 1
+    # Capture the fused target verification graph when MTP is enabled.
+    mtp_verify_graph: str = "on"
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -235,11 +237,13 @@ class EngineConfig:
             )
         from freetoken.spec_decode import (
             validate_mtp_draft_tokens,
+            validate_mtp_verify_graph,
             validate_speculative_mtp,
         )
 
         validate_speculative_mtp(self.speculative_mtp)
         validate_mtp_draft_tokens(self.mtp_draft_tokens)
+        validate_mtp_verify_graph(self.mtp_verify_graph)
         if self.kv_cache_dtype not in ("auto", "bf16", "fp8_e4m3"):
             raise ValueError(
                 "--kv-cache-dtype must be 'auto', 'bf16', or 'fp8_e4m3', got "

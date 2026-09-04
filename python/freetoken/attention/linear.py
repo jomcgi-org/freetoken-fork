@@ -54,9 +54,9 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
     stalling it.
 
-    Decode is one token per request, so ``cu_seqlens`` is a plain ``arange(bs+1)`` and
-    ``cache_indices`` is ``batch.linear_table_idx`` (already int32) -- reused as-is. Under
-    CUDA graph the decode ``FLAMetadata`` is instead built directly in
+    Decode normally has one token per request. Fused MTP verification uses its fixed query
+    width as the arange stride. ``cache_indices`` is ``batch.linear_table_idx`` (already
+    int32) and is reused as-is. Under CUDA graph the decode ``FLAMetadata`` is built in
     ``GraphCaptureBuffer.set_batch`` against the persistent buffers (stable addresses); this
     builder serves the eager scheduler path and direct-op test callers.
     """
@@ -70,7 +70,10 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
 
     if batch.is_decode:
         bs = len(reqs)
-        cu_seqlens = torch.arange(bs + 1, dtype=torch.int32, device=device)
+        width = batch.input_ids.numel() // bs if getattr(batch, "mtp_fused", False) else 1
+        cu_seqlens = torch.arange(
+            0, (bs + 1) * width, width, dtype=torch.int32, device=device
+        )
         # the scheduler stages linear_table_idx from gdn_slot (decode), reused as-is here
         assert batch.linear_table_idx is not None
         return FLAMetadata(cu_seqlens=cu_seqlens, cache_indices=batch.linear_table_idx)

@@ -5,8 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from freetoken.attention.linear import build_fla_metadata
+from freetoken.attention.qsa_sparse import QSASparseAttnBackend, QSASparseMetadata
 from freetoken.distributed import DistributedInfo
 from freetoken.engine.config import EngineConfig
+from freetoken.engine.graph import GraphCaptureBuffer, GraphRunner
 from freetoken.spec_decode import (
     configure_mtp_decode_step,
     configure_mtp_fused_step,
@@ -25,6 +28,14 @@ class _Batch(SimpleNamespace):
     def is_prefill(self) -> bool:
         return self.phase == "prefill"
 
+    @property
+    def size(self) -> int:
+        return len(self.reqs)
+
+    @property
+    def padded_size(self) -> int:
+        return len(self.padded_reqs)
+
 
 def test_engine_config_rejects_more_than_one_mtp_draft():
     with pytest.raises(ValueError, match=r"--mtp-draft-tokens.*fixed at 1"):
@@ -34,6 +45,182 @@ def test_engine_config_rejects_more_than_one_mtp_draft():
             dtype=torch.bfloat16,
             mtp_draft_tokens=2,
         )
+
+
+def test_engine_config_validates_mtp_verify_graph():
+    base = dict(
+        model_path="unused",
+        tp_info=DistributedInfo(rank=0, size=1),
+        dtype=torch.bfloat16,
+    )
+    assert EngineConfig(**base).mtp_verify_graph == "on"
+    assert EngineConfig(**base, mtp_verify_graph="off").mtp_verify_graph == "off"
+    with pytest.raises(ValueError, match=r"--mtp-verify-graph.*off.*on"):
+        EngineConfig(**base, mtp_verify_graph="auto")
+
+
+@pytest.mark.parametrize(
+    ("bs", "width", "cu_seqlens"),
+    [
+        (1, 1, [0, 1]),
+        (4, 1, [0, 1, 2, 3, 4]),
+        (1, 2, [0, 2]),
+        (3, 2, [0, 2, 4, 6]),
+        (2, 4, [0, 4, 8]),
+    ],
+)
+def test_graph_capture_buffer_sizes_rows_and_strides_cu_seqlens(
+    bs, width, cu_seqlens
+):
+    vocab_size = 11
+    buffer = GraphCaptureBuffer.init(
+        bs, vocab_size, torch.device("cpu"), width=width
+    )
+
+    rows = bs * width
+    assert buffer.input_ids.shape == (rows,)
+    assert buffer.positions.shape == (rows,)
+    assert buffer.out_loc.shape == (rows,)
+    assert buffer.table_idx.shape == (rows,)
+    assert buffer.request_table_idx.shape == (rows,)
+    assert buffer.logits.shape == (rows, vocab_size)
+    assert buffer.fla_cu_seqlens.tolist() == cu_seqlens
+
+
+@pytest.mark.parametrize(
+    ("bs", "width", "cu_seqlens"),
+    [
+        (1, 1, [0, 1]),
+        (3, 1, [0, 1, 2, 3]),
+        (1, 2, [0, 2]),
+        (3, 2, [0, 2, 4, 6]),
+    ],
+)
+def test_eager_fla_metadata_matches_fixed_query_width(bs, width, cu_seqlens):
+    reqs = [SimpleNamespace() for _ in range(bs)]
+    batch = _Batch(
+        reqs=reqs,
+        padded_reqs=reqs,
+        phase="decode",
+        mtp_fused=width > 1,
+        input_ids=torch.zeros(bs * width, dtype=torch.int32),
+        linear_table_idx=torch.arange(bs, dtype=torch.int32),
+    )
+
+    metadata = build_fla_metadata(batch, torch.device("cpu"))
+
+    assert metadata.cu_seqlens.tolist() == cu_seqlens
+    assert metadata.cache_indices is batch.linear_table_idx
+
+
+def test_verify_buffer_binds_token_and_request_slices_separately():
+    req = SimpleNamespace()
+    batch = _Batch(reqs=[req], padded_reqs=[req], phase="decode")
+    buffer = GraphCaptureBuffer.init(1, 5, torch.device("cpu"), width=2)
+
+    buffer.set_batch(batch)
+
+    assert batch.input_ids.shape == (2,)
+    assert batch.positions.shape == (2,)
+    assert batch.out_loc.shape == (2,)
+    assert batch.linear_table_idx.shape == (1,)
+    assert batch.active_table_idx.shape == (1,)
+    assert batch.fla_metadata.cu_seqlens.tolist() == [0, 2]
+
+
+def test_qsa_verify_steps_keep_distinct_persistent_lengths():
+    backend = QSASparseAttnBackend.__new__(QSASparseAttnBackend)
+    backend.device = torch.device("cpu")
+    backend.page_size = 1
+    backend._graph = {
+        "block_table": torch.zeros(1, 3, dtype=torch.int32),
+        "kvlen": torch.zeros(1, dtype=torch.int32),
+        "table_idx": torch.zeros(1, dtype=torch.int32),
+        "token_to_req": torch.zeros(1, dtype=torch.int32),
+        "cu_seqlens": torch.tensor([0, 1], dtype=torch.int32),
+    }
+    backend._block_base_view = lambda: torch.tensor(
+        [[0, 0, 0], [3, 4, 5]], dtype=torch.int32
+    )
+    metadata = [
+        QSASparseMetadata(
+            is_decode=True,
+            last_indices=torch.zeros(1, dtype=torch.int32),
+            qo_indptr_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            kv_len_cpu=torch.tensor([length], dtype=torch.int32),
+        )
+        for length in (8, 9)
+    ]
+
+    for step, md in enumerate(metadata):
+        backend._stage_mtp_decode(
+            md, step, 1, torch.tensor([1], dtype=torch.int64)
+        )
+
+    assert metadata[0].seq_lens.tolist() == [8]
+    assert metadata[1].seq_lens.tolist() == [9]
+    assert metadata[0].seq_lens.data_ptr() != metadata[1].seq_lens.data_ptr()
+    assert metadata[0].block_table.tolist() == [[3, 4, 5]]
+
+
+def _mtp_graph_batch(width=2):
+    req = SimpleNamespace(lazy_kv_restore=None)
+    batch = _Batch(
+        reqs=[req],
+        padded_reqs=[req],
+        phase="decode",
+        mtp_fused=True,
+        input_ids=torch.arange(width, dtype=torch.int32),
+        positions=torch.arange(width, dtype=torch.int32),
+        out_loc=torch.arange(width, dtype=torch.int32),
+        linear_table_idx=torch.tensor([3], dtype=torch.int32),
+        active_table_idx=torch.tensor([4], dtype=torch.int32),
+        lazy_restore_pending=False,
+    )
+    return batch
+
+
+def test_mtp_verify_graph_eligibility_is_width_keyed_and_requires_mtp():
+    runner = GraphRunner.__new__(GraphRunner)
+    runner.mtp_enabled = True
+    runner.mtp_graph_map = {2: object()}
+    batch = _mtp_graph_batch()
+
+    assert runner.can_use_mtp_verify_graph(batch, 2)
+    assert not runner.can_use_mtp_verify_graph(batch, 3)
+
+    runner.mtp_enabled = False
+    assert not runner.can_use_mtp_verify_graph(batch, 2)
+
+
+def test_mtp_verify_replay_restores_the_captured_hidden_storage():
+    runner = GraphRunner.__new__(GraphRunner)
+    runner.mtp_enabled = True
+    captured_hidden = torch.zeros(2, 3)
+    model_core = SimpleNamespace(_last_hc_hidden=torch.full((2, 3), -1.0))
+    runner.model = SimpleNamespace(model=model_core)
+    runner.attn_backend = SimpleNamespace(prepare_for_replay=lambda batch: None)
+    runner.moe_offload_cache = None
+    runner.mtp_graph_map = {}
+    runner.mtp_hidden_map = {2: captured_hidden}
+    buffer = GraphCaptureBuffer.init(1, 5, torch.device("cpu"), width=2)
+    runner.mtp_buffer_map = {2: buffer}
+
+    class _Graph:
+        def replay(self):
+            captured_hidden.fill_(7)
+
+    runner.mtp_graph_map[2] = _Graph()
+    batch = _mtp_graph_batch()
+
+    logits = runner.replay_mtp_verify(batch, 2)
+
+    assert logits.shape == (2, 5)
+    assert buffer.input_ids.tolist() == [0, 1]
+    assert buffer.table_idx[0].item() == 3
+    assert buffer.request_table_idx[0].item() == 4
+    assert model_core._last_hc_hidden is captured_hidden
+    assert torch.equal(model_core._last_hc_hidden, torch.full((2, 3), 7.0))
 
 
 def test_engine_config_disk_prefix_cache_defaults_off_and_requires_directory():
