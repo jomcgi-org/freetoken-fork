@@ -1282,3 +1282,64 @@ bisect on 04 Sep exonerated `test_step_timing.py` and confirmed `test_cpu_moe.py
 as the polluter, while the CUDA-stream restore fixture was active, so the leak is
 not the stream. Retained CUDA graph memory pools are the leading candidate. Fork
 issue #18; 461 of 462 tier tests pass.
+
+## GLM 5.3 Flash replication (04 Sep, g4-standard-48 spot, us-central1-b)
+
+Ran the current tier against GLM to test whether the node-4 work transfers.
+Same machine type as the 03 September rungs, checkpoint on four local NVMe SSDs
+in RAID 0 rather than the boot disk. Instance and its subnet deleted afterwards.
+
+### The substrate, found by getting it wrong
+
+The first attempt put the 177 GiB checkpoint on a `hyperdisk-balanced` boot disk
+provisioned at 5,700 IOPS and 815 MB/s. The known-good F1 configuration, 11 to
+12 tok/s on 03 September, thrashed at 0.08 to 0.92 tok/s with 5,000 to 10,800
+disk major faults per decode step. At 10,800 faults per step and 5,700 IOPS a
+single decode step needs about two seconds of the device's entire random-read
+budget, which is exactly what was measured. Four local NVMe SSDs in RAID 0 give
+1.5 TB at 2,605 MB/s and the configuration immediately returned to 12.1 tok/s.
+
+The disk expert tier is random-read bound by construction, so network-attached
+storage cannot serve it. On GCE that is a machine-type decision made at creation
+time. Worth stating plainly anywhere this technique is described.
+
+### Rungs
+
+| rung | config | x1 tok/s (mean of 3) | batches (mean of 12) | hot_pair_rate | major faults/step |
+|---|---|---|---|---|---|
+| F1 | pin 112, hot 48 | 12.12 | 13.79 | 99.8% | 1458 |
+| F5a | pin 8, hot 60, cold tail on CPU | 9.80 | 11.64 | 82 to 86% | 154 |
+| F1b | F1 plus split histories, phase aim | 12.37 | 14.07 | 99.7% | 678 |
+
+F1 reproduces the 03 September baseline, so the setup is sound.
+
+### The CPU executor is worse here, and the reason inverts cleanly
+
+F5a genuinely engaged the path: 40 of 42 MoE layers on DISK (152 GiB
+file-backed, 2 pinned) against F1's 13 DISK and 29 pinned. It still lost.
+
+node-4 has 64 GB of RAM against roughly 60 GB of experts, so almost nothing can
+be pinned, and reading an expert from page cache to compute it on the CPU,
+returning kilobytes rather than megabytes, beats the bus. The G4 box has 176 GB
+against 160 GB, pins 110 GiB, and streams over PCIe, which is faster than 48
+vCPU of AVX-512. The optimal tier strategy is a function of the host RAM to
+model size ratio, and this fork's default assumptions are tuned for the scarce
+end of it.
+
+### The hot-set work has no headroom here
+
+F1 reports `oracle_hit: 100.00% vs realized: 99.78%`. Pinning 29 layers leaves
+13 on the DISK path and a 48 GiB hot set covers them almost entirely. Split
+histories with phase-aware aim, worth +13 to +17 percent on node-4, moved
+throughput about 2 percent, inside the noise. It did halve major faults per
+step, 1458 to 678, so the mechanism works exactly as designed. Faults are not
+what limits this box.
+
+### Conclusion
+
+The two systems are bottlenecked on different things. node-4 is bound by disk
+faults and hot-set aim, which is what the recent work addressed. GLM on a 176 GB
+box is bound by PCIe bandwidth moving about 3.1 GB per token, and none of this
+work touches that. Making GLM faster means moving fewer bytes across the bus: a
+larger hot set (a bigger card), fewer bytes per expert (more aggressive
+quantisation), or fewer experts per token (fork issue #24).
