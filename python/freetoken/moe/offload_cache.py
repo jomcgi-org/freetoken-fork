@@ -107,6 +107,7 @@ MOE_LAYER_PROFILE_VERSION = 2
 
 def serialize_moe_layer_profile(
     stats: dict, expert_hits: list[list[int]] | None = None,
+    hot_experts: Mapping[int, list[int | None]] | None = None,
 ) -> dict:
     """Serialize traffic into the versioned layer and per-expert profile format."""
     layers: dict[str, float] = {}
@@ -117,6 +118,13 @@ def serialize_moe_layer_profile(
         profile["expert_hits"] = {
             str(layer_id): [int(count) for count in counts]
             for layer_id, counts in enumerate(expert_hits)
+        }
+    if hot_experts is not None:
+        profile["hot_experts"] = {
+            str(layer_id): sorted(
+                int(expert) for expert in owners if expert is not None
+            )
+            for layer_id, owners in sorted(hot_experts.items())
         }
     return profile
 
@@ -3527,8 +3535,17 @@ class OffloadMoeCache:
     def decode_miss_layer_profile(self) -> dict:
         """JSON-ready layer traffic and per-expert hit profile."""
         return serialize_moe_layer_profile(
-            self.decode_miss_stats_per_layer(), self.decode_freq.tolist()
+            self.decode_miss_stats_per_layer(),
+            self.decode_freq.tolist(),
+            self.hot_slot_owners(),
         )
+
+    def hot_slot_owners(self) -> dict[int, list[int | None]]:
+        """Return a host snapshot of protected GPU slot occupancy."""
+        return {
+            layer_id: list(owners)
+            for layer_id, owners in self._hot_slot_owners.items()
+        }
 
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.

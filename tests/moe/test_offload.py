@@ -426,6 +426,41 @@ def test_moe_layer_profile_serializer_uses_realized_misses_per_step():
     }
 
 
+def test_moe_layer_profile_serializer_includes_hot_experts():
+    from freetoken.moe.offload_cache import serialize_moe_layer_profile
+
+    profile = serialize_moe_layer_profile(
+        {"per_layer": [{"layer": 0, "missing_per_step": 1.25}]},
+        hot_experts={2: [7, None, 2], 0: [4, 1, None]},
+    )
+
+    assert profile["hot_experts"] == {"0": [1, 4], "2": [2, 7]}
+
+
+def test_moe_layer_profile_serializer_omits_hot_experts_without_slot_owners():
+    from freetoken.moe.offload_cache import serialize_moe_layer_profile
+
+    profile = serialize_moe_layer_profile(
+        {"per_layer": [{"layer": 0, "missing_per_step": 1.25}]},
+        [[4, 1]],
+    )
+
+    assert "hot_experts" not in profile
+
+
+def test_moe_layer_profile_reads_hot_slot_owners():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.decode_miss_stats_per_layer = lambda: {
+        "per_layer": [{"layer": 0, "missing_per_step": 1.25}]
+    }
+    cache.decode_freq = torch.tensor([[4, 1]])
+    cache._hot_slot_owners = {0: [1, None]}
+
+    assert cache.decode_miss_layer_profile()["hot_experts"] == {"0": [1]}
+
+
 def test_adjust_config_converts_moe_cache_rate_to_cache_size():
     from types import SimpleNamespace
 

@@ -416,6 +416,27 @@ def test_hot_profile_requires_complete_integer_expert_counts(tmp_path):
         load_hot_profile(str(profile), 2, 3)
 
 
+@pytest.mark.parametrize(
+    "hot_experts",
+    [None, {"0": [0, 2], "1": [1]}],
+)
+def test_hot_profile_accepts_optional_hot_experts(tmp_path, hot_experts):
+    profile = tmp_path / "traffic-v2.json"
+    contents = {
+        "version": 2,
+        "layers": {"0": 1, "1": 2},
+        "expert_hits": {"0": [3, 2, 1], "1": [4, 5, 6]},
+    }
+    if hot_experts is not None:
+        contents["hot_experts"] = hot_experts
+    profile.write_text(json.dumps(contents))
+
+    assert load_hot_profile(str(profile), 2, 3) == {
+        0: (3, 2, 1),
+        1: (4, 5, 6),
+    }
+
+
 def test_hot_budget_is_independent_of_host_pin_budget(tmp_path, monkeypatch):
     index = {
         "format": "freetoken_weight",
