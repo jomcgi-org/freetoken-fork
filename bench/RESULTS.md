@@ -1060,3 +1060,49 @@ previous checkout and the unit file are kept for rollback. Box time lost to
 the harness tonight: about 15 minutes to the cache-hit chain and 11 minutes to
 an idle check that matched the word "running" inside a dead unit's command
 line (`--max-running-requests`).
+
+### PINNED hot set: neutral, and the tier measured
+
+Chain 17 (`feat/pinned-hot-set`, control last, every arm with
+`--moe-cpu-willneed recent` from the unit):
+
+| arm | x1 wall tok/s | batches (median) | DISK hot rate | pinned misses/step | pinned H2D MB/step |
+|---|---|---|---|---|---|
+| DISK 5 GiB + PINNED 1.2 GiB | 16.8 (warming), 22.9, 23.1 | 22 to 33 (26) | 65% | 43 to 48 | 115 to 128 |
+| DISK 4 GiB + PINNED 2.4 GiB | 19.2, 20.6, 23.0 | 18 to 31 (25) | 55 to 60% | 30 to 35 | 80 to 92 |
+| control, DISK 6 GiB | 22.7, 23.5, 22.3 | 21 to 30 (27) | 73% | 40 to 55 | 105 to 146 |
+
+The estimate in the section above was three times too high: the LRU already
+catches about three quarters of PINNED routes, so the tier costs about 4 ms of
+a 37 ms step, and what a protected set saves in PCIe the smaller DISK set gives
+back in CPU experts. The branch stays unmerged; its three PINNED stats (which
+report with the flag off) are the useful part.
+
+### Where the DISK window actually goes
+
+`perf record -e cpu-clock -F 999 -g` on the scheduler process during
+single-stream decode (14 executor threads on 8 physical cores):
+
+| symbol | share |
+|---|---|
+| `CpuMoeExecutor::run_task_body`, self | 48% |
+| `dot_nvfp4_i8_avx512vnni` | 23% |
+| flag coordinator spin | 10% |
+| small unresolved helpers | about 8% |
+
+`perf annotate` puts 83 percent of the task body's self time on one
+instruction: the `cmp` in the sense-reversing `barrier()` spin. About 40
+percent of all executor samples are threads pause-spinning at the pass
+barriers for the two or three threads that hold the layer's expert rows, and
+with 14 threads on 8 cores the spinners share SMT siblings with the threads
+doing the dot products. The math is a quarter of the samples. So the 513 us
+of "compute" per layer is mostly fork-join shape (issue #5), and the first
+test needs no code: fewer executor threads (chain 18, below).
+
+### Deploy gate
+
+Deploy 2 (tier 6aa3922 with both flags in the unit) aborted twice on one
+test, `test_disk_hot_cold_split_matches_pure_cpu_decode`, which passes alone
+and in the hot-adapt subset and fails only after `test_step_timing` and
+`test_cpu_moe` have run in the same session (issue #18). The gate now runs the
+subset; the deploy landed on the third attempt.
