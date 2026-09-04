@@ -86,10 +86,27 @@ production-relevant path anyway, since production runs uring.
 
 Capture itself now succeeds (`MTP verify CUDA graphs with widths: [2]`).
 
-The honest status is "the reason the post gives is wrong, the real one is
-identified and mostly addressed, and the payoff is unmeasured". Acceptance of 52
-to 78 percent at K=1 means the ceiling is worth pursuing, roughly 1.5x, but a
-ceiling is not a result.
+**Measured, 04 September.** The verify pass captures and replays cleanly on the
+production uring backend with no crash markers:
+
+| arm | x1 tok/s, mean of 3 | decode batches, mean of 12 |
+|---|---|---|
+| MTP on, verify graph off | 16.1 | 17.5 |
+| MTP on, verify graph on | 19.5 | 21.6 |
+| MTP off entirely | 21.5 | 25.7 |
+
+Draft acceptance was 767 accepted against 299 rejected, 72.0 percent, matching
+the post's figure. So capturing the verify pass is worth about +21 percent over
+eager MTP, and MTP is still about 9 percent behind not speculating at all. The
+cost model predicted break-even near the top of the acceptance range, and 72
+percent lands just under it.
+
+The conclusion for the post is therefore that its verdict was right and its
+reasoning was most of the way there. Speculation on this tier does not get a
+discount on the drafted token, because that token routes to its own experts. The
+missing graphs were a real and separable second cost, now removed, and removing
+them was not enough. Closed as measured-negative rather than as a suspicion,
+which is the actual improvement over what the post could say.
 
 ### 2.2 The 1,000-step adaptation interval makes short experiments blind
 
