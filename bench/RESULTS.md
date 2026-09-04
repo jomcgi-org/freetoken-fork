@@ -1107,3 +1107,31 @@ and in the hot-adapt subset and fails only after `test_step_timing` and
 `test_cpu_moe` have run in the same session (issue #18). The gate now runs the
 subset; the third attempt is queued behind the thread-count arms as this is
 written (result in the production section below when it lands).
+
+### Executor thread count (chain 18, no code)
+
+Production flags plus `--moe-step-timing`, control last, per DISK layer:
+
+| executor threads | x1 wall tok/s | batches (median) | CPU windows/step | compute | major faults/step |
+|---|---|---|---|---|---|
+| 14 (control) | 22.1, 17.6, 22.4 | 21 to 30 (26.4) | 32.7 ms | 506 us | 366 |
+| 8 | 24.5, 18.5, 22.3 | 23 to 31 (26) | 35.9 ms | 581 | 715 |
+| 6 | 23.1, 17.9, 24.7 | 26 to 34 (28) | 30.1 ms | 422 | 329 |
+
+Six threads take 17 percent off compute per layer and 8 percent off the CPU
+windows; eight is worse than fourteen, which fits the coordinator's pinned
+core and the main thread's GPU launches colliding with a full set of workers.
+So the sweet spot is physical cores minus two, and the cost is the spinners
+on the SMT siblings rather than the work split. The setting cannot go into
+the unit as is because the same pool serves prefill, where all fourteen
+threads are compute-bound work; issue #5 now carries a decode-only worker
+cap and a spin-then-wait barrier, both behind flags.
+
+### Production, end of round two
+
+Tier 30e333c deployed at 00:26 UTC on 4 September with two flags added to the
+unit: `--moe-cpu-willneed recent` and `--moe-hot-adapt-prefill-weight 0.1`.
+Cold probe after the restart 15.0 tok/s; warm single-stream wall 22 to 24
+tok/s on 300-token essays, up from 19.9 at the start of the round; the three
+turns after a 76k-token document 11.0, 15.2, 15.8 against 4.9, 12.3, 7.2. The
+previous checkout and both unit backups are kept for rollback.
