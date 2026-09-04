@@ -92,7 +92,7 @@ ft serve \
   --model models/flash-e2m1.ftw \
   --moe-backend offload --moe-cache-auto \
   --moe-disk-prefill cpu \
-  --ple-backend hmm \
+  --ple-backend uring \
   --moe-hot-expert-budget-gib 6 \
   --moe-hot-adapt-interval-steps auto \
   --moe-hot-plan-persist auto \
@@ -112,9 +112,11 @@ What each line does:
 - `--moe-disk-prefill cpu`: prefill for disk-resident layers runs on the CPU
   executor and touches only the routed experts. Without it a prefill pages in
   whole expert layers and a six-token prompt takes minutes.
-- `--ple-backend hmm`: the GPU reads lookup-table rows through the file
-  mapping. If the startup readback probe fails you are on the proprietary
-  modules; `--ple-backend disk` is the staged fallback, slower.
+- `--ple-backend uring`: the lookup-table rows are read from the file with
+  batched io_uring reads into a bounded pinned staging bank; this is the unit
+  of record. `--ple-backend hmm` (the GPU reading the file mapping through
+  Linux HMM) was retired on the 4090 box after two UVM kernel oopses;
+  `--ple-backend disk` is the staged fallback, slower.
 - `--moe-hot-expert-budget-gib 6`: the hot set. The most-routed expert rows of
   the disk layers are pinned and go through the GPU slot cache; the cold tail
   stays on CPU decode. 6 GiB was the optimum in a two-dimensional sweep with a
@@ -204,7 +206,8 @@ once the table's working set is cached.
   pin budget is eating the page cache. Lower `FREETOKEN_PIN_BUDGET_GB` or
   raise `--host-cache-reserve-gib`.
 - **`--ple-backend hmm` fails its readback probe:** proprietary kernel modules.
-  Install the open ones, or fall back to `--ple-backend disk`.
+  Use `--ple-backend uring` (the default recommendation above) or the staged
+  `--ple-backend disk` fallback; HMM is retired on this box.
 - **Relaunch fails with the port in use:** a killed frontend leaves the
   scheduler child holding the port plus one. `fuser -k <port>/tcp
   <port+1>/tcp` between runs.
