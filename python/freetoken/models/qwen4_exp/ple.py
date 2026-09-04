@@ -2547,6 +2547,25 @@ def _state_slot(req) -> int:
     return req.table_idx if slot is None else slot
 
 
+_MTP_FUSED_INDPTR: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _mtp_fused_cu_seqlens(device: torch.device, width: int) -> torch.Tensor:
+    """Return the constant [0, width] indptr for a fused MTP verify batch.
+
+    Allocated once per device and width, because building it with
+    torch.tensor(..., device=cuda) copies from unpinned host memory, which CUDA
+    graph capture rejects. The value is a compile-time constant for a given
+    width, so caching it also gives the captured kernels a stable address.
+    """
+    key = (device, width)
+    indptr = _MTP_FUSED_INDPTR.get(key)
+    if indptr is None:
+        indptr = torch.tensor([0, width], dtype=torch.int32, device=device)
+        _MTP_FUSED_INDPTR[key] = indptr
+    return indptr
+
+
 def _ngram_context_pool() -> torch.Tensor:
     pool = get_global_ctx().linear_state_pool
     assert pool is not None and pool.has_slot_state(PLE_NGRAM_STATE), (
@@ -2588,7 +2607,7 @@ def build_ple_metadata(
             assert bs == 1 and batch.input_ids.numel() == 2
             return PLEMetadata(
                 input_ids=batch.input_ids,
-                cu_seqlens=torch.tensor([0, 2], dtype=torch.int32, device=device),
+                cu_seqlens=_mtp_fused_cu_seqlens(device, 2),
                 seq_lens=(2,),
                 ngram_context=context_pool.index_select(0, slots).long(),
                 state_slots=slots,
