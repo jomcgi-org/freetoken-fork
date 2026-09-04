@@ -1164,3 +1164,78 @@ goes into the unit. The floor for this layer shape is about 360 to 400 us of
 compute for under three experts on a warm cache, and the lever left in the
 DISK window is faults during compute, which the willneed skip trades against
 its own saving.
+
+### Round three, early 2026-09-04: the harness was the bug
+
+Four more knobs measured neutral before the round produced anything, and the
+reason turned out to be the harness rather than the knobs.
+
+**The A/B arms never let the hot adapter tick.** Every arm reported
+`adapt_ticks_prefill: 0, adapt_ticks_decode: 0, adapt_ticks_idle: 0` for a whole
+real-text arm, and 0 or 1 for an essay arm. `moe_hot_adapt_interval_steps='auto'`
+resolves to 1000 decode steps while an arm runs about 600 (real-text, three
+post-document turns) to 1800 (essays). Each arm also restores the hot plan from
+a pre-arm backup, so it starts from a plan adapted to production traffic and
+never re-aims. `realized_hit` in an arm was therefore a property of a stale
+mismatched plan:
+
+| window | oracle_hit | realized_hit | gap |
+|---|---|---|---|
+| essay arm | 92 to 96% | 59 to 69% | ~28 points |
+| post-76k-document arm | 87 to 95% | 43 to 49% | ~47 points |
+| long-running production | 84 to 97% | 78 to 93% | ~5 points |
+
+Production, left alone long enough for idle ticks to fire, sits within about 5
+points of the hindsight-optimal hot set. The adapter was healthy the whole time.
+Any knob that changes what the adapter aims at (the prefill weight, the capacity
+policy, the history split) could not possibly show an effect at the default
+interval, which is exactly what the previous two rounds kept measuring. Fork
+issue #23; the fix is `--moe-hot-adapt-interval-steps 150` on both arms.
+
+**The essay harness cannot resolve a small effect either.** The empty-skip arms
+ran ABBA (control, knob, knob, control) so a monotone page-cache trend cancels.
+Arm medians came out 23.8, 29.4, 25.9, 29.1 tok/s, with positions 2 and 3 the
+same arm, so neither the knob nor warming explains the pattern. That puts the
+noise floor somewhere around 10 to 20 percent, and every knob in rounds two and
+three was contesting 1 to 5 percent.
+
+**Split prefill and decode histories (#21): the round's one real win.** Once the
+adapter actually ticked, the long-document arm moved a long way. Both arms at
+`--moe-hot-adapt-interval-steps 150`, 76,596 real tokens with a nonce defeating
+the KV prefix cache, then three 200-token turns:
+
+| | control (shared) | split histories |
+|---|---|---|
+| post-document decode, 3 turns | 12.5 tok/s | 17.4 tok/s |
+| decode batches, mean of 9 | 19.4 | 26.4 |
+| disk major faults / decode step | 471.7 | 125.9 |
+| realized hot_pair_rate | 47.0% | 67.2% |
+| PLE major faults | 14,696 | 7,003 |
+| long prompt prefill wall | 664 s | 817 s |
+
+The control ran first and position 2 is systematically faster here, so
+throughput alone would not settle it. `hot_pair_rate` does: it is a hot-set
+property, order-independent, and 47 to 67 percent is far outside anything
+positional, with the 3.7x fault collapse as its mechanical consequence. A shared
+history lets a 76k prefill flood the decayed counters so the hot set re-aims at a
+distribution the following decode does not use. The cost is real and belongs
+next to the win: prefill is 23 percent slower. Read a document once and discuss
+it over many turns and the trade is clearly right; prefill and emit twenty
+tokens and it is clearly wrong.
+
+A position-swapped confirmation (split first, control second) was still running
+when this was written, so treat the decode figures as one ordering until it
+lands. The pair-rate argument above does not depend on it.
+
+**Capacity policy (#20): neutral, with its own ceiling as the evidence.** The
+planner prints `profiled hot_pair_rate equal=73.9%, chosen=74.4%`, so its
+predicted gain over `equal` is half a point before any measurement; live
+cumulative came in at 72.6 against 72.5. Capacity was genuinely redistributed
+(`min/median/max=59/82/104` against a flat 82, `layers_at_floor=0`), so the
+mechanism works and the model simply does not have the per-layer skew for it to
+exploit. Not deployed; the flag defaults to `equal`.
+
+**Empty-skip (#19): neutral.** All-hot layers measured 2.9 to 3.5 of 28 DISK
+layers, bounding the saving at a fraction of a millisecond against 16 to 19 ms
+of CPU windows. Pooled means say +5.9 percent and pooled medians say -1.3
+percent; when they disagree in sign there is nothing there. Not deployed.
