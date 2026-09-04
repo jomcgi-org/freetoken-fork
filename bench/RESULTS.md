@@ -1135,3 +1135,25 @@ Cold probe after the restart 15.0 tok/s; warm single-stream wall 22 to 24
 tok/s on 300-token essays, up from 19.9 at the start of the round; the three
 turns after a 76k-token document 11.0, 15.2, 15.8 against 4.9, 12.3, 7.2. The
 previous checkout and both unit backups are kept for rollback.
+
+### Decode worker policy (chain 19): neutral once the cache confound is removed
+
+`feat/decode-threads` adds a decode-only participant cap and a spin-then-wait
+barrier, both default off. Control last, per DISK layer:
+
+| arm | x1 wall tok/s | batches (median) | CPU windows/step | compute | major faults/step |
+|---|---|---|---|---|---|
+| decode cap 6 | 22.2, 23.9, 17.8 | 21 to 29 (26) | 30.5 ms | 413 us | 329 |
+| hybrid barrier | 23.4, 19.4, 23.2 | 25 to 31 (27) | 35.2 ms | 573 | 215 |
+| both | 18.4, 23.9, 25.0 | 25 to 32 (28.5) | 30.1 ms | 397 | 253 |
+| control, 14 threads | 16.9, 23.0, 24.2 | 26 to 30 (28.5) | 29.1 ms | 364 | 151 |
+
+The control ran on the warmest page cache of the night and posted the best
+compute. Chain 18's thread-count gain does not survive that: compute per
+layer tracks major faults during compute more than participant count, the
+spinners in the perf profile sit on siblings that would otherwise be idle,
+and a condvar wake costs more than the spin it replaces. Neither mechanism
+goes into the unit. The floor for this layer shape is about 360 to 400 us of
+compute for under three experts on a warm cache, and the lever left in the
+DISK window is faults during compute, which the willneed skip trades against
+its own saving.
