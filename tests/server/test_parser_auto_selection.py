@@ -115,6 +115,39 @@ def test_hot_adapt_interval_accepts_auto_or_an_explicit_integer(value, expected)
     assert args.moe_hot_adapt_interval_steps == expected
 
 
+def test_hot_capacity_cli_defaults_and_explicit_values():
+    defaults, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    coverage, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-hot-capacity-policy",
+            "coverage",
+            "--moe-hot-capacity-floor",
+            "3",
+        ]
+    )
+
+    assert defaults.moe_hot_capacity_policy == "equal"
+    assert defaults.moe_hot_capacity_floor == 8
+    assert coverage.moe_hot_capacity_policy == "coverage"
+    assert coverage.moe_hot_capacity_floor == 3
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--moe-hot-capacity-policy", "adaptive"],
+        ["--moe-hot-capacity-floor", "0"],
+    ],
+)
+def test_hot_capacity_cli_rejects_invalid_values(args):
+    with pytest.raises(SystemExit):
+        parse_args(["--model", ANON_PATH, "--dtype", "bfloat16", *args])
+
+
 @pytest.mark.parametrize("value", ["auto", "bf16", "fp8_e4m3"])
 def test_kv_cache_dtype_cli_choices(value):
     args, _ = parse_args(
@@ -155,6 +188,37 @@ def test_moe_cpu_precb_rejects_unknown_mode():
                 "bfloat16",
                 "--moe-cpu-precb",
                 "during",
+            ]
+        )
+
+
+def test_moe_cpu_empty_skip_defaults_off_and_accepts_on():
+    default, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    enabled, _ = parse_args(
+        [
+            "--model",
+            ANON_PATH,
+            "--dtype",
+            "bfloat16",
+            "--moe-cpu-empty-skip",
+            "on",
+        ]
+    )
+
+    assert default.moe_cpu_empty_skip == "off"
+    assert enabled.moe_cpu_empty_skip == "on"
+
+
+def test_moe_cpu_empty_skip_rejects_unknown_mode():
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                "--model",
+                ANON_PATH,
+                "--dtype",
+                "bfloat16",
+                "--moe-cpu-empty-skip",
+                "auto",
             ]
         )
 
@@ -232,6 +296,12 @@ def test_hot_adapt_prefill_flags_reach_server_config():
             "bfloat16",
             "--moe-hot-adapt-prefill-weight",
             "0.25",
+            "--moe-hot-adapt-histories",
+            "split",
+            "--moe-hot-adapt-prefill-blend",
+            "0.4",
+            "--moe-hot-adapt-prefill-normalize",
+            "tokens",
             "--moe-hot-adapt-prefill-run-cap-frac",
             "0.4",
             "--moe-hot-adapt-post-prefill-tick",
@@ -240,6 +310,9 @@ def test_hot_adapt_prefill_flags_reach_server_config():
     )
 
     assert args.moe_hot_adapt_prefill_weight == 0.25
+    assert args.moe_hot_adapt_histories == "split"
+    assert args.moe_hot_adapt_prefill_blend == 0.4
+    assert args.moe_hot_adapt_prefill_normalize == "tokens"
     assert args.moe_hot_adapt_prefill_run_cap_frac == 0.4
     assert args.moe_hot_adapt_post_prefill_tick is True
 

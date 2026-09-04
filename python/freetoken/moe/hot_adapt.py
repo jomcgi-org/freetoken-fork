@@ -11,7 +11,7 @@ import struct
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -44,10 +44,74 @@ class HotPlanSeed:
     expert_ids: dict[int, tuple[int, ...]]
     counters: dict[int, tuple[float, ...]]
     seeded_layers: frozenset[int]
+    partially_seeded_layers: frozenset[int]
     age_seconds: float
     saved_hot_budget_bytes: int
+    capacity_policy: str
     tier_commit: str
     tier_mismatch: bool
+    prefill_counters: dict[int, tuple[float, ...]] = field(default_factory=dict)
+
+
+def allocate_hot_capacity(
+    weights: Mapping[int, Sequence[float]],
+    total_rows: int,
+    *,
+    floor: int,
+    num_experts: int,
+) -> dict[int, int]:
+    """Allocate fixed per-layer rows by normalized marginal route coverage."""
+    if isinstance(total_rows, bool) or not isinstance(total_rows, int) or total_rows < 0:
+        raise ValueError("HOT capacity total_rows must be a non-negative integer")
+    if isinstance(floor, bool) or not isinstance(floor, int) or floor < 1:
+        raise ValueError("HOT capacity floor must be a positive integer")
+    if isinstance(num_experts, bool) or not isinstance(num_experts, int) or num_experts < 1:
+        raise ValueError("HOT capacity num_experts must be a positive integer")
+    if any(isinstance(layer_id, bool) or not isinstance(layer_id, int) for layer_id in weights):
+        raise ValueError("HOT capacity layer ids must be integers")
+    layer_ids = sorted(weights)
+    rows: dict[int, tuple[float, ...]] = {}
+    totals: dict[int, float] = {}
+    for layer_id in layer_ids:
+        row = tuple(float(value) for value in weights[layer_id])
+        if len(row) != num_experts:
+            raise ValueError(
+                f"weights layer {layer_id} has {len(row)} experts, expected {num_experts}"
+            )
+        if any(not math.isfinite(value) or value < 0 for value in row):
+            raise ValueError(f"weights layer {layer_id} has an invalid value")
+        rows[layer_id] = tuple(sorted(row, reverse=True))
+        totals[layer_id] = sum(row)
+        if not math.isfinite(totals[layer_id]):
+            raise ValueError(f"weights layer {layer_id} total is not finite")
+    if not layer_ids:
+        return {}
+
+    target = min(total_rows, len(layer_ids) * num_experts)
+    base = min(floor, num_experts, target // len(layer_ids))
+    capacity = {layer_id: base for layer_id in layer_ids}
+    remaining = target - base * len(layer_ids)
+    while remaining:
+        candidates = [
+            layer_id
+            for layer_id in layer_ids
+            if capacity[layer_id] < num_experts
+        ]
+        if not candidates:
+            break
+
+        def marginal_key(layer_id: int) -> tuple[float, int, int]:
+            index = capacity[layer_id]
+            total = totals[layer_id]
+            share = rows[layer_id][index] / total if total else 0.0
+            # Prefer the strongest next marginal. Equal marginals stay balanced,
+            # then use the lower layer id as the final deterministic tie-break.
+            return (-share, capacity[layer_id], layer_id)
+
+        chosen = min(candidates, key=marginal_key)
+        capacity[chosen] += 1
+        remaining -= 1
+    return capacity
 
 
 def resolve_tier_commit() -> str:
@@ -202,6 +266,7 @@ def load_hot_plan(
     current_hot_budget_bytes: int,
     static_expert_ids: Mapping[int, Sequence[int]],
     tier_commit: str,
+    current_capacity_policy: str = "equal",
     now: float | None = None,
 ) -> HotPlanSeed:
     """Validate and resize one persisted plan for the current protected slots."""
@@ -228,6 +293,11 @@ def load_hot_plan(
     ):
         raise ValueError("invalid current HOT budget")
     budget_grew = current_hot_budget_bytes > saved_budget
+    saved_capacity_policy = raw.get("capacity_policy", "equal")
+    if saved_capacity_policy not in ("equal", "coverage"):
+        raise ValueError("invalid saved HOT capacity policy")
+    if current_capacity_policy not in ("equal", "coverage"):
+        raise ValueError("invalid current HOT capacity policy")
     written_at = raw.get("written_at")
     if isinstance(written_at, bool) or not isinstance(written_at, (int, float)):
         raise ValueError("invalid HOT plan timestamp")
@@ -237,16 +307,21 @@ def load_hot_plan(
         raise ValueError("HOT plan counters are not marked float32")
     protected = raw.get("protected_slots")
     counters_raw = raw.get("decayed_counters")
+    prefill_counters_raw = raw.get("decayed_prefill_counters")
     ranked_raw = raw.get("counter_ranked")
     if not all(isinstance(section, dict) for section in (protected, counters_raw, ranked_raw)):
         raise ValueError("HOT plan layer sections must be objects")
+    if prefill_counters_raw is not None and not isinstance(prefill_counters_raw, dict):
+        raise ValueError("HOT plan prefill counter section must be an object")
 
     selected = {
         layer_id: tuple(int(expert) for expert in static_expert_ids.get(layer_id, ()))
         for layer_id in disk_layer_ids
     }
     counters: dict[int, tuple[float, ...]] = {}
+    prefill_counters: dict[int, tuple[float, ...]] = {}
     seeded_layers: set[int] = set()
+    partially_seeded_layers: set[int] = set()
     for layer_id in sorted(disk_layer_ids):
         key = str(layer_id)
         if key not in protected:
@@ -280,12 +355,22 @@ def load_hot_plan(
             )
             chosen_list.extend(next_ranked[: capacity - len(chosen_list)])
         chosen = tuple(chosen_list)
+        if len(chosen) < capacity:
+            partially_seeded_layers.add(layer_id)
         selected[layer_id] = chosen
         counters[layer_id] = row
+        if prefill_counters_raw is not None and key in prefill_counters_raw:
+            prefill_counters[layer_id] = _validated_counter_row(
+                prefill_counters_raw.get(key), num_experts, layer_id
+            )
         seeded_layers.add(layer_id)
     if not seeded_layers:
         raise ValueError("HOT plan has no protected layers for this process")
-    if not any(any(value != 0.0 for value in row) for row in counters.values()):
+    if not any(
+        any(value != 0.0 for value in row)
+        for rows in (counters, prefill_counters)
+        for row in rows.values()
+    ):
         raise ValueError("HOT plan counters are all zero")
 
     saved_tier = raw.get("tier_commit")
@@ -296,10 +381,13 @@ def load_hot_plan(
         expert_ids=selected,
         counters=counters,
         seeded_layers=frozenset(seeded_layers),
+        partially_seeded_layers=frozenset(partially_seeded_layers),
         age_seconds=max(0.0, (time.time() if now is None else now) - timestamp),
         saved_hot_budget_bytes=saved_budget,
+        capacity_policy=saved_capacity_policy,
         tier_commit=saved_tier,
         tier_mismatch=saved_tier != tier_commit,
+        prefill_counters=prefill_counters,
     )
 
 
@@ -313,9 +401,14 @@ def make_hot_plan_document(
     tier_commit: str,
     protected_slots: Mapping[int, Sequence[int | None]],
     decayed_counters: Mapping[int, Sequence[float]],
+    capacity_policy: str = "equal",
+    decayed_prefill_counters: Mapping[int, Sequence[float]] | None = None,
+    ranking_counters: Mapping[int, Sequence[float]] | None = None,
     written_at: float | None = None,
 ) -> dict[str, Any] | None:
     """Create a compact JSON document, or None for an all-zero snapshot."""
+    if capacity_policy not in ("equal", "coverage"):
+        raise ValueError("HOT capacity policy must be 'equal' or 'coverage'")
     counter_rows = {
         int(layer_id): tuple(float(value) for value in decayed_counters[layer_id])
         for layer_id in sorted(decayed_counters)
@@ -327,13 +420,51 @@ def make_hot_plan_document(
             )
         if any(not math.isfinite(value) or value < 0 for value in row):
             raise ValueError(f"counter layer {layer_id} has an invalid value")
-    if not any(any(value != 0.0 for value in row) for row in counter_rows.values()):
+    prefill_rows = {
+        int(layer_id): tuple(float(value) for value in row)
+        for layer_id, row in (decayed_prefill_counters or {}).items()
+    }
+    if prefill_rows and set(prefill_rows) != set(counter_rows):
+        raise ValueError("decode and prefill counter layers must match")
+    for layer_id, row in prefill_rows.items():
+        if len(row) != num_experts:
+            raise ValueError(
+                f"prefill counter layer {layer_id} has {len(row)} values, "
+                f"expected {num_experts}"
+            )
+        if any(not math.isfinite(value) or value < 0 for value in row):
+            raise ValueError(f"prefill counter layer {layer_id} has an invalid value")
+    ranked_rows = {
+        int(layer_id): tuple(float(value) for value in row)
+        for layer_id, row in (ranking_counters or counter_rows).items()
+    }
+    if set(ranked_rows) != set(counter_rows):
+        raise ValueError("ranking and persisted counter layers must match")
+    for layer_id, row in ranked_rows.items():
+        if len(row) != num_experts:
+            raise ValueError(
+                f"ranking counter layer {layer_id} has {len(row)} values, "
+                f"expected {num_experts}"
+            )
+        if any(not math.isfinite(value) or value < 0 for value in row):
+            raise ValueError(f"ranking counter layer {layer_id} has an invalid value")
+    if not any(
+        any(value != 0.0 for value in row)
+        for rows in (counter_rows, prefill_rows)
+        for row in rows.values()
+    ):
         return None
     counters = {
         str(layer_id): base64.b64encode(
             struct.pack(f"<{num_experts}f", *row)
         ).decode("ascii")
         for layer_id, row in counter_rows.items()
+    }
+    prefill_counters = {
+        str(layer_id): base64.b64encode(
+            struct.pack(f"<{num_experts}f", *row)
+        ).decode("ascii")
+        for layer_id, row in prefill_rows.items()
     }
     protected: dict[str, list[int]] = {}
     ranked: dict[str, list[int]] = {}
@@ -347,11 +478,11 @@ def make_hot_plan_document(
         ):
             raise ValueError(f"protected layer {layer_id} has invalid expert ids")
         protected[str(layer_id)] = residents
-        row = counter_rows[layer_id]
+        row = ranked_rows[layer_id]
         ranked[str(layer_id)] = sorted(
             residents, key=lambda expert: (-row[expert], expert)
         )
-    return {
+    document = {
         "version": HOT_PLAN_VERSION,
         "written_at": time.time() if written_at is None else float(written_at),
         "ftw_identity": dict(identity),
@@ -359,6 +490,7 @@ def make_hot_plan_document(
         "num_layers": int(num_layers),
         "num_experts": int(num_experts),
         "hot_budget_bytes": int(hot_budget_bytes),
+        "capacity_policy": capacity_policy,
         "tier_commit": str(tier_commit),
         "counter_dtype": "float32",
         "counter_encoding": "base64-le",
@@ -366,6 +498,9 @@ def make_hot_plan_document(
         "counter_ranked": ranked,
         "decayed_counters": counters,
     }
+    if prefill_counters:
+        document["decayed_prefill_counters"] = prefill_counters
+    return document
 
 
 def atomic_write_hot_plan(
@@ -745,6 +880,35 @@ def update_decayed_counts(
     return tuple(float(old) * factor + float(new) for old, new in zip(previous, routed))
 
 
+def blend_histories(
+    decode_counts: Mapping[int, Sequence[float]],
+    prefill_counts: Mapping[int, Sequence[float]],
+    blend: float,
+) -> dict[int, tuple[float, ...]]:
+    """Combine decode history with a bounded share of prefill history."""
+    if (
+        isinstance(blend, bool)
+        or not math.isfinite(float(blend))
+        or not 0 <= blend <= 1
+    ):
+        raise ValueError("history blend must be finite and in [0, 1]")
+    if set(decode_counts) != set(prefill_counts):
+        raise ValueError("decode and prefill history layers must match")
+    result = {}
+    for layer_id in decode_counts:
+        decode_row = decode_counts[layer_id]
+        prefill_row = prefill_counts[layer_id]
+        if len(decode_row) != len(prefill_row):
+            raise ValueError(
+                f"decode and prefill history shapes differ for layer {layer_id}"
+            )
+        result[layer_id] = tuple(
+            float(decode) + float(blend) * float(prefill)
+            for decode, prefill in zip(decode_row, prefill_row)
+        )
+    return result
+
+
 def recompute_hot_partition(
     expert_counts: Mapping[int, Sequence[float]],
     disk_layer_ids: frozenset[int],
@@ -752,8 +916,9 @@ def recompute_hot_partition(
     budget_bytes: int,
     expert_bytes: int,
     num_experts: int,
+    capacities: Mapping[int, int] | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    """Select an equal top-N partition under the configured resident-byte budget."""
+    """Select each layer's top experts under fixed protected-row capacities."""
     if budget_bytes < 0 or expert_bytes <= 0 or num_experts <= 0:
         raise ValueError("HOT planner geometry must be non-negative with positive rows")
     if not disk_layer_ids or budget_bytes == 0:
@@ -761,12 +926,27 @@ def recompute_hot_partition(
     missing = set(disk_layer_ids) - set(expert_counts)
     if missing:
         raise ValueError(f"counts have no entries for DISK layers {sorted(missing)}")
-    top_n = min(
-        num_experts,
-        budget_bytes // (expert_bytes * len(disk_layer_ids)),
-    )
-    if top_n <= 0:
-        return {}
+    if capacities is None:
+        top_n = min(
+            num_experts,
+            budget_bytes // (expert_bytes * len(disk_layer_ids)),
+        )
+        if top_n <= 0:
+            return {}
+        resolved_capacity = {layer_id: top_n for layer_id in disk_layer_ids}
+    else:
+        if set(capacities) != set(disk_layer_ids):
+            raise ValueError("HOT capacities must cover exactly the DISK layers")
+        resolved_capacity = {
+            layer_id: int(capacities[layer_id]) for layer_id in disk_layer_ids
+        }
+        if any(
+            value < 0 or value > num_experts
+            for value in resolved_capacity.values()
+        ):
+            raise ValueError("HOT capacities must be within the expert geometry")
+        if sum(resolved_capacity.values()) * expert_bytes > budget_bytes:
+            raise ValueError("HOT capacities exceed the resident-byte budget")
     result = {}
     for layer_id in sorted(disk_layer_ids):
         counts = expert_counts[layer_id]
@@ -778,7 +958,9 @@ def recompute_hot_partition(
             range(num_experts),
             key=lambda expert_id: (-float(counts[expert_id]), expert_id),
         )
-        result[layer_id] = tuple(sorted(ranked[:top_n]))
+        result[layer_id] = tuple(
+            sorted(ranked[: resolved_capacity[layer_id]])
+        )
     return result
 
 

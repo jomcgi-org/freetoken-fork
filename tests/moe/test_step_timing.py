@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import torch
+
 import freetoken.moe.cpu_executor as cpu_executor
+from freetoken.layers.moe import _all_hot, _split_hot_cold_routes
 from freetoken.moe.cpu_executor import CpuMoeExecutor, _StepTimingEvents
 
 
@@ -39,7 +42,9 @@ def test_step_timing_breakdown_aggregates_native_rows_and_d2h():
                 "last_done_stored_ns": 0,
                 "compute_us": 100,
                 "signal_us": 5,
+                "empty_us": 9,
                 "tasks": 1,
+                "empty_tasks": 1,
                 "experts": 4,
                 "bytes": 4096,
             },
@@ -77,7 +82,9 @@ def test_step_timing_breakdown_aggregates_native_rows_and_d2h():
         "h2d_us": 1000.0,
         "compute_us": 100.0,
         "signal_us": 5.0,
+        "empty_us": 9.0,
         "tasks": 1,
+        "empty_tasks": 1,
         "experts": 4,
         "bytes": 4096,
     }
@@ -94,7 +101,9 @@ def test_step_timing_breakdown_aggregates_native_rows_and_d2h():
         "h2d_us": 2000.0,
         "compute_us": 300.0,
         "signal_us": 11.0,
+        "empty_us": 9.0,
         "total_tasks": 3,
+        "total_empty_tasks": 1,
         "total_experts": 12,
         "total_bytes": 12_288,
     }
@@ -172,6 +181,39 @@ def test_pre_run_callback_mode_is_forwarded_to_native_executor():
     assert calls == [1]
 
 
+def test_empty_skip_is_forwarded_only_when_enabled():
+    calls = []
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor._ext = SimpleNamespace(set_empty_skip=calls.append)
+
+    executor._configure_empty_skip("off")
+    executor._configure_empty_skip("on")
+
+    assert calls == [1]
+
+
+def test_all_hot_classification_uses_valid_cpu_routes():
+    raw_ids = torch.tensor([[1, 2]], dtype=torch.int32)
+    weights = torch.tensor([[0.6, 0.4]], dtype=torch.float32)
+
+    _, all_hot_ids, _, _ = _split_hot_cold_routes(
+        raw_ids, torch.tensor([[3, 4]], dtype=torch.int32), weights
+    )
+    _, mixed_ids, _, _ = _split_hot_cold_routes(
+        raw_ids, torch.tensor([[3, -1]], dtype=torch.int32), weights
+    )
+
+    assert not bool((all_hot_ids >= 0).any())
+    assert bool(_all_hot(all_hot_ids))
+    assert not bool(_all_hot(mixed_ids))
+
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor._all_hot_layers = torch.zeros((), dtype=torch.int64)
+    executor.record_all_hot(_all_hot(all_hot_ids))
+    executor.record_all_hot(_all_hot(mixed_ids))
+    assert int(executor._all_hot_layers.item()) == 1
+
+
 def test_step_timing_breakdown_is_zero_and_does_not_call_native_when_off():
     executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
     executor._step_timing = False
@@ -194,7 +236,9 @@ def test_step_timing_breakdown_is_zero_and_does_not_call_native_when_off():
             "h2d_us": 0.0,
             "compute_us": 0.0,
             "signal_us": 0.0,
+            "empty_us": 0.0,
             "total_tasks": 0,
+            "total_empty_tasks": 0,
             "total_experts": 0,
             "total_bytes": 0,
         },
@@ -297,3 +341,22 @@ def test_willneed_stats_reset_counts_but_preserve_guard_trips(monkeypatch):
     assert reset["willneed_skipped_experts"] == 0
     assert reset["willneed_advised_experts"] == 0
     assert reset["willneed_guard_trips"] == 3
+
+
+def test_all_hot_layers_per_decode_step_stats_reset(monkeypatch):
+    executor, _ = _willneed_executor("always")
+    executor._disk_decode_steps = 4
+    executor._all_hot_layers = torch.tensor(2, dtype=torch.int64)
+    executor._moe_cpu_empty_skip = "off"
+    monkeypatch.setattr(cpu_executor, "_process_faults", lambda: (0, 0))
+
+    stats = executor.disk_prefetch_stats(reset=True)
+    executor._disk_decode_steps = 2
+    executor._all_hot_layers.fill_(2)
+    executor._moe_cpu_empty_skip = "on"
+    enabled_stats = executor.disk_prefetch_stats(reset=True)
+    reset = executor.disk_prefetch_stats()
+
+    assert stats["all_hot_layers_per_decode_step"] == 0.5
+    assert enabled_stats["all_hot_layers_per_decode_step"] == 0.5
+    assert reset["all_hot_layers_per_decode_step"] == 0.0

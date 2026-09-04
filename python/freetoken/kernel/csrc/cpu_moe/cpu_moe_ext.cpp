@@ -1421,6 +1421,7 @@ struct MoeTask {
   const int32_t* ids;  // [num_tokens, top_k]  (raw expert ids; <0 = skip)
   const float* w;      // [num_tokens, top_k]
   bf16_t* y;           // [num_tokens, H]
+  bool empty_step = false;
   // Native doorbell-to-completion span for optional per-step diagnostics. Atomics
   // let Python read the last completed replay after synchronizing its CUDA fence.
   std::atomic<int64_t> t_doorbell_ns{0};
@@ -1454,12 +1455,14 @@ struct StepTimingAccum {
   int64_t last_done_stored_ns = 0;
   int64_t compute_ns = 0;
   int64_t signal_ns = 0;
+  int64_t empty_ns = 0;
   int64_t wake_max_ns = 0;
   int64_t gil_max_ns = 0;
   int64_t precb_max_ns = 0;
   int64_t compute_max_ns = 0;
   int64_t signal_max_ns = 0;
   uint64_t tasks = 0;
+  uint64_t empty_tasks = 0;
   uint64_t experts = 0;
   uint64_t bytes = 0;
 };
@@ -1730,6 +1733,7 @@ struct CpuMoeExecutor {
   std::vector<StepTimingAccum> step_timing;
   std::atomic<uint64_t> step_timing_inflight{0};
   std::atomic<int> pre_run_callback_mode{0};  // 0 = before notify, 1 = after notify
+  std::atomic<int> empty_skip{0};
 
   std::vector<MoeTask*> owned_tasks;  // persistent task descriptors (graph-stable)
   std::vector<GpuFetchTask*> owned_gpufetch_tasks;
@@ -2833,7 +2837,9 @@ struct CpuMoeExecutor {
         t->t_first_worker_ns.load(std::memory_order_acquire);
     const int64_t compute_done_ns =
         t->t_compute_done_ns.load(std::memory_order_acquire);
-    t->t_signalled_ns.store(signalled_ns, std::memory_order_release);
+    const int64_t effective_signalled_ns =
+        t->empty_step ? doorbell_ns : signalled_ns;
+    t->t_signalled_ns.store(effective_signalled_ns, std::memory_order_release);
     const int64_t wake_ns = std::max<int64_t>(0, first_worker_ns - doorbell_ns);
     const int64_t groups_ns = std::max<int64_t>(0, groups_done_ns - doorbell_ns);
     // Deferred callback (after notify): the GIL wait starts at the notify stamp and
@@ -2853,9 +2859,13 @@ struct CpuMoeExecutor {
             ? std::max<int64_t>(0, done_stored_ns - worker_signalled_ns)
             : 0;
     const int64_t compute_ns = std::max<int64_t>(0, compute_done_ns - first_worker_ns);
-    const int64_t signal_ns = std::max<int64_t>(0, signalled_ns - compute_done_ns);
+    const int64_t signal_ns =
+        std::max<int64_t>(0, effective_signalled_ns - compute_done_ns);
+    const int64_t empty_ns =
+        t->empty_step ? std::max<int64_t>(0, signalled_ns - doorbell_ns) : 0;
     t->timing_last_run_ns.store(
-        std::max<int64_t>(0, signalled_ns - doorbell_ns), std::memory_order_release);
+        std::max<int64_t>(0, effective_signalled_ns - doorbell_ns),
+        std::memory_order_release);
     {
       std::lock_guard<std::mutex> lk(step_timing_mtx);
       StepTimingAccum& row = step_timing.at(static_cast<size_t>(t->layer_id));
@@ -2870,12 +2880,14 @@ struct CpuMoeExecutor {
       row.last_done_stored_ns = done_stored_ns;
       row.compute_ns += compute_ns;
       row.signal_ns += signal_ns;
+      row.empty_ns += empty_ns;
       row.wake_max_ns = std::max(row.wake_max_ns, wake_ns);
       row.gil_max_ns = std::max(row.gil_max_ns, gil_ns);
       row.precb_max_ns = std::max(row.precb_max_ns, precb_ns);
       row.compute_max_ns = std::max(row.compute_max_ns, compute_ns);
       row.signal_max_ns = std::max(row.signal_max_ns, signal_ns);
       ++row.tasks;
+      if (t->empty_step) ++row.empty_tasks;
       row.experts += t->timing_experts;
       row.bytes += t->timing_bytes;
     }
@@ -2904,12 +2916,14 @@ struct CpuMoeExecutor {
       values["last_done_stored_ns"] = row.last_done_stored_ns;
       values["compute_us"] = static_cast<double>(row.compute_ns) / 1000.0;
       values["signal_us"] = static_cast<double>(row.signal_ns) / 1000.0;
+      values["empty_us"] = static_cast<double>(row.empty_ns) / 1000.0;
       values["wake_max_us"] = static_cast<double>(row.wake_max_ns) / 1000.0;
       values["gil_max_us"] = static_cast<double>(row.gil_max_ns) / 1000.0;
       values["precb_max_us"] = static_cast<double>(row.precb_max_ns) / 1000.0;
       values["compute_max_us"] = static_cast<double>(row.compute_max_ns) / 1000.0;
       values["signal_max_us"] = static_cast<double>(row.signal_max_ns) / 1000.0;
       values["tasks"] = row.tasks;
+      values["empty_tasks"] = row.empty_tasks;
       values["experts"] = row.experts;
       values["bytes"] = row.bytes;
       result[pybind11::int_(layer_id)] = std::move(values);
@@ -2920,6 +2934,7 @@ struct CpuMoeExecutor {
 
   void submit(MoeTask* t, bool run_pre_callback = true,
               bool coordinator_submission = false) {
+    t->empty_step = false;
     // Persistent group_routes tasks are decode tasks. Prefill remains outside the
     // per-step snapshot even when diagnostics are enabled.
     const bool time_task = t->group_routes &&
@@ -2946,6 +2961,31 @@ struct CpuMoeExecutor {
       // Each valid route applies one expert and streams that expert's weights once.
       t->timing_experts = static_cast<uint64_t>(grouped_routes.size());
       t->timing_bytes = t->timing_experts * expert_weight_bytes();
+    }
+    const bool empty_coordinator_decode =
+        empty_skip.load(std::memory_order_relaxed) != 0 &&
+        coordinator_submission && t->group_routes && !t->prefill_batch &&
+        grouped_routes.empty();
+    if (empty_coordinator_decode) {
+      t->empty_step = true;
+      // The pinned y buffer is reused by batch size. Normal grouped pass 3 writes
+      // every row, including zeros for an empty route set, so the skipped task must
+      // replace any previous partial before the GPU copies num_tokens rows.
+      std::memset(t->y, 0,
+                  static_cast<size_t>(t->num_tokens) * H * sizeof(bf16_t));
+      if (time_task) {
+        const int64_t doorbell_ns =
+            t->t_doorbell_ns.load(std::memory_order_relaxed);
+        t->t_groups_done_ns.store(doorbell_ns, std::memory_order_relaxed);
+        t->t_gil_acquired_ns.store(doorbell_ns, std::memory_order_relaxed);
+        t->t_precb_done_ns.store(doorbell_ns, std::memory_order_relaxed);
+        t->t_notified_ns.store(doorbell_ns, std::memory_order_relaxed);
+        t->t_first_worker_ns.store(doorbell_ns, std::memory_order_relaxed);
+        t->t_compute_done_ns.store(doorbell_ns, std::memory_order_relaxed);
+        t->t_signalled_ns.store(doorbell_ns, std::memory_order_release);
+        step_timing_inflight.fetch_add(1, std::memory_order_relaxed);
+      }
+      return;
     }
     const bool defer_pre_callback =
         coordinator_submission && t->group_routes && !t->prefill_batch &&
@@ -3200,7 +3240,7 @@ struct CpuMoeExecutor {
               t->t_seen_ns.store(0, std::memory_order_relaxed);
             }
             submit(t, true, true);
-            sync(t);
+            if (!t->empty_step) sync(t);
           }
           // Release: the workers' y stores are visible before the GPU sees done.
           flag_store_release(&done_flags[L], 1);
@@ -3329,6 +3369,12 @@ struct CpuMoeExecutor {
     pre_run_callback_mode.store(mode, std::memory_order_relaxed);
   }
 
+  void set_empty_skip(int enabled) {
+    if (enabled != 0 && enabled != 1)
+      throw std::invalid_argument("empty skip must be 0 or 1");
+    empty_skip.store(enabled, std::memory_order_relaxed);
+  }
+
   void gpufetch_with_cuda_stream(uintptr_t stream, uintptr_t task) {
     cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream),
                        &CpuMoeExecutor::gpufetch_cb,
@@ -3411,6 +3457,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("callback"))
       .def("set_pre_run_callback_mode", &CpuMoeExecutor::set_pre_run_callback_mode,
            py::arg("mode"))
+      .def("set_empty_skip", &CpuMoeExecutor::set_empty_skip,
+           py::arg("enabled"))
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,
            py::arg("slot"), py::arg("task"))
       .def("register_flag_gpufetch_task", &CpuMoeExecutor::register_flag_gpufetch_task,

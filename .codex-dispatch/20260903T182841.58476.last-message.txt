@@ -1,0 +1,21 @@
+Implemented issue #19 without committing.
+
+Summary:
+
+- Added always-on, graph-captured all-hot DISK layer counting and `all_hot_layers_per_decode_step` stats.
+- Added `all-hot layers/step` to scheduler status.
+- Added `--moe-cpu-empty-skip {off,on}`, default `off`, with full config and engine plumbing.
+- Added native coordinator skip, zero partial handling, and empty-task timing diagnostics.
+- Added Python, CLI, config, status, and C++-backed tests.
+- Updated [docs/cli.md](/Users/jomcgi/repos/ft-worktrees/emptyskip/docs/cli.md).
+
+Validation:
+
+- Python syntax compilation passed.
+- Targeted Ruff checks passed.
+- `git diff --check` passed.
+- No added em-dashes.
+- C++ braces and lifecycle counters were manually re-read and checked.
+- Pytest could not collect because the available interpreter lacks PyTorch. The requested `python` executable is also unavailable.
+
+Open questions: none. The existing untracked `.codex-dispatch/lock/` was left untouched.

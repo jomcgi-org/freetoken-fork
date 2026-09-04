@@ -48,6 +48,11 @@ def _split_hot_cold_routes(
     return on_gpu, cpu_ids, gpu_ids, gpu_weights
 
 
+def _all_hot(cpu_ids: torch.Tensor) -> torch.Tensor:
+    """Return a device scalar indicating that no valid CPU route remains."""
+    return ~(cpu_ids >= 0).any()
+
+
 def _is_oom_error(exc: BaseException) -> bool:
     """Recognize allocator OOMs across PyTorch versions and test doubles."""
     return isinstance(exc, (MemoryError, torch.OutOfMemoryError)) or (
@@ -471,7 +476,7 @@ class OffloadMoELayer(MoELayer):
         raw = topk_ids.clone()
         cache.ensure_experts_hot(self.layer_id, topk_ids)
         return self._decode_split_partials(
-            cache, hidden_states, topk_weights, topk_ids, raw
+            cache, hidden_states, topk_weights, topk_ids, raw, count_all_hot=True
         )
 
     def _decode_split_partials(
@@ -481,6 +486,8 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         gpu_ids: torch.Tensor,
         raw_ids: torch.Tensor,
+        *,
+        count_all_hot: bool = False,
     ) -> torch.Tensor:
         """Merge GPU-assigned and CPU-assigned weighted route partials.
 
@@ -492,6 +499,8 @@ class OffloadMoELayer(MoELayer):
         on_gpu, cpu_ids, gpu_slots, gpu_w = _split_hot_cold_routes(
             raw_ids, gpu_ids, topk_weights
         )
+        if count_all_hot:
+            executor.record_all_hot(_all_hot(cpu_ids))
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
@@ -589,11 +598,30 @@ class OffloadMoELayer(MoELayer):
     ) -> torch.Tensor:
         """Run resident DISK routes on protected slots and cold routes on CPU."""
         raw_ids = topk_ids.clone()
-        counted_tokens = cache.ensure_experts_hot(
-            self.layer_id,
-            topk_ids,
-            route_weight=cache.hot_adapt_prefill_weight,
-        )
+        if getattr(cache, "hot_adapt_histories", "shared") == "split":
+            routed_tokens = (
+                int(topk_ids.shape[0])
+                if topk_ids.ndim
+                else int(topk_ids.numel())
+            )
+            route_weight = cache.hot_adapt_prefill_weight
+            if (
+                getattr(cache, "hot_adapt_prefill_normalize", "off") == "tokens"
+                and routed_tokens
+            ):
+                route_weight /= routed_tokens
+            counted_tokens = cache.ensure_experts_hot(
+                self.layer_id,
+                topk_ids,
+                route_weight=route_weight,
+                history="prefill",
+            )
+        else:
+            counted_tokens = cache.ensure_experts_hot(
+                self.layer_id,
+                topk_ids,
+                route_weight=cache.hot_adapt_prefill_weight,
+            )
         cache.record_hot_adapt_prefill_tokens(counted_tokens)
         on_gpu, cpu_ids, gpu_slots, gpu_weights = _split_hot_cold_routes(
             raw_ids, topk_ids, topk_weights

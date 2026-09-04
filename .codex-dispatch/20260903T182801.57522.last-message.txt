@@ -1,0 +1,23 @@
+Implemented unequal startup-only HOT capacity allocation.
+
+- Added `equal` and `coverage` policies with floor validation and CLI defaults.
+- Added deterministic marginal-coverage allocation, persisted-counter preference, profile fallback, and equal fallback.
+- Preserved unequal capacities during adaptation.
+- Added cross-policy persistence resizing, partial seed tracking, and policy metadata.
+- Added startup capacity histogram and stats fields.
+- Updated documentation and GPU-free tests.
+- No em-dashes in the diff. No commit created.
+
+Key files: [engine.py](/Users/jomcgi/repos/ft-worktrees/capacity/python/freetoken/engine/engine.py), [hot_adapt.py](/Users/jomcgi/repos/ft-worktrees/capacity/python/freetoken/moe/hot_adapt.py), [offload_cache.py](/Users/jomcgi/repos/ft-worktrees/capacity/python/freetoken/moe/offload_cache.py), [config.py](/Users/jomcgi/repos/ft-worktrees/capacity/python/freetoken/engine/config.py), [args.py](/Users/jomcgi/repos/ft-worktrees/capacity/python/freetoken/server/args.py), [QUICKSTART.md](/Users/jomcgi/repos/ft-worktrees/capacity/QUICKSTART.md), and [docs/cli.md](/Users/jomcgi/repos/ft-worktrees/capacity/docs/cli.md).
+
+Validation passed:
+
+- Python compilation
+- Ruff critical checks
+- `git diff --check`
+- Em-dash scan
+- Standalone allocator, unequal rerank, and cross-policy persistence checks
+
+The requested pytest suite could not collect because available environments lack `torch`, `huggingface_hub`, and a synchronized pytest environment. The unrelated `.codex-dispatch/lock/` remains untouched.
+
+Open questions: none.

@@ -19,6 +19,7 @@ from freetoken.engine.engine import _load_hot_expert_profile as load_hot_profile
 from freetoken.engine.engine import _plan_hot_experts as plan_hot
 from freetoken.engine.engine import _profiled_hot_pair_rate as profiled_hot_rate
 from freetoken.engine.engine import _resolve_hot_expert_sets as resolve_hot
+from freetoken.engine.engine import _resolve_hot_expert_setup as resolve_hot_setup
 from freetoken.engine.engine import _resolve_persisted_hot_plan as resolve_hot_plan
 from freetoken.engine.engine import _validate_disk_prefill_task_size as validate_chunk
 from freetoken.moe.cpu_executor import (
@@ -303,6 +304,105 @@ def test_hot_partition_leaves_sub_round_budget_unused():
         hits, frozenset({0, 1}), budget_bytes=199,
         expert_bytes=100, num_experts=2,
     ) == {}
+
+
+def test_hot_capacity_coverage_is_unequal_with_the_same_total_rows(
+    tmp_path, monkeypatch
+):
+    _write_ftw_index(tmp_path, 2)
+    profile = tmp_path / "traffic-v2.json"
+    profile.write_text(json.dumps({
+        "version": 2,
+        "layers": {"0": 1, "1": 1},
+        "expert_hits": {"0": [10, 9, 1, 0], "1": [100, 0, 0, 0]},
+    }))
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(num_experts=4, num_experts_per_tok=1),
+        moe_cache_size=12,
+        moe_prefill_overlap=False,
+        moe_hot_expert_budget_gib=100 / 2**30,
+        moe_hot_capacity_policy="coverage",
+        moe_hot_capacity_floor=1,
+        moe_hot_adapt_interval_steps=1000,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=str(profile),
+    )
+    logs = []
+    monkeypatch.setattr("freetoken.engine.engine.logger.info_rank0", logs.append)
+
+    plan, capacity, _ = resolve_hot_setup(config, frozenset({0, 1}), 2)
+
+    assert capacity == {0: 3, 1: 1}
+    assert sum(capacity.values()) == 4
+    assert {layer: len(experts) for layer, experts in plan.items()} == capacity
+    coverage_log = next(message for message in logs if "policy=coverage" in message)
+    assert "capacities=min/median/max=1/2/3" in coverage_log
+    assert "layers_at_floor=1, total_rows=4" in coverage_log
+    assert "profiled hot_pair_rate equal=" in coverage_log
+    assert ", chosen=" in coverage_log
+
+    config.moe_hot_capacity_policy = "equal"
+    equal_plan, equal_capacity, _ = resolve_hot_setup(
+        config, frozenset({0, 1}), 2
+    )
+    assert equal_capacity == {0: 2, 1: 2}
+    assert equal_plan == {0: (0, 1), 1: (0, 1)}
+
+
+def test_hot_capacity_prefers_persisted_counters_over_profile(tmp_path):
+    _write_ftw_index(tmp_path, 2)
+    profile = tmp_path / "traffic-v2.json"
+    profile.write_text(json.dumps({
+        "version": 2,
+        "layers": {"0": 1, "1": 1},
+        "expert_hits": {"0": [10, 9, 1, 0], "1": [100, 0, 0, 0]},
+    }))
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(num_experts=4, num_experts_per_tok=1),
+        moe_cache_size=12,
+        moe_prefill_overlap=False,
+        moe_hot_expert_budget_gib=100 / 2**30,
+        moe_hot_capacity_policy="coverage",
+        moe_hot_capacity_floor=1,
+        moe_hot_adapt_interval_steps=1000,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=str(profile),
+    )
+    persisted = {0: (100.0, 0.0, 0.0, 0.0), 1: (10.0, 9.0, 1.0, 0.0)}
+
+    _, capacity, _ = resolve_hot_setup(
+        config,
+        frozenset({0, 1}),
+        2,
+        persisted_counters=persisted,
+    )
+
+    assert capacity == {0: 1, 1: 3}
+
+
+def test_hot_capacity_without_signal_falls_back_to_equal(tmp_path, monkeypatch):
+    _write_ftw_index(tmp_path, 2)
+    logs = []
+    monkeypatch.setattr("freetoken.engine.engine.logger.info_rank0", logs.append)
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(num_experts=4, num_experts_per_tok=1),
+        moe_cache_size=12,
+        moe_prefill_overlap=False,
+        moe_hot_expert_budget_gib=100 / 2**30,
+        moe_hot_capacity_policy="coverage",
+        moe_hot_capacity_floor=1,
+        moe_hot_adapt_interval_steps=1000,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=None,
+    )
+
+    _, capacity, _ = resolve_hot_setup(config, frozenset({0, 1}), 2)
+
+    assert capacity == {0: 2, 1: 2}
+    assert any("no per-layer signal, equal capacity" in message for message in logs)
 
 
 def test_hot_profile_requires_complete_integer_expert_counts(tmp_path):
@@ -670,11 +770,16 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_disk_decode == "cpu"
     assert config.moe_gpu_prefill_layers == "auto"
     assert config.moe_hot_expert_budget_gib == 0
+    assert config.moe_hot_capacity_policy == "equal"
+    assert config.moe_hot_capacity_floor == 8
     assert config.moe_hot_adapt_halflife_steps == 2000
     assert config.moe_hot_adapt_interval_steps == "auto"
     assert config.moe_hot_adapt_max_swap_gib == 0.5
     assert config.moe_hot_adapt_boundary_cap_frac == 0.5
     assert config.moe_hot_adapt_prefill_weight == 1.0
+    assert config.moe_hot_adapt_histories == "shared"
+    assert config.moe_hot_adapt_prefill_blend == 0.25
+    assert config.moe_hot_adapt_prefill_normalize == "off"
     assert config.moe_hot_adapt_prefill_run_cap_frac == 0.0
     assert config.moe_hot_adapt_post_prefill_tick is False
     assert config.moe_hot_plan_persist == "auto"
@@ -697,6 +802,36 @@ def test_engine_config_rejects_invalid_hot_expert_budget(budget):
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_hot_expert_budget_gib=budget,
+        )
+
+
+def test_engine_config_rejects_unknown_hot_capacity_policy():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-capacity-policy"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_capacity_policy="adaptive",
+        )
+
+
+def test_engine_config_rejects_zero_hot_capacity_floor():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-capacity-floor"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_capacity_floor=0,
         )
 
 
@@ -779,6 +914,54 @@ def test_engine_config_rejects_invalid_hot_adapt_prefill_weight(weight):
             tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16,
             moe_hot_adapt_prefill_weight=weight,
+        )
+
+
+@pytest.mark.parametrize("histories", ["combined", "decode", ""])
+def test_engine_config_rejects_invalid_hot_adapt_histories(histories):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-histories"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_histories=histories,
+        )
+
+
+@pytest.mark.parametrize("blend", [-0.1, 1.5, float("inf"), float("nan"), True])
+def test_engine_config_rejects_invalid_hot_adapt_prefill_blend(blend):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-prefill-blend"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_prefill_blend=blend,
+        )
+
+
+@pytest.mark.parametrize("normalize", ["token", "on", ""])
+def test_engine_config_rejects_invalid_hot_adapt_prefill_normalize(normalize):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-prefill-normalize"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_prefill_normalize=normalize,
         )
 
 
@@ -964,6 +1147,24 @@ def test_engine_config_validates_cpu_willneed_settings():
         EngineConfig(**base, moe_cpu_willneed_recent_steps=0)
     with pytest.raises(ValueError, match="fault-ceiling must be positive"):
         EngineConfig(**base, moe_cpu_willneed_fault_ceiling=0)
+
+
+def test_engine_config_validates_cpu_empty_skip():
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    base = {
+        "model_path": "/tmp/model",
+        "tp_info": DistributedInfo(0, 1),
+        "dtype": torch.bfloat16,
+    }
+    assert EngineConfig(**base).moe_cpu_empty_skip == "off"
+    enabled = EngineConfig(**base, moe_cpu_empty_skip="on")
+    assert enabled.moe_cpu_empty_skip == "on"
+    with pytest.raises(ValueError, match="--moe-cpu-empty-skip.*off.*on"):
+        EngineConfig(**base, moe_cpu_empty_skip="auto")
 
 
 @pytest.mark.parametrize("pager", ["madvise", "uffd"])

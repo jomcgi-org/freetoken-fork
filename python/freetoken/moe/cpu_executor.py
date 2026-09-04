@@ -331,6 +331,7 @@ class CpuMoeExecutor:
         disk_lookahead: bool = True,
         step_timing: bool = False,
         moe_cpu_precb: str = "before",
+        moe_cpu_empty_skip: str = "off",
         moe_cpu_willneed: str = "always",
         moe_cpu_willneed_recent_steps: int = 256,
         moe_cpu_willneed_fault_ceiling: float = 2000.0,
@@ -372,6 +373,13 @@ class CpuMoeExecutor:
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self._step_timing = bool(step_timing)
+        if moe_cpu_empty_skip not in ("off", "on"):
+            raise ValueError(
+                "moe_cpu_empty_skip must be 'off' or 'on', got "
+                f"{moe_cpu_empty_skip!r}"
+            )
+        self._moe_cpu_empty_skip = moe_cpu_empty_skip
+        self._all_hot_layers = torch.zeros((), dtype=torch.int64, device=device)
         if moe_cpu_precb not in ("before", "after"):
             raise ValueError(
                 "moe_cpu_precb must be 'before' or 'after', got "
@@ -524,6 +532,7 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        self._configure_empty_skip(moe_cpu_empty_skip)
         self._configure_pre_run_callback_mode(moe_cpu_precb)
         self._configure_prefill_batch()
         if self._disk_banks:
@@ -629,9 +638,24 @@ class CpuMoeExecutor:
                 f"populate scratch={self._prefill_populate_scratch_bytes / 2**20:.0f} MiB"
             )
 
+    def _configure_empty_skip(self, mode: str) -> None:
+        if mode == "on":
+            setter = getattr(self._ext, "set_empty_skip", None)
+            if setter is None:
+                raise RuntimeError(
+                    "the CPU MoE extension needs rebuilding for "
+                    "--moe-cpu-empty-skip on; run `python setup.py build_ext "
+                    "--inplace` or reinstall the wheel"
+                )
+            setter(1)
+
     def _configure_pre_run_callback_mode(self, mode: str) -> None:
         if mode == "after":
             self._ext.set_pre_run_callback_mode(1)
+
+    def record_all_hot(self, is_all_hot: torch.Tensor) -> None:
+        """Accumulate one graph-captured all-hot DISK-layer classification."""
+        self._all_hot_layers.add_(is_all_hot.to(dtype=torch.int64))
 
     def _configure_willneed(
         self, mode: str, recent_steps: int, fault_ceiling: float
@@ -939,7 +963,9 @@ class CpuMoeExecutor:
             "h2d_us": 0.0,
             "compute_us": 0.0,
             "signal_us": 0.0,
+            "empty_us": 0.0,
             "total_tasks": 0,
+            "total_empty_tasks": 0,
             "total_experts": 0,
             "total_bytes": 0,
         }
@@ -1003,7 +1029,9 @@ class CpuMoeExecutor:
                 "h2d_us": max(0.0, h2d_us),
                 "compute_us": float(raw.get("compute_us", 0.0)),
                 "signal_us": float(raw.get("signal_us", 0.0)),
+                "empty_us": float(raw.get("empty_us", 0.0)),
                 "tasks": int(raw.get("tasks", 0)),
+                "empty_tasks": int(raw.get("empty_tasks", 0)),
                 "experts": int(raw.get("experts", 0)),
                 "bytes": int(raw.get("bytes", 0)),
             }
@@ -1023,7 +1051,9 @@ class CpuMoeExecutor:
             total["h2d_us"] += row["h2d_us"]
             total["compute_us"] += row["compute_us"]
             total["signal_us"] += row["signal_us"]
+            total["empty_us"] += row["empty_us"]
             total["total_tasks"] += row["tasks"]
+            total["total_empty_tasks"] += row["empty_tasks"]
             total["total_experts"] += row["experts"]
             total["total_bytes"] += row["bytes"]
         return {
@@ -1660,6 +1690,9 @@ class CpuMoeExecutor:
         self._disk_lookahead_hits = 0
         self._disk_lookahead_routes = 0
         self._disk_delta_pages = 0
+        all_hot_layers = getattr(self, "_all_hot_layers", None)
+        if all_hot_layers is not None:
+            all_hot_layers.zero_()
         if getattr(self, "_moe_cpu_willneed", "always") == "recent":
             self._willneed_skipped_experts = 0
             self._willneed_advised_experts = 0
@@ -1703,7 +1736,14 @@ class CpuMoeExecutor:
         if getattr(self, "_gpufetch_tasks", None) and hasattr(self._ext, "gpufetch_stats"):
             gpufetch_fills, gpufetch_steps, gpufetch_ns = self._ext.gpufetch_stats(reset)
         disk_layers = len(self._disk_banks)
-        decode_steps = self._disk_decode_steps / disk_layers if disk_layers else 0
+        all_hot_counter = getattr(self, "_all_hot_layers", None)
+        all_hot_layers = (
+            int(all_hot_counter.item()) if all_hot_counter is not None else 0
+        )
+        callback_layers = self._disk_decode_steps
+        if getattr(self, "_moe_cpu_empty_skip", "off") == "on":
+            callback_layers += all_hot_layers
+        decode_steps = callback_layers / disk_layers if disk_layers else 0
         gpufetch_layers = len(getattr(self, "_gpufetch_tasks", ()))
         gpufetch_decode_steps = (
             gpufetch_steps / gpufetch_layers if gpufetch_layers else 0
@@ -1730,6 +1770,9 @@ class CpuMoeExecutor:
                 major_faults / decode_steps
                 if major_faults is not None and decode_steps else 0.0
             ),
+            "all_hot_layers_per_decode_step": (
+                all_hot_layers / decode_steps if decode_steps else 0.0
+            ),
             "minor_faults": minor_faults,
             "minor_faults_unit": "kernel_events_4KiB_or_2MiB",
             "minor_faults_per_decode_step": (
@@ -1737,8 +1780,8 @@ class CpuMoeExecutor:
                 if minor_faults is not None and decode_steps else 0.0
             ),
             "distinct_experts_per_step": (
-                self._disk_distinct_experts / self._disk_decode_steps
-                if self._disk_decode_steps else 0.0
+                self._disk_distinct_experts / callback_layers
+                if callback_layers else 0.0
             ),
             "dedup_ratio": (
                 self._disk_route_pairs / self._disk_distinct_experts
@@ -1843,6 +1886,8 @@ class CpuMoeExecutor:
             self._disk_lookahead_hits = 0
             self._disk_lookahead_routes = 0
             self._disk_delta_pages = 0
+            if all_hot_counter is not None:
+                all_hot_counter.zero_()
             if getattr(self, "_moe_cpu_willneed", "always") == "recent":
                 self._willneed_skipped_experts = 0
                 self._willneed_advised_experts = 0
