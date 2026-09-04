@@ -269,6 +269,27 @@ about ten seconds after start, twice, with nothing in dmesg, which is the
 signature of a cgroup kill and therefore plausibly the same bug the memory
 governor fix addresses.
 
+### 5.2 The substrate matters: this technique needs local NVMe
+
+Discovered by getting it wrong. The first cloud replication put the 177 GiB
+checkpoint on a `hyperdisk-balanced` boot disk, provisioned at 5,700 IOPS and
+815 MB/s. The known-good F1 configuration, which measured 11 to 12 tok/s on 03
+September, instead thrashed at 0.08 to 0.92 tok/s with 5,000 to 10,800 disk
+major faults per decode step.
+
+The arithmetic is unambiguous: at 10,800 faults per step and 5,700 IOPS, a
+single decode step needs about two seconds of the device's entire random-read
+budget, which is what 0.5 tok/s means. Attaching four local NVMe SSDs in RAID 0
+gives 1.5 TB at 2,605 MB/s sequential and vastly more IOPS, which is the
+substrate node-4 has had all along.
+
+This belongs in any writeup, because it is a real constraint on the whole
+approach and it is invisible until you hit it. The disk expert tier is random
+read bound by construction. Network-attached storage cannot serve it at any
+sensible price, so "run a 177 GiB model on one GPU" implicitly requires local
+NVMe, and on a cloud instance that is a machine-type decision made at creation
+time, not something that can be fixed afterwards.
+
 ### 5.2 Transfer expectations, ranked
 
 | technique | expected transfer | reasoning |
