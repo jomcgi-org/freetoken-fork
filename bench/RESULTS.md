@@ -1136,6 +1136,13 @@ tok/s on 300-token essays, up from 19.9 at the start of the round; the three
 turns after a 76k-token document 11.0, 15.2, 15.8 against 4.9, 12.3, 7.2. The
 previous checkout and both unit backups are kept for rollback.
 
+01:15 UTC: tier 103b481 deployed on top, carrying upstream #329 (exact
+Triton top-k/top-p sampling) and #336 (shard download); sampled requests at
+the model defaults and with explicit top-p/top-k came back coherent and
+varied, no errors in the journal. Neutral branches kept unmerged:
+`feat/spinwait`, `feat/fetchpolicy`, `feat/pinned-hot-set`,
+`feat/decode-threads`.
+
 ### Decode worker policy (chain 19): neutral once the cache confound is removed
 
 `feat/decode-threads` adds a decode-only participant cap and a spin-then-wait
