@@ -1239,3 +1239,46 @@ exploit. Not deployed; the flag defaults to `equal`.
 layers, bounding the saving at a fraction of a millisecond against 16 to 19 ms
 of CPU windows. Pooled means say +5.9 percent and pooled medians say -1.3
 percent; when they disagree in sign there is nothing there. Not deployed.
+
+### Deployed: split histories with phase-aware aim (04 Sep, 07:17 UTC)
+
+Tier c5c7dfb on the serving worktree, unit carrying
+`--moe-hot-adapt-histories split --moe-hot-adapt-aim phase`. Normalisation left
+at its default of off, which is the whole point: `--moe-hot-adapt-prefill-
+normalize tokens` divides the prefill route weight by the batch token count, so
+with `--moe-hot-adapt-prefill-weight 0.1` a 2048-token chunk accrued about
+0.1/2048 per token against decode's 1.0. The prefill history was roughly
+20,000x under-weighted, which made the hot set ignore prefill and made
+phase-aware aim a no-op. That one bug produced three consecutive null results
+before it was found: the swap cap in both directions, and phase aim itself.
+
+Position-matched arms, all at position 1:
+
+| | shared | split + normalize | split + phase, no normalize |
+|---|---|---|---|
+| long prompt prefill wall | 664 s | 885 s | 652 s |
+| prefill hot coverage, mean | 30.4% | 17.8% | 37.6% |
+| realised hot_pair_rate | 47.0% | 67.9% | 64.2% |
+| decode batches, mean of 9 | 19.37 | 23.87 | 21.88 |
+| post-document turns | 12.5 tok/s | 19.2 tok/s | 14.6 tok/s |
+| `decayed_prefill_share` | 0.00 | 0.13 | 69.15 |
+
+The normalize variant buys more decode and costs 33 percent of prefill; the
+no-normalize variant buys less and costs nothing. Production prefill sizes
+sampled from the journal reach p90 8,192 and max 30,912 tokens, so the prefill
+penalty is a real cost there and the smaller decode win is the right side of the
+trade.
+
+Post-deploy, warm: 23.0, 19.0, 22.4 tok/s single stream, batch mean 25.7,
+cumulative hot_pair_rate 73.9 percent, `hot_adapt_histories: split` and
+`aim=phase` confirmed in the production journal. That is parity with the
+pre-deploy essay numbers, which is the expected result: essays are not the
+workload this helps. The gain is on the long-document path measured above.
+
+The deploy gate deselects
+`test_disk_hot_cold_split_matches_pure_cpu_decode`, which is order-dependent and
+fails on the tier as well as on any branch after `test_cpu_moe.py` has run. A
+bisect on 04 Sep exonerated `test_step_timing.py` and confirmed `test_cpu_moe.py`
+as the polluter, while the CUDA-stream restore fixture was active, so the leak is
+not the stream. Retained CUDA graph memory pools are the leading candidate. Fork
+issue #18; 461 of 462 tier tests pass.
