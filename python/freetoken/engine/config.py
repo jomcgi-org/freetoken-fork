@@ -88,6 +88,10 @@ class EngineConfig:
     # Protected GPU HOT row capacity for DISK layers. A profile seeds the rows;
     # without one, online adaptation starts the fixed partition all-cold.
     moe_hot_expert_budget_gib: float = 0.0
+    # Equal preserves the historical per-layer split. Coverage assigns the same
+    # total rows by normalized marginal route coverage at startup.
+    moe_hot_capacity_policy: str = "equal"
+    moe_hot_capacity_floor: int = 8
     # Online HOT-set adaptation. "auto" derives the fill cadence from the HOT
     # allocation and swap bound; an integer retains a fixed cadence, with 0 off.
     moe_hot_adapt_halflife_steps: int = 2000
@@ -365,6 +369,17 @@ class EngineConfig:
             raise ValueError(
                 "--moe-hot-expert-budget-gib must be a finite non-negative number"
             )
+        if self.moe_hot_capacity_policy not in ("equal", "coverage"):
+            raise ValueError(
+                "--moe-hot-capacity-policy must be 'equal' or 'coverage', got "
+                f"{self.moe_hot_capacity_policy!r}"
+            )
+        if (
+            isinstance(self.moe_hot_capacity_floor, bool)
+            or not isinstance(self.moe_hot_capacity_floor, int)
+            or self.moe_hot_capacity_floor < 1
+        ):
+            raise ValueError("--moe-hot-capacity-floor must be a positive integer")
         if (
             isinstance(self.moe_hot_adapt_halflife_steps, bool)
             or not isinstance(self.moe_hot_adapt_halflife_steps, int)

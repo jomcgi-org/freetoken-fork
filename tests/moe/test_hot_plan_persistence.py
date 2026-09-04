@@ -53,7 +53,9 @@ def test_checkpoint_identity_hashes_index_and_stats_shards(tmp_path):
     assert len(identity["index_sha256"]) == 64
 
 
-def _document(*, layers=(0, 1), budget=400, written_at=1000.0):
+def _document(
+    *, layers=(0, 1), budget=400, capacity_policy="equal", written_at=1000.0
+):
     counters = {
         0: (1.0, 9.0, 8.0, 2.0),
         1: (7.0, 1.0, 6.0, 3.0),
@@ -64,6 +66,7 @@ def _document(*, layers=(0, 1), budget=400, written_at=1000.0):
         num_layers=2,
         num_experts=4,
         hot_budget_bytes=budget,
+        capacity_policy=capacity_policy,
         tier_commit="tier-old",
         protected_slots={layer: ((0, 3) if layer == 0 else (2, 1)) for layer in layers},
         decayed_counters={layer: counters[layer] for layer in layers},
@@ -71,7 +74,9 @@ def _document(*, layers=(0, 1), budget=400, written_at=1000.0):
     )
 
 
-def _load(path, *, budget=400, capacity=None, identity=IDENTITY):
+def _load(
+    path, *, budget=400, capacity=None, identity=IDENTITY, capacity_policy="equal"
+):
     return load_hot_plan(
         str(path),
         identity=identity,
@@ -82,6 +87,7 @@ def _load(path, *, budget=400, capacity=None, identity=IDENTITY):
         current_hot_budget_bytes=budget,
         static_expert_ids={0: (1, 2), 1: (0, 3)},
         tier_commit="tier-new",
+        current_capacity_policy=capacity_policy,
         now=1060.0,
     )
 
@@ -99,6 +105,7 @@ def test_hot_plan_round_trip_preserves_slot_order_counters_and_metadata(tmp_path
     assert seed.seeded_layers == frozenset({0, 1})
     assert seed.age_seconds == 60.0
     assert seed.saved_hot_budget_bytes == 400
+    assert seed.capacity_policy == "equal"
     assert seed.tier_commit == "tier-old"
     assert seed.tier_mismatch
 
@@ -135,6 +142,63 @@ def test_larger_budget_extends_saved_residents_from_counter_ranking(tmp_path):
 
     assert seed.expert_ids[0] == (3, 0, 1)
     assert seed.expert_ids[1] == (2, 1, 0)
+
+
+def test_policy_change_truncates_or_leaves_layer_partially_seeded(tmp_path):
+    path = tmp_path / HOT_PLAN_FILENAME
+    document = _document(capacity_policy="equal")
+    assert document is not None
+    atomic_write_hot_plan(str(path), document)
+
+    seed = _load(
+        path,
+        budget=400,
+        capacity={0: 1, 1: 3},
+        capacity_policy="coverage",
+    )
+
+    assert seed.expert_ids == {0: (3,), 1: (2, 1)}
+    assert seed.seeded_layers == frozenset({0, 1})
+    assert seed.partially_seeded_layers == frozenset({1})
+    assert seed.capacity_policy == "equal"
+
+
+def test_capacity_policy_round_trips_in_plan_document(tmp_path):
+    path = tmp_path / HOT_PLAN_FILENAME
+    document = _document(capacity_policy="coverage")
+    assert document is not None
+    atomic_write_hot_plan(str(path), document)
+
+    seed = _load(path, capacity_policy="equal")
+
+    assert seed.capacity_policy == "coverage"
+
+
+def test_coverage_plan_loads_under_equal_with_truncation_and_partial_seed(tmp_path):
+    path = tmp_path / HOT_PLAN_FILENAME
+    document = make_hot_plan_document(
+        identity=IDENTITY,
+        disk_layer_ids=(0, 1),
+        num_layers=2,
+        num_experts=4,
+        hot_budget_bytes=400,
+        capacity_policy="coverage",
+        tier_commit="tier-old",
+        protected_slots={0: (3,), 1: (2, 1, 0)},
+        decayed_counters={
+            0: (1.0, 9.0, 8.0, 2.0),
+            1: (7.0, 1.0, 6.0, 3.0),
+        },
+        written_at=1000.0,
+    )
+    assert document is not None
+    atomic_write_hot_plan(str(path), document)
+
+    seed = _load(path, capacity={0: 2, 1: 2}, capacity_policy="equal")
+
+    assert seed.expert_ids == {0: (3,), 1: (0, 2)}
+    assert seed.partially_seeded_layers == frozenset({0})
+    assert seed.capacity_policy == "coverage"
 
 
 def test_missing_plan_layer_keeps_static_seed_and_is_marked_unseeded(tmp_path):

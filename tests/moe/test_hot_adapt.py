@@ -18,6 +18,7 @@ from freetoken.moe.hot_adapt import (
     HotAdaptIntervalController,
     HotAdaptTokenClock,
     HotSwap,
+    allocate_hot_capacity,
     finish_hot_swaps,
     hot_boundary_interval_tokens,
     hot_catchup_swap_bytes,
@@ -29,6 +30,51 @@ from freetoken.moe.hot_adapt import (
     retire_hot_swaps,
     update_decayed_counts,
 )
+
+
+def test_capacity_allocator_keeps_equal_weights_balanced():
+    weights = {2: (1, 1, 1, 1), 5: (1, 1, 1, 1), 9: (1, 1, 1, 1)}
+
+    assert allocate_hot_capacity(
+        weights, 6, floor=1, num_experts=4
+    ) == {2: 2, 5: 2, 9: 2}
+
+
+def test_capacity_allocator_gives_strongest_next_marginal_the_surplus():
+    weights = {
+        0: (30, 29, 1, 0),
+        1: (1, 1, 1, 1),
+        2: (1, 1, 1, 1),
+    }
+
+    assert allocate_hot_capacity(
+        weights, 4, floor=1, num_experts=4
+    ) == {0: 2, 1: 1, 2: 1}
+
+
+def test_capacity_allocator_holds_floor_caps_rows_and_preserves_total():
+    weights = {
+        0: (9, 8, 7, 6),
+        1: (4, 3, 2, 1),
+        2: (1, 1, 1, 1),
+    }
+    capacity = allocate_hot_capacity(weights, 9, floor=2, num_experts=4)
+
+    assert min(capacity.values()) >= 2
+    assert max(capacity.values()) <= 4
+    assert sum(capacity.values()) == 9
+    assert allocate_hot_capacity(
+        weights, 20, floor=2, num_experts=4
+    ) == {0: 4, 1: 4, 2: 4}
+
+
+def test_capacity_allocator_breaks_balanced_ties_by_lower_layer_id():
+    assert allocate_hot_capacity(
+        {4: (1, 1, 1), 7: (1, 1, 1)},
+        5,
+        floor=1,
+        num_experts=3,
+    ) == {4: 3, 7: 2}
 
 
 def _real_slot_cache_stats_without_triton(monkeypatch):
@@ -634,6 +680,19 @@ def test_partition_recompute_uses_same_equal_per_layer_byte_budget():
     ) == {0: (0, 2), 2: (1, 2)}
 
 
+def test_partition_recompute_honors_fixed_unequal_capacities():
+    counts = {0: (9.0, 8.0, 7.0, 1.0), 2: (6.0, 5.0, 4.0, 3.0)}
+
+    assert recompute_hot_partition(
+        counts,
+        frozenset({0, 2}),
+        budget_bytes=400,
+        expert_bytes=100,
+        num_experts=4,
+        capacities={0: 3, 2: 1},
+    ) == {0: (0, 1, 2), 2: (0,)}
+
+
 def test_swap_planner_honors_global_byte_bound_and_prioritizes_gain():
     counts = {0: (1.0, 10.0, 9.0), 1: (1.0, 8.0, 7.0)}
     owners = {0: (0, None), 1: (0, None)}
@@ -932,10 +991,17 @@ def test_tensor_parallelism_disables_idle_ticks_and_logs_staging_bound(monkeypat
         idle_ms=500,
         tp_size=2,
         configure_logs=logs,
+        hot_capacity_policy="coverage",
     )
     try:
         assert cache._hot_adapt_idle_tracker is None
-        assert any("hot_staging_rows=1" in message for message in logs)
+        residency = next(
+            message for message in logs if "MoE HOT expert residency" in message
+        )
+        assert "hot_capacity_policy=coverage" in residency
+        assert "hot_capacity_rows_min=2" in residency
+        assert "hot_capacity_rows_max=2" in residency
+        assert "hot_staging_rows=1" in residency
         assert any("idle=off (tensor parallel)" in message for message in logs)
     finally:
         cache.shutdown_hot_adaptation()

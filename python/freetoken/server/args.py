@@ -890,6 +890,27 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-capacity-policy",
+        choices=("equal", "coverage"),
+        default=ServerArgs.moe_hot_capacity_policy,
+        help=(
+            "Fixed startup allocation of protected HOT rows across DISK layers. "
+            "'equal' preserves the historical split; 'coverage' uses persisted "
+            "counters first, then profile route counts (default: equal)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-capacity-floor",
+        type=_positive_int,
+        default=ServerArgs.moe_hot_capacity_floor,
+        help=(
+            "Minimum protected rows per DISK layer under the coverage policy, "
+            "subject to the total row budget and expert count (default: 8)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-halflife-steps",
         type=int,
         default=ServerArgs.moe_hot_adapt_halflife_steps,
