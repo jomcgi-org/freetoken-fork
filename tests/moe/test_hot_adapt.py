@@ -534,19 +534,110 @@ def test_split_blend_keeps_decode_heavy_experts_ranked_first():
     ) == {0: (2, 3)}
 
 
-def test_decayed_hot_pair_rate_uses_split_history_blend(monkeypatch):
+@pytest.mark.parametrize(
+    ("aim", "boundary", "expected"),
+    [
+        ("phase", "prefill", {0: (2.0, 20.0, 0.5, 4.0)}),
+        ("phase", "decode", {0: (8.0, 0.0, 2.0, 0.0)}),
+        ("blend", "prefill", {0: (8.0, 5.0, 2.0, 1.0)}),
+    ],
+)
+def test_split_history_aim_counts_follow_boundary(
+    monkeypatch, aim, boundary, expected,
+):
+    import torch
+
+    from freetoken.moe import hot_adapt
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache._hot_adapt_snapshot_host = torch.tensor([[8.0, 0.0, 2.0, 0.0]])
+    cache._hot_adapt_prefill_snapshot_host = torch.tensor([[0.0, 20.0, 0.0, 4.0]])
+    cache.hot_expert_capacity = {0: 1}
+    cache.hot_adapt_histories = "split"
+    cache.hot_adapt_aim = aim
+    cache.hot_adapt_prefill_blend = 0.25
+    cache.hot_adapt_expert_bytes = 1
+    cache.num_experts = 4
+    cache._hot_slot_owners = {0: [0]}
+    cache.hot_adapt_max_swap_bytes = 1
+    cache.hot_adapt_hot_budget_bytes = 1
+    cache.hot_adapt_boundary_cap_frac = 1.0
+    captured = {}
+
+    def capture_partition(counts, *_args, **_kwargs):
+        captured["counts"] = counts
+        return {0: (0,)}
+
+    monkeypatch.setattr(hot_adapt, "recompute_hot_partition", capture_partition)
+
+    cache._plan_hot_adaptation(
+        None,
+        token=1,
+        swap_budget_bytes=1,
+        boundary=boundary,
+        tick_count=1,
+    )
+
+    assert captured["counts"] == expected
+
+
+@pytest.mark.parametrize(
+    ("aim", "boundary", "expected"),
+    [
+        ("blend", "prefill", 0.5),
+        ("phase", "prefill", 2.0 / 26.5),
+        ("phase", "decode", 0.8),
+    ],
+)
+def test_decayed_hot_pair_rate_follows_active_aim(monkeypatch, aim, boundary, expected):
     import torch
 
     OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
     cache = OffloadMoeCache.__new__(OffloadMoeCache)
     cache.hot_adapt_enabled = True
     cache.num_layers = 1
+    cache.hot_adapt_aim = aim
     cache.hot_adapt_prefill_blend = 0.25
-    cache.decayed_decode_freq = torch.tensor([[0.0, 8.0, 0.0, 2.0]])
-    cache.decayed_prefill_freq = torch.tensor([[100.0, 0.0, 0.0, 0.0]])
-    cache._hot_slot_owners = {0: [1]}
+    cache._hot_adapt_tick_boundary = boundary
+    cache.decayed_decode_freq = torch.tensor([[8.0, 0.0, 2.0, 0.0]])
+    cache.decayed_prefill_freq = torch.tensor([[0.0, 20.0, 0.0, 4.0]])
+    cache._hot_slot_owners = {0: [0]}
 
-    assert cache.decayed_hot_pair_rate() == pytest.approx(8.0 / 35.0)
+    assert cache.decayed_hot_pair_rate() == pytest.approx(expected)
+
+
+def test_engine_config_defaults_hot_adapt_aim_to_blend(monkeypatch):
+    import torch
+
+    _offload_cache_class_without_triton(monkeypatch)
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+    )
+
+    assert config.moe_hot_adapt_aim == "blend"
+
+
+@pytest.mark.parametrize("aim", ["mixed", "", None])
+def test_engine_config_rejects_invalid_hot_adapt_aim(monkeypatch, aim):
+    import torch
+
+    _offload_cache_class_without_triton(monkeypatch)
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(ValueError, match="--moe-hot-adapt-aim"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_aim=aim,
+        )
 
 
 def test_boundary_routing_counts_prefill_decode_and_deferred_ticks(monkeypatch):
@@ -1111,6 +1202,7 @@ def test_tensor_parallelism_disables_idle_ticks_and_logs_staging_bound(monkeypat
         tp_size=2,
         configure_logs=logs,
         hot_capacity_policy="coverage",
+        aim="phase",
     )
     try:
         assert cache._hot_adapt_idle_tracker is None
@@ -1121,7 +1213,12 @@ def test_tensor_parallelism_disables_idle_ticks_and_logs_staging_bound(monkeypat
         assert "hot_capacity_rows_min=2" in residency
         assert "hot_capacity_rows_max=2" in residency
         assert "hot_staging_rows=1" in residency
-        assert any("idle=off (tensor parallel)" in message for message in logs)
+        interval_logs = [
+            message for message in logs if "MoE HOT adaptation intervals" in message
+        ]
+        assert len(interval_logs) == 1
+        assert "aim=phase" in interval_logs[0]
+        assert "idle=off (tensor parallel)" in interval_logs[0]
     finally:
         cache.shutdown_hot_adaptation()
 

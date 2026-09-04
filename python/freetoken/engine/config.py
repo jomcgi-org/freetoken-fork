@@ -100,6 +100,7 @@ class EngineConfig:
     moe_hot_adapt_boundary_cap_frac: float = 0.5
     moe_hot_adapt_prefill_weight: float = 1.0
     moe_hot_adapt_histories: str = "shared"
+    moe_hot_adapt_aim: str = "blend"
     moe_hot_adapt_prefill_blend: float = 0.25
     moe_hot_adapt_prefill_normalize: str = "off"
     moe_hot_adapt_prefill_run_cap_frac: float = 0.0
@@ -430,6 +431,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-hot-adapt-histories must be 'shared' or 'split', got "
                 f"{self.moe_hot_adapt_histories!r}"
+            )
+        if self.moe_hot_adapt_aim not in ("blend", "phase"):
+            raise ValueError(
+                "--moe-hot-adapt-aim must be 'blend' or 'phase', got "
+                f"{self.moe_hot_adapt_aim!r}"
             )
         if (
             isinstance(self.moe_hot_adapt_prefill_blend, bool)

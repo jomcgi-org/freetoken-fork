@@ -339,6 +339,7 @@ class OffloadMoeCache:
         self.hot_adapt_boundary_cap_frac = 0.5
         self.hot_adapt_prefill_weight = 1.0
         self.hot_adapt_histories = "shared"
+        self.hot_adapt_aim = "blend"
         self.hot_adapt_prefill_blend = 0.25
         self.hot_adapt_prefill_normalize = "off"
         self.hot_adapt_prefill_run_cap_frac = 0.0
@@ -1134,6 +1135,7 @@ class OffloadMoeCache:
         boundary_cap_frac: float = 0.5,
         prefill_weight: float = 1.0,
         histories: str = "shared",
+        aim: str = "blend",
         prefill_blend: float = 0.25,
         prefill_normalize: str = "off",
         prefill_run_cap_frac: float = 0.0,
@@ -1175,6 +1177,8 @@ class OffloadMoeCache:
             raise ValueError("HOT prefill weight must be finite and in [0, 1]")
         if histories not in ("shared", "split"):
             raise ValueError("HOT adaptation histories must be 'shared' or 'split'")
+        if aim not in ("blend", "phase"):
+            raise ValueError("HOT adaptation aim must be 'blend' or 'phase'")
         if (
             isinstance(prefill_blend, bool)
             or not math.isfinite(prefill_blend)
@@ -1225,6 +1229,7 @@ class OffloadMoeCache:
         self.hot_adapt_boundary_cap_frac = float(boundary_cap_frac)
         self.hot_adapt_prefill_weight = float(prefill_weight)
         self.hot_adapt_histories = histories
+        self.hot_adapt_aim = aim
         self.hot_adapt_prefill_blend = float(prefill_blend)
         self.hot_adapt_prefill_normalize = prefill_normalize
         self.decayed_prefill_freq = (
@@ -1351,6 +1356,7 @@ class OffloadMoeCache:
             idle = f"{idle_ms} ms"
         logger.info_rank0(
             f"MoE HOT adaptation intervals: mode={mode}, "
+            f"aim={self.hot_adapt_aim}, "
             f"unit=routed_tokens, "
             f"hot_budget_gib={self.hot_adapt_hot_budget_bytes / 2**30:.2f}, "
             f"max_swap_gib={self.hot_adapt_max_swap_bytes / 2**30:.2f}, "
@@ -1799,11 +1805,23 @@ class OffloadMoeCache:
                 )
                 for layer_id in self.hot_expert_capacity
             }
-            counts = blend_histories(
-                counts,
-                prefill_counts,
-                getattr(self, "hot_adapt_prefill_blend", 0.25),
-            )
+            if getattr(self, "hot_adapt_aim", "blend") == "phase":
+                if boundary == "prefill":
+                    # Keep the active prefill covered while still retaining bounded
+                    # evidence from the decode history.
+                    counts = blend_histories(
+                        prefill_counts,
+                        counts,
+                        getattr(self, "hot_adapt_prefill_blend", 0.25),
+                    )
+                else:
+                    counts = blend_histories(counts, prefill_counts, 0)
+            else:
+                counts = blend_histories(
+                    counts,
+                    prefill_counts,
+                    getattr(self, "hot_adapt_prefill_blend", 0.25),
+                )
         budget_bytes = sum(self.hot_expert_capacity.values()) * self.hot_adapt_expert_bytes
         desired = recompute_hot_partition(
             counts,
@@ -2480,11 +2498,23 @@ class OffloadMoeCache:
         if getattr(self, "decayed_prefill_freq", None) is not None:
             from freetoken.moe.hot_adapt import blend_histories
 
-            blended = blend_histories(
-                dict(enumerate(counts)),
-                dict(enumerate(self.decayed_prefill_freq.tolist())),
-                getattr(self, "hot_adapt_prefill_blend", 0.25),
-            )
+            decode_counts = dict(enumerate(counts))
+            prefill_counts = dict(enumerate(self.decayed_prefill_freq.tolist()))
+            if getattr(self, "hot_adapt_aim", "blend") == "phase":
+                if getattr(self, "_hot_adapt_tick_boundary", None) == "prefill":
+                    blended = blend_histories(
+                        prefill_counts,
+                        decode_counts,
+                        getattr(self, "hot_adapt_prefill_blend", 0.25),
+                    )
+                else:
+                    blended = blend_histories(decode_counts, prefill_counts, 0)
+            else:
+                blended = blend_histories(
+                    decode_counts,
+                    prefill_counts,
+                    getattr(self, "hot_adapt_prefill_blend", 0.25),
+                )
             counts = [blended[layer_id] for layer_id in range(self.num_layers)]
         total = sum(sum(layer) for layer in counts)
         hot = sum(

@@ -972,6 +972,13 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-adapt-aim",
+        choices=["blend", "phase"],
+        default=ServerArgs.moe_hot_adapt_aim,
+        help="HOT adaptation history aim (default: blend).",
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-prefill-blend",
         type=float,
         default=ServerArgs.moe_hot_adapt_prefill_blend,
