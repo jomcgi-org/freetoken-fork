@@ -115,8 +115,19 @@ class Qwen4ExpModel(BaseOP):
             from .ple import build_ple_metadata, commit_ngram_context
 
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
-            for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
-                ple.start_prefetch(batch, meta)
+            if (
+                getattr(batch, "mtp_verify_graph_capture", False)
+                and getattr(self, "_mtp_verify_ple_staging_required", False)
+            ):
+                # Replay never reruns this Python prefetch, so capture must use the
+                # rows staged for this exact warmup or capture step.
+                assert getattr(self, "_mtp_verify_ple_staging_prepared", False), (
+                    "MTP verify CUDA graph capture requires prepared PLE staging"
+                )
+                self._mtp_verify_ple_staging_prepared = False
+            else:
+                for ple in self._ple:  # gather PLE rows while the early layers run
+                    ple.start_prefetch(batch, meta)
         for layer in self.layers.op_list:
             hidden = layer.forward(hidden, batch)
         if getattr(self, "_capture_mtp_hidden", False):
@@ -452,6 +463,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         )
 
     def _init_mtp_verify_ple_staging(self, args, width: int) -> None:
+        self.model._mtp_verify_ple_staging_required = width > 1
         if width <= 1:
             return
         from freetoken.spec_decode import MTPVerifyHostStaging
@@ -459,7 +471,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         self._ple_mtp_host_staging = MTPVerifyHostStaging.init(
             width, args.ngram_size - 1
         )
-        self._ple_mtp_staging_ready = False
+        self.model._mtp_verify_ple_staging_prepared = False
 
     def ple_disk_stats(self, *, reset: bool = False) -> dict:
         """Aggregate mapped PLE prefetch and procfs major-fault counters.
@@ -664,7 +676,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         backends = getattr(self, "_ple_disk_backends", None)
         if not backends:
             return True
-        self._ple_mtp_staging_ready = False
+        self.model._mtp_verify_ple_staging_prepared = False
         try:
             started = time.perf_counter_ns()
             args = self._config.qwen4_args
@@ -684,7 +696,7 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 if getattr(backend, "_decode_shape", None) != row_ids.shape:
                     raise RuntimeError("PLE backend did not complete MTP verify staging")
             self._ple_staging_ns += time.perf_counter_ns() - started
-            self._ple_mtp_staging_ready = True
+            self.model._mtp_verify_ple_staging_prepared = True
             return True
         except (MemoryError, OSError, RuntimeError, ValueError) as exc:
             for backend in backends:
@@ -703,15 +715,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         expected = torch.Size(
             (batch.input_ids.numel(), self._config.qwen4_args.num_ngram_heads)
         )
-        return self._ple_mtp_staging_ready and all(
-            getattr(backend, "_decode_shape", None) == expected
-            for backend in backends
+        return (
+            getattr(self.model, "_mtp_verify_ple_staging_prepared", False)
+            and all(
+                getattr(backend, "_decode_shape", None) == expected
+                for backend in backends
+            )
         )
 
     def finish_mtp_verify_cuda_graph_replay(self, *, record_event: bool) -> None:
         self.finish_cuda_graph_replay(record_event=record_event)
         if getattr(self, "_ple_disk_backends", None):
-            self._ple_mtp_staging_ready = False
+            self.model._mtp_verify_ple_staging_prepared = False
 
     def finish_cuda_graph_replay(self, *, record_event: bool) -> None:
         """Fence fixed host-buffer reuse after a submitted graph or eager warmup."""

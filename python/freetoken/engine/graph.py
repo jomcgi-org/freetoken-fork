@@ -264,6 +264,7 @@ class GraphRunner:
             batch = Batch(reqs=[self.dummy_req], phase="decode")
             batch.padded_reqs = batch.reqs
             batch.mtp_fused = True
+            batch.mtp_verify_graph_capture = True
             batch.mtp_original_cached_len = self.dummy_req.cached_len
             batch.mtp_original_device_len = self.dummy_req.cached_len + 1
             self.attn_backend.prepare_for_capture(batch)

@@ -221,6 +221,160 @@ def test_staged_ple_backends_remain_eligible_for_mtp_verify_capture(
     assert runner.mtp_verify_widths == [2]
 
 
+def _ple_prefetch_spy_model(monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+    from types import ModuleType
+
+    package_name = "freetoken.models.qwen4_exp"
+    source_dir = Path(__file__).resolve().parents[2] / "python/freetoken/models/qwen4_exp"
+    package = ModuleType(package_name)
+    package.__path__ = [str(source_dir)]
+    monkeypatch.setitem(sys.modules, package_name, package)
+
+    dependencies = {
+        "attention": "Qwen4ExpAttention",
+        "hc": "GatedResidual",
+        "moe": "Qwen4ExpMoE",
+        "ple": "PLELayer",
+    }
+    modules = {}
+    for name, symbol in dependencies.items():
+        module_name = f"{package_name}.{name}"
+        module = ModuleType(module_name)
+        setattr(module, symbol, object)
+        monkeypatch.setitem(sys.modules, module_name, module)
+        modules[name] = module
+
+    model_name = f"{package_name}.model"
+    spec = importlib.util.spec_from_file_location(model_name, source_dir / "model.py")
+    assert spec is not None and spec.loader is not None
+    model_module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, model_name, model_module)
+    spec.loader.exec_module(model_module)
+
+    calls = []
+
+    class _Embedding:
+        def host_decode_row_ids(self, contexts, input_ids):
+            return input_ids.view(-1, 1).expand(-1, 4).clone()
+
+    class _PLE:
+        args = SimpleNamespace()
+        ple_embedding = _Embedding()
+
+        def start_prefetch(self, batch, meta):
+            calls.append((batch.phase, meta))
+
+    ple = _PLE()
+    meta = object()
+    modules["ple"].build_ple_metadata = lambda *args: meta
+    modules["ple"].commit_ngram_context = lambda *args: None
+
+    model = model_module.Qwen4ExpModel.__new__(model_module.Qwen4ExpModel)
+    model.hc_count = 1
+    model.embed_tokens = SimpleNamespace(
+        forward=lambda input_ids: input_ids.float().unsqueeze(1)
+    )
+    model.layers = SimpleNamespace(op_list=[])
+    model.hyper_connection_mixer = SimpleNamespace(
+        mix=lambda hidden: (hidden, None)
+    )
+    model._ple = (ple,)
+    model._mtp_verify_ple_staging_required = True
+    model._mtp_verify_ple_staging_prepared = False
+    return model_module, model, ple, calls
+
+
+def _ple_forward_batch(*, phase, mtp_fused, graph_capture=False):
+    req = SimpleNamespace(
+        uid=1,
+        cached_len=2,
+        input_ids=torch.tensor([10, 11, 12], dtype=torch.int32),
+        pending_token_cpu=None,
+        sample_copy_done=None,
+    )
+    return _Batch(
+        reqs=[req],
+        padded_reqs=[req],
+        phase=phase,
+        mtp_fused=mtp_fused,
+        mtp_verify_graph_capture=graph_capture,
+        input_ids=torch.tensor([12, 13], dtype=torch.int32),
+        linear_table_idx=torch.tensor([0], dtype=torch.int32),
+        fla_metadata=None,
+    )
+
+
+def test_mtp_verify_capture_forward_skips_prepared_ple_prefetch(monkeypatch):
+    model_module, model, ple, calls = _ple_prefetch_spy_model(monkeypatch)
+    batch = _ple_forward_batch(
+        phase="decode", mtp_fused=True, graph_capture=True
+    )
+
+    class _Backend:
+        _decode_shape = None
+
+        def prepare_decode(self, row_ids):
+            self._decode_shape = row_ids.shape
+
+        def finish_decode(self, *, record_event):
+            self._decode_shape = None
+
+    backend = _Backend()
+    causal_model = model_module.Qwen4ExpForCausalLM.__new__(
+        model_module.Qwen4ExpForCausalLM
+    )
+    causal_model.model = model
+    causal_model._config = SimpleNamespace(
+        qwen4_args=SimpleNamespace(
+            ngram_boundary_token_id=2, num_ngram_heads=4
+        )
+    )
+    causal_model._ple_disk_backends = [backend]
+    causal_model._ple_disk_decode = ((ple, backend),)
+    causal_model._ple_mtp_host_staging = MTPVerifyHostStaging.init(2, 2)
+    causal_model._ple_staging_ns = 0
+
+    assert causal_model.prepare_mtp_verify_cuda_graph_replay(batch)
+    model.forward(batch.input_ids, batch)
+
+    assert calls == []
+    assert not model._mtp_verify_ple_staging_prepared
+
+
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+def test_non_mtp_forward_still_prefetches_ple(monkeypatch, phase):
+    _model_module, model, _ple, calls = _ple_prefetch_spy_model(monkeypatch)
+    batch = _ple_forward_batch(phase=phase, mtp_fused=False)
+
+    model.forward(batch.input_ids, batch)
+
+    assert [call[0] for call in calls] == [phase]
+
+
+def test_mtp_verify_capture_forward_requires_prepared_ple_staging(monkeypatch):
+    _model_module, model, _ple, calls = _ple_prefetch_spy_model(monkeypatch)
+    batch = _ple_forward_batch(
+        phase="decode", mtp_fused=True, graph_capture=True
+    )
+
+    with pytest.raises(AssertionError, match="requires prepared PLE staging"):
+        model.forward(batch.input_ids, batch)
+
+    assert calls == []
+
+
+def test_mtp_verify_eager_fallback_still_prefetches_ple(monkeypatch):
+    _model_module, model, _ple, calls = _ple_prefetch_spy_model(monkeypatch)
+    batch = _ple_forward_batch(phase="decode", mtp_fused=True)
+
+    model.forward(batch.input_ids, batch)
+
+    assert [call[0] for call in calls] == ["decode"]
+
+
 def test_mtp_verify_replay_restores_the_captured_hidden_storage():
     runner = GraphRunner.__new__(GraphRunner)
     runner.mtp_enabled = True
