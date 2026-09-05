@@ -1,0 +1,15 @@
+COMMAND ['sudo', '-n', 'systemctl', 'stop', 'freetoken-serve']
+COMMAND ['git', 'rev-parse', 'HEAD']
+REVISION 78848ce
+COMMAND ['/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python', '-m', 'pytest', 'tests/moe/test_disk_prefill_staging.py', 'tests/moe/test_materialize_hot_slots.py', 'tests/moe/test_disk_prefill_policy.py', '-q', '--disable-warnings', '--maxfail=3', '--basetemp', '/var/lib/longhorn/nvme-02/freetoken/tmp/astra-cached-io-cli-pytest']
+........................................................................ [ 72%]
+...........................                                              [100%]
+99 passed, 1 warning in 7.22s
+COMMAND ['/usr/local/cuda-13.0/bin/compute-sanitizer', '--tool', 'memcheck', '--error-exitcode', '99', '/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python', '-m', 'pytest', 'tests/moe/test_disk_prefill_staging.py', 'tests/moe/test_materialize_hot_slots.py', 'tests/moe/test_disk_prefill_policy.py', '-q', '--disable-warnings', '--maxfail=3', '--basetemp', '/var/lib/longhorn/nvme-02/freetoken/tmp/astra-cached-io-cli-pytest']
+========= COMPUTE-SANITIZER
+........................................................................ [ 72%]
+...........................                                              [100%]
+99 passed, 1 warning in 5.56s
+========= ERROR SUMMARY: 0 errors
+COMMAND ['sudo', '-n', 'systemctl', 'start', 'freetoken-serve']
+ORIGINAL SERVICE VERIFIED {"id": "chatcmpl-0", "object": "chat.completion", "created": 1788644711, "model": "qwen3.6-27b", "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 17, "completion_tokens": 2, "total_tokens": 19}}

@@ -212,3 +212,20 @@ page cache is retained between starts, and each start has limited adaptation
 history. A fresh comparison against CPU prefill and a sustained run with
 retained serving state remain necessary before a general production claim.
 This 18.3% cannot be added to earlier gains against different baselines.
+
+## Serving configuration validation
+
+At `78848ce`, `--moe-disk-prefill-io cached` is wired from the CLI through
+engine configuration into the staging reader. Invalid file policies and
+cached reads with CPU or copy prefill are rejected. The ordinary serving
+defaults remain CPU prefill and buffered reads.
+
+All 99 focused Linux CUDA checks in staging, materialization, and policy
+validation pass normally and under GPU memcheck with zero errors. The actual
+cache initialization path is exercised with both file policies, protected HOT
+rows, overlap on/off, and fused-copy fallbacks. Both modes preserve exact
+selected bytes and leave uncopied scratch rows unowned. The
+[validation log](../bench/results/4090-cached-io-cli-validation-20260905.txt)
+retains commands, revision, and a real completion from the restored original
+service. The direct original-versus-combined model comparison uses this
+frozen revision and the real CLI, without a constructor probe.
