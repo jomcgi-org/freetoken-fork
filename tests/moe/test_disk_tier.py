@@ -1486,6 +1486,46 @@ def test_prefill_hot_split_selects_and_normalizes_prefill_history(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("histories,normalize", [("shared", "off"), ("split", "tokens")])
+@pytest.mark.parametrize("adapt,stats", [(False, False), (True, False), (False, True)])
+def test_staged_prefill_preserves_routes_weights_and_optional_hot_observations(
+    monkeypatch, histories, normalize, adapt, stats,
+):
+    layer, hidden, weights, ids, calls, _cpu_out, gpu_out = _prefill_hot_split_fixture(
+        monkeypatch, hot_slots=[7, -1, 9, -1], histories=histories,
+        prefill_normalize=normalize,
+    )
+    cache = layer.offload_cache
+    cache.moe_disk_prefill = "staged"
+    cache.hot_expert_capacity = {0: 2}
+    cache.hot_adapt_enabled = adapt
+    cache.collect_stats = stats
+    cache.collect_decode_freq = False
+    cache.begin_prefill = lambda tokens: calls.append(("begin", tokens))
+    cache.stage_disk_prefill_layer = lambda layer_id, routed: calls.append(
+        ("stage", routed.clone())
+    )
+    original = ids.clone()
+    result = layer._prefill_routed(hidden, weights, ids)
+    assert torch.equal(result, gpu_out)
+    assert torch.equal(ids, original)
+    assert torch.equal(next(c[1] for c in calls if c[0] == "stage"), original)
+    gemm = next(c for c in calls if c[0] == "gpu")
+    assert torch.equal(gemm[1], weights)
+    assert torch.equal(gemm[2], original)
+    assert gemm[3:] == (4, True)
+    assert not any(c[0] in ("cpu", "prepare", "prefetch", "stats") for c in calls)
+    observations = [c for c in calls if c[0] == "adapt"]
+    assert len(observations) == int(adapt or stats)
+    if observations:
+        expected = {"route_weight": 0.25}
+        if histories == "split":
+            expected = {"route_weight": pytest.approx(0.25 / 3), "history": "prefill"}
+        assert observations[0][2] == expected
+        assert torch.equal(observations[0][1], original)
+        assert ("adapt_tokens", 3) in calls
+
+
 def test_decode_hot_split_uses_default_route_weight(monkeypatch):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer

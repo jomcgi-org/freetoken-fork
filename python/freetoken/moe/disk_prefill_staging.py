@@ -1,7 +1,7 @@
 """Experimental bounded file-to-GPU transport for uncaptured prefill.
 
-No serving path enables this class yet. A benchmark can reuse one instance
-across banks, layers, and requests without allocating a whole-layer mirror.
+The staged DISK policy reuses one instance across banks, layers, and requests
+without allocating a whole-layer mirror.
 """
 
 from __future__ import annotations

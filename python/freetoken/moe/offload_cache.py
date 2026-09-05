@@ -219,6 +219,7 @@ class OffloadMoeCache:
     # DISK-only prefill policy. LOCKED/PAGEABLE layers always keep the whole-layer
     # pageable copy path.
     moe_disk_prefill: str = "cpu"
+    moe_disk_prefill_min_tokens: int = 512
     moe_prefill_coalesce: str = "populate"
     moe_prefill_hot_split: str = "on"
     moe_prefill_split_kernel: str = "grouped"
@@ -258,7 +259,11 @@ class OffloadMoeCache:
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
-        assert self.moe_disk_prefill in ("cpu", "copy"), self.moe_disk_prefill
+        assert self.moe_disk_prefill in ("cpu", "copy", "staged"), self.moe_disk_prefill
+        if self.moe_disk_prefill_min_tokens < 1:
+            raise ValueError("staged DISK prefill needs a positive token threshold")
+        self._staged_prefill_active = False
+        self._disk_prefill_staging = None
         assert self.moe_prefill_coalesce in (
             "populate", "on", "off"
         ), self.moe_prefill_coalesce
@@ -753,8 +758,64 @@ class OffloadMoeCache:
             if layer_id not in self._unpinned_layers:
                 self._prefill_overlap_buffer_ids[layer_id] = next_buffer
                 next_buffer ^= 1
-            elif residency != "disk" or self.moe_disk_prefill != "cpu":
+            elif residency != "disk" or self.effective_disk_prefill != "cpu":
                 next_buffer = 1
+
+    @property
+    def effective_disk_prefill(self) -> str:
+        if self.moe_disk_prefill != "staged":
+            return self.moe_disk_prefill
+        return "staged" if self._staged_prefill_active else "cpu"
+
+    def _validate_staging_slots(self, cache_size: int) -> None:
+        if self.moe_disk_prefill != "staged":
+            return
+        # Rebuild disables overlap below 2E. Otherwise both prefill buffers must
+        # remain outside permanent HOT storage, even in deliberately small caches.
+        buffers = 2 if self.prefill_overlap and cache_size >= 2 * self.num_experts else 1
+        required = buffers * self.num_experts
+        if cache_size - sum(self.hot_expert_capacity.values()) < required:
+            raise ValueError(f"staged DISK prefill needs {required} unprotected GPU slots")
+
+    def init_disk_prefill_staging(self) -> None:
+        if self.moe_disk_prefill != "staged" or "disk" not in self.layer_residency:
+            return
+        if self.device.type != "cuda" or self.quant_format != "nvfp4" or self.moe_disk_decode != "cpu":
+            raise ValueError("staged DISK prefill requires native NVFP4 on CUDA with CPU decode")
+        self._validate_staging_slots(self.cache_size)
+        for per_layer, _ in self.banks:
+            for layer, source in enumerate(per_layer):
+                if self.layer_residency[layer] != "disk":
+                    continue
+                bank = getattr(source, "_freetoken_host_bank", None)
+                if bank is None or bank._uffd or bank._file_path is None:
+                    raise ValueError("staged DISK prefill requires ordinary file-backed banks")
+        if self._disk_prefill_staging is None:
+            from freetoken.moe.disk_prefill_staging import DiskPrefillStaging
+
+            self._disk_prefill_staging = DiskPrefillStaging(self.device)
+            logger.info_rank0(
+                f"DISK staged prefill: ring={self._disk_prefill_staging.pinned_bytes / 2**20:.0f} MiB, "
+                f"minimum_chunk={self.moe_disk_prefill_min_tokens} tokens"
+            )
+
+    def stage_disk_prefill_layer(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        assert self._disk_prefill_staging is not None, "staging must be initialized before serving"
+        assert self.layer_residency[layer_id] == "disk"
+        rows = torch.unique(expert_ids).cpu().tolist()
+        # Sparse copies cannot advertise uncopied experts as cache hits. This
+        # applies to layers without protected HOT slots as well as HOT layers.
+        self.materialize_layer(layer_id, temporary=True)
+        for per_layer, destination in self.banks:
+            copied = self._disk_prefill_staging.copy_bank(
+                per_layer[layer_id], destination[:self.num_experts], rows,
+            )
+            if self.collect_stats:
+                self.prefill_h2d_bytes += copied
+
+    def synchronize_disk_prefill_staging(self) -> None:
+        if self._disk_prefill_staging is not None:
+            self._disk_prefill_staging.synchronize()
 
     def prefill_overlap_for_layer(self, layer_id: int) -> bool:
         """Whether this pinned layer uses the prefill double-buffer path."""
@@ -767,7 +828,7 @@ class OffloadMoeCache:
         """Return boot-time counts for overlap, synchronous, and CPU prefill."""
         overlap = sum(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids)
         cpu = sum(
-            residency == "disk" and self.moe_disk_prefill == "cpu"
+            residency == "disk" and self.effective_disk_prefill == "cpu"
             for residency in self.layer_residency
         )
         return overlap, self.num_layers - overlap - cpu, cpu
@@ -917,6 +978,7 @@ class OffloadMoeCache:
         """
         if cache_size < self.num_experts:
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
+        self._validate_staging_slots(cache_size)
         if self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
             raise ValueError(
                 f"moe_cache_size={cache_size} exceeds the marlin backend's slot limit of "
@@ -2885,7 +2947,7 @@ class OffloadMoeCache:
         assert self.cpu_executor is not None, "DISK layer requires the CPU MoE executor"
         prepare = getattr(self.cpu_executor, "prepare_prefill_layer", None)
         if (
-            self.moe_disk_prefill != "cpu"
+            self.effective_disk_prefill != "cpu"
             or self.moe_prefill_coalesce == "off"
             or prepare is None
         ):
@@ -2903,7 +2965,7 @@ class OffloadMoeCache:
         if (
             layer_id != 0
             or self.layer_residency[layer_id] != "disk"
-            or self.moe_disk_prefill != "cpu"
+            or self.effective_disk_prefill != "cpu"
             or self.moe_prefill_coalesce != "populate"
         ):
             return None
@@ -3145,6 +3207,13 @@ class OffloadMoeCache:
         self.usage[slot_start:slot_end].zero_()
 
     def begin_prefill(self, num_tokens: int | None = None) -> None:
+        staged = bool(
+            self.moe_disk_prefill == "staged" and num_tokens is not None
+            and num_tokens >= self.moe_disk_prefill_min_tokens
+        )
+        if staged != getattr(self, "_staged_prefill_active", False):
+            self._staged_prefill_active = staged
+            self._configure_prefill_overlap_layers()
         self.prefill_selective_active = bool(
             num_tokens is not None
             and 0 < num_tokens <= self.prefill_selective_max_tokens
@@ -3514,12 +3583,12 @@ class OffloadMoeCache:
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
 
-    def materialize_layer(self, layer_id: int) -> None:
+    def materialize_layer(self, layer_id: int, *, temporary: bool = False) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
-        materialize_layer(self, layer_id)
+        materialize_layer(self, layer_id, temporary=temporary)
 
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache

@@ -114,8 +114,11 @@ class EngineConfig:
     moe_hot_adapt_idle_ms: int = 500
     moe_hot_adapt_idle_min_interval_ms: int = 2000
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
-    # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
+    # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks;
+    # "staged" copies the original routed union through bounded pinned buffers.
     moe_disk_prefill: str = "cpu"
+    # Staged GPU prefill keeps smaller chunks on the existing CPU path.
+    moe_disk_prefill_min_tokens: int = 512
     # Warm a CPU prefill layer's bounded routed union. "populate" reads the file,
     # "on" keeps advisory WILLNEED, and "off" preserves the original seam behavior.
     # The setting is inert for the DISK copy path.
@@ -321,11 +324,15 @@ class EngineConfig:
             raise ValueError(
                 "--ple-uring-queue-depth must be an integer in [1, 4096]"
             )
-        if self.moe_disk_prefill not in ("cpu", "copy"):
+        if self.moe_disk_prefill not in ("cpu", "copy", "staged"):
             raise ValueError(
-                "--moe-disk-prefill must be 'cpu' or 'copy', got "
+                "--moe-disk-prefill must be 'cpu', 'copy', or 'staged', got "
                 f"{self.moe_disk_prefill!r}"
             )
+        if self.moe_disk_prefill_min_tokens < 1:
+            raise ValueError("--moe-disk-prefill-min-tokens must be positive")
+        if self.moe_disk_prefill == "staged" and self.moe_disk_decode != "cpu":
+            raise ValueError("staged DISK prefill requires --moe-disk-decode cpu")
         if self.moe_prefill_coalesce not in ("populate", "on", "off"):
             raise ValueError(
                 "--moe-prefill-coalesce must be 'populate', 'on', or 'off', got "

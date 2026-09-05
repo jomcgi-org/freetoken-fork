@@ -533,15 +533,21 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill movement: DISK layers default to routed CPU compute. Other layers,
-        and DISK under the copy escape hatch, stream whole layers to the GPU cache."""
+        """Run routed CPU prefill or stage exact DISK rows for the GPU GEMM.
+
+        Other layers and the DISK copy benchmark stream whole GPU layers.
+        """
         cache = self.offload_cache
         assert cache is not None
-        if self.layer_id == 0 and cache.prefill_overlap:
+        if self.layer_id == 0 and (
+            cache.prefill_overlap or getattr(cache, "moe_disk_prefill", "cpu") == "staged"
+        ):
             cache.begin_prefill(hidden_states.shape[0])
         residency = getattr(cache, "layer_residency", ())
+        disk_mode = None
         if self.layer_id < len(residency) and residency[self.layer_id] == "disk":
-            if cache.moe_disk_prefill == "cpu":
+            disk_mode = getattr(cache, "effective_disk_prefill", cache.moe_disk_prefill)
+            if disk_mode == "cpu":
                 hot_split = getattr(cache, "is_hot_split_layer", None)
                 if (
                     getattr(cache, "moe_prefill_hot_split", "on") == "on"
@@ -559,8 +565,18 @@ class OffloadMoELayer(MoELayer):
                 return self._prefill_cpu_routes(
                     cache, hidden_states, topk_weights, topk_ids
                 )
-            # Preserve the existing advisory sweep for the full-layer copy benchmark.
-            cache.prefetch_disk_experts(self.layer_id, topk_ids)
+            if disk_mode == "staged":
+                # Preserve adaptation observations without remapping the ids used
+                # by the full GPU GEMM. Diagnostic collection remains optional.
+                if self.layer_id in cache.hot_expert_capacity and (
+                    cache.hot_adapt_enabled or cache.collect_stats or cache.collect_decode_freq
+                ):
+                    self._observe_hot_prefill(cache, topk_ids.clone())
+                elif cache.collect_stats or cache.collect_decode_freq:
+                    cache.record_decode_frequency(self.layer_id, topk_ids)
+            else:
+                # Preserve the existing advisory sweep for the full-layer copy benchmark.
+                cache.prefetch_disk_experts(self.layer_id, topk_ids)
         if cache.prefill_overlap and cache.prefill_overlap_for_layer(self.layer_id):
             if cache.prefill_selective_active:
                 cache.prefetch_routed_prefill_layer(self.layer_id, topk_ids)
@@ -579,8 +595,11 @@ class OffloadMoELayer(MoELayer):
             )
             cache.release_prefill_layer(self.layer_id)
             return out
-        cache.materialize_layer(self.layer_id)
-        cache.copy_missing()
+        if disk_mode == "staged":
+            cache.stage_disk_prefill_layer(self.layer_id, topk_ids)
+        else:
+            cache.materialize_layer(self.layer_id)
+            cache.copy_missing()
         self._prefetch_next_overlap_layer(cache)
         return self._expert_gemm(
             cache,
@@ -593,15 +612,8 @@ class OffloadMoELayer(MoELayer):
             is_prefill=True,
         )
 
-    def _prefill_hot_split(
-        self,
-        cache: OffloadMoeCache,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run resident DISK routes on protected slots and cold routes on CPU."""
-        raw_ids = topk_ids.clone()
+    def _observe_hot_prefill(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> None:
+        """Update the existing HOT histories and remap the supplied scratch ids."""
         if getattr(cache, "hot_adapt_histories", "shared") == "split":
             routed_tokens = (
                 int(topk_ids.shape[0])
@@ -627,6 +639,17 @@ class OffloadMoELayer(MoELayer):
                 route_weight=cache.hot_adapt_prefill_weight,
             )
         cache.record_hot_adapt_prefill_tokens(counted_tokens)
+
+    def _prefill_hot_split(
+        self,
+        cache: OffloadMoeCache,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run resident DISK routes on protected slots and cold routes on CPU."""
+        raw_ids = topk_ids.clone()
+        self._observe_hot_prefill(cache, topk_ids)
         on_gpu, cpu_ids, gpu_slots, gpu_weights = _split_hot_cold_routes(
             raw_ids, topk_ids, topk_weights
         )
