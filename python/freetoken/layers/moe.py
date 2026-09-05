@@ -538,7 +538,7 @@ class OffloadMoELayer(MoELayer):
         cache = self.offload_cache
         assert cache is not None
         if self.layer_id == 0 and cache.prefill_overlap:
-            cache.begin_prefill()
+            cache.begin_prefill(hidden_states.shape[0])
         residency = getattr(cache, "layer_residency", ())
         if self.layer_id < len(residency) and residency[self.layer_id] == "disk":
             if cache.moe_disk_prefill == "cpu":
@@ -562,7 +562,11 @@ class OffloadMoELayer(MoELayer):
             # Preserve the existing advisory sweep for the full-layer copy benchmark.
             cache.prefetch_disk_experts(self.layer_id, topk_ids)
         if cache.prefill_overlap and cache.prefill_overlap_for_layer(self.layer_id):
-            views = self._wait_prefill_overlap(cache)
+            if cache.prefill_selective_active:
+                cache.prefetch_routed_prefill_layer(self.layer_id, topk_ids)
+                views = cache.wait_prefill_layer(self.layer_id)
+            else:
+                views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
                 cache,
                 hidden_states,
@@ -776,7 +780,7 @@ class OffloadMoELayer(MoELayer):
 
     def _prefetch_next_overlap_layer(self, cache: OffloadMoeCache) -> None:
         """Start the next physical layer's copy when it has pinned banks."""
-        if not cache.prefill_overlap:
+        if not cache.prefill_overlap or cache.prefill_selective_active:
             return
         next_layer_id = self.layer_id + 1
         if cache.prefill_overlap_for_layer(next_layer_id):
