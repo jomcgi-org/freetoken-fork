@@ -69,8 +69,55 @@ therefore insufficient evidence that a policy avoids cache insertion.
 
 The [mincore implementation](https://github.com/torvalds/linux/blob/v6.8/mm/mincore.c#L147)
 provides a residency snapshot, but it can become stale immediately. It also
-reports every page resident when the caller lacks ownership or write access
-to the file. Any use as a transport hint must preserve correct reads when
+reports every page resident when ownership and permission checks disallow
+exposing residency. Any use as a transport hint must preserve correct reads when
 the hint is stale or unavailable, and must measure the cost of inspecting
 pages and splitting transfers. These candidates are not implemented or
 performance-qualified by the direct-reader tests.
+
+## Whole-response result: direct-only reads do not qualify
+
+Four isolated starts at runtime `2b6da47` compared buffered/direct/direct/buffered
+transport. Both modes used staged GPU prefill with published HOT weight reuse,
+automatic adaptation with unchanged phase aim and split histories, 20 PIN
+layers, 28 DISK layers, and 82 HOT experts per DISK layer. Both allocated the
+same 64 MiB ring. Diagnostics, GPU timing, HOT persistence, and KV reuse were
+off. Full-response warmups preceded four measured requests per start.
+
+| Mean client response time | Buffered | Direct | Result |
+| --- | ---: | ---: | --- |
+| 1,844-token prompt, 383-token JSON | 29.452 s | 30.869 s | 4.8% slower; 1/4 pairs faster |
+| About 1,880-token prompt, 192-token prose | 22.702 s | 21.944 s | 3.3% shorter; 1/4 pairs faster |
+
+The prose average benefits from one large improvement in the second direct
+start. Six of eight measured pairs are slower. Total wall time for the fixed
+eight-request mix increases from 208.615 to 211.249 seconds, 1.3% slower.
+Host page cache is retained between starts, and the reversal changes the
+aggregate direction. This does not establish a dependable general gain.
+
+Direct I/O also increases mean whole-worker storage-read accounting from
+5.137 to 27.178 GiB per JSON response and from 5.933 to 26.535 GiB per prose
+response. These counters include other worker I/O, not just expert weights.
+They are consistent with sacrificing useful buffered cache hits; they do
+not independently attribute subsequent decode costs to particular evictions.
+
+All twelve JSON responses, including warmups, pass value, integer-type,
+key-order, and multiplicity checks, finish normally, and use 383 output tokens.
+Every start scores 7/8 on the long fidelity questions, with identical answers
+including the same code-trace failure (`108`, expected `68`). Prose remains
+unscored. The transport's byte/GEMM tests establish exact arithmetic for the
+same inputs; these model checks do not establish broad quality equivalence.
+
+Keep buffered reads as the serving default. The direct-only constructor
+option remains an experimental comparison point for a more selective reader,
+with no CLI integration or default-policy change. The next candidate needs
+to preserve useful RAM hits while reducing insertion of cold prefill data,
+then repeat a complete-response gate.
+
+The [complete record](../bench/results/4090-direct-io-wall-20260905.json)
+retains all four starts, native binary identity, startup transport selection,
+matching cache geometry, raw outputs, journals, exact clients and driver,
+the measured transport source, I/O snapshots, and reproducible analysis.
+All four measured JSON pairs have identical text; all eight pairs have
+identical usage counts. The original service was restored and verified
+with a real `OK` completion.

@@ -138,9 +138,11 @@ kernel speedups and model wall time have separate meanings.
 | Gate diagnostic-only decode classification and idle history readback | Removes ordinary decode's reduction/counter work and idle coverage's GPU-to-CPU history synchronization; 99 focused Linux tests pass, with no independent wall-time claim | [#31](https://github.com/jomcgi-org/freetoken-fork/pull/31), ready; also included in #33 |
 | Correct temporary materialization ownership | Prevents sparse scratch from advertising uncopied experts as hits; protected HOT bytes retained | [#32](https://github.com/jomcgi-org/freetoken-fork/pull/32), ready |
 | Selected DISK staging and exact HOT VRAM reuse | Strong long-prefill gains, 31.6% lower prose response time in the latest CPU comparison, mixed JSON response-time results | [#33](https://github.com/jomcgi-org/freetoken-fork/pull/33), draft |
+| Experimental direct-only staged reads | Exact byte/GEMM checks pass, but the fixed response mix is 1.3% slower, with six of eight pairs slower and substantially more storage reads | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; serving remains buffered |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
+#34 evaluates a transport option on top of #33.
 The original serving checkout is restored after every model gate; these
 changes are delivered in PRs.
 
@@ -178,10 +180,19 @@ is claimed for that gate.
 Keep CPU DISK prefill as the default and use staged execution as an opt-in
 for the measured long-prefill workloads. The next larger opportunity is
 protecting useful decode residency while reducing prefill's storage traffic.
-Candidate experiments should hold the router and checkpoint fixed: bounded
-direct-I/O staging, placement budgets, and better reuse of already resident
-weights. Each needs a fresh whole-response comparison with JSON and prose,
-plus the same quality checks.
+The [direct-only staging experiment](direct-prefill-io.md#whole-response-result-direct-only-reads-do-not-qualify)
+is now measured: JSON takes 4.8% longer, while prose averages 3.3% shorter
+with only one of four pairs faster in each workload. Worker storage reads
+increase from about 5-6 GiB to about 27 GiB per response. The fixed mix is
+1.3% slower overall, so the reader remains an experimental comparison point.
+
+The next candidate should retain useful RAM cache hits while reducing
+insertion of cold prefill data. Placement budgets and reuse of resident
+weights remain possible improvements, with the router and checkpoint fixed.
+Each needs a fresh whole-response comparison with JSON and prose, plus the
+same quality checks. A nonblocking buffered read is insufficient proof of
+avoiding cache insertion on this kernel; the direct-reader document records
+the source review and constraints on residency hints.
 
 The tested automatic decode-history preference was reverted: it improved
 JSON by 26.8% but slowed prose by 8.6%. That experiment changed only placement
