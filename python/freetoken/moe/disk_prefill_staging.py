@@ -11,7 +11,7 @@ import os
 import torch
 
 from freetoken.kernel.pinned import alloc_pinned_tensor
-from freetoken.moe.host_banks import coalesced_row_ranges
+from freetoken.moe.host_banks import _BLK, _preadv_all, coalesced_row_ranges
 
 
 class DiskPrefillStaging:
@@ -24,17 +24,32 @@ class DiskPrefillStaging:
     owns an instance; concurrent calls are unsupported.
     """
 
-    def __init__(self, device: torch.device, *, chunk_bytes: int = 32 << 20):
+    def __init__(
+        self, device: torch.device, *, chunk_bytes: int = 32 << 20,
+        direct_io: bool = False,
+    ):
         self.device = torch.device(device)
         chunk_bytes = int(chunk_bytes)
         if self.device.type != "cuda" or chunk_bytes <= 0:
             raise ValueError("staging requires a CUDA device and a positive chunk size")
+        if direct_io and (not hasattr(os, "O_DIRECT") or chunk_bytes < 2 * _BLK):
+            raise ValueError("direct staging requires O_DIRECT and at least two alignment blocks")
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.chunk_bytes = chunk_bytes
-        self.buffers = [
+        self.direct_io = direct_io
+        self._allocations = [
             alloc_pinned_tensor(self.chunk_bytes, dtype=torch.uint8) for _ in range(2)
         ]
+        self.buffers = self._allocations
+        if direct_io:
+            # Align within the existing allocation. This spends a little usable
+            # capacity instead of adding memory outside the governor's ring budget.
+            self.buffers = []
+            for allocation in self._allocations:
+                offset = (-allocation.data_ptr()) % _BLK
+                usable = (allocation.numel() - offset) // _BLK * _BLK
+                self.buffers.append(allocation[offset:offset + usable])
         self._views = [memoryview(buffer.numpy()).cast("B") for buffer in self.buffers]
         self._events = [torch.cuda.Event() for _ in self.buffers]
         self._pending = [False] * len(self.buffers)
@@ -42,7 +57,7 @@ class DiskPrefillStaging:
 
     @property
     def pinned_bytes(self) -> int:
-        return len(self.buffers) * self.chunk_bytes
+        return sum(buffer.numel() for buffer in self._allocations)
 
     def synchronize(self) -> None:
         for slot, event in enumerate(self._events):
@@ -56,6 +71,10 @@ class DiskPrefillStaging:
         Source tensors must retain their authoritative file-backed HostBank.
         Packed weights and all scale formats travel as bytes, without casting.
         The return value is the logical byte count, without a device readback.
+        Experimental direct I/O rounds file reads outward to alignment blocks,
+        but copies only the requested bytes. Unsupported filesystems fail rather
+        than silently changing the measured transport. It must not run across
+        a concurrent fork; the serving worker owns the ring after spawning.
         """
         bank = getattr(source, "_freetoken_host_bank", None)
         if bank is None or not bank._disk or bank._uffd or bank._file_path is None:
@@ -81,7 +100,8 @@ class DiskPrefillStaging:
         target = destination.view(torch.uint8).view(-1)
         stream = torch.cuda.current_stream(self.device)
         copied = 0
-        fd = os.open(bank._file_path, os.O_RDONLY)
+        flags = os.O_RDONLY | (os.O_DIRECT if self.direct_io else 0)
+        fd = os.open(bank._file_path, flags)
         try:
             for start, length in ranges:
                 done = 0
@@ -90,18 +110,23 @@ class DiskPrefillStaging:
                     if self._pending[slot]:
                         self._events[slot].synchronize()
                         self._pending[slot] = False
-                    count = min(self.chunk_bytes, length - done)
-                    filled = 0
-                    while filled < count:
-                        got = os.preadv(
-                            fd, [self._views[slot][filled:count]],
-                            file_offset + start + done + filled,
-                        )
-                        if got <= 0:
-                            raise OSError("short file read while staging prefill weights")
-                        filled += got
+                    offset = file_offset + start + done
+                    head = offset % _BLK if self.direct_io else 0
+                    count = min(self.buffers[slot].numel() - head, length - done)
+                    if self.direct_io:
+                        span = (head + count + _BLK - 1) // _BLK * _BLK
+                        _preadv_all(fd, self._views[slot][:span], offset - head, head + count)
+                    else:
+                        filled = 0
+                        while filled < count:
+                            got = os.preadv(
+                                fd, [self._views[slot][filled:count]], offset + filled,
+                            )
+                            if got <= 0:
+                                raise OSError("short file read while staging prefill weights")
+                            filled += got
                     target[start + done:start + done + count].copy_(
-                        self.buffers[slot][:count], non_blocking=True,
+                        self.buffers[slot][head:head + count], non_blocking=True,
                     )
                     self._events[slot].record(stream)
                     self._pending[slot] = True
