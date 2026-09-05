@@ -24,6 +24,7 @@ def request(base_url, payload):
     start = time.perf_counter()
     first = None
     chunks, usage = [], {}
+    finish_reason = None
     with urllib.request.urlopen(req, timeout=300) as response:
         for raw in response:
             if not raw.startswith(b"data: "):
@@ -36,6 +37,8 @@ def request(base_url, payload):
                 raise RuntimeError(event["error"])
             usage = event.get("usage") or usage
             for choice in event.get("choices", []):
+                if choice.get("finish_reason") is not None:
+                    finish_reason = choice["finish_reason"]
                 delta = choice.get("delta", {})
                 text = delta.get("content") or delta.get("reasoning_content") or ""
                 if text:
@@ -47,6 +50,7 @@ def request(base_url, payload):
     return {
         "ttft_s": first - start, "wall_s": end - start,
         "decode_s": end - first, "text": "".join(chunks), "usage": usage,
+        "finish_reason": finish_reason,
     }
 
 

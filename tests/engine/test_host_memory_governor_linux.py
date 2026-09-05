@@ -13,6 +13,7 @@ from freetoken.engine.host_memory import (
     fit_host_memory_budgets,
     govern_host_memory,
     read_linux_memory_info,
+    _prefill_scratch_gib,
 )
 
 
@@ -32,6 +33,21 @@ class _Logger:
 
     def warning_rank0(self, message):
         self.warnings.append(message)
+
+
+@pytest.mark.parametrize("explicit_disk", [False, True])
+def test_staging_budget_includes_ring_and_cpu_fallback_with_auto_placement(explicit_disk):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hidden_size=2048, moe_intermediate_size=512, num_experts_per_tok=8,
+        ),
+        max_extend_tokens=2048, moe_disk_prefill="cpu", moe_disk_layers="all",
+    )
+    cpu_bytes = _prefill_scratch_gib(config) * 2**30
+    assert cpu_bytes > 32 << 20
+    config.moe_disk_prefill = "staged"
+    config.moe_disk_layers = "all" if explicit_disk else None
+    assert _prefill_scratch_gib(config) * 2**30 == cpu_bytes + (64 << 20)
 
 
 def test_fitting_arithmetic_preserves_explicit_budget_and_uses_remainder():

@@ -1,0 +1,35 @@
+Revision: 9b73b2a
+Environment: node-4 RTX 4090, Linux, CUDA 13, Python 3.12
+
+Command: python -m pytest tests/moe/test_materialize_hot_slots.py tests/moe/test_disk_prefill_staging.py tests/moe/test_hot_adapt.py tests/moe/test_moe_collect_stats.py tests/moe/test_disk_prefill_policy.py tests/moe/test_offload.py -q --disable-warnings --maxfail=3
+
+........................................................................ [ 44%]
+........................................................................ [ 88%]
+...................                                                      [100%]
+163 passed, 1 warning in 8.31s
+
+Command: compute-sanitizer --tool memcheck --error-exitcode 99 python -m pytest tests/moe/test_materialize_hot_slots.py tests/moe/test_disk_prefill_staging.py -q --disable-warnings --maxfail=2
+
+========= COMPUTE-SANITIZER
+..................................                                       [100%]
+34 passed, 1 warning in 4.46s
+========= ERROR SUMMARY: 0 errors
+
+Additional coverage at a2a09f0 (runtime unchanged from 9b73b2a):
+Commands: python -m pytest tests/moe/test_materialize_hot_slots.py -k "rebuilt or all_hot" -q --disable-warnings --maxfail=2
+Repeat under compute-sanitizer --tool memcheck --error-exitcode 99.
+
+....                                                                     [100%]
+4 passed, 22 deselected, 1 warning in 5.62s
+
+========= COMPUTE-SANITIZER
+....                                                                     [100%]
+4 passed, 22 deselected, 1 warning in 3.64s
+========= ERROR SUMMARY: 0 errors
+
+Optional process I/O helper: local fixtures checked comm parsing, deltas, and worker restart rejection. A live Linux self-PID check read 4096 bytes and observed rchar delta 4498, syscr delta 6, read_bytes delta 0 (cached read), with matching worker identity.
+
+Integration of diagnostic all-HOT classification gate at 8e4ef5a
+Command: python -m pytest tests/moe/test_moe_collect_stats.py -q --disable-warnings --maxfail=2
+...........                                                              [100%]
+11 passed in 1.95s

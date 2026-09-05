@@ -1087,13 +1087,21 @@ def parse_args(
 
     parser.add_argument(
         "--moe-disk-prefill",
-        choices=["cpu", "copy"],
+        choices=["cpu", "copy", "staged"],
         default=ServerArgs.moe_disk_prefill,
         help=(
             "How DISK layers run prefill: 'cpu' computes routed experts through the "
             "CPU executor (default); 'copy' restores the whole-layer pageable copy "
-            "to the GPU cache for benchmarking."
+            "to the GPU cache for benchmarking; 'staged' reads exactly the routed "
+            "NVFP4 experts through 64 MiB of pinned buffers for GPU computation, "
+            "keeping smaller chunks on CPU."
         ),
+    )
+    parser.add_argument(
+        "--moe-disk-prefill-min-tokens",
+        type=int,
+        default=ServerArgs.moe_disk_prefill_min_tokens,
+        help="Minimum chunk size for staged DISK GPU prefill (default: %(default)s tokens).",
     )
 
     parser.add_argument(
