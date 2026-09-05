@@ -797,12 +797,16 @@ def _ensure_experts_hot_kernel(
             positions = start + off_r
             valid = positions < num_active
             experts = tl.load(expert_ids_ptr + positions, mask=valid, other=0)
+            # Small tiles have redundant readers in multiple warps. Snapshot
+            # every reader before the elected writers replace IDs in place.
+            tl.debug_barrier()
             is_hot = tl.load(hot_row_ptr + base + experts, mask=valid, other=-1) >= 0
             result = tl.load(slot_for_id_ptr + base + experts, mask=valid, other=-1)
             tl.store(expert_ids_ptr + positions, tl.where(is_hot, result, -1), mask=valid)
     else:
         for i in tl.range(num_active):
             expert = tl.load(expert_ids_ptr + i)
+            tl.debug_barrier()
             is_hot = tl.load(hot_row_ptr + base + expert) >= 0
             result = tl.load(slot_for_id_ptr + base + expert)
             tl.store(expert_ids_ptr + i, tl.where(is_hot, result, -1))
