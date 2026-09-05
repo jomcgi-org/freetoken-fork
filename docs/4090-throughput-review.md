@@ -124,6 +124,29 @@ explains why the existing mapping does not inherit that flag on upstream
 Linux 6.8. Eager release is off in these benchmarks, so this finding does
 not explain the CPU/staged difference.
 
+## Earlier fork measurements that constrain the next experiment
+
+The fork's existing [results log](../bench/RESULTS.md) records useful negative
+controls. In its late-September-3 and early-September-4 rounds, moving the
+WILLNEED callback after worker notification reduced wake time but increased
+faults and total CPU windows. A decode-only worker cap and a spin-then-wait
+barrier also failed to beat the final warm control consistently. These
+reports provide no reason to repeat those policies without new evidence.
+
+The same log reports much better HOT coverage after a production adapter has
+run long enough, approximately 78-93%, than in its short starts, approximately
+59-69%. Those are historical observations with different traffic and timing
+settings; they are not measurements of the current benchmark. In particular,
+the fixed-HOT diagnostic's 11% coverage above must not be treated as typical
+of an adapted production server.
+
+The new transport gates deliberately disable plan persistence and KV reuse,
+use full warmups, retain automatic adaptation, and reverse server order.
+They still measure a limited number of requests after startup. A candidate
+that passes should also be checked after sustained adaptation with retained
+serving state before making a general production-throughput claim. The
+existing source-path tests separately establish byte and arithmetic parity.
+
 ## Changes and evidence
 
 PR states below describe this review date. Percentages are time reductions;
