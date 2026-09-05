@@ -223,7 +223,8 @@ def test_native_weight_rows_match_single_row_kernel_exactly():
     torch.testing.assert_close(blocked, singles, rtol=0, atol=0)
 
 
-def test_batch_run_failure_disables_it_and_retries_serial():
+@pytest.mark.parametrize("with_callback", [False, True])
+def test_batch_run_failure_disables_it_and_retries_serial(with_callback):
     class RunExtension:
         def __init__(self):
             self.batch_calls = 0
@@ -251,13 +252,19 @@ def test_batch_run_failure_disables_it_and_retries_serial():
     hidden = torch.randn(3, 16, dtype=torch.bfloat16)
     ids = torch.tensor([[0, 1], [1, 2], [2, 0]], dtype=torch.int32)
     weights = torch.rand(3, 2, dtype=torch.float32)
-    output = executor.prefill(0, hidden, weights, ids)
+    ready_calls = []
+    output = executor.prefill(
+        0, hidden, weights, ids,
+        on_inputs_ready=(lambda: ready_calls.append(True)) if with_callback else None,
+    )
 
     assert output.shape == hidden.shape
     assert extension.batch_calls == 1
     assert extension.serial_calls == 1
     assert executor._prefill_batch_enabled is False
     assert executor._prefill_batch_degrades == 1
+    # A degraded CPU batch must not launch the independent GPU partial twice.
+    assert ready_calls == ([True] if with_callback else [])
 
 
 def test_native_batch_matches_serial_and_reuses_workspace():

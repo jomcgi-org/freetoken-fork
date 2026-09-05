@@ -24,6 +24,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from functools import partial
+from typing import Callable
 
 import torch
 
@@ -1928,12 +1929,16 @@ class CpuMoeExecutor:
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        *,
+        on_inputs_ready: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Run one prefill chunk synchronously on the native CPU worker pool.
 
         The caller performs the DISK expert-union prefetch before entering here.
         Blocking copies make all task inputs visible before the native task starts, and
         the returned tensor preserves the GPU path's input dtype, shape, and device.
+        ``on_inputs_ready`` can launch independent GPU work after those copies.
+        The existing CPU kernel then runs while that GPU work is in flight.
         """
         bs = validate_cpu_moe_task_tokens(
             hidden_states.shape[0], source="CPU MoE prefill batch size"
@@ -1952,6 +1957,10 @@ class CpuMoeExecutor:
                 "the CPU MoE extension needs rebuilding for DISK CPU prefill; run "
                 "`python setup.py build_ext --inplace` or reinstall the wheel"
             )
+        if on_inputs_ready is not None:
+            # Keep callback failures outside the CPU batch fallback: a GPU OOM
+            # must not disable an otherwise healthy CPU kernel.
+            on_inputs_ready()
         if self._prefill_batch_enabled and bs <= self._prefill_batch_capacity:
             try:
                 rows, gemms = self._ext.run_prefill_batch_sync(

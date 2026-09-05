@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Callable, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
@@ -24,6 +24,10 @@ TopK = Tuple[torch.Tensor, torch.Tensor]
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
 # GPU work) -- a measurement-only escape hatch to A/B the overlap benefit.
 _HYBRID_OVERLAP = os.getenv("FREETOKEN_HYBRID_OVERLAP", "1") != "0"
+
+# Experimental scheduling switch. Prepare cold CPU inputs before launching the
+# HOT GPU partial, then run the unchanged CPU kernel alongside GPU execution.
+_PREFILL_HOT_OVERLAP = os.getenv("FREETOKEN_PREFILL_HOT_OVERLAP", "0") == "1"
 
 logger = init_logger(__name__)
 
@@ -643,7 +647,7 @@ class OffloadMoELayer(MoELayer):
         fill_slot = gpu_slots[on_gpu].reshape(-1)[0]
         gpu_slots = torch.where(on_gpu, gpu_slots, fill_slot).contiguous()
 
-        try:
+        def gpu_partial():
             # Keep the original activations intact for the cold CPU partial and
             # for the full-CPU OOM fallback.
             original_views = cache.bank_views()
@@ -708,6 +712,27 @@ class OffloadMoELayer(MoELayer):
                     alphas=original_alphas,
                     is_prefill=False,
                 )
+            return gpu_routed
+
+        concurrent = (
+            _PREFILL_HOT_OVERLAP
+            and getattr(cache, "quant_format", None) == "nvfp4"
+            and not bool(on_gpu.all().item())
+        )
+        try:
+            if concurrent:
+                gpu_routed = None
+
+                def launch_gpu():
+                    nonlocal gpu_routed
+                    gpu_routed = gpu_partial()
+
+                cpu_routed = self._prefill_cpu_routes(
+                    cache, hidden_states, topk_weights, cpu_ids,
+                    on_inputs_ready=launch_gpu,
+                )
+            else:
+                gpu_routed = gpu_partial()
         except (MemoryError, RuntimeError) as exc:
             if not _is_oom_error(exc):
                 raise
@@ -720,6 +745,9 @@ class OffloadMoELayer(MoELayer):
             )
 
         self._record_prefill_split(cache, raw_ids, on_gpu)
+        if concurrent:
+            assert gpu_routed is not None
+            return gpu_routed + cpu_routed
         if bool(on_gpu.all().item()):
             self._prefetch_next_overlap_layer(cache)
             return gpu_routed
@@ -744,6 +772,8 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         cpu_ids: torch.Tensor,
+        *,
+        on_inputs_ready: Callable[[], None] | None = None,
     ) -> torch.Tensor:
         """Run exactly the selected routes through the existing CPU prefill seam."""
         executor = cache.cpu_executor
@@ -756,8 +786,12 @@ class OffloadMoELayer(MoELayer):
             cache.prefetch_disk_experts(self.layer_id, cpu_ids)
         self._prefetch_next_overlap_layer(cache)
         try:
+            kwargs = (
+                {"on_inputs_ready": on_inputs_ready}
+                if on_inputs_ready is not None else {}
+            )
             out = executor.prefill(
-                self.layer_id, hidden_states, topk_weights, cpu_ids
+                self.layer_id, hidden_states, topk_weights, cpu_ids, **kwargs
             )
         finally:
             release = getattr(cache, "release_disk_prefill", None)

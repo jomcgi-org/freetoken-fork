@@ -1,0 +1,2448 @@
+{
+  "runtime_commit": "880011b1f26300e3a50e1c09ba2a713925d0c2fe",
+  "control_meaning": "parallel=False: serial prefill, parallel=True: concurrent CPU/GPU prefill",
+  "run_order": [
+    "pin40r1",
+    "autor1",
+    "autor2",
+    "pin40r2"
+  ],
+  "records": {
+    "pin40r1": {
+      "requests": [
+        {
+          "kind": "warmup",
+          "size": 64,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 2.6258335830061696,
+          "wall_s": 2.691559174010763,
+          "decode_s": 0.0657255910045933,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 512,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 6.088792271999409,
+          "wall_s": 6.144892579992302,
+          "decode_s": 0.05610030799289234,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 2048,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 14.783072207996156,
+          "wall_s": 14.890903134015389,
+          "decode_s": 0.10783092601923272,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 64,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 1.8939651230175514,
+          "wall_s": 1.9701733680267353,
+          "decode_s": 0.07620824500918388,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 512,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 5.52441940701101,
+          "wall_s": 5.580413533985848,
+          "decode_s": 0.055994126974837855,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 2048,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 12.089826138981152,
+          "wall_s": 12.145572343986714,
+          "decode_s": 0.05574620500556193,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 12.188088561990298,
+          "wall_s": 12.252522085007513,
+          "decode_s": 0.06443352301721461,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 11.858416299015516,
+          "wall_s": 11.920561131992145,
+          "decode_s": 0.062144832976628095,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 4.508981557999505,
+          "wall_s": 4.573629541002447,
+          "decode_s": 0.06464798300294206,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 4.419755593989976,
+          "wall_s": 4.4770966449868865,
+          "decode_s": 0.05734105099691078,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 4.470249563019024,
+          "wall_s": 4.525517825008137,
+          "decode_s": 0.05526826198911294,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 4.345560605986975,
+          "wall_s": 4.408553210989339,
+          "decode_s": 0.06299260500236414,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 1.5477188719960395,
+          "wall_s": 1.607885545003228,
+          "decode_s": 0.060166673007188365,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 1.5246005709923338,
+          "wall_s": 1.5805091649817768,
+          "decode_s": 0.055908593989443034,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 12.084963391011115,
+          "wall_s": 12.14646196900867,
+          "decode_s": 0.061498577997554094,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 11.84941285799141,
+          "wall_s": 11.905769022996537,
+          "decode_s": 0.05635616500512697,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 1.4522788519971073,
+          "wall_s": 11.205086514004506,
+          "decode_s": 9.752807662007399,
+          "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE, marking a profound shift from monarchical rule to a complex system of representative government. This transformation was not merely political but ideological, rooted in the deep-seated Roman aversion to kingship, or *regnum*, following the tyrannical reign of the last king, Tarquinius Superbus. The expulsion of the Tarquin dynasty established a new constitutional framework designed to prevent the concentration of power in any single individual, a principle that would define Roman politics for nearly five centuries.\n\nAt the heart of the early Republic was the concept of *res publica*, or \"public affair,\" emphasizing that the state belonged to the people rather than a sovereign ruler. The government was structured around a delicate balance of powers, primarily divided among the magistrates, the Senate, and the popular assemblies. The highest executive authority rested with two consuls",
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 192,
+            "total_tokens": 243
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 1.3660261080076452,
+          "wall_s": 7.993309339013649,
+          "decode_s": 6.627283231006004,
+          "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE, marking a profound shift from monarchical rule to a complex system of representative government. This transformation was not merely political but ideological, rooted in the deep-seated Roman aversion to kingship, or *regnum*, following the tyrannical reign of the last king, Tarquinius Superbus. The expulsion of the Tarquin dynasty established a new constitutional framework designed to prevent the concentration of power in any single individual, a principle that would define Roman politics for nearly five centuries.\n\nAt the heart of the early Republic was the concept of *res publica*, or \"public affair,\" emphasizing that the state belonged to the people rather than a sovereign ruler. The government was structured around a delicate balance of powers, primarily divided among the magistrates, the Senate, and the popular assemblies. The highest executive authority rested with two consuls",
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 192,
+            "total_tokens": 243
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 1.7061797479982488,
+          "wall_s": 1.797652225010097,
+          "decode_s": 0.09147247701184824,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 1.6253283460100647,
+          "wall_s": 1.679504881001776,
+          "decode_s": 0.05417653499171138,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 1.357078689004993,
+          "wall_s": 8.114028470008634,
+          "decode_s": 6.756949781003641,
+          "text": "The history of the Roman Republic is not merely a chronicle of political evolution but a foundational narrative for Western civilization, marking the transition from monarchical rule to a complex system of representative governance. The genesis of this era, often referred to as \"Part 0\" in historical retrospectives, begins in 509 BCE with the overthrow of the last Roman king, Lucius Tarquinius Superbus. This pivotal moment was triggered by the infamous rape of Lucretia by the king\u2019s son, Sextus Tarquinius, an act that ignited a revolt led by Lucius Junius Brutus and Lucius Tarquinius Collatinus. The expulsion of the Tarquin dynasty did not simply remove a tyrant; it fundamentally restructured Roman society, embedding a deep-seated cultural aversion to monarchy (*regnum*) that would influence Roman politics for centuries.\n\nIn the immediate aftermath of the regicide, the Romans established a new constitutional framework",
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 192,
+            "total_tokens": 241
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 1.2393967240059283,
+          "wall_s": 7.467402492999099,
+          "decode_s": 6.228005768993171,
+          "text": "The history of the Roman Republic is not merely a chronicle of political evolution but a foundational narrative for Western civilization, marking the transition from monarchical rule to a complex system of representative governance. The genesis of this era, often referred to as \"Part 0\" in historical retrospectives, begins in 509 BCE with the overthrow of the last Roman king, Lucius Tarquinius Superbus. This pivotal moment was triggered by the infamous rape of Lucretia by the king\u2019s son, Sextus Tarquinius, an act that ignited a revolt led by Lucius Junius Brutus and Lucius Tarquinius Collatinus. The expulsion of the Tarquin dynasty did not simply remove a tyrant; it fundamentally restructured Roman society, embedding a deep-seated cultural aversion to monarchy (*regnum*) that would influence Roman politics for centuries.\n\nIn the immediate aftermath of the regicide, the Romans established a new constitutional framework",
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 192,
+            "total_tokens": 241
+          }
+        }
+      ],
+      "quality": [
+        {
+          "name": "arithmetic",
+          "prompt": "Compute 17 + 28 + 45 + 96 + 133. Output only the integer result.",
+          "expected": "319",
+          "answer": "319",
+          "passed": true,
+          "wall_s": 3.7811072590120602,
+          "usage": {
+            "prompt_tokens": 40,
+            "completion_tokens": 4,
+            "total_tokens": 44
+          }
+        },
+        {
+          "name": "codeword",
+          "prompt": "Remember the access code ZEPHYR-58319. Return that exact access code and nothing else.",
+          "expected": "ZEPHYR-58319",
+          "answer": "ZEPHYR-58319",
+          "passed": true,
+          "wall_s": 3.735854466998717,
+          "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 11,
+            "total_tokens": 47
+          }
+        },
+        {
+          "name": "position",
+          "prompt": "The list is [amber, birch, cobalt, delta, elm]. Output only its third item.",
+          "expected": "cobalt",
+          "answer": "cobalt",
+          "passed": true,
+          "wall_s": 2.199041298008524,
+          "usage": {
+            "prompt_tokens": 34,
+            "completion_tokens": 3,
+            "total_tokens": 37
+          }
+        },
+        {
+          "name": "code_trace",
+          "prompt": "In Python, what is sum(n*n for n in [2,5,8] if n % 2 == 0)? Output only the integer.",
+          "expected": "68",
+          "answer": "108",
+          "passed": false,
+          "wall_s": 2.426120923977578,
+          "usage": {
+            "prompt_tokens": 44,
+            "completion_tokens": 4,
+            "total_tokens": 48
+          }
+        },
+        {
+          "name": "negation",
+          "prompt": "A farmer has 17 sheep. All but 9 run away. How many remain? Output only the integer.",
+          "expected": "9",
+          "answer": "9",
+          "passed": true,
+          "wall_s": 1.870584410004085,
+          "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 2,
+            "total_tokens": 38
+          }
+        },
+        {
+          "name": "ordering",
+          "prompt": "Repeat these IDs in their original order, separated by single spaces, with no other text: Z5 A12 C3 B8",
+          "expected": "Z5 A12 C3 B8",
+          "answer": "Z5 A12 C3 B8",
+          "passed": true,
+          "wall_s": 2.942394349985989,
+          "usage": {
+            "prompt_tokens": 39,
+            "completion_tokens": 10,
+            "total_tokens": 49
+          }
+        },
+        {
+          "name": "context_override",
+          "prompt": "In this fictional ledger, the capital listed for Norway is Bergen, not Oslo. According to this ledger, what is the capital? Output only the city name.",
+          "expected": "Bergen",
+          "answer": "Bergen",
+          "passed": true,
+          "wall_s": 2.7714764540141914,
+          "usage": {
+            "prompt_tokens": 44,
+            "completion_tokens": 3,
+            "total_tokens": 47
+          }
+        },
+        {
+          "name": "long_retrieval",
+          "prompt": "Read these shipping records:\nRecord 000: package parcel000 has status queued.\nRecord 001: package parcel001 has status queued.\nRecord 002: package parcel002 has status queued.\nRecord 003: package parcel003 has status queued.\nRecord 004: package parcel004 has status queued.\nRecord 005: package parcel005 has status queued.\nRecord 006: package parcel006 has status queued.\nRecord 007: package parcel007 has status queued.\nRecord 008: package parcel008 has status queued.\nRecord 009: package parcel009 has status queued.\nRecord 010: package parcel010 has status queued.\nRecord 011: package parcel011 has status queued.\nRecord 012: package parcel012 has status queued.\nRecord 013: package parcel013 has status queued.\nRecord 014: package parcel014 has status queued.\nRecord 015: package parcel015 has status queued.\nRecord 016: package parcel016 has status queued.\nRecord 017: package parcel017 has status queued.\nRecord 018: package parcel018 has status queued.\nRecord 019: package parcel019 has status queued.\nRecord 020: package parcel020 has status queued.\nRecord 021: package parcel021 has status queued.\nRecord 022: package parcel022 has status queued.\nRecord 023: package parcel023 has status queued.\nRecord 024: package parcel024 has status queued.\nRecord 025: package parcel025 has status queued.\nRecord 026: package parcel026 has status queued.\nRecord 027: package parcel027 has status queued.\nRecord 028: package parcel028 has status queued.\nRecord 029: package parcel029 has status queued.\nRecord 030: package parcel030 has status queued.\nRecord 031: package parcel031 has status queued.\nRecord 032: package parcel032 has status queued.\nRecord 033: package parcel033 has status queued.\nRecord 034: package parcel034 has status queued.\nRecord 035: package parcel035 has status queued.\nRecord 036: package parcel036 has status queued.\nRecord 037: package parcel037 has status queued.\nRecord 038: package parcel038 has status queued.\nRecord 039: package parcel039 has status queued.\nRecord 040: package parcel040 has status queued.\nRecord 041: package parcel041 has status queued.\nRecord 042: package parcel042 has status queued.\nRecord 043: package parcel043 has status queued.\nRecord 044: package parcel044 has status queued.\nRecord 045: package parcel045 has status queued.\nRecord 046: package parcel046 has status queued.\nRecord 047: package parcel047 has status queued.\nRecord 048: package parcel048 has status queued.\nRecord 049: package parcel049 has status queued.\nRecord 050: package parcel050 has status queued.\nRecord 051: package parcel051 has status delivered; its receipt is VIOLET-68243.\nRecord 052: package parcel052 has status queued.\nRecord 053: package parcel053 has status queued.\nRecord 054: package parcel054 has status queued.\nRecord 055: package parcel055 has status queued.\nRecord 056: package parcel056 has status queued.\nRecord 057: package parcel057 has status queued.\nRecord 058: package parcel058 has status queued.\nRecord 059: package parcel059 has status queued.\nRecord 060: package parcel060 has status queued.\nRecord 061: package parcel061 has status queued.\nRecord 062: package parcel062 has status queued.\nRecord 063: package parcel063 has status queued.\nRecord 064: package parcel064 has status queued.\nRecord 065: package parcel065 has status queued.\nRecord 066: package parcel066 has status queued.\nRecord 067: package parcel067 has status queued.\nRecord 068: package parcel068 has status queued.\nRecord 069: package parcel069 has status queued.\nRecord 070: package parcel070 has status queued.\nRecord 071: package parcel071 has status queued.\nRecord 072: package parcel072 has status queued.\nRecord 073: package parcel073 has status queued.\nRecord 074: package parcel074 has status queued.\nRecord 075: package parcel075 has status queued.\nRecord 076: package parcel076 has status queued.\nRecord 077: package parcel077 has status queued.\nRecord 078: package parcel078 has status queued.\nRecord 079: package parcel079 has status queued.\nRecord 080: package parcel080 has status queued.\nRecord 081: package parcel081 has status queued.\nRecord 082: package parcel082 has status queued.\nRecord 083: package parcel083 has status queued.\nRecord 084: package parcel084 has status queued.\nRecord 085: package parcel085 has status queued.\nRecord 086: package parcel086 has status queued.\nRecord 087: package parcel087 has status queued.\nRecord 088: package parcel088 has status queued.\nRecord 089: package parcel089 has status queued.\nRecord 090: package parcel090 has status queued.\nRecord 091: package parcel091 has status queued.\nRecord 092: package parcel092 has status queued.\nRecord 093: package parcel093 has status queued.\nRecord 094: package parcel094 has status queued.\nRecord 095: package parcel095 has status queued.\nRecord 096: package parcel096 has status queued.\nRecord 097: package parcel097 has status queued.\nRecord 098: package parcel098 has status queued.\nRecord 099: package parcel099 has status queued.\nRecord 100: package parcel100 has status queued.\nRecord 101: package parcel101 has status queued.\nRecord 102: package parcel102 has status queued.\nRecord 103: package parcel103 has status queued.\nRecord 104: package parcel104 has status queued.\nRecord 105: package parcel105 has status queued.\nRecord 106: package parcel106 has status queued.\nRecord 107: package parcel107 has status queued.\nRecord 108: package parcel108 has status queued.\nRecord 109: package parcel109 has status queued.\nRecord 110: package parcel110 has status queued.\nRecord 111: package parcel111 has status queued.\nRecord 112: package parcel112 has status queued.\nRecord 113: package parcel113 has status queued.\nRecord 114: package parcel114 has status queued.\nRecord 115: package parcel115 has status queued.\nRecord 116: package parcel116 has status queued.\nRecord 117: package parcel117 has status queued.\nRecord 118: package parcel118 has status queued.\nRecord 119: package parcel119 has status queued.\nWhat is the receipt for parcel051? Return only the exact receipt code.",
+          "expected": "VIOLET-68243",
+          "answer": "VIOLET-68243",
+          "passed": true,
+          "wall_s": 17.00487796199741,
+          "usage": {
+            "prompt_tokens": 1968,
+            "completion_tokens": 10,
+            "total_tokens": 1978
+          }
+        }
+      ],
+      "summary": {
+        "prefill_64": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 1.6153901594952913,
+            "wall_mean_s": 1.689080694995937,
+            "decode_tokens_per_s": 13.57026371441199
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 1.5865236090030521,
+            "wall_mean_s": 1.643695213002502,
+            "decode_tokens_per_s": 17.49120070183132
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.08085140198818408,
+            0.02311830100370571
+          ]
+        },
+        "prefill_512": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 4.4450025785045,
+            "wall_mean_s": 4.501307234997512,
+            "decode_tokens_per_s": 17.760520395397723
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 4.42727108199324,
+            "wall_mean_s": 4.491091375995893,
+            "decode_tokens_per_s": 15.66899707416623
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.12468895703204907,
+            0.08922596400952898
+          ]
+        },
+        "prefill_2048": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 12.136525976500707,
+            "wall_mean_s": 12.199492027008091,
+            "decode_tokens_per_s": 15.881574148957062
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 11.853914578503463,
+            "wall_mean_s": 11.913165077494341,
+            "decode_tokens_per_s": 16.8774949921344
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.23555053301970474,
+            -0.3296722629747819
+          ]
+        },
+        "decode_64": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 1.3027114160067867,
+            "wall_mean_s": 7.730355916006374,
+            "decode_tokens_per_s": 29.715395741007807
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 1.4046787705010502,
+            "wall_mean_s": 9.65955749200657,
+            "decode_tokens_per_s": 23.137832358749122
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            0.1176819649990648,
+            0.08625274398946203
+          ]
+        }
+      },
+      "startup": [
+        "ServerArgs(model_path='/var/lib/longhorn/nvme-02/freetoken/models/flash-e2m1.ftw', tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, max_running_req=1, attention_backend='auto', kv_cache_dtype='auto', moe_backend='offload', nvfp4_backend=None, moe_activation_dtype='auto', expert_load='auto', bank_source='auto', moe_bank_hugepages='off', moe_bank_hugepages_tmpfs=None, moe_bank_hugepages_tmpfs_margin_gib=1.0, moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=True, kv_reserve_tokens=8192, kv_ladder='on', kv_ladder_explicit=False, kv_ladder_floor_tokens=None, kv_ladder_cap_tokens=None, kv_ladder_explicit_cap=False, moe_cache_policy='lru', moe_prefill_overlap=True, moe_gpu_prefill_layers='auto', moe_prefill_hit_d2d=False, moe_collect_stats=False, moe_cpu_threads=14, moe_cpu_layers=None, moe_disk_layers=None, moe_disk_layer_profile='/var/lib/longhorn/nvme-02/freetoken/layer-profile-v3.json', moe_hot_expert_budget_gib=6.0, moe_hot_capacity_policy='equal', moe_hot_capacity_floor=8, moe_hot_adapt_halflife_steps=2000, moe_hot_adapt_interval_steps=0, moe_hot_adapt_max_swap_gib=0.5, moe_hot_adapt_boundary_cap_frac=0.5, moe_hot_adapt_prefill_weight=0.1, moe_hot_adapt_histories='split', moe_hot_adapt_aim='phase', moe_hot_adapt_prefill_blend=0.25, moe_hot_adapt_prefill_normalize='off', moe_hot_adapt_prefill_run_cap_frac=0.0, moe_hot_adapt_post_prefill_tick=False, moe_hot_plan_persist='off', moe_hot_plan_dir=None, moe_hot_plan_interval_minutes=10.0, moe_hot_adapt_idle_ms=500, moe_hot_adapt_idle_min_interval_ms=2000, moe_disk_prefill='cpu', moe_prefill_coalesce='populate', moe_prefill_hot_split='on', moe_prefill_split_kernel='grouped', moe_cpu_prefill_batch='on', moe_disk_decode='cpu', moe_disk_pager='madvise', moe_disk_lookahead='off', session_expert_prefetch='on', session_protect_experts=64, moe_step_timing=False, moe_cpu_precb='before', moe_cpu_empty_skip='off', moe_cpu_willneed='recent', moe_cpu_willneed_recent_steps=256, moe_cpu_willneed_fault_ceiling=2000.0, host_cache_reserve_gib=None, moe_pager_budget_gib=None, moe_hybrid_max_fetch=-1, ple_backend='uring', ple_prefill_gather='on', ple_cache_gib=8.0, ple_cache_warm=None, ple_cache_profile_out=None, ple_uring_staging_mib=64, ple_uring_queue_depth=64, speculative_mtp='off', mtp_draft_tokens=1, cuda_graph_bs=None, cuda_graph_max_bs=None, page_size=1, memory_ratio=0.9, linear_state_cache_ratio=4.0, kv_disk_cache_dir='/var/lib/longhorn/nvme-02/freetoken/prefix-cache', kv_disk_cache_gib=0.0, kv_harness_prefixes=('opencode=You are OpenCode,', 'pi=You are a focused coding agent.'), lazy_restore='on', swa_full_tokens_ratio=0.2, swa_num_pages_override=None, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=True, max_seq_len_override=100352, num_page_override=None, num_token_override=None, max_extend_tokens=2048, cache_type='naive', offline_mode=False, decode_log_interval=40, special_token_ckpt=False, priority_aging_seconds=30.0, _unique_suffix='.pid=547745', server_host='127.0.0.1', server_port=18090, num_tokenizer=0, silent_output=False, shell_mode=False, served_model_name='qwen3.6-27b', tool_call_parser='qwen3_coder', reasoning_parser='qwen3', sampling_defaults='model', max_output_tokens=None, abort_on_disconnect='on', enable_cache_report=True, cors_origins='tauri://localhost,http://tauri.localhost,http://localhost:1420', gpu=(), gpu_assigned=None)",
+        "[2026-09-05|09:54:08|core|rank=0] INFO     Host memory budget table: total=61.91 GiB, available=57.92 GiB, ceiling=48.63 GiB, pinned_banks=40.00 GiB (explicit), hot_staging=0.56 GiB, prefill_scratch=0.30 GiB, pager=7.77 GiB (derived), reserve=9.29 GiB, remainder=0.00 GiB, target pin:pager=28:22",
+        "[2026-09-05|09:57:03|core|rank=0] INFO     MoE bank split residency: 39.66 GiB pinned (cudaHostRegister, 30 GPU layers) + 0.00 GiB OS-locked (0 CPU layers: []) + 23.80 GiB file-backed (18 DISK layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 39, 40, 41, 42, 43, 44, 45, 46, 47])",
+        "[2026-09-05|09:57:03|core|rank=0] INFO     --moe-cache-auto resolved moe_cache_size=4045 num_pages=1024 (+1 dummy page; prefill_overlap=True)",
+        "[2026-09-05|09:57:03|core|rank=0] INFO     MoE HOT expert plan: top 129/512 experts in each of 18 DISK layers, 6.00 GiB protected GPU, bound=budget (budget_limit=129, slot_limit=167, slots=4045, fetch_reserve=1024), profiled hot_pair_rate=77.0%",
+        "[2026-09-05|09:57:03|core|rank=0] INFO     MoE selective prefill: max_tokens=128, dense_union=75%, requires pinned overlap buffers and CUDA batch memcpy; hit-D2D takes precedence",
+        "[2026-09-05|09:57:21|core|rank=0] INFO     MoE HOT expert residency: 2322 protected GPU rows across 18 DISK layers, hot_capacity_policy=equal, hot_capacity_rows_min=129, hot_capacity_rows_max=129, hot_staging_gib=0.56, hot_staging_rows=193"
+      ],
+      "fidelity_passes": 7,
+      "same_answers_as_auto_baseline": 8
+    },
+    "autor1": {
+      "requests": [
+        {
+          "kind": "warmup",
+          "size": 64,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 5.250110027001938,
+          "wall_s": 5.353466225991724,
+          "decode_s": 0.10335619898978621,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 512,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 10.91222968098009,
+          "wall_s": 10.995425323984819,
+          "decode_s": 0.08319564300472848,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 2048,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 22.823707290983293,
+          "wall_s": 22.98009213298792,
+          "decode_s": 0.156384842004627,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 64,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 3.015686544997152,
+          "wall_s": 3.1316713959968183,
+          "decode_s": 0.11598485099966638,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 512,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 7.489216429006774,
+          "wall_s": 7.575727874995209,
+          "decode_s": 0.0865114459884353,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 2048,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 20.151466269016964,
+          "wall_s": 20.228210023022257,
+          "decode_s": 0.07674375400529243,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 18.987024364003446,
+          "wall_s": 19.053989006002666,
+          "decode_s": 0.06696464199922048,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 17.855274613015354,
+          "wall_s": 17.92357060100767,
+          "decode_s": 0.06829598799231462,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 5.998313374991994,
+          "wall_s": 6.070142726995982,
+          "decode_s": 0.07182935200398788,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 5.759567389002768,
+          "wall_s": 5.8280774780141655,
+          "decode_s": 0.06851008901139721,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 5.836259911011439,
+          "wall_s": 5.907757402019342,
+          "decode_s": 0.07149749100790359,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 5.674477661988931,
+          "wall_s": 5.745313878986053,
+          "decode_s": 0.07083621699712239,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 1.917712071997812,
+          "wall_s": 1.994947475992376,
+          "decode_s": 0.07723540399456397,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 1.8549147470039316,
+          "wall_s": 1.9213776960095856,
+          "decode_s": 0.06646294900565408,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 18.555047417001333,
+          "wall_s": 18.626359086018056,
+          "decode_s": 0.07131166901672259,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 18.038363942992873,
+          "wall_s": 18.107382441987284,
+          "decode_s": 0.06901849899441004,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 1.9960436880064663,
+          "wall_s": 14.989104912994662,
+          "decode_s": 12.993061224988196,
+          "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE. This transition marked a profound shift from monarchical rule to a complex system of representative government, driven by the aristocratic desire to prevent the concentration of power in a single individual. The traditional narrative attributes the founding of the Republic to the overthrow of the last king, Tarquin the Proud, following the infamous rape of Lucretia by his son. While historical accuracy of this specific event is debated, the underlying political reality was clear: the patrician class sought to dismantle the monarchy to secure their own political dominance and establish a system where power was shared among the elite.\n\nThe early Republic was characterized by a rigid social hierarchy and a unique constitutional structure designed to balance power. At its core were two consuls, elected annually, who held supreme executive authority but could veto each other\u2019s decisions, ensuring no single leader could dominate.",
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 192,
+            "total_tokens": 243
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 1.497589662001701,
+          "wall_s": 8.704869390989188,
+          "decode_s": 7.207279728987487,
+          "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE. This transition marked a profound shift from monarchical rule to a complex system of representative government, driven by the aristocratic desire to prevent the concentration of power in a single individual. The traditional narrative attributes the founding of the Republic to the overthrow of the last king, Tarquin the Proud, following the infamous rape of Lucretia by his son. While historical accuracy of this specific event is debated, the underlying political reality was clear: the patrician class sought to dismantle the monarchy to secure their own political dominance and establish a system where power was shared among the elite.\n\nThe early Republic was characterized by a rigid social hierarchy and a unique constitutional structure designed to balance power. At its core were two consuls, elected annually, who held supreme executive authority but could veto each other\u2019s decisions, ensuring no single leader could dominate.",
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 192,
+            "total_tokens": 243
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 1.8409817059873603,
+          "wall_s": 1.9116901019879151,
+          "decode_s": 0.07070839600055479,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 1.8304346509976313,
+          "wall_s": 1.8858695730159525,
+          "decode_s": 0.05543492201832123,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 1.5216039689839818,
+          "wall_s": 9.449154396977974,
+          "decode_s": 7.927550427993992,
+          "text": "The history of the Roman Republic is a foundational narrative in Western civilization, marking a pivotal transition from monarchy to a complex system of representative governance. This era, spanning roughly from 509 BCE to 27 BCE, was not merely a political experiment but a dynamic engine of expansion, legal innovation, and social conflict that shaped the modern world. To understand the Republic, one must first examine its origins in the overthrow of the last Roman king, Tarquin the Proud. According to tradition, the rape of Lucretia by the king\u2019s son sparked a revolt led by Lucius Junius Brutus, who expelled the Tarquin dynasty and established a new order designed to prevent the concentration of power in a single individual. This foundational myth underscored the Roman aversion to *regnum* (kingship) and their reverence for *libertas* (liberty).\n\nThe early Republic was characterized by a delicate balance of power among three main branches",
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 192,
+            "total_tokens": 241
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 1.4096494859841187,
+          "wall_s": 8.821015067980625,
+          "decode_s": 7.411365581996506,
+          "text": "The history of the Roman Republic is a foundational narrative in Western civilization, marking a pivotal transition from monarchy to a complex system of representative governance. This era, spanning roughly from 509 BCE to 27 BCE, was not merely a political experiment but a dynamic engine of expansion, legal innovation, and social conflict that shaped the modern world. To understand the Republic, one must first examine its origins in the overthrow of the last Roman king, Tarquin the Proud. According to tradition, the rape of Lucretia by the king\u2019s son sparked a revolt led by Lucius Junius Brutus, who expelled the Tarquin dynasty and established a new order designed to prevent the concentration of power in a single individual. This foundational myth underscored the Roman aversion to *regnum* (kingship) and their reverence for *libertas* (liberty).\n\nThe early Republic was characterized by a delicate balance of power among three main branches",
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 192,
+            "total_tokens": 241
+          }
+        }
+      ],
+      "quality": [
+        {
+          "name": "arithmetic",
+          "prompt": "Compute 17 + 28 + 45 + 96 + 133. Output only the integer result.",
+          "expected": "319",
+          "answer": "319",
+          "passed": true,
+          "wall_s": 3.256348644994432,
+          "usage": {
+            "prompt_tokens": 40,
+            "completion_tokens": 4,
+            "total_tokens": 44
+          }
+        },
+        {
+          "name": "codeword",
+          "prompt": "Remember the access code ZEPHYR-58319. Return that exact access code and nothing else.",
+          "expected": "ZEPHYR-58319",
+          "answer": "ZEPHYR-58319",
+          "passed": true,
+          "wall_s": 3.4973038579919375,
+          "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 11,
+            "total_tokens": 47
+          }
+        },
+        {
+          "name": "position",
+          "prompt": "The list is [amber, birch, cobalt, delta, elm]. Output only its third item.",
+          "expected": "cobalt",
+          "answer": "cobalt",
+          "passed": true,
+          "wall_s": 2.511590449983487,
+          "usage": {
+            "prompt_tokens": 34,
+            "completion_tokens": 3,
+            "total_tokens": 37
+          }
+        },
+        {
+          "name": "code_trace",
+          "prompt": "In Python, what is sum(n*n for n in [2,5,8] if n % 2 == 0)? Output only the integer.",
+          "expected": "68",
+          "answer": "108",
+          "passed": false,
+          "wall_s": 2.699872939992929,
+          "usage": {
+            "prompt_tokens": 44,
+            "completion_tokens": 4,
+            "total_tokens": 48
+          }
+        },
+        {
+          "name": "negation",
+          "prompt": "A farmer has 17 sheep. All but 9 run away. How many remain? Output only the integer.",
+          "expected": "9",
+          "answer": "9",
+          "passed": true,
+          "wall_s": 2.090153099008603,
+          "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 2,
+            "total_tokens": 38
+          }
+        },
+        {
+          "name": "ordering",
+          "prompt": "Repeat these IDs in their original order, separated by single spaces, with no other text: Z5 A12 C3 B8",
+          "expected": "Z5 A12 C3 B8",
+          "answer": "Z5 A12 C3 B8",
+          "passed": true,
+          "wall_s": 2.659017271012999,
+          "usage": {
+            "prompt_tokens": 39,
+            "completion_tokens": 10,
+            "total_tokens": 49
+          }
+        },
+        {
+          "name": "context_override",
+          "prompt": "In this fictional ledger, the capital listed for Norway is Bergen, not Oslo. According to this ledger, what is the capital? Output only the city name.",
+          "expected": "Bergen",
+          "answer": "Bergen",
+          "passed": true,
+          "wall_s": 2.581392507010605,
+          "usage": {
+            "prompt_tokens": 44,
+            "completion_tokens": 3,
+            "total_tokens": 47
+          }
+        },
+        {
+          "name": "long_retrieval",
+          "prompt": "Read these shipping records:\nRecord 000: package parcel000 has status queued.\nRecord 001: package parcel001 has status queued.\nRecord 002: package parcel002 has status queued.\nRecord 003: package parcel003 has status queued.\nRecord 004: package parcel004 has status queued.\nRecord 005: package parcel005 has status queued.\nRecord 006: package parcel006 has status queued.\nRecord 007: package parcel007 has status queued.\nRecord 008: package parcel008 has status queued.\nRecord 009: package parcel009 has status queued.\nRecord 010: package parcel010 has status queued.\nRecord 011: package parcel011 has status queued.\nRecord 012: package parcel012 has status queued.\nRecord 013: package parcel013 has status queued.\nRecord 014: package parcel014 has status queued.\nRecord 015: package parcel015 has status queued.\nRecord 016: package parcel016 has status queued.\nRecord 017: package parcel017 has status queued.\nRecord 018: package parcel018 has status queued.\nRecord 019: package parcel019 has status queued.\nRecord 020: package parcel020 has status queued.\nRecord 021: package parcel021 has status queued.\nRecord 022: package parcel022 has status queued.\nRecord 023: package parcel023 has status queued.\nRecord 024: package parcel024 has status queued.\nRecord 025: package parcel025 has status queued.\nRecord 026: package parcel026 has status queued.\nRecord 027: package parcel027 has status queued.\nRecord 028: package parcel028 has status queued.\nRecord 029: package parcel029 has status queued.\nRecord 030: package parcel030 has status queued.\nRecord 031: package parcel031 has status queued.\nRecord 032: package parcel032 has status queued.\nRecord 033: package parcel033 has status queued.\nRecord 034: package parcel034 has status queued.\nRecord 035: package parcel035 has status queued.\nRecord 036: package parcel036 has status queued.\nRecord 037: package parcel037 has status queued.\nRecord 038: package parcel038 has status queued.\nRecord 039: package parcel039 has status queued.\nRecord 040: package parcel040 has status queued.\nRecord 041: package parcel041 has status queued.\nRecord 042: package parcel042 has status queued.\nRecord 043: package parcel043 has status queued.\nRecord 044: package parcel044 has status queued.\nRecord 045: package parcel045 has status queued.\nRecord 046: package parcel046 has status queued.\nRecord 047: package parcel047 has status queued.\nRecord 048: package parcel048 has status queued.\nRecord 049: package parcel049 has status queued.\nRecord 050: package parcel050 has status queued.\nRecord 051: package parcel051 has status delivered; its receipt is VIOLET-68243.\nRecord 052: package parcel052 has status queued.\nRecord 053: package parcel053 has status queued.\nRecord 054: package parcel054 has status queued.\nRecord 055: package parcel055 has status queued.\nRecord 056: package parcel056 has status queued.\nRecord 057: package parcel057 has status queued.\nRecord 058: package parcel058 has status queued.\nRecord 059: package parcel059 has status queued.\nRecord 060: package parcel060 has status queued.\nRecord 061: package parcel061 has status queued.\nRecord 062: package parcel062 has status queued.\nRecord 063: package parcel063 has status queued.\nRecord 064: package parcel064 has status queued.\nRecord 065: package parcel065 has status queued.\nRecord 066: package parcel066 has status queued.\nRecord 067: package parcel067 has status queued.\nRecord 068: package parcel068 has status queued.\nRecord 069: package parcel069 has status queued.\nRecord 070: package parcel070 has status queued.\nRecord 071: package parcel071 has status queued.\nRecord 072: package parcel072 has status queued.\nRecord 073: package parcel073 has status queued.\nRecord 074: package parcel074 has status queued.\nRecord 075: package parcel075 has status queued.\nRecord 076: package parcel076 has status queued.\nRecord 077: package parcel077 has status queued.\nRecord 078: package parcel078 has status queued.\nRecord 079: package parcel079 has status queued.\nRecord 080: package parcel080 has status queued.\nRecord 081: package parcel081 has status queued.\nRecord 082: package parcel082 has status queued.\nRecord 083: package parcel083 has status queued.\nRecord 084: package parcel084 has status queued.\nRecord 085: package parcel085 has status queued.\nRecord 086: package parcel086 has status queued.\nRecord 087: package parcel087 has status queued.\nRecord 088: package parcel088 has status queued.\nRecord 089: package parcel089 has status queued.\nRecord 090: package parcel090 has status queued.\nRecord 091: package parcel091 has status queued.\nRecord 092: package parcel092 has status queued.\nRecord 093: package parcel093 has status queued.\nRecord 094: package parcel094 has status queued.\nRecord 095: package parcel095 has status queued.\nRecord 096: package parcel096 has status queued.\nRecord 097: package parcel097 has status queued.\nRecord 098: package parcel098 has status queued.\nRecord 099: package parcel099 has status queued.\nRecord 100: package parcel100 has status queued.\nRecord 101: package parcel101 has status queued.\nRecord 102: package parcel102 has status queued.\nRecord 103: package parcel103 has status queued.\nRecord 104: package parcel104 has status queued.\nRecord 105: package parcel105 has status queued.\nRecord 106: package parcel106 has status queued.\nRecord 107: package parcel107 has status queued.\nRecord 108: package parcel108 has status queued.\nRecord 109: package parcel109 has status queued.\nRecord 110: package parcel110 has status queued.\nRecord 111: package parcel111 has status queued.\nRecord 112: package parcel112 has status queued.\nRecord 113: package parcel113 has status queued.\nRecord 114: package parcel114 has status queued.\nRecord 115: package parcel115 has status queued.\nRecord 116: package parcel116 has status queued.\nRecord 117: package parcel117 has status queued.\nRecord 118: package parcel118 has status queued.\nRecord 119: package parcel119 has status queued.\nWhat is the receipt for parcel051? Return only the exact receipt code.",
+          "expected": "VIOLET-68243",
+          "answer": "VIOLET-68243",
+          "passed": true,
+          "wall_s": 27.839857027021935,
+          "usage": {
+            "prompt_tokens": 1968,
+            "completion_tokens": 10,
+            "total_tokens": 1978
+          }
+        }
+      ],
+      "summary": {
+        "prefill_64": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 1.847948226495646,
+            "wall_mean_s": 1.9165338989987504,
+            "decode_tokens_per_s": 14.580304654076789
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 1.8740733614977216,
+            "wall_mean_s": 1.9404085245041642,
+            "decode_tokens_per_s": 15.074961071594533
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.010547054989729077,
+            0.06279732499388047
+          ]
+        },
+        "prefill_512": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 5.797913650007104,
+            "wall_mean_s": 5.867917440016754,
+            "decode_tokens_per_s": 14.284940856232849
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 5.836395518490463,
+            "wall_mean_s": 5.907728302991018,
+            "decode_tokens_per_s": 14.01879944827077
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.16178224902250804,
+            0.23874598598922603
+          ]
+        },
+        "prefill_2048": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 18.77103589050239,
+            "wall_mean_s": 18.84017404601036,
+            "decode_tokens_per_s": 14.463793438699726
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 17.946819278004114,
+            "wall_mean_s": 18.015476521497476,
+            "decode_tokens_per_s": 14.565105575447088
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.5166834740084596,
+            -1.1317497509880923
+          ]
+        },
+        "decode_64": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 1.4536195739929099,
+            "wall_mean_s": 8.762942229484906,
+            "decode_tokens_per_s": 26.13101227054036
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 1.758823828495224,
+            "wall_mean_s": 12.219129654986318,
+            "decode_tokens_per_s": 18.25950437474646
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            0.1119544829998631,
+            0.4984540260047652
+          ]
+        }
+      },
+      "startup": [
+        "ServerArgs(model_path='/var/lib/longhorn/nvme-02/freetoken/models/flash-e2m1.ftw', tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, max_running_req=1, attention_backend='auto', kv_cache_dtype='auto', moe_backend='offload', nvfp4_backend=None, moe_activation_dtype='auto', expert_load='auto', bank_source='auto', moe_bank_hugepages='off', moe_bank_hugepages_tmpfs=None, moe_bank_hugepages_tmpfs_margin_gib=1.0, moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=True, kv_reserve_tokens=8192, kv_ladder='on', kv_ladder_explicit=False, kv_ladder_floor_tokens=None, kv_ladder_cap_tokens=None, kv_ladder_explicit_cap=False, moe_cache_policy='lru', moe_prefill_overlap=True, moe_gpu_prefill_layers='auto', moe_prefill_hit_d2d=False, moe_collect_stats=False, moe_cpu_threads=14, moe_cpu_layers=None, moe_disk_layers=None, moe_disk_layer_profile='/var/lib/longhorn/nvme-02/freetoken/layer-profile-v3.json', moe_hot_expert_budget_gib=6.0, moe_hot_capacity_policy='equal', moe_hot_capacity_floor=8, moe_hot_adapt_halflife_steps=2000, moe_hot_adapt_interval_steps=0, moe_hot_adapt_max_swap_gib=0.5, moe_hot_adapt_boundary_cap_frac=0.5, moe_hot_adapt_prefill_weight=0.1, moe_hot_adapt_histories='split', moe_hot_adapt_aim='phase', moe_hot_adapt_prefill_blend=0.25, moe_hot_adapt_prefill_normalize='off', moe_hot_adapt_prefill_run_cap_frac=0.0, moe_hot_adapt_post_prefill_tick=False, moe_hot_plan_persist='off', moe_hot_plan_dir=None, moe_hot_plan_interval_minutes=10.0, moe_hot_adapt_idle_ms=500, moe_hot_adapt_idle_min_interval_ms=2000, moe_disk_prefill='cpu', moe_prefill_coalesce='populate', moe_prefill_hot_split='on', moe_prefill_split_kernel='grouped', moe_cpu_prefill_batch='on', moe_disk_decode='cpu', moe_disk_pager='madvise', moe_disk_lookahead='off', session_expert_prefetch='on', session_protect_experts=64, moe_step_timing=False, moe_cpu_precb='before', moe_cpu_empty_skip='off', moe_cpu_willneed='recent', moe_cpu_willneed_recent_steps=256, moe_cpu_willneed_fault_ceiling=2000.0, host_cache_reserve_gib=None, moe_pager_budget_gib=None, moe_hybrid_max_fetch=-1, ple_backend='uring', ple_prefill_gather='on', ple_cache_gib=8.0, ple_cache_warm=None, ple_cache_profile_out=None, ple_uring_staging_mib=64, ple_uring_queue_depth=64, speculative_mtp='off', mtp_draft_tokens=1, cuda_graph_bs=None, cuda_graph_max_bs=None, page_size=1, memory_ratio=0.9, linear_state_cache_ratio=4.0, kv_disk_cache_dir='/var/lib/longhorn/nvme-02/freetoken/prefix-cache', kv_disk_cache_gib=0.0, kv_harness_prefixes=('opencode=You are OpenCode,', 'pi=You are a focused coding agent.'), lazy_restore='on', swa_full_tokens_ratio=0.2, swa_num_pages_override=None, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=True, max_seq_len_override=100352, num_page_override=None, num_token_override=None, max_extend_tokens=2048, cache_type='naive', offline_mode=False, decode_log_interval=40, special_token_ckpt=False, priority_aging_seconds=30.0, _unique_suffix='.pid=549934', server_host='127.0.0.1', server_port=18090, num_tokenizer=0, silent_output=False, shell_mode=False, served_model_name='qwen3.6-27b', tool_call_parser='qwen3_coder', reasoning_parser='qwen3', sampling_defaults='model', max_output_tokens=None, abort_on_disconnect='on', enable_cache_report=True, cors_origins='tauri://localhost,http://tauri.localhost,http://localhost:1420', gpu=(), gpu_assigned=None)",
+        "[2026-09-05|10:01:03|core|rank=0] INFO     Host memory budget table: total=61.91 GiB, available=58.38 GiB, ceiling=49.09 GiB, pinned_banks=27.01 GiB (derived), hot_staging=0.56 GiB, prefill_scratch=0.30 GiB, pager=21.22 GiB (derived), reserve=9.29 GiB, remainder=0.00 GiB, target pin:pager=28:22",
+        "[2026-09-05|10:02:29|core|rank=0] INFO     MoE bank split residency: 26.44 GiB pinned (cudaHostRegister, 20 GPU layers) + 0.00 GiB OS-locked (0 CPU layers: []) + 37.02 GiB file-backed (28 DISK layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 15, 16, 23, 25, 31, 32, 35, 36, 39, 40, 41, 42, 43, 44, 45, 46, 47])",
+        "[2026-09-05|10:02:29|core|rank=0] INFO     --moe-cache-auto resolved moe_cache_size=4045 num_pages=1024 (+1 dummy page; prefill_overlap=True)",
+        "[2026-09-05|10:02:29|core|rank=0] INFO     MoE HOT expert plan: top 82/512 experts in each of 28 DISK layers, 5.93 GiB protected GPU, bound=budget (budget_limit=82, slot_limit=107, slots=4045, fetch_reserve=1024), profiled hot_pair_rate=66.1%",
+        "[2026-09-05|10:02:29|core|rank=0] INFO     MoE selective prefill: max_tokens=128, dense_union=75%, requires pinned overlap buffers and CUDA batch memcpy; hit-D2D takes precedence",
+        "[2026-09-05|10:02:52|core|rank=0] INFO     MoE HOT expert residency: 2296 protected GPU rows across 28 DISK layers, hot_capacity_policy=equal, hot_capacity_rows_min=82, hot_capacity_rows_max=82, hot_staging_gib=0.56, hot_staging_rows=193"
+      ],
+      "fidelity_passes": 7,
+      "same_answers_as_auto_baseline": 8
+    },
+    "autor2": {
+      "requests": [
+        {
+          "kind": "warmup",
+          "size": 64,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 6.844621394993737,
+          "wall_s": 7.113123466988327,
+          "decode_s": 0.26850207199458964,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 512,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 12.04482006499893,
+          "wall_s": 12.134621787001379,
+          "decode_s": 0.08980172200244851,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 2048,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 21.549981954012765,
+          "wall_s": 21.62504959499347,
+          "decode_s": 0.07506764098070562,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 64,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 1.9549191760015674,
+          "wall_s": 2.025864310009638,
+          "decode_s": 0.07094513400807045,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 512,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 7.103317052999046,
+          "wall_s": 7.182520409987774,
+          "decode_s": 0.07920335698872805,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 2048,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 19.373524394002743,
+          "wall_s": 19.44998545999988,
+          "decode_s": 0.07646106599713676,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 18.86587613998563,
+          "wall_s": 18.932833105995087,
+          "decode_s": 0.06695696600945666,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 18.188806543999817,
+          "wall_s": 18.25641718300176,
+          "decode_s": 0.06761063900194131,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 5.94075747099123,
+          "wall_s": 6.01339812099468,
+          "decode_s": 0.07264065000344999,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 5.736636443005409,
+          "wall_s": 5.807281965011498,
+          "decode_s": 0.07064552200608887,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 5.792653831013013,
+          "wall_s": 5.863734264014056,
+          "decode_s": 0.07108043300104327,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 5.628046486992389,
+          "wall_s": 5.698101914982544,
+          "decode_s": 0.0700554279901553,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 1.919846245989902,
+          "wall_s": 1.993967201007763,
+          "decode_s": 0.07412095501786098,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 1.8589235029940028,
+          "wall_s": 1.9276136760017835,
+          "decode_s": 0.06869017300778069,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 18.730550294014392,
+          "wall_s": 18.799059426004533,
+          "decode_s": 0.0685091319901403,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 17.9107946419972,
+          "wall_s": 17.97856215099455,
+          "decode_s": 0.06776750899734907,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 1.8917542889830656,
+          "wall_s": 14.952514695993159,
+          "decode_s": 13.060760407010093,
+          "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE. This transition marked a profound shift from monarchical rule to a complex system of representative government, driven by the aristocratic desire to prevent the concentration of power in a single individual. The traditional narrative attributes the founding of the Republic to the overthrow of the last king, Tarquin the Proud, following the infamous rape of Lucretia by his son. While historical accuracy of this specific event is debated, the underlying political reality was clear: the patrician class sought to dismantle the monarchy to secure their own political dominance and establish a system where power was shared among the elite.\n\nThe early Republic was characterized by a rigid social hierarchy and a unique constitutional structure designed to balance power. At its core were two consuls, elected annually, who held supreme executive authority but could veto each other\u2019s decisions, ensuring no single leader could dominate.",
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 192,
+            "total_tokens": 243
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 1.4792237580113579,
+          "wall_s": 8.79412992100697,
+          "decode_s": 7.314906162995612,
+          "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE. This transition marked a profound shift from monarchical rule to a complex system of representative government, driven by the aristocratic desire to prevent the concentration of power in a single individual. The traditional narrative attributes the founding of the Republic to the overthrow of the last king, Tarquin the Proud, following the infamous rape of Lucretia by his son. While historical accuracy of this specific event is debated, the underlying political reality was clear: the patrician class sought to dismantle the monarchy to secure their own political dominance and establish a system where power was shared among the elite.\n\nThe early Republic was characterized by a rigid social hierarchy and a unique constitutional structure designed to balance power. At its core were two consuls, elected annually, who held supreme executive authority but could veto each other\u2019s decisions, ensuring no single leader could dominate.",
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 192,
+            "total_tokens": 243
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 1.8223898590076715,
+          "wall_s": 1.890061836980749,
+          "decode_s": 0.06767197797307745,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 1.823857344017597,
+          "wall_s": 1.8771584230125882,
+          "decode_s": 0.05330107899499126,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 1.529073679994326,
+          "wall_s": 9.400670991977677,
+          "decode_s": 7.871597311983351,
+          "text": "The history of the Roman Republic is a foundational narrative in Western civilization, marking a pivotal transition from monarchy to a complex system of representative governance. This era, spanning roughly from 509 BCE to 27 BCE, was not merely a political experiment but a dynamic engine of expansion, legal innovation, and social conflict that shaped the modern world. To understand the Republic, one must first examine its origins in the overthrow of the last Roman king, Tarquin the Proud. According to tradition, the rape of Lucretia by the king\u2019s son sparked a revolt led by Lucius Junius Brutus, who expelled the Tarquin dynasty and established a new order designed to prevent the concentration of power in a single individual. This foundational myth underscored the Roman aversion to *regnum* (kingship) and their reverence for *libertas* (liberty).\n\nThe early Republic was characterized by a delicate balance of power among three main branches",
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 192,
+            "total_tokens": 241
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 1.4360199270013254,
+          "wall_s": 8.555322175991023,
+          "decode_s": 7.1193022489896975,
+          "text": "The history of the Roman Republic is a foundational narrative in Western civilization, marking a pivotal transition from monarchy to a complex system of representative governance. This era, spanning roughly from 509 BCE to 27 BCE, was not merely a political experiment but a dynamic engine of expansion, legal innovation, and social conflict that shaped the modern world. To understand the Republic, one must first examine its origins in the overthrow of the last Roman king, Tarquin the Proud. According to tradition, the rape of Lucretia by the king\u2019s son sparked a revolt led by Lucius Junius Brutus, who expelled the Tarquin dynasty and established a new order designed to prevent the concentration of power in a single individual. This foundational myth underscored the Roman aversion to *regnum* (kingship) and their reverence for *libertas* (liberty).\n\nThe early Republic was characterized by a delicate balance of power among three main branches",
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 192,
+            "total_tokens": 241
+          }
+        }
+      ],
+      "quality": [
+        {
+          "name": "arithmetic",
+          "prompt": "Compute 17 + 28 + 45 + 96 + 133. Output only the integer result.",
+          "expected": "319",
+          "answer": "319",
+          "passed": true,
+          "wall_s": 2.8749157970014494,
+          "usage": {
+            "prompt_tokens": 40,
+            "completion_tokens": 4,
+            "total_tokens": 44
+          }
+        },
+        {
+          "name": "codeword",
+          "prompt": "Remember the access code ZEPHYR-58319. Return that exact access code and nothing else.",
+          "expected": "ZEPHYR-58319",
+          "answer": "ZEPHYR-58319",
+          "passed": true,
+          "wall_s": 2.9054308320046403,
+          "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 11,
+            "total_tokens": 47
+          }
+        },
+        {
+          "name": "position",
+          "prompt": "The list is [amber, birch, cobalt, delta, elm]. Output only its third item.",
+          "expected": "cobalt",
+          "answer": "cobalt",
+          "passed": true,
+          "wall_s": 2.2185537090117577,
+          "usage": {
+            "prompt_tokens": 34,
+            "completion_tokens": 3,
+            "total_tokens": 37
+          }
+        },
+        {
+          "name": "code_trace",
+          "prompt": "In Python, what is sum(n*n for n in [2,5,8] if n % 2 == 0)? Output only the integer.",
+          "expected": "68",
+          "answer": "108",
+          "passed": false,
+          "wall_s": 2.2446046169789042,
+          "usage": {
+            "prompt_tokens": 44,
+            "completion_tokens": 4,
+            "total_tokens": 48
+          }
+        },
+        {
+          "name": "negation",
+          "prompt": "A farmer has 17 sheep. All but 9 run away. How many remain? Output only the integer.",
+          "expected": "9",
+          "answer": "9",
+          "passed": true,
+          "wall_s": 1.8636336739873514,
+          "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 2,
+            "total_tokens": 38
+          }
+        },
+        {
+          "name": "ordering",
+          "prompt": "Repeat these IDs in their original order, separated by single spaces, with no other text: Z5 A12 C3 B8",
+          "expected": "Z5 A12 C3 B8",
+          "answer": "Z5 A12 C3 B8",
+          "passed": true,
+          "wall_s": 2.4564974140084814,
+          "usage": {
+            "prompt_tokens": 39,
+            "completion_tokens": 10,
+            "total_tokens": 49
+          }
+        },
+        {
+          "name": "context_override",
+          "prompt": "In this fictional ledger, the capital listed for Norway is Bergen, not Oslo. According to this ledger, what is the capital? Output only the city name.",
+          "expected": "Bergen",
+          "answer": "Bergen",
+          "passed": true,
+          "wall_s": 2.4399568229855504,
+          "usage": {
+            "prompt_tokens": 44,
+            "completion_tokens": 3,
+            "total_tokens": 47
+          }
+        },
+        {
+          "name": "long_retrieval",
+          "prompt": "Read these shipping records:\nRecord 000: package parcel000 has status queued.\nRecord 001: package parcel001 has status queued.\nRecord 002: package parcel002 has status queued.\nRecord 003: package parcel003 has status queued.\nRecord 004: package parcel004 has status queued.\nRecord 005: package parcel005 has status queued.\nRecord 006: package parcel006 has status queued.\nRecord 007: package parcel007 has status queued.\nRecord 008: package parcel008 has status queued.\nRecord 009: package parcel009 has status queued.\nRecord 010: package parcel010 has status queued.\nRecord 011: package parcel011 has status queued.\nRecord 012: package parcel012 has status queued.\nRecord 013: package parcel013 has status queued.\nRecord 014: package parcel014 has status queued.\nRecord 015: package parcel015 has status queued.\nRecord 016: package parcel016 has status queued.\nRecord 017: package parcel017 has status queued.\nRecord 018: package parcel018 has status queued.\nRecord 019: package parcel019 has status queued.\nRecord 020: package parcel020 has status queued.\nRecord 021: package parcel021 has status queued.\nRecord 022: package parcel022 has status queued.\nRecord 023: package parcel023 has status queued.\nRecord 024: package parcel024 has status queued.\nRecord 025: package parcel025 has status queued.\nRecord 026: package parcel026 has status queued.\nRecord 027: package parcel027 has status queued.\nRecord 028: package parcel028 has status queued.\nRecord 029: package parcel029 has status queued.\nRecord 030: package parcel030 has status queued.\nRecord 031: package parcel031 has status queued.\nRecord 032: package parcel032 has status queued.\nRecord 033: package parcel033 has status queued.\nRecord 034: package parcel034 has status queued.\nRecord 035: package parcel035 has status queued.\nRecord 036: package parcel036 has status queued.\nRecord 037: package parcel037 has status queued.\nRecord 038: package parcel038 has status queued.\nRecord 039: package parcel039 has status queued.\nRecord 040: package parcel040 has status queued.\nRecord 041: package parcel041 has status queued.\nRecord 042: package parcel042 has status queued.\nRecord 043: package parcel043 has status queued.\nRecord 044: package parcel044 has status queued.\nRecord 045: package parcel045 has status queued.\nRecord 046: package parcel046 has status queued.\nRecord 047: package parcel047 has status queued.\nRecord 048: package parcel048 has status queued.\nRecord 049: package parcel049 has status queued.\nRecord 050: package parcel050 has status queued.\nRecord 051: package parcel051 has status delivered; its receipt is VIOLET-68243.\nRecord 052: package parcel052 has status queued.\nRecord 053: package parcel053 has status queued.\nRecord 054: package parcel054 has status queued.\nRecord 055: package parcel055 has status queued.\nRecord 056: package parcel056 has status queued.\nRecord 057: package parcel057 has status queued.\nRecord 058: package parcel058 has status queued.\nRecord 059: package parcel059 has status queued.\nRecord 060: package parcel060 has status queued.\nRecord 061: package parcel061 has status queued.\nRecord 062: package parcel062 has status queued.\nRecord 063: package parcel063 has status queued.\nRecord 064: package parcel064 has status queued.\nRecord 065: package parcel065 has status queued.\nRecord 066: package parcel066 has status queued.\nRecord 067: package parcel067 has status queued.\nRecord 068: package parcel068 has status queued.\nRecord 069: package parcel069 has status queued.\nRecord 070: package parcel070 has status queued.\nRecord 071: package parcel071 has status queued.\nRecord 072: package parcel072 has status queued.\nRecord 073: package parcel073 has status queued.\nRecord 074: package parcel074 has status queued.\nRecord 075: package parcel075 has status queued.\nRecord 076: package parcel076 has status queued.\nRecord 077: package parcel077 has status queued.\nRecord 078: package parcel078 has status queued.\nRecord 079: package parcel079 has status queued.\nRecord 080: package parcel080 has status queued.\nRecord 081: package parcel081 has status queued.\nRecord 082: package parcel082 has status queued.\nRecord 083: package parcel083 has status queued.\nRecord 084: package parcel084 has status queued.\nRecord 085: package parcel085 has status queued.\nRecord 086: package parcel086 has status queued.\nRecord 087: package parcel087 has status queued.\nRecord 088: package parcel088 has status queued.\nRecord 089: package parcel089 has status queued.\nRecord 090: package parcel090 has status queued.\nRecord 091: package parcel091 has status queued.\nRecord 092: package parcel092 has status queued.\nRecord 093: package parcel093 has status queued.\nRecord 094: package parcel094 has status queued.\nRecord 095: package parcel095 has status queued.\nRecord 096: package parcel096 has status queued.\nRecord 097: package parcel097 has status queued.\nRecord 098: package parcel098 has status queued.\nRecord 099: package parcel099 has status queued.\nRecord 100: package parcel100 has status queued.\nRecord 101: package parcel101 has status queued.\nRecord 102: package parcel102 has status queued.\nRecord 103: package parcel103 has status queued.\nRecord 104: package parcel104 has status queued.\nRecord 105: package parcel105 has status queued.\nRecord 106: package parcel106 has status queued.\nRecord 107: package parcel107 has status queued.\nRecord 108: package parcel108 has status queued.\nRecord 109: package parcel109 has status queued.\nRecord 110: package parcel110 has status queued.\nRecord 111: package parcel111 has status queued.\nRecord 112: package parcel112 has status queued.\nRecord 113: package parcel113 has status queued.\nRecord 114: package parcel114 has status queued.\nRecord 115: package parcel115 has status queued.\nRecord 116: package parcel116 has status queued.\nRecord 117: package parcel117 has status queued.\nRecord 118: package parcel118 has status queued.\nRecord 119: package parcel119 has status queued.\nWhat is the receipt for parcel051? Return only the exact receipt code.",
+          "expected": "VIOLET-68243",
+          "answer": "VIOLET-68243",
+          "passed": true,
+          "wall_s": 30.217613059998257,
+          "usage": {
+            "prompt_tokens": 1968,
+            "completion_tokens": 10,
+            "total_tokens": 1978
+          }
+        }
+      ],
+      "summary": {
+        "prefill_64": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 1.8406566810008371,
+            "wall_mean_s": 1.9088377564912662,
+            "decode_tokens_per_s": 14.666826429576858
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 1.8718517950037494,
+            "wall_mean_s": 1.9355628120101755,
+            "decode_tokens_per_s": 15.695872503481407
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            0.00146748500992544,
+            0.06092274299589917
+          ]
+        },
+        "prefill_512": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 5.764645137009211,
+            "wall_mean_s": 5.835508114512777,
+            "decode_tokens_per_s": 14.111741211405864
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 5.784401978991809,
+            "wall_mean_s": 5.855750017988612,
+            "decode_tokens_per_s": 14.015802172850378
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.1646073440206237,
+            0.20412102798582055
+          ]
+        },
+        "prefill_2048": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 18.79821321700001,
+            "wall_mean_s": 18.86594626599981,
+            "decode_tokens_per_s": 14.763841503768347
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 18.04980059299851,
+            "wall_mean_s": 18.117489666998154,
+            "decode_tokens_per_s": 14.77343300641462
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.8197556520171929,
+            -0.6770695959858131
+          ]
+        },
+        "decode_64": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 1.4576218425063416,
+            "wall_mean_s": 8.674726048498997,
+            "decode_tokens_per_s": 26.464908161005205
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 1.7104139844886959,
+            "wall_mean_s": 12.176592843985418,
+            "decode_tokens_per_s": 18.249258164233634
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            0.09305375299300067,
+            0.4125305309717078
+          ]
+        }
+      },
+      "startup": [
+        "ServerArgs(model_path='/var/lib/longhorn/nvme-02/freetoken/models/flash-e2m1.ftw', tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, max_running_req=1, attention_backend='auto', kv_cache_dtype='auto', moe_backend='offload', nvfp4_backend=None, moe_activation_dtype='auto', expert_load='auto', bank_source='auto', moe_bank_hugepages='off', moe_bank_hugepages_tmpfs=None, moe_bank_hugepages_tmpfs_margin_gib=1.0, moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=True, kv_reserve_tokens=8192, kv_ladder='on', kv_ladder_explicit=False, kv_ladder_floor_tokens=None, kv_ladder_cap_tokens=None, kv_ladder_explicit_cap=False, moe_cache_policy='lru', moe_prefill_overlap=True, moe_gpu_prefill_layers='auto', moe_prefill_hit_d2d=False, moe_collect_stats=False, moe_cpu_threads=14, moe_cpu_layers=None, moe_disk_layers=None, moe_disk_layer_profile='/var/lib/longhorn/nvme-02/freetoken/layer-profile-v3.json', moe_hot_expert_budget_gib=6.0, moe_hot_capacity_policy='equal', moe_hot_capacity_floor=8, moe_hot_adapt_halflife_steps=2000, moe_hot_adapt_interval_steps=0, moe_hot_adapt_max_swap_gib=0.5, moe_hot_adapt_boundary_cap_frac=0.5, moe_hot_adapt_prefill_weight=0.1, moe_hot_adapt_histories='split', moe_hot_adapt_aim='phase', moe_hot_adapt_prefill_blend=0.25, moe_hot_adapt_prefill_normalize='off', moe_hot_adapt_prefill_run_cap_frac=0.0, moe_hot_adapt_post_prefill_tick=False, moe_hot_plan_persist='off', moe_hot_plan_dir=None, moe_hot_plan_interval_minutes=10.0, moe_hot_adapt_idle_ms=500, moe_hot_adapt_idle_min_interval_ms=2000, moe_disk_prefill='cpu', moe_prefill_coalesce='populate', moe_prefill_hot_split='on', moe_prefill_split_kernel='grouped', moe_cpu_prefill_batch='on', moe_disk_decode='cpu', moe_disk_pager='madvise', moe_disk_lookahead='off', session_expert_prefetch='on', session_protect_experts=64, moe_step_timing=False, moe_cpu_precb='before', moe_cpu_empty_skip='off', moe_cpu_willneed='recent', moe_cpu_willneed_recent_steps=256, moe_cpu_willneed_fault_ceiling=2000.0, host_cache_reserve_gib=None, moe_pager_budget_gib=None, moe_hybrid_max_fetch=-1, ple_backend='uring', ple_prefill_gather='on', ple_cache_gib=8.0, ple_cache_warm=None, ple_cache_profile_out=None, ple_uring_staging_mib=64, ple_uring_queue_depth=64, speculative_mtp='off', mtp_draft_tokens=1, cuda_graph_bs=None, cuda_graph_max_bs=None, page_size=1, memory_ratio=0.9, linear_state_cache_ratio=4.0, kv_disk_cache_dir='/var/lib/longhorn/nvme-02/freetoken/prefix-cache', kv_disk_cache_gib=0.0, kv_harness_prefixes=('opencode=You are OpenCode,', 'pi=You are a focused coding agent.'), lazy_restore='on', swa_full_tokens_ratio=0.2, swa_num_pages_override=None, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=True, max_seq_len_override=100352, num_page_override=None, num_token_override=None, max_extend_tokens=2048, cache_type='naive', offline_mode=False, decode_log_interval=40, special_token_ckpt=False, priority_aging_seconds=30.0, _unique_suffix='.pid=551956', server_host='127.0.0.1', server_port=18090, num_tokenizer=0, silent_output=False, shell_mode=False, served_model_name='qwen3.6-27b', tool_call_parser='qwen3_coder', reasoning_parser='qwen3', sampling_defaults='model', max_output_tokens=None, abort_on_disconnect='on', enable_cache_report=True, cors_origins='tauri://localhost,http://tauri.localhost,http://localhost:1420', gpu=(), gpu_assigned=None)",
+        "[2026-09-05|10:07:42|core|rank=0] INFO     Host memory budget table: total=61.91 GiB, available=58.43 GiB, ceiling=49.14 GiB, pinned_banks=27.04 GiB (derived), hot_staging=0.56 GiB, prefill_scratch=0.30 GiB, pager=21.24 GiB (derived), reserve=9.29 GiB, remainder=0.00 GiB, target pin:pager=28:22",
+        "[2026-09-05|10:09:10|core|rank=0] INFO     MoE bank split residency: 26.44 GiB pinned (cudaHostRegister, 20 GPU layers) + 0.00 GiB OS-locked (0 CPU layers: []) + 37.02 GiB file-backed (28 DISK layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 15, 16, 23, 25, 31, 32, 35, 36, 39, 40, 41, 42, 43, 44, 45, 46, 47])",
+        "[2026-09-05|10:09:10|core|rank=0] INFO     --moe-cache-auto resolved moe_cache_size=4045 num_pages=1024 (+1 dummy page; prefill_overlap=True)",
+        "[2026-09-05|10:09:10|core|rank=0] INFO     MoE HOT expert plan: top 82/512 experts in each of 28 DISK layers, 5.93 GiB protected GPU, bound=budget (budget_limit=82, slot_limit=107, slots=4045, fetch_reserve=1024), profiled hot_pair_rate=66.1%",
+        "[2026-09-05|10:09:10|core|rank=0] INFO     MoE selective prefill: max_tokens=128, dense_union=75%, requires pinned overlap buffers and CUDA batch memcpy; hit-D2D takes precedence",
+        "[2026-09-05|10:09:33|core|rank=0] INFO     MoE HOT expert residency: 2296 protected GPU rows across 28 DISK layers, hot_capacity_policy=equal, hot_capacity_rows_min=82, hot_capacity_rows_max=82, hot_staging_gib=0.56, hot_staging_rows=193"
+      ],
+      "fidelity_passes": 7,
+      "same_answers_as_auto_baseline": 8
+    },
+    "pin40r2": {
+      "requests": [
+        {
+          "kind": "warmup",
+          "size": 64,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 2.7106610640184954,
+          "wall_s": 2.7773323160072323,
+          "decode_s": 0.06667125198873691,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 512,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 6.609403801994631,
+          "wall_s": 6.673359973996412,
+          "decode_s": 0.06395617200178094,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 2048,
+          "repeat": -1,
+          "parallel": false,
+          "ttft_s": 14.374960151995765,
+          "wall_s": 14.442153585987398,
+          "decode_s": 0.06719343399163336,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 64,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 2.265872360992944,
+          "wall_s": 2.3539385010080878,
+          "decode_s": 0.0880661400151439,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 512,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 5.557615903991973,
+          "wall_s": 5.611653054016642,
+          "decode_s": 0.054037150024669245,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "warmup",
+          "size": 2048,
+          "repeat": -1,
+          "parallel": true,
+          "ttft_s": 12.46468945601373,
+          "wall_s": 12.520482124004047,
+          "decode_s": 0.05579266799031757,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 12.035506301996065,
+          "wall_s": 12.092610894993413,
+          "decode_s": 0.057104592997347936,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 11.521486334007932,
+          "wall_s": 11.57635825802572,
+          "decode_s": 0.05487192401778884,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 4.431247747997986,
+          "wall_s": 4.4874861979915295,
+          "decode_s": 0.05623844999354333,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 4.350777539017145,
+          "wall_s": 4.404921400011517,
+          "decode_s": 0.05414386099437252,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 4.453561447997345,
+          "wall_s": 4.511661884986097,
+          "decode_s": 0.058100436988752335,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 512,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 4.301389294996625,
+          "wall_s": 4.353586568002356,
+          "decode_s": 0.052197273005731404,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 524,
+            "completion_tokens": 2,
+            "total_tokens": 526
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 1.5404205509985331,
+          "wall_s": 1.5937112779938616,
+          "decode_s": 0.05329072699532844,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 1.5199713460169733,
+          "wall_s": 1.5742213180055842,
+          "decode_s": 0.05424997198861092,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 11.902956129983068,
+          "wall_s": 11.961396757978946,
+          "decode_s": 0.05844062799587846,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 2048,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 11.67666780698346,
+          "wall_s": 11.733739709976362,
+          "decode_s": 0.057071902992902324,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 2060,
+            "completion_tokens": 2,
+            "total_tokens": 2062
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 1,
+          "parallel": true,
+          "ttft_s": 1.459132326010149,
+          "wall_s": 10.369042293023085,
+          "decode_s": 8.909909967012936,
+          "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE, marking a profound shift from monarchical rule to a complex system of representative government. This transformation was not merely political but ideological, rooted in the deep-seated Roman aversion to kingship, or *regnum*, following the tyrannical reign of the last king, Tarquinius Superbus. The expulsion of the Tarquin dynasty established a new constitutional framework designed to prevent the concentration of power in any single individual, a principle that would define Roman politics for nearly five centuries.\n\nAt the heart of the early Republic was the concept of *res publica*, or \"public affair,\" emphasizing that the state belonged to the people rather than a sovereign ruler. The government was structured around a delicate balance of powers, primarily divided among the magistrates, the Senate, and the popular assemblies. The highest executive authority rested with two consuls",
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 192,
+            "total_tokens": 243
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 1,
+          "parallel": false,
+          "ttft_s": 1.2251847099978477,
+          "wall_s": 7.262597699998878,
+          "decode_s": 6.03741299000103,
+          "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE, marking a profound shift from monarchical rule to a complex system of representative government. This transformation was not merely political but ideological, rooted in the deep-seated Roman aversion to kingship, or *regnum*, following the tyrannical reign of the last king, Tarquinius Superbus. The expulsion of the Tarquin dynasty established a new constitutional framework designed to prevent the concentration of power in any single individual, a principle that would define Roman politics for nearly five centuries.\n\nAt the heart of the early Republic was the concept of *res publica*, or \"public affair,\" emphasizing that the state belonged to the people rather than a sovereign ruler. The government was structured around a delicate balance of powers, primarily divided among the magistrates, the Senate, and the popular assemblies. The highest executive authority rested with two consuls",
+          "usage": {
+            "prompt_tokens": 51,
+            "completion_tokens": 192,
+            "total_tokens": 243
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 1.4896933090058155,
+          "wall_s": 1.562254344986286,
+          "decode_s": 0.07256103598047048,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "prefill",
+          "size": 64,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 1.5048455110227223,
+          "wall_s": 1.5606168090016581,
+          "decode_s": 0.05577129797893576,
+          "text": "OK",
+          "usage": {
+            "prompt_tokens": 76,
+            "completion_tokens": 2,
+            "total_tokens": 78
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 0,
+          "parallel": true,
+          "ttft_s": 1.3002863059809897,
+          "wall_s": 7.988274176983396,
+          "decode_s": 6.687987871002406,
+          "text": "The history of the Roman Republic is not merely a chronicle of political evolution but a foundational narrative for Western civilization, marking the transition from monarchical rule to a complex system of representative governance. The genesis of this era, often referred to as \"Part 0\" in historical retrospectives, begins in 509 BCE with the overthrow of the last Roman king, Lucius Tarquinius Superbus. This pivotal moment was triggered by the infamous rape of Lucretia by the king\u2019s son, Sextus Tarquinius, an act that ignited a revolt led by Lucius Junius Brutus and Lucius Tarquinius Collatinus. The expulsion of the Tarquin dynasty did not simply remove a tyrant; it fundamentally restructured Roman society, embedding a deep-seated cultural aversion to monarchy (*regnum*) that would influence Roman politics for centuries.\n\nIn the immediate aftermath of the regicide, the Romans established a new constitutional framework",
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 192,
+            "total_tokens": 241
+          }
+        },
+        {
+          "kind": "decode",
+          "size": 64,
+          "repeat": 0,
+          "parallel": false,
+          "ttft_s": 1.2064314630115405,
+          "wall_s": 7.257943773991428,
+          "decode_s": 6.051512310979888,
+          "text": "The history of the Roman Republic is not merely a chronicle of political evolution but a foundational narrative for Western civilization, marking the transition from monarchical rule to a complex system of representative governance. The genesis of this era, often referred to as \"Part 0\" in historical retrospectives, begins in 509 BCE with the overthrow of the last Roman king, Lucius Tarquinius Superbus. This pivotal moment was triggered by the infamous rape of Lucretia by the king\u2019s son, Sextus Tarquinius, an act that ignited a revolt led by Lucius Junius Brutus and Lucius Tarquinius Collatinus. The expulsion of the Tarquin dynasty did not simply remove a tyrant; it fundamentally restructured Roman society, embedding a deep-seated cultural aversion to monarchy (*regnum*) that would influence Roman politics for centuries.\n\nIn the immediate aftermath of the regicide, the Romans established a new constitutional framework",
+          "usage": {
+            "prompt_tokens": 49,
+            "completion_tokens": 192,
+            "total_tokens": 241
+          }
+        }
+      ],
+      "quality": [
+        {
+          "name": "arithmetic",
+          "prompt": "Compute 17 + 28 + 45 + 96 + 133. Output only the integer result.",
+          "expected": "319",
+          "answer": "319",
+          "passed": true,
+          "wall_s": 3.1471539170015603,
+          "usage": {
+            "prompt_tokens": 40,
+            "completion_tokens": 4,
+            "total_tokens": 44
+          }
+        },
+        {
+          "name": "codeword",
+          "prompt": "Remember the access code ZEPHYR-58319. Return that exact access code and nothing else.",
+          "expected": "ZEPHYR-58319",
+          "answer": "ZEPHYR-58319",
+          "passed": true,
+          "wall_s": 3.5101889219949953,
+          "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 11,
+            "total_tokens": 47
+          }
+        },
+        {
+          "name": "position",
+          "prompt": "The list is [amber, birch, cobalt, delta, elm]. Output only its third item.",
+          "expected": "cobalt",
+          "answer": "cobalt",
+          "passed": true,
+          "wall_s": 2.473274059011601,
+          "usage": {
+            "prompt_tokens": 34,
+            "completion_tokens": 3,
+            "total_tokens": 37
+          }
+        },
+        {
+          "name": "code_trace",
+          "prompt": "In Python, what is sum(n*n for n in [2,5,8] if n % 2 == 0)? Output only the integer.",
+          "expected": "68",
+          "answer": "108",
+          "passed": false,
+          "wall_s": 2.7227132379775867,
+          "usage": {
+            "prompt_tokens": 44,
+            "completion_tokens": 4,
+            "total_tokens": 48
+          }
+        },
+        {
+          "name": "negation",
+          "prompt": "A farmer has 17 sheep. All but 9 run away. How many remain? Output only the integer.",
+          "expected": "9",
+          "answer": "9",
+          "passed": true,
+          "wall_s": 1.981916638003895,
+          "usage": {
+            "prompt_tokens": 36,
+            "completion_tokens": 2,
+            "total_tokens": 38
+          }
+        },
+        {
+          "name": "ordering",
+          "prompt": "Repeat these IDs in their original order, separated by single spaces, with no other text: Z5 A12 C3 B8",
+          "expected": "Z5 A12 C3 B8",
+          "answer": "Z5 A12 C3 B8",
+          "passed": true,
+          "wall_s": 3.0010117659985553,
+          "usage": {
+            "prompt_tokens": 39,
+            "completion_tokens": 10,
+            "total_tokens": 49
+          }
+        },
+        {
+          "name": "context_override",
+          "prompt": "In this fictional ledger, the capital listed for Norway is Bergen, not Oslo. According to this ledger, what is the capital? Output only the city name.",
+          "expected": "Bergen",
+          "answer": "Bergen",
+          "passed": true,
+          "wall_s": 3.2627857759944163,
+          "usage": {
+            "prompt_tokens": 44,
+            "completion_tokens": 3,
+            "total_tokens": 47
+          }
+        },
+        {
+          "name": "long_retrieval",
+          "prompt": "Read these shipping records:\nRecord 000: package parcel000 has status queued.\nRecord 001: package parcel001 has status queued.\nRecord 002: package parcel002 has status queued.\nRecord 003: package parcel003 has status queued.\nRecord 004: package parcel004 has status queued.\nRecord 005: package parcel005 has status queued.\nRecord 006: package parcel006 has status queued.\nRecord 007: package parcel007 has status queued.\nRecord 008: package parcel008 has status queued.\nRecord 009: package parcel009 has status queued.\nRecord 010: package parcel010 has status queued.\nRecord 011: package parcel011 has status queued.\nRecord 012: package parcel012 has status queued.\nRecord 013: package parcel013 has status queued.\nRecord 014: package parcel014 has status queued.\nRecord 015: package parcel015 has status queued.\nRecord 016: package parcel016 has status queued.\nRecord 017: package parcel017 has status queued.\nRecord 018: package parcel018 has status queued.\nRecord 019: package parcel019 has status queued.\nRecord 020: package parcel020 has status queued.\nRecord 021: package parcel021 has status queued.\nRecord 022: package parcel022 has status queued.\nRecord 023: package parcel023 has status queued.\nRecord 024: package parcel024 has status queued.\nRecord 025: package parcel025 has status queued.\nRecord 026: package parcel026 has status queued.\nRecord 027: package parcel027 has status queued.\nRecord 028: package parcel028 has status queued.\nRecord 029: package parcel029 has status queued.\nRecord 030: package parcel030 has status queued.\nRecord 031: package parcel031 has status queued.\nRecord 032: package parcel032 has status queued.\nRecord 033: package parcel033 has status queued.\nRecord 034: package parcel034 has status queued.\nRecord 035: package parcel035 has status queued.\nRecord 036: package parcel036 has status queued.\nRecord 037: package parcel037 has status queued.\nRecord 038: package parcel038 has status queued.\nRecord 039: package parcel039 has status queued.\nRecord 040: package parcel040 has status queued.\nRecord 041: package parcel041 has status queued.\nRecord 042: package parcel042 has status queued.\nRecord 043: package parcel043 has status queued.\nRecord 044: package parcel044 has status queued.\nRecord 045: package parcel045 has status queued.\nRecord 046: package parcel046 has status queued.\nRecord 047: package parcel047 has status queued.\nRecord 048: package parcel048 has status queued.\nRecord 049: package parcel049 has status queued.\nRecord 050: package parcel050 has status queued.\nRecord 051: package parcel051 has status delivered; its receipt is VIOLET-68243.\nRecord 052: package parcel052 has status queued.\nRecord 053: package parcel053 has status queued.\nRecord 054: package parcel054 has status queued.\nRecord 055: package parcel055 has status queued.\nRecord 056: package parcel056 has status queued.\nRecord 057: package parcel057 has status queued.\nRecord 058: package parcel058 has status queued.\nRecord 059: package parcel059 has status queued.\nRecord 060: package parcel060 has status queued.\nRecord 061: package parcel061 has status queued.\nRecord 062: package parcel062 has status queued.\nRecord 063: package parcel063 has status queued.\nRecord 064: package parcel064 has status queued.\nRecord 065: package parcel065 has status queued.\nRecord 066: package parcel066 has status queued.\nRecord 067: package parcel067 has status queued.\nRecord 068: package parcel068 has status queued.\nRecord 069: package parcel069 has status queued.\nRecord 070: package parcel070 has status queued.\nRecord 071: package parcel071 has status queued.\nRecord 072: package parcel072 has status queued.\nRecord 073: package parcel073 has status queued.\nRecord 074: package parcel074 has status queued.\nRecord 075: package parcel075 has status queued.\nRecord 076: package parcel076 has status queued.\nRecord 077: package parcel077 has status queued.\nRecord 078: package parcel078 has status queued.\nRecord 079: package parcel079 has status queued.\nRecord 080: package parcel080 has status queued.\nRecord 081: package parcel081 has status queued.\nRecord 082: package parcel082 has status queued.\nRecord 083: package parcel083 has status queued.\nRecord 084: package parcel084 has status queued.\nRecord 085: package parcel085 has status queued.\nRecord 086: package parcel086 has status queued.\nRecord 087: package parcel087 has status queued.\nRecord 088: package parcel088 has status queued.\nRecord 089: package parcel089 has status queued.\nRecord 090: package parcel090 has status queued.\nRecord 091: package parcel091 has status queued.\nRecord 092: package parcel092 has status queued.\nRecord 093: package parcel093 has status queued.\nRecord 094: package parcel094 has status queued.\nRecord 095: package parcel095 has status queued.\nRecord 096: package parcel096 has status queued.\nRecord 097: package parcel097 has status queued.\nRecord 098: package parcel098 has status queued.\nRecord 099: package parcel099 has status queued.\nRecord 100: package parcel100 has status queued.\nRecord 101: package parcel101 has status queued.\nRecord 102: package parcel102 has status queued.\nRecord 103: package parcel103 has status queued.\nRecord 104: package parcel104 has status queued.\nRecord 105: package parcel105 has status queued.\nRecord 106: package parcel106 has status queued.\nRecord 107: package parcel107 has status queued.\nRecord 108: package parcel108 has status queued.\nRecord 109: package parcel109 has status queued.\nRecord 110: package parcel110 has status queued.\nRecord 111: package parcel111 has status queued.\nRecord 112: package parcel112 has status queued.\nRecord 113: package parcel113 has status queued.\nRecord 114: package parcel114 has status queued.\nRecord 115: package parcel115 has status queued.\nRecord 116: package parcel116 has status queued.\nRecord 117: package parcel117 has status queued.\nRecord 118: package parcel118 has status queued.\nRecord 119: package parcel119 has status queued.\nWhat is the receipt for parcel051? Return only the exact receipt code.",
+          "expected": "VIOLET-68243",
+          "answer": "VIOLET-68243",
+          "passed": true,
+          "wall_s": 16.14745272800792,
+          "usage": {
+            "prompt_tokens": 1968,
+            "completion_tokens": 10,
+            "total_tokens": 1978
+          }
+        }
+      ],
+      "summary": {
+        "prefill_64": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 1.5048323275113944,
+            "wall_mean_s": 1.568237831495935,
+            "decode_tokens_per_s": 15.771501481067265
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 1.5226330310106277,
+            "wall_mean_s": 1.5771640434977598,
+            "decode_tokens_per_s": 18.338188755178056
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            0.015152202016906813,
+            0.020449204981559888
+          ]
+        },
+        "prefill_512": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 4.402169493507245,
+            "wall_mean_s": 4.458291642498807,
+            "decode_tokens_per_s": 17.818277061171393
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 4.3663185214973055,
+            "wall_mean_s": 4.420536382996943,
+            "decode_tokens_per_s": 18.44410628417516
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.15217215300071985,
+            0.08047020898084156
+          ]
+        },
+        "prefill_2048": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 11.969231215989566,
+            "wall_mean_s": 12.02700382648618,
+            "decode_tokens_per_s": 17.309240337315604
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 11.599077070495696,
+            "wall_mean_s": 11.655048984001041,
+            "decode_tokens_per_s": 17.866103503938547
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            -0.22628832299960777,
+            -0.5140199679881334
+          ]
+        },
+        "decode_64": {
+          "False": {
+            "count": 2,
+            "ttft_mean_s": 1.215808086504694,
+            "wall_mean_s": 7.260270736995153,
+            "decode_tokens_per_s": 31.599169528246136
+          },
+          "True": {
+            "count": 2,
+            "ttft_mean_s": 1.3797093159955693,
+            "wall_mean_s": 9.17865823500324,
+            "decode_tokens_per_s": 24.490479676625785
+          },
+          "text_matches": 2,
+          "usage_matches": 2,
+          "ttft_deltas_s": [
+            0.09385484296944924,
+            0.2339476160123013
+          ]
+        }
+      },
+      "startup": [
+        "ServerArgs(model_path='/var/lib/longhorn/nvme-02/freetoken/models/flash-e2m1.ftw', tp_info=DistributedInfo(rank=0, size=1), dtype=torch.bfloat16, max_running_req=1, attention_backend='auto', kv_cache_dtype='auto', moe_backend='offload', nvfp4_backend=None, moe_activation_dtype='auto', expert_load='auto', bank_source='auto', moe_bank_hugepages='off', moe_bank_hugepages_tmpfs=None, moe_bank_hugepages_tmpfs_margin_gib=1.0, moe_cache_size=0, moe_cache_rate=None, moe_cache_auto=True, kv_reserve_tokens=8192, kv_ladder='on', kv_ladder_explicit=False, kv_ladder_floor_tokens=None, kv_ladder_cap_tokens=None, kv_ladder_explicit_cap=False, moe_cache_policy='lru', moe_prefill_overlap=True, moe_gpu_prefill_layers='auto', moe_prefill_hit_d2d=False, moe_collect_stats=False, moe_cpu_threads=14, moe_cpu_layers=None, moe_disk_layers=None, moe_disk_layer_profile='/var/lib/longhorn/nvme-02/freetoken/layer-profile-v3.json', moe_hot_expert_budget_gib=6.0, moe_hot_capacity_policy='equal', moe_hot_capacity_floor=8, moe_hot_adapt_halflife_steps=2000, moe_hot_adapt_interval_steps=0, moe_hot_adapt_max_swap_gib=0.5, moe_hot_adapt_boundary_cap_frac=0.5, moe_hot_adapt_prefill_weight=0.1, moe_hot_adapt_histories='split', moe_hot_adapt_aim='phase', moe_hot_adapt_prefill_blend=0.25, moe_hot_adapt_prefill_normalize='off', moe_hot_adapt_prefill_run_cap_frac=0.0, moe_hot_adapt_post_prefill_tick=False, moe_hot_plan_persist='off', moe_hot_plan_dir=None, moe_hot_plan_interval_minutes=10.0, moe_hot_adapt_idle_ms=500, moe_hot_adapt_idle_min_interval_ms=2000, moe_disk_prefill='cpu', moe_prefill_coalesce='populate', moe_prefill_hot_split='on', moe_prefill_split_kernel='grouped', moe_cpu_prefill_batch='on', moe_disk_decode='cpu', moe_disk_pager='madvise', moe_disk_lookahead='off', session_expert_prefetch='on', session_protect_experts=64, moe_step_timing=False, moe_cpu_precb='before', moe_cpu_empty_skip='off', moe_cpu_willneed='recent', moe_cpu_willneed_recent_steps=256, moe_cpu_willneed_fault_ceiling=2000.0, host_cache_reserve_gib=None, moe_pager_budget_gib=None, moe_hybrid_max_fetch=-1, ple_backend='uring', ple_prefill_gather='on', ple_cache_gib=8.0, ple_cache_warm=None, ple_cache_profile_out=None, ple_uring_staging_mib=64, ple_uring_queue_depth=64, speculative_mtp='off', mtp_draft_tokens=1, cuda_graph_bs=None, cuda_graph_max_bs=None, page_size=1, memory_ratio=0.9, linear_state_cache_ratio=4.0, kv_disk_cache_dir='/var/lib/longhorn/nvme-02/freetoken/prefix-cache', kv_disk_cache_gib=0.0, kv_harness_prefixes=('opencode=You are OpenCode,', 'pi=You are a focused coding agent.'), lazy_restore='on', swa_full_tokens_ratio=0.2, swa_num_pages_override=None, distributed_timeout=60.0, use_dummy_weight=False, use_pynccl=True, max_seq_len_override=100352, num_page_override=None, num_token_override=None, max_extend_tokens=2048, cache_type='naive', offline_mode=False, decode_log_interval=40, special_token_ckpt=False, priority_aging_seconds=30.0, _unique_suffix='.pid=553758', server_host='127.0.0.1', server_port=18090, num_tokenizer=0, silent_output=False, shell_mode=False, served_model_name='qwen3.6-27b', tool_call_parser='qwen3_coder', reasoning_parser='qwen3', sampling_defaults='model', max_output_tokens=None, abort_on_disconnect='on', enable_cache_report=True, cors_origins='tauri://localhost,http://tauri.localhost,http://localhost:1420', gpu=(), gpu_assigned=None)",
+        "[2026-09-05|10:14:17|core|rank=0] INFO     Host memory budget table: total=61.91 GiB, available=58.38 GiB, ceiling=49.09 GiB, pinned_banks=40.00 GiB (explicit), hot_staging=0.56 GiB, prefill_scratch=0.30 GiB, pager=8.22 GiB (derived), reserve=9.29 GiB, remainder=0.00 GiB, target pin:pager=28:22",
+        "[2026-09-05|10:17:20|core|rank=0] INFO     MoE bank split residency: 39.66 GiB pinned (cudaHostRegister, 30 GPU layers) + 0.00 GiB OS-locked (0 CPU layers: []) + 23.80 GiB file-backed (18 DISK layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 39, 40, 41, 42, 43, 44, 45, 46, 47])",
+        "[2026-09-05|10:17:20|core|rank=0] INFO     --moe-cache-auto resolved moe_cache_size=4045 num_pages=1024 (+1 dummy page; prefill_overlap=True)",
+        "[2026-09-05|10:17:20|core|rank=0] INFO     MoE HOT expert plan: top 129/512 experts in each of 18 DISK layers, 6.00 GiB protected GPU, bound=budget (budget_limit=129, slot_limit=167, slots=4045, fetch_reserve=1024), profiled hot_pair_rate=77.0%",
+        "[2026-09-05|10:17:20|core|rank=0] INFO     MoE selective prefill: max_tokens=128, dense_union=75%, requires pinned overlap buffers and CUDA batch memcpy; hit-D2D takes precedence",
+        "[2026-09-05|10:17:39|core|rank=0] INFO     MoE HOT expert residency: 2322 protected GPU rows across 18 DISK layers, hot_capacity_policy=equal, hot_capacity_rows_min=129, hot_capacity_rows_max=129, hot_staging_gib=0.56, hot_staging_rows=193"
+      ],
+      "fidelity_passes": 7,
+      "same_answers_as_auto_baseline": 8
+    }
+  },
+  "date_utc": "2026-09-05",
+  "hardware": {
+    "host": "node-4",
+    "gpu": "RTX 4090 24GB",
+    "ram_gib": 61.91,
+    "torch": "2.11.0+cu130",
+    "triton": "3.6.0",
+    "cuda_toolkit": "13.0",
+    "cpu": "AMD Ryzen 7 7800X3D, 8 physical cores / 16 logical CPUs"
+  },
+  "model": "existing flash-e2m1.ftw, native NVFP4 experts",
+  "configuration": {
+    "parallel_field_means": "FREETOKEN_PREFILL_HOT_OVERLAP scheduling policy",
+    "moe_collect_stats": false,
+    "moe_step_timing": false,
+    "ple_profile_polling": false,
+    "hot_adapt_interval_steps": 0,
+    "hot_plan_persist": "off",
+    "kv_disk_cache_gib": 0,
+    "cache_type": "naive",
+    "selective_prefill_max_tokens": 128,
+    "parallel_hot_routing": true,
+    "cpu_threads": 14,
+    "cpu_prefill_kernel": "vnni_rows32",
+    "max_extend_length": 2048,
+    "max_running_requests": 1,
+    "kv_tokens": 65536,
+    "expert_slots": 4045,
+    "control": "8-byte mmap read at begin_prefill in both modes; no timers/counters/profiling added",
+    "mode": "four server starts: 40 GiB, automatic, automatic, 40 GiB; two pairs per workload per start",
+    "cold_boot_page_cache_flush": false
+  },
+  "baseline_quality": {
+    "pin40a": [
+      {
+        "name": "arithmetic",
+        "prompt": "Compute 17 + 28 + 45 + 96 + 133. Output only the integer result.",
+        "expected": "319",
+        "answer": "319",
+        "passed": true,
+        "wall_s": 4.359104205999756,
+        "usage": {
+          "prompt_tokens": 40,
+          "completion_tokens": 4,
+          "total_tokens": 44
+        }
+      },
+      {
+        "name": "codeword",
+        "prompt": "Remember the access code ZEPHYR-58319. Return that exact access code and nothing else.",
+        "expected": "ZEPHYR-58319",
+        "answer": "ZEPHYR-58319",
+        "passed": true,
+        "wall_s": 4.831581956008449,
+        "usage": {
+          "prompt_tokens": 36,
+          "completion_tokens": 11,
+          "total_tokens": 47
+        }
+      },
+      {
+        "name": "position",
+        "prompt": "The list is [amber, birch, cobalt, delta, elm]. Output only its third item.",
+        "expected": "cobalt",
+        "answer": "cobalt",
+        "passed": true,
+        "wall_s": 3.8557538829918485,
+        "usage": {
+          "prompt_tokens": 34,
+          "completion_tokens": 3,
+          "total_tokens": 37
+        }
+      },
+      {
+        "name": "code_trace",
+        "prompt": "In Python, what is sum(n*n for n in [2,5,8] if n % 2 == 0)? Output only the integer.",
+        "expected": "68",
+        "answer": "108",
+        "passed": false,
+        "wall_s": 3.9717935619992204,
+        "usage": {
+          "prompt_tokens": 44,
+          "completion_tokens": 4,
+          "total_tokens": 48
+        }
+      },
+      {
+        "name": "negation",
+        "prompt": "A farmer has 17 sheep. All but 9 run away. How many remain? Output only the integer.",
+        "expected": "9",
+        "answer": "9",
+        "passed": true,
+        "wall_s": 3.1451516800152604,
+        "usage": {
+          "prompt_tokens": 36,
+          "completion_tokens": 2,
+          "total_tokens": 38
+        }
+      },
+      {
+        "name": "ordering",
+        "prompt": "Repeat these IDs in their original order, separated by single spaces, with no other text: Z5 A12 C3 B8",
+        "expected": "Z5 A12 C3 B8",
+        "answer": "Z5 A12 C3 B8",
+        "passed": true,
+        "wall_s": 4.129413435002789,
+        "usage": {
+          "prompt_tokens": 39,
+          "completion_tokens": 10,
+          "total_tokens": 49
+        }
+      },
+      {
+        "name": "context_override",
+        "prompt": "In this fictional ledger, the capital listed for Norway is Bergen, not Oslo. According to this ledger, what is the capital? Output only the city name.",
+        "expected": "Bergen",
+        "answer": "Bergen",
+        "passed": true,
+        "wall_s": 3.5206479160115123,
+        "usage": {
+          "prompt_tokens": 44,
+          "completion_tokens": 3,
+          "total_tokens": 47
+        }
+      },
+      {
+        "name": "long_retrieval",
+        "prompt": "Read these shipping records:\nRecord 000: package parcel000 has status queued.\nRecord 001: package parcel001 has status queued.\nRecord 002: package parcel002 has status queued.\nRecord 003: package parcel003 has status queued.\nRecord 004: package parcel004 has status queued.\nRecord 005: package parcel005 has status queued.\nRecord 006: package parcel006 has status queued.\nRecord 007: package parcel007 has status queued.\nRecord 008: package parcel008 has status queued.\nRecord 009: package parcel009 has status queued.\nRecord 010: package parcel010 has status queued.\nRecord 011: package parcel011 has status queued.\nRecord 012: package parcel012 has status queued.\nRecord 013: package parcel013 has status queued.\nRecord 014: package parcel014 has status queued.\nRecord 015: package parcel015 has status queued.\nRecord 016: package parcel016 has status queued.\nRecord 017: package parcel017 has status queued.\nRecord 018: package parcel018 has status queued.\nRecord 019: package parcel019 has status queued.\nRecord 020: package parcel020 has status queued.\nRecord 021: package parcel021 has status queued.\nRecord 022: package parcel022 has status queued.\nRecord 023: package parcel023 has status queued.\nRecord 024: package parcel024 has status queued.\nRecord 025: package parcel025 has status queued.\nRecord 026: package parcel026 has status queued.\nRecord 027: package parcel027 has status queued.\nRecord 028: package parcel028 has status queued.\nRecord 029: package parcel029 has status queued.\nRecord 030: package parcel030 has status queued.\nRecord 031: package parcel031 has status queued.\nRecord 032: package parcel032 has status queued.\nRecord 033: package parcel033 has status queued.\nRecord 034: package parcel034 has status queued.\nRecord 035: package parcel035 has status queued.\nRecord 036: package parcel036 has status queued.\nRecord 037: package parcel037 has status queued.\nRecord 038: package parcel038 has status queued.\nRecord 039: package parcel039 has status queued.\nRecord 040: package parcel040 has status queued.\nRecord 041: package parcel041 has status queued.\nRecord 042: package parcel042 has status queued.\nRecord 043: package parcel043 has status queued.\nRecord 044: package parcel044 has status queued.\nRecord 045: package parcel045 has status queued.\nRecord 046: package parcel046 has status queued.\nRecord 047: package parcel047 has status queued.\nRecord 048: package parcel048 has status queued.\nRecord 049: package parcel049 has status queued.\nRecord 050: package parcel050 has status queued.\nRecord 051: package parcel051 has status delivered; its receipt is VIOLET-68243.\nRecord 052: package parcel052 has status queued.\nRecord 053: package parcel053 has status queued.\nRecord 054: package parcel054 has status queued.\nRecord 055: package parcel055 has status queued.\nRecord 056: package parcel056 has status queued.\nRecord 057: package parcel057 has status queued.\nRecord 058: package parcel058 has status queued.\nRecord 059: package parcel059 has status queued.\nRecord 060: package parcel060 has status queued.\nRecord 061: package parcel061 has status queued.\nRecord 062: package parcel062 has status queued.\nRecord 063: package parcel063 has status queued.\nRecord 064: package parcel064 has status queued.\nRecord 065: package parcel065 has status queued.\nRecord 066: package parcel066 has status queued.\nRecord 067: package parcel067 has status queued.\nRecord 068: package parcel068 has status queued.\nRecord 069: package parcel069 has status queued.\nRecord 070: package parcel070 has status queued.\nRecord 071: package parcel071 has status queued.\nRecord 072: package parcel072 has status queued.\nRecord 073: package parcel073 has status queued.\nRecord 074: package parcel074 has status queued.\nRecord 075: package parcel075 has status queued.\nRecord 076: package parcel076 has status queued.\nRecord 077: package parcel077 has status queued.\nRecord 078: package parcel078 has status queued.\nRecord 079: package parcel079 has status queued.\nRecord 080: package parcel080 has status queued.\nRecord 081: package parcel081 has status queued.\nRecord 082: package parcel082 has status queued.\nRecord 083: package parcel083 has status queued.\nRecord 084: package parcel084 has status queued.\nRecord 085: package parcel085 has status queued.\nRecord 086: package parcel086 has status queued.\nRecord 087: package parcel087 has status queued.\nRecord 088: package parcel088 has status queued.\nRecord 089: package parcel089 has status queued.\nRecord 090: package parcel090 has status queued.\nRecord 091: package parcel091 has status queued.\nRecord 092: package parcel092 has status queued.\nRecord 093: package parcel093 has status queued.\nRecord 094: package parcel094 has status queued.\nRecord 095: package parcel095 has status queued.\nRecord 096: package parcel096 has status queued.\nRecord 097: package parcel097 has status queued.\nRecord 098: package parcel098 has status queued.\nRecord 099: package parcel099 has status queued.\nRecord 100: package parcel100 has status queued.\nRecord 101: package parcel101 has status queued.\nRecord 102: package parcel102 has status queued.\nRecord 103: package parcel103 has status queued.\nRecord 104: package parcel104 has status queued.\nRecord 105: package parcel105 has status queued.\nRecord 106: package parcel106 has status queued.\nRecord 107: package parcel107 has status queued.\nRecord 108: package parcel108 has status queued.\nRecord 109: package parcel109 has status queued.\nRecord 110: package parcel110 has status queued.\nRecord 111: package parcel111 has status queued.\nRecord 112: package parcel112 has status queued.\nRecord 113: package parcel113 has status queued.\nRecord 114: package parcel114 has status queued.\nRecord 115: package parcel115 has status queued.\nRecord 116: package parcel116 has status queued.\nRecord 117: package parcel117 has status queued.\nRecord 118: package parcel118 has status queued.\nRecord 119: package parcel119 has status queued.\nWhat is the receipt for parcel051? Return only the exact receipt code.",
+        "expected": "VIOLET-68243",
+        "answer": "VIOLET-68243",
+        "passed": true,
+        "wall_s": 16.34942535002483,
+        "usage": {
+          "prompt_tokens": 1968,
+          "completion_tokens": 10,
+          "total_tokens": 1978
+        }
+      }
+    ],
+    "autoq": [
+      {
+        "name": "arithmetic",
+        "prompt": "Compute 17 + 28 + 45 + 96 + 133. Output only the integer result.",
+        "expected": "319",
+        "answer": "319",
+        "passed": true,
+        "wall_s": 3.7217073059873655,
+        "usage": {
+          "prompt_tokens": 40,
+          "completion_tokens": 4,
+          "total_tokens": 44
+        }
+      },
+      {
+        "name": "codeword",
+        "prompt": "Remember the access code ZEPHYR-58319. Return that exact access code and nothing else.",
+        "expected": "ZEPHYR-58319",
+        "answer": "ZEPHYR-58319",
+        "passed": true,
+        "wall_s": 3.9943202440044843,
+        "usage": {
+          "prompt_tokens": 36,
+          "completion_tokens": 11,
+          "total_tokens": 47
+        }
+      },
+      {
+        "name": "position",
+        "prompt": "The list is [amber, birch, cobalt, delta, elm]. Output only its third item.",
+        "expected": "cobalt",
+        "answer": "cobalt",
+        "passed": true,
+        "wall_s": 2.786641298007453,
+        "usage": {
+          "prompt_tokens": 34,
+          "completion_tokens": 3,
+          "total_tokens": 37
+        }
+      },
+      {
+        "name": "code_trace",
+        "prompt": "In Python, what is sum(n*n for n in [2,5,8] if n % 2 == 0)? Output only the integer.",
+        "expected": "68",
+        "answer": "108",
+        "passed": false,
+        "wall_s": 2.9325163849862292,
+        "usage": {
+          "prompt_tokens": 44,
+          "completion_tokens": 4,
+          "total_tokens": 48
+        }
+      },
+      {
+        "name": "negation",
+        "prompt": "A farmer has 17 sheep. All but 9 run away. How many remain? Output only the integer.",
+        "expected": "9",
+        "answer": "9",
+        "passed": true,
+        "wall_s": 2.6727680480107665,
+        "usage": {
+          "prompt_tokens": 36,
+          "completion_tokens": 2,
+          "total_tokens": 38
+        }
+      },
+      {
+        "name": "ordering",
+        "prompt": "Repeat these IDs in their original order, separated by single spaces, with no other text: Z5 A12 C3 B8",
+        "expected": "Z5 A12 C3 B8",
+        "answer": "Z5 A12 C3 B8",
+        "passed": true,
+        "wall_s": 3.1719407519849483,
+        "usage": {
+          "prompt_tokens": 39,
+          "completion_tokens": 10,
+          "total_tokens": 49
+        }
+      },
+      {
+        "name": "context_override",
+        "prompt": "In this fictional ledger, the capital listed for Norway is Bergen, not Oslo. According to this ledger, what is the capital? Output only the city name.",
+        "expected": "Bergen",
+        "answer": "Bergen",
+        "passed": true,
+        "wall_s": 3.062684350006748,
+        "usage": {
+          "prompt_tokens": 44,
+          "completion_tokens": 3,
+          "total_tokens": 47
+        }
+      },
+      {
+        "name": "long_retrieval",
+        "prompt": "Read these shipping records:\nRecord 000: package parcel000 has status queued.\nRecord 001: package parcel001 has status queued.\nRecord 002: package parcel002 has status queued.\nRecord 003: package parcel003 has status queued.\nRecord 004: package parcel004 has status queued.\nRecord 005: package parcel005 has status queued.\nRecord 006: package parcel006 has status queued.\nRecord 007: package parcel007 has status queued.\nRecord 008: package parcel008 has status queued.\nRecord 009: package parcel009 has status queued.\nRecord 010: package parcel010 has status queued.\nRecord 011: package parcel011 has status queued.\nRecord 012: package parcel012 has status queued.\nRecord 013: package parcel013 has status queued.\nRecord 014: package parcel014 has status queued.\nRecord 015: package parcel015 has status queued.\nRecord 016: package parcel016 has status queued.\nRecord 017: package parcel017 has status queued.\nRecord 018: package parcel018 has status queued.\nRecord 019: package parcel019 has status queued.\nRecord 020: package parcel020 has status queued.\nRecord 021: package parcel021 has status queued.\nRecord 022: package parcel022 has status queued.\nRecord 023: package parcel023 has status queued.\nRecord 024: package parcel024 has status queued.\nRecord 025: package parcel025 has status queued.\nRecord 026: package parcel026 has status queued.\nRecord 027: package parcel027 has status queued.\nRecord 028: package parcel028 has status queued.\nRecord 029: package parcel029 has status queued.\nRecord 030: package parcel030 has status queued.\nRecord 031: package parcel031 has status queued.\nRecord 032: package parcel032 has status queued.\nRecord 033: package parcel033 has status queued.\nRecord 034: package parcel034 has status queued.\nRecord 035: package parcel035 has status queued.\nRecord 036: package parcel036 has status queued.\nRecord 037: package parcel037 has status queued.\nRecord 038: package parcel038 has status queued.\nRecord 039: package parcel039 has status queued.\nRecord 040: package parcel040 has status queued.\nRecord 041: package parcel041 has status queued.\nRecord 042: package parcel042 has status queued.\nRecord 043: package parcel043 has status queued.\nRecord 044: package parcel044 has status queued.\nRecord 045: package parcel045 has status queued.\nRecord 046: package parcel046 has status queued.\nRecord 047: package parcel047 has status queued.\nRecord 048: package parcel048 has status queued.\nRecord 049: package parcel049 has status queued.\nRecord 050: package parcel050 has status queued.\nRecord 051: package parcel051 has status delivered; its receipt is VIOLET-68243.\nRecord 052: package parcel052 has status queued.\nRecord 053: package parcel053 has status queued.\nRecord 054: package parcel054 has status queued.\nRecord 055: package parcel055 has status queued.\nRecord 056: package parcel056 has status queued.\nRecord 057: package parcel057 has status queued.\nRecord 058: package parcel058 has status queued.\nRecord 059: package parcel059 has status queued.\nRecord 060: package parcel060 has status queued.\nRecord 061: package parcel061 has status queued.\nRecord 062: package parcel062 has status queued.\nRecord 063: package parcel063 has status queued.\nRecord 064: package parcel064 has status queued.\nRecord 065: package parcel065 has status queued.\nRecord 066: package parcel066 has status queued.\nRecord 067: package parcel067 has status queued.\nRecord 068: package parcel068 has status queued.\nRecord 069: package parcel069 has status queued.\nRecord 070: package parcel070 has status queued.\nRecord 071: package parcel071 has status queued.\nRecord 072: package parcel072 has status queued.\nRecord 073: package parcel073 has status queued.\nRecord 074: package parcel074 has status queued.\nRecord 075: package parcel075 has status queued.\nRecord 076: package parcel076 has status queued.\nRecord 077: package parcel077 has status queued.\nRecord 078: package parcel078 has status queued.\nRecord 079: package parcel079 has status queued.\nRecord 080: package parcel080 has status queued.\nRecord 081: package parcel081 has status queued.\nRecord 082: package parcel082 has status queued.\nRecord 083: package parcel083 has status queued.\nRecord 084: package parcel084 has status queued.\nRecord 085: package parcel085 has status queued.\nRecord 086: package parcel086 has status queued.\nRecord 087: package parcel087 has status queued.\nRecord 088: package parcel088 has status queued.\nRecord 089: package parcel089 has status queued.\nRecord 090: package parcel090 has status queued.\nRecord 091: package parcel091 has status queued.\nRecord 092: package parcel092 has status queued.\nRecord 093: package parcel093 has status queued.\nRecord 094: package parcel094 has status queued.\nRecord 095: package parcel095 has status queued.\nRecord 096: package parcel096 has status queued.\nRecord 097: package parcel097 has status queued.\nRecord 098: package parcel098 has status queued.\nRecord 099: package parcel099 has status queued.\nRecord 100: package parcel100 has status queued.\nRecord 101: package parcel101 has status queued.\nRecord 102: package parcel102 has status queued.\nRecord 103: package parcel103 has status queued.\nRecord 104: package parcel104 has status queued.\nRecord 105: package parcel105 has status queued.\nRecord 106: package parcel106 has status queued.\nRecord 107: package parcel107 has status queued.\nRecord 108: package parcel108 has status queued.\nRecord 109: package parcel109 has status queued.\nRecord 110: package parcel110 has status queued.\nRecord 111: package parcel111 has status queued.\nRecord 112: package parcel112 has status queued.\nRecord 113: package parcel113 has status queued.\nRecord 114: package parcel114 has status queued.\nRecord 115: package parcel115 has status queued.\nRecord 116: package parcel116 has status queued.\nRecord 117: package parcel117 has status queued.\nRecord 118: package parcel118 has status queued.\nRecord 119: package parcel119 has status queued.\nWhat is the receipt for parcel051? Return only the exact receipt code.",
+        "expected": "VIOLET-68243",
+        "answer": "VIOLET-68243",
+        "passed": true,
+        "wall_s": 25.784430194005836,
+        "usage": {
+          "prompt_tokens": 1968,
+          "completion_tokens": 10,
+          "total_tokens": 1978
+        }
+      }
+    ]
+  },
+  "interpretation": [
+    "The initial 40 GiB check failed an absolute exact-answer gate. The automatic budget returned the identical wrong code_trace answer, 108 instead of 68. All eight baseline answers matched between budgets. These preliminary checks had selective transfers disabled and no wall-time requests followed the failing gate.",
+    "All four measured starts enabled selective transfers up to 128 tokens and retained the same 7/8 score and eight answers. No new failure was allowed relative to the automatic baseline. This is a small prompt-fidelity check, not a broad model-quality evaluation.",
+    "The first/second schedule order was chosen from a global shuffled index. This accidentally put concurrent mode second for both long-prefill pairs and serial mode second for both decode pairs. Apparent schedule effects are confounded by expert-cache warming; they are not evidence accepting overlap.",
+    "Request order is identical across RAM budgets, so the large RAM effect is compared within each fixed schedule. Decode answers differ across RAM budgets. The RAM setting changes CPU/GPU placement and arithmetic, and its throughput results alone do not establish unchanged quality.",
+    "The paired-order bug is corrected in input-reuse benchmark revision a6a07aa, balancing order separately within each workload. The original records are retained without reordering or excluding pairs."
+  ],
+  "driver_source": "import json, os, pathlib, shlex, signal, subprocess, time, urllib.request\nR=pathlib.Path('/var/lib/longhorn/nvme-02/freetoken')\nWT=R/'wt-astra-concurrent-prefill'\nSRC=R/'wt-plegather'\nOUT=R/'results'\nUNIT='astra-ram-overlap-server'\n\ndef run(*args, **kwargs):\n    return subprocess.run(args, check=True, text=True, **kwargs)\n\ndef stop():\n    subprocess.run(['sudo','-n','systemctl','stop',UNIT], check=False)\n\ndef interrupted(*_):\n    raise RuntimeError('benchmark interrupted, restoring service')\n\nsignal.signal(signal.SIGTERM, interrupted)\nsignal.signal(signal.SIGINT, interrupted)\nrun('git','-C',str(WT),'pull','--ff-only','https://github.com/jomcgi-org/freetoken-fork.git','perf/4090-concurrent-prefill')\n# Both modes read the same control mmap at a prefill boundary.\n# This benchmark-only hook collects no profiling data.\nprobe=R/'tmp'/'astra-ram-overlap-toggle'\nprobe.mkdir(exist_ok=True)\ncontrol=R/'tmp/astra-ram-overlap-control.bin'\ncontrol.write_bytes((1).to_bytes(8,'little'))\n(probe/'sitecustomize.py').write_text(\"\"\"\nimport mmap\nfrom freetoken.moe.offload_cache import OffloadMoeCache\nfrom freetoken.layers import moe\n_control_file = open('/var/lib/longhorn/nvme-02/freetoken/tmp/astra-ram-overlap-control.bin', 'rb')\n_control = mmap.mmap(_control_file.fileno(), 8, access=mmap.ACCESS_READ)\n_original = OffloadMoeCache.begin_prefill\ndef _begin(self, num_tokens=None):\n    moe._PREFILL_HOT_OVERLAP = bool(int.from_bytes(_control[:8], 'little'))\n    return _original(self, num_tokens)\nOffloadMoeCache.begin_prefill = _begin\n\"\"\")\n\nservice=pathlib.Path('/etc/systemd/system/freetoken-serve.service').read_text().replace('\\\\\\n', ' ')\nargs=shlex.split(next(line[10:] for line in service.splitlines() if line.startswith('ExecStart=')))\nargs[0]=str(SRC/'.venv/bin/ft')\n# Same CPU, PLE, and KV settings as the deployed unit. Vary only the PIN budget.\n# Selective transfers up to 128 tokens are enabled in both arms. Fixed static HOT\n# placement and disabled disk KV make repeated arms compare the same work.\nfor flag,value in [('--port','18090'),('--moe-hot-adapt-interval-steps','0'),('--kv-disk-cache-gib','0')]:\n    idx=args.index(flag)\n    args[idx+1]=value\nargs.extend(['--moe-hot-plan-persist','off'])\nargs.remove('--moe-collect-stats')\nargs.extend(['--cache-type','naive'])\nbaseenv=dict(os.environ, CUDA_HOME='/usr/local/cuda-13.0', PATH=f'{SRC}/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin', TMPDIR=str(R/'tmp'), PYTHONPATH=str(WT/'python'))\ntry:\n    run('sudo','-n','systemctl','stop','freetoken-serve')\n    for label,pin in [('pin40r1',40),('autor1',None),('autor2',None),('pin40r2',40)]:\n        stop()\n        print(f'START {label} pin_gib={pin}', flush=True)\n        cmd=['sudo','-n','systemd-run','--unit='+UNIT,'--collect','--uid=jomcgi','--working-directory='+str(WT), '--property=KillMode=control-group','--property=TimeoutStopSec=30','--property=RuntimeMaxSec=1500']\n        env=dict(baseenv, PYTHONPATH=f'{probe}:{WT}/python', FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS='128')\n        for key in ['CUDA_HOME','PATH','TMPDIR','PYTHONPATH','FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS']:\n            cmd.append('--setenv='+key+'='+env[key])\n        if pin is not None:\n            cmd.append('--setenv=FREETOKEN_PIN_BUDGET_GB='+str(pin))\n        cmd.append('--setenv=HOME=/home/jomcgi')\n        since=time.strftime('%Y-%m-%d %H:%M:%S',time.localtime())\n        run(*(cmd+args))\n        deadline=time.monotonic()+420\n        while True:\n            try:\n                payload={'model':'qwen3.6-27b','messages':[{'role':'user','content':'hi'}],'max_tokens':1}\n                req=urllib.request.Request('http://127.0.0.1:18090/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})\n                with urllib.request.urlopen(req,timeout=5) as response:\n                    result=json.load(response)\n                if 'choices' in result:\n                    break\n            except Exception:\n                pass\n            if time.monotonic()>deadline:\n                raise RuntimeError(f'{label} server did not become ready')\n            time.sleep(5)\n        print('READY '+label,flush=True)\n        with control.open('r+b', buffering=0) as file:\n            file.write((1).to_bytes(8,'little'))\n        quality = subprocess.run([str(SRC/'.venv/bin/python'),str(WT/'bench/moe-fidelity.py'),'--output',str(OUT/f'astra-ram-overlap-{label}-fidelity.jsonl')],env=baseenv,timeout=500)\n        if quality.returncode not in (0, 1):\n            raise RuntimeError(f'{label} fidelity process failed: {quality.returncode}')\n        baseline = [json.loads(line) for line in (OUT/'astra-ram-overlap-autoq-fidelity.jsonl').read_text().splitlines()]\n        candidate = [json.loads(line) for line in (OUT/f'astra-ram-overlap-{label}-fidelity.jsonl').read_text().splitlines()]\n        assert len(baseline) == len(candidate) == 8\n        for before, after in zip(baseline, candidate):\n            assert all(before[key] == after[key] for key in ('name', 'prompt', 'expected'))\n            if not after['passed'] and before['answer'] != after['answer']:\n                raise RuntimeError(f\"{label} quality regression: {after['name']}: {before['answer']!r} -> {after['answer']!r}\")\n        print('FIDELITY '+json.dumps(dict(label=label, baseline_passed=sum(row['passed'] for row in baseline), candidate_passed=sum(row['passed'] for row in candidate), matching_answers=sum(a['answer']==b['answer'] for a,b in zip(baseline,candidate)))),flush=True)\n        run(str(SRC/'.venv/bin/python'),str(WT/'bench/hot-routing-wall.py'),'--tokenizer',str(R/'models/flash-e2m1.ftw'),'--control',str(control),'--output',str(OUT/f'astra-ram-overlap-{label}.jsonl'),'--repeats','2','--decode-repeats','2',env=baseenv,timeout=1050)\n        stop()\n        with (OUT/f'astra-ram-overlap-{label}-journal.log').open('w') as log:\n            run('sudo','-n','journalctl','-u',UNIT,'--since',since,'--no-pager','-o','cat',stdout=log)\nfinally:\n    stop()\n    run('sudo','-n','systemctl','start','freetoken-serve')\n    print('PRODUCTION RESTORED',flush=True)\n",
+  "budget_comparison": [
+    {
+      "concurrent": false,
+      "prompt_tokens": 76,
+      "samples_per_budget": 4,
+      "auto_ttft_s": 1.8443024537482415,
+      "pin40_ttft_s": 1.5601112435033428,
+      "ttft_reduction_percent": 15.409143422616323
+    },
+    {
+      "concurrent": false,
+      "prompt_tokens": 524,
+      "samples_per_budget": 4,
+      "auto_ttft_s": 5.781279393508157,
+      "pin40_ttft_s": 4.423586036005872,
+      "ttft_reduction_percent": 23.484306242435704
+    },
+    {
+      "concurrent": false,
+      "prompt_tokens": 2060,
+      "samples_per_budget": 4,
+      "auto_ttft_s": 18.7846245537512,
+      "pin40_ttft_s": 12.052878596245137,
+      "ttft_reduction_percent": 35.83646794879255
+    },
+    {
+      "concurrent": true,
+      "prompt_tokens": 76,
+      "samples_per_budget": 4,
+      "auto_ttft_s": 1.8729625782507355,
+      "pin40_ttft_s": 1.55457832000684,
+      "ttft_reduction_percent": 16.99896527250707
+    },
+    {
+      "concurrent": true,
+      "prompt_tokens": 524,
+      "samples_per_budget": 4,
+      "auto_ttft_s": 5.810398748741136,
+      "pin40_ttft_s": 4.396794801745273,
+      "ttft_reduction_percent": 24.328862925322127
+    },
+    {
+      "concurrent": true,
+      "prompt_tokens": 2060,
+      "samples_per_budget": 4,
+      "auto_ttft_s": 17.99830993550131,
+      "pin40_ttft_s": 11.72649582449958,
+      "ttft_reduction_percent": 34.8466835690539
+    }
+  ]
+}

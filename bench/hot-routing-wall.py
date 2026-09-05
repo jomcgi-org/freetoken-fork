@@ -21,6 +21,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--base-url", default="http://127.0.0.1:18090")
     parser.add_argument("--model", default="qwen3.6-27b")
+    parser.add_argument("--repeats", type=int, default=4)
+    parser.add_argument("--decode-repeats", type=int, default=3)
     args = parser.parse_args()
     from transformers import AutoTokenizer
 
@@ -59,8 +61,8 @@ def main():
         for parallel in (False, True):
             for size in (64, 512, 2048):
                 one(out, "warmup", size, -1, parallel)
-        cases = [("prefill", size, rep) for rep in range(4) for size in (64, 512, 2048)]
-        cases.extend(("decode", 64, rep) for rep in range(3))
+        cases = [("prefill", size, rep) for rep in range(args.repeats) for size in (64, 512, 2048)]
+        cases.extend(("decode", 64, rep) for rep in range(args.decode_repeats))
         random.Random(4090).shuffle(cases)
         for index, (kind, size, rep) in enumerate(cases):
             for parallel in ((False, True) if index % 2 == 0 else (True, False)):

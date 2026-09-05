@@ -1,0 +1,725 @@
+{
+  "date_utc": "2026-09-05",
+  "runtime_revision": "72df522",
+  "base_pr": "https://github.com/jomcgi-org/freetoken-fork/pull/28",
+  "hardware": {
+    "host": "node-4",
+    "gpu": "RTX 4090 24GB",
+    "ram_gib": 61.91,
+    "torch": "2.11.0+cu130",
+    "triton": "3.6.0",
+    "cuda_toolkit": "13.0"
+  },
+  "model": "existing flash-e2m1.ftw, native NVFP4 experts",
+  "configuration": {
+    "mode": "one server, adjacent matched pairs, alternating order",
+    "parallel_field_means": "FREETOKEN_PREFILL_HOT_OVERLAP scheduling policy",
+    "moe_collect_stats": false,
+    "moe_step_timing": false,
+    "ple_profile_polling": false,
+    "hot_adapt_interval_steps": 0,
+    "hot_plan_persist": "off",
+    "kv_disk_cache_gib": 0,
+    "cache_type": "naive",
+    "selective_prefill_max_tokens": 0,
+    "parallel_hot_routing": true,
+    "cpu_threads": 14,
+    "cpu_prefill_kernel": "vnni_rows32",
+    "max_extend_length": 2048,
+    "max_running_requests": 1,
+    "kv_tokens": 65536,
+    "pinned_layers": 20,
+    "pinned_gib": 26.44,
+    "disk_layers": 28,
+    "disk_gib": 37.02,
+    "protected_rows": 2296,
+    "hot_rows_per_disk_layer": 82,
+    "expert_slots": 4045,
+    "control": "8-byte mmap read at begin_prefill in both modes; no timers/counters/profiling added"
+  },
+  "summary": [
+    {
+      "kind": "prefill",
+      "requested_size": 64,
+      "pairs": 4,
+      "ttft_s": {
+        "serial_mean": 2.532653410009516,
+        "concurrent_mean": 2.4344991402467713,
+        "change_percent": -3.8755508106565584,
+        "paired_deltas": [
+          -0.10391134102246724,
+          -0.2146750089887064,
+          -0.1114813810272608,
+          0.037450651987455785
+        ],
+        "paired_delta_sample_sd": 0.10356404336896868
+      },
+      "wall_s": {
+        "serial_mean": 2.594562514757854,
+        "concurrent_mean": 2.542041113745654,
+        "change_percent": -2.024287359177457,
+        "paired_deltas": [
+          -0.10681695400853641,
+          -0.014379621017724276,
+          -0.12826249800855294,
+          0.039373468986013904
+        ],
+        "paired_delta_sample_sd": 0.07870659303710319
+      }
+    },
+    {
+      "kind": "prefill",
+      "requested_size": 512,
+      "pairs": 4,
+      "ttft_s": {
+        "serial_mean": 6.572039321246848,
+        "concurrent_mean": 6.338610966486158,
+        "change_percent": -3.551840507192894,
+        "paired_deltas": [
+          -1.2260741769860033,
+          0.0972116419870872,
+          0.18470769497798756,
+          0.010441420978168026
+        ],
+        "paired_delta_sample_sd": 0.6655771328806114
+      },
+      "wall_s": {
+        "serial_mean": 6.64255802675325,
+        "concurrent_mean": 6.420546910987468,
+        "change_percent": -3.342253313732746,
+        "paired_deltas": [
+          -1.2288512880040798,
+          0.09910244899219833,
+          0.1822648259694688,
+          0.05943954997928813
+        ],
+        "paired_delta_sample_sd": 0.6731752045885949
+      }
+    },
+    {
+      "kind": "prefill",
+      "requested_size": 2048,
+      "pairs": 4,
+      "ttft_s": {
+        "serial_mean": 20.805136893250165,
+        "concurrent_mean": 20.283849081752123,
+        "change_percent": -2.505572610133433,
+        "paired_deltas": [
+          0.3343835520208813,
+          -1.3293591070105322,
+          -0.8226505939965136,
+          -0.2675250970060006
+        ],
+        "paired_delta_sample_sd": 0.7165583816454777
+      },
+      "wall_s": {
+        "serial_mean": 20.87310743574926,
+        "concurrent_mean": 20.371726729506918,
+        "change_percent": -2.4020415157909425,
+        "paired_deltas": [
+          0.34068937902338803,
+          -1.3329404809919652,
+          -0.8261220090207644,
+          -0.187149713980034
+        ],
+        "paired_delta_sample_sd": 0.7313849232129093
+      }
+    },
+    {
+      "kind": "decode",
+      "requested_size": 64,
+      "pairs": 3,
+      "ttft_s": {
+        "serial_mean": 2.288616054332427,
+        "concurrent_mean": 2.162084559997311,
+        "change_percent": -5.52873401790519,
+        "paired_deltas": [
+          -0.26417682599276304,
+          -0.20866568700876087,
+          0.09324802999617532
+        ],
+        "paired_delta_sample_sd": 0.19234773490813942
+      },
+      "wall_s": {
+        "serial_mean": 12.216240542999003,
+        "concurrent_mean": 10.55682039433547,
+        "change_percent": -13.583721954578976,
+        "paired_deltas": [
+          -6.144707711995579,
+          -1.2723032600188162,
+          2.438750526023796
+        ],
+        "paired_delta_sample_sd": 4.304803531528604
+      },
+      "after_first_token_tps": {
+        "False": 19.23924501959623,
+        "True": 22.752353828541697
+      }
+    }
+  ],
+  "request_parity": {
+    "matched_pairs": 15,
+    "identical_text_and_usage": 15
+  },
+  "interpretation": "Mean TTFT improves 2.5-3.9% in this first paired run. Sample has four prefill pairs per size and substantial variation; keep opt-in pending replication. Decode code is unchanged; do not attribute apparent decode throughput spread to prefill overlap.",
+  "requests": [
+    {
+      "kind": "warmup",
+      "size": 64,
+      "repeat": -1,
+      "parallel": false,
+      "ttft_s": 4.334702146996278,
+      "wall_s": 4.482191579998471,
+      "decode_s": 0.14748943300219253,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 512,
+      "repeat": -1,
+      "parallel": false,
+      "ttft_s": 11.303814134007553,
+      "wall_s": 11.448903337004595,
+      "decode_s": 0.14508920299704187,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 2048,
+      "repeat": -1,
+      "parallel": false,
+      "ttft_s": 24.882586380990688,
+      "wall_s": 24.960211607976817,
+      "decode_s": 0.07762522698612884,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 64,
+      "repeat": -1,
+      "parallel": true,
+      "ttft_s": 2.663941006991081,
+      "wall_s": 2.7353477379947435,
+      "decode_s": 0.07140673100366257,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 512,
+      "repeat": -1,
+      "parallel": true,
+      "ttft_s": 6.276402160001453,
+      "wall_s": 6.3470662780164275,
+      "decode_s": 0.07066411801497452,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 2048,
+      "repeat": -1,
+      "parallel": true,
+      "ttft_s": 23.9003129430057,
+      "wall_s": 23.97673933499027,
+      "decode_s": 0.07642639198456891,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 0,
+      "parallel": false,
+      "ttft_s": 7.5251456769765355,
+      "wall_s": 7.609764700988308,
+      "decode_s": 0.08461902401177213,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 0,
+      "parallel": true,
+      "ttft_s": 6.299071499990532,
+      "wall_s": 6.380913412984228,
+      "decode_s": 0.08184191299369559,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 0,
+      "parallel": true,
+      "ttft_s": 21.008575511019444,
+      "wall_s": 21.109772073017666,
+      "decode_s": 0.10119656199822202,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 0,
+      "parallel": false,
+      "ttft_s": 20.674191958998563,
+      "wall_s": 20.769082693994278,
+      "decode_s": 0.09489073499571532,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 3,
+      "parallel": false,
+      "ttft_s": 21.18628728200565,
+      "wall_s": 21.25892324600136,
+      "decode_s": 0.07263596399570815,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 3,
+      "parallel": true,
+      "ttft_s": 19.85692817499512,
+      "wall_s": 19.925982765009394,
+      "decode_s": 0.06905459001427516,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 3,
+      "parallel": true,
+      "ttft_s": 6.079792965989327,
+      "wall_s": 6.151796296995599,
+      "decode_s": 0.07200333100627176,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 3,
+      "parallel": false,
+      "ttft_s": 5.98258132400224,
+      "wall_s": 6.0526938480034005,
+      "decode_s": 0.07011252400116064,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 1,
+      "parallel": false,
+      "ttft_s": 2.517038603022229,
+      "wall_s": 2.5912502340215724,
+      "decode_s": 0.07421163099934347,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 1,
+      "parallel": true,
+      "ttft_s": 2.4131272619997617,
+      "wall_s": 2.484433280013036,
+      "decode_s": 0.0713060180132743,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 1,
+      "parallel": true,
+      "ttft_s": 6.200811613991391,
+      "wall_s": 6.271584940986941,
+      "decode_s": 0.07077332699554972,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 1,
+      "parallel": false,
+      "ttft_s": 6.016103919013403,
+      "wall_s": 6.089320115017472,
+      "decode_s": 0.07321619600406848,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 2,
+      "parallel": false,
+      "ttft_s": 2.4581615770002827,
+      "wall_s": 16.661109634995228,
+      "decode_s": 14.202948057994945,
+      "text": "The Roman Republic, spanning from 509 BCE to 27 BCE, represents a pivotal era in Western political history, characterized by a complex interplay of aristocratic privilege, popular sovereignty, and military expansion. Following the overthrow of the last king, Tarquin the Proud, Rome established a system designed to prevent the concentration of power in a single individual. This new order was defined by a mixed constitution that balanced monarchical, aristocratic, and democratic elements, creating a resilient yet ultimately fragile political structure.\n\nAt the heart of the Republic was the Senate, an advisory body composed of former magistrates and patrician elites. While technically lacking legislative power, the Senate wielded immense influence through its *auctoritas*, guiding foreign policy, managing state finances, and controlling provincial administration. Alongside the Senate stood the popular assemblies, such as the *Comitia Centuriata* and the *Concilium Plebis*, which granted citizens the",
+      "usage": {
+        "prompt_tokens": 50,
+        "completion_tokens": 192,
+        "total_tokens": 242
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 2,
+      "parallel": true,
+      "ttft_s": 2.1939847510075197,
+      "wall_s": 10.516401922999648,
+      "decode_s": 8.322417171992129,
+      "text": "The Roman Republic, spanning from 509 BCE to 27 BCE, represents a pivotal era in Western political history, characterized by a complex interplay of aristocratic privilege, popular sovereignty, and military expansion. Following the overthrow of the last king, Tarquin the Proud, Rome established a system designed to prevent the concentration of power in a single individual. This new order was defined by a mixed constitution that balanced monarchical, aristocratic, and democratic elements, creating a resilient yet ultimately fragile political structure.\n\nAt the heart of the Republic was the Senate, an advisory body composed of former magistrates and patrician elites. While technically lacking legislative power, the Senate wielded immense influence through its *auctoritas*, guiding foreign policy, managing state finances, and controlling provincial administration. Alongside the Senate stood the popular assemblies, such as the *Comitia Centuriata* and the *Concilium Plebis*, which granted citizens the",
+      "usage": {
+        "prompt_tokens": 50,
+        "completion_tokens": 192,
+        "total_tokens": 242
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 2,
+      "parallel": true,
+      "ttft_s": 6.774767785973381,
+      "wall_s": 6.8778929929831065,
+      "decode_s": 0.10312520700972527,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 2,
+      "parallel": false,
+      "ttft_s": 6.764326364995213,
+      "wall_s": 6.818453443003818,
+      "decode_s": 0.05412707800860517,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 1,
+      "parallel": false,
+      "ttft_s": 2.299299548001727,
+      "wall_s": 10.733780625014333,
+      "decode_s": 8.434481077012606,
+      "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE. This transition marked a profound shift from monarchical rule to a complex system of representative government, driven by the aristocratic desire to prevent the concentration of power in a single individual. The traditional narrative attributes the founding of the Republic to the overthrow of the last king, Tarquin the Proud, following the infamous rape of Lucretia by his son. While historical accuracy of this specific event is debated, the underlying political reality was clear: the patrician class sought to dismantle the monarchy to secure their own political dominance and establish a system where power was shared among the elite.\n\nThe early Republic was characterized by a rigid social hierarchy and a unique constitutional structure designed to balance power. At its core were two consuls, elected annually, who held supreme executive authority but could veto each other\u2019s decisions, ensuring no single leader could dominate.",
+      "usage": {
+        "prompt_tokens": 51,
+        "completion_tokens": 192,
+        "total_tokens": 243
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 1,
+      "parallel": true,
+      "ttft_s": 2.090633860992966,
+      "wall_s": 9.461477364995517,
+      "decode_s": 7.370843504002551,
+      "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE. This transition marked a profound shift from monarchical rule to a complex system of representative government, driven by the aristocratic desire to prevent the concentration of power in a single individual. The traditional narrative attributes the founding of the Republic to the overthrow of the last king, Tarquin the Proud, following the infamous rape of Lucretia by his son. While historical accuracy of this specific event is debated, the underlying political reality was clear: the patrician class sought to dismantle the monarchy to secure their own political dominance and establish a system where power was shared among the elite.\n\nThe early Republic was characterized by a rigid social hierarchy and a unique constitutional structure designed to balance power. At its core were two consuls, elected annually, who held supreme executive authority but could veto each other\u2019s decisions, ensuring no single leader could dominate.",
+      "usage": {
+        "prompt_tokens": 51,
+        "completion_tokens": 192,
+        "total_tokens": 243
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 3,
+      "parallel": true,
+      "ttft_s": 2.4705453460046556,
+      "wall_s": 2.723920967982849,
+      "decode_s": 0.2533756219781935,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 3,
+      "parallel": false,
+      "ttft_s": 2.685220354993362,
+      "wall_s": 2.7383005890005734,
+      "decode_s": 0.0530802340072114,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 1,
+      "parallel": false,
+      "ttft_s": 20.680323948996374,
+      "wall_s": 20.73618052501115,
+      "decode_s": 0.05585657601477578,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 1,
+      "parallel": true,
+      "ttft_s": 19.85767335499986,
+      "wall_s": 19.910058515990386,
+      "decode_s": 0.05238516099052504,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 0,
+      "parallel": true,
+      "ttft_s": 2.2016350679914467,
+      "wall_s": 11.692581895011244,
+      "decode_s": 9.490946827019798,
+      "text": "The history of the Roman Republic is a foundational narrative in Western civilization, marking a pivotal transition from monarchy to a complex system of representative governance. This era, spanning roughly from 509 BCE to 27 BCE, was not merely a political experiment but a dynamic engine of expansion, legal innovation, and social conflict that shaped the modern world. To understand the Republic, one must first examine its origins in the overthrow of the last Roman king, Tarquin the Proud. According to tradition, the rape of Lucretia by the king\u2019s son sparked a revolt led by Lucius Junius Brutus, who expelled the Tarquin dynasty and established a new order designed to prevent the concentration of power in a single individual. This foundational myth underscored the Roman aversion to *regnum* (kingship) and their reverence for *libertas* (liberty).\n\nThe early Republic was characterized by a delicate balance of power among three main branches",
+      "usage": {
+        "prompt_tokens": 49,
+        "completion_tokens": 192,
+        "total_tokens": 241
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 0,
+      "parallel": false,
+      "ttft_s": 2.1083870379952714,
+      "wall_s": 9.253831368987449,
+      "decode_s": 7.145444330992177,
+      "text": "The history of the Roman Republic is a foundational narrative in Western civilization, marking a pivotal transition from monarchy to a complex system of representative governance. This era, spanning roughly from 509 BCE to 27 BCE, was not merely a political experiment but a dynamic engine of expansion, legal innovation, and social conflict that shaped the modern world. To understand the Republic, one must first examine its origins in the overthrow of the last Roman king, Tarquin the Proud. According to tradition, the rape of Lucretia by the king\u2019s son sparked a revolt led by Lucius Junius Brutus, who expelled the Tarquin dynasty and established a new order designed to prevent the concentration of power in a single individual. This foundational myth underscored the Roman aversion to *regnum* (kingship) and their reverence for *libertas* (liberty).\n\nThe early Republic was characterized by a delicate balance of power among three main branches",
+      "usage": {
+        "prompt_tokens": 49,
+        "completion_tokens": 192,
+        "total_tokens": 241
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 0,
+      "parallel": false,
+      "ttft_s": 2.5386343880090863,
+      "wall_s": 2.6063659799983725,
+      "decode_s": 0.06773159198928624,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 0,
+      "parallel": true,
+      "ttft_s": 2.4271530069818255,
+      "wall_s": 2.4781034819898196,
+      "decode_s": 0.0509504750079941,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 2,
+      "parallel": true,
+      "ttft_s": 2.4271709460008424,
+      "wall_s": 2.4817067249969114,
+      "decode_s": 0.054535778996068984,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 2,
+      "parallel": false,
+      "ttft_s": 2.3897202940133866,
+      "wall_s": 2.4423332560108975,
+      "decode_s": 0.052612961997510865,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 2,
+      "parallel": false,
+      "ttft_s": 20.67974438300007,
+      "wall_s": 20.72824327799026,
+      "decode_s": 0.048498894990189,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 2,
+      "parallel": true,
+      "ttft_s": 20.41221928599407,
+      "wall_s": 20.541093564010225,
+      "decode_s": 0.12887427801615559,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    }
+  ],
+  "validation": {
+    "tests_passed": 118,
+    "explicit_overlap_test": "CPU call observes GPU completion event not ready; returned output is ready",
+    "native_nvfp4_parity": "bitwise equal across serial/concurrent schedules, including H=2560/I=640 and workspace reuse",
+    "fallbacks": "GPU OOM cleanup, grouped fallback, invalid slot rejection, CPU batch degradation"
+  },
+  "service_restored": {
+    "revision": "3a67403a293be20836604bc25729329997848e09",
+    "checkout_clean": true,
+    "real_completion": "OK",
+    "new_code_deployed": false
+  },
+  "followup_order_audit": {
+    "status": "Performance unqualified. Original measured rows retained unchanged.",
+    "long_prefill_concurrent_second_pairs": 3,
+    "long_prefill_pairs": 4,
+    "limitation": "First/second order was globally alternated, not balanced per workload. Expert-cache warming can confound the observed scheduling means. See 4090-ram-placement-20260905.json for the repetition and a6a07aa for the benchmark fix."
+  }
+}
