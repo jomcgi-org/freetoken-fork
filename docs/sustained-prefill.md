@@ -44,6 +44,13 @@ outputs. Compare the early and late blocks, not just a grand mean. A gain in
 this finite continuous workload does not establish optimal throughput for all
 context lengths, concurrency levels, or production cache states.
 
-The client's ten pure Python protocol checks pass locally. Linux validation,
-the model run, and full prose review remain pending. The runner must restore
-the original service and verify a real completion after the model gate.
+At `132b629`, the client's ten pure Python protocol checks pass locally and
+on node-4's Linux environment. The [validation record](../bench/results/4090-sustained-client-validation-20260905.txt)
+also confirms no inference-code changes from the previously validated
+`78848ce` runtime. The model run and full prose review remain pending.
+
+The detached driver has a two-hour runtime limit and a recovery command that
+stops its benchmark server and starts the original system service on exit.
+The normal driver finalizer also waits for readiness and verifies a real
+completion. Each model start has a separate 45-minute limit. The driver is
+observed through its systemd unit and must not be restarted while active.
