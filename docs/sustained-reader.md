@@ -54,7 +54,10 @@ the next candidate should admit recurring useful weights without sacrificing
 the short-run benefit of selective direct reads. If it does not, investigate
 other differences in the combined stack before changing cache admission.
 
-The experiment has not produced timing results yet. The previous 99 focused
+The four-start comparison is running in the detached systemd unit
+`astra-sustained-reader-wall-driver`. Its first start has verified the actual
+buffered transport and entered measured requests. Complete comparisons and
+the final restoration check remain pending. The previous 99 focused
 CUDA tests and zero-error memcheck cover both readers on this unchanged
 inference runtime. The sustained client's ten protocol checks also remain
 unchanged. The driver and recovery script pass syntax checks. A read-only
@@ -62,3 +65,12 @@ preflight on node-4 verifies the identical frozen revisions and native
 binaries, diagnostics off, staged prefill in both modes, and the single
 argument difference. Its SHA-256 matches the committed driver:
 `b84a67d5b3c7e5025ebc16ae80f975048c72c31dbae9dedcc216b438a0d82852`.
+
+The live comparison stays on the frozen `132b629` client. A later optional
+client diagnostic, described in [the sustained protocol](sustained-prefill.md),
+can split whole-worker I/O around the first observed generated text. It is
+not enabled in this wall-time gate. The current row-based reader sends an
+entire partially resident expert row through direct I/O; after the isolated
+comparison, inspect whether storage traffic comes from ongoing generation,
+prefill rereading resident portions of those rows, or both. Existing whole
+request counters cannot distinguish those cases.

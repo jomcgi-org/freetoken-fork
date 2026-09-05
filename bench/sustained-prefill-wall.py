@@ -102,6 +102,27 @@ def build_cases(tokenizer, root, warmup_pairs=2, blocks=6):
     return cases
 
 
+def measure_request(stream, checks, base_url, payload, pid, *, phase_io=False):
+    """Optionally split worker I/O at client-observed first generated text.
+
+    This boundary includes network delay and may include queued generation.
+    It is not an exact prefill/decode boundary or expert-only attribution.
+    """
+    before = checks.process_io_snapshot(pid)
+    observer = {"observe_first_text": lambda: checks.process_io_snapshot(pid)} if phase_io else {}
+    result = stream.request(base_url, payload, **observer)
+    after = checks.process_io_snapshot(pid)
+    process_io = dict(before=before, after=after, delta=checks.process_io_delta(before, after))
+    if phase_io:
+        first = result.pop("first_text_observation")
+        process_io.update(
+            first_text=first,
+            before_first_text_delta=checks.process_io_delta(before, first),
+            after_first_text_delta=checks.process_io_delta(first, after),
+        )
+    return result, process_io
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", required=True)
@@ -112,6 +133,10 @@ def main():
     parser.add_argument("--warmup-pairs", type=int, default=2)
     parser.add_argument("--blocks", type=int, default=6)
     parser.add_argument("--io-pid", required=True, type=int)
+    parser.add_argument(
+        "--phase-io", action="store_true",
+        help="diagnostic I/O snapshot at first text; keep off for wall-time comparisons",
+    )
     args = parser.parse_args()
     if args.io_pid <= 0 or args.warmup_pairs < 1 or args.blocks < 1:
         parser.error("I/O PID, warmup pairs, and blocks must be positive")
@@ -128,20 +153,18 @@ def main():
     cumulative = dict(prompt_tokens=0, completion_tokens=0, wall_s=0.0)
     with args.output.open("w") as out:
         for case in cases:
-            before = checks.process_io_snapshot(args.io_pid)
-            result = client.request(args.base_url, dict(
+            result, process_io = measure_request(client, checks, args.base_url, dict(
                 model=args.model, messages=[dict(role="user", content=case["prompt"])],
                 max_tokens=case["max_tokens"], temperature=0,
                 chat_template_kwargs=dict(enable_thinking=False),
-            ))
-            after = checks.process_io_snapshot(args.io_pid)
+            ), args.io_pid, phase_io=args.phase_io)
             if result["usage"]["prompt_tokens"] < 1024:
                 raise RuntimeError("sustained prompt must exercise long prefill")
             for key in ("prompt_tokens", "completion_tokens"):
                 cumulative[key] += result["usage"][key]
             cumulative["wall_s"] += result["wall_s"]
-            row = dict(case, mode=args.mode, **result, cumulative=dict(cumulative))
-            row["process_io"] = dict(before=before, after=after, delta=checks.process_io_delta(before, after))
+            row = dict(case, mode=args.mode, **result, cumulative=dict(cumulative), diagnostic_phase_io=args.phase_io)
+            row["process_io"] = process_io
             if case["kind"] == "json":
                 row.update(checks.score_json_response(result["text"], case["expected"]))
                 row["completed"] = result["finish_reason"] == "stop" and row["passed"]
