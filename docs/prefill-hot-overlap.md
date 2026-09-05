@@ -81,11 +81,17 @@ identical text and usage.
 | 2,060 | 20.805 | 20.284 | 2.5% |
 
 Whole-request prefill wall times improved by 2.0%, 3.3%, and 2.4%, respectively.
-These are encouraging first-run means, not a replicated gain. Each size has
+These means do not establish a speedup. Each size has
 only four pairs, and paired TTFT differences have sample standard deviations
 of 0.104, 0.666, and 0.717 seconds. In the 524-token case, one faster pair
 drives the mean while the other three are slightly slower. The switch remains
 off by default pending replication across restarts and workload conditions.
+
+A later order audit found that concurrent mode ran second in three of four
+long-prefill pairs. The [RAM placement repetition](4090-ram-placement.md)
+also put it second in both long-prefill pairs per start. Expert-cache warming
+confounds these scheduling comparisons. The benchmark now balances order
+within each workload; overlap remains unqualified for a throughput claim.
 
 Decode measured 19.24 versus 22.75 tokens/s after the first token. Its code is
 unchanged, and paired whole-request differences ranged from 2.44 seconds
