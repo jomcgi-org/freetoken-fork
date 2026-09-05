@@ -1,0 +1,1161 @@
+{
+  "hidden": 2560,
+  "intermediate": 640,
+  "top_k": 10,
+  "threads": 14,
+  "experts": 128,
+  "buffer_bytes": 270827520,
+  "source_sha256": "43b25ca4b0caaeaf00603921caf0d0b8b2f4579bb442f8696fbae16ccb152caf",
+  "requests": [
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 4.96856,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 4.669889,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 4.85815,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 4.85655,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 4.83219,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 4.826059,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 4.90359,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 4.8053,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 4.763899,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 4.7898,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 4.745979,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 4.84794,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 4.669659,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 1,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 4.77103,
+      "rows": 64,
+      "gemms": 108
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 12.28077,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 10.499412,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 10.325032,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 12.510121,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 12.062689,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 10.378992,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 10.345112,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 12.03735,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 12.104069,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 10.443353,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 10.322022,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 12.26981,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 12.035229,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 4,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 10.484042,
+      "rows": 256,
+      "gemms": 216
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 22.894113,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 18.001853,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 18.154534,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 22.946854,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 22.903223,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 18.122494,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 18.079744,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 23.005584,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 23.058774,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 18.592256,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 18.141094,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 22.894673,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 23.039204,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 64,
+      "routes_per_token": 10,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 18.226835,
+      "rows": 640,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 24.41324,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 24.719351,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 24.44232,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 24.40668,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 24.726641,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 24.186948,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 24.279129,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 24.435999,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 24.44004,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 24.676731,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 24.138859,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 24.573411,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 24.447,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 1,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 24.287749,
+      "rows": 512,
+      "gemms": 254
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 65.531177,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 54.199781,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 54.244561,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 67.547736,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 66.939153,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 53.82942,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 53.92041,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 67.038503,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 67.437345,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 52.466464,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 52.676845,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 67.330094,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 66.698612,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 4,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 52.131593,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 156.519768,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 116.656335,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 116.720835,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 155.976436,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 157.793384,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 118.017291,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 115.978923,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 156.90354,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 157.536252,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 116.533045,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 116.978497,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 156.98631,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 157.00883,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 512,
+      "routes_per_token": 10,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 117.121487,
+      "rows": 5120,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 83.19941,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 82.732227,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 83.924952,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 83.982912,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 82.939698,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 81.985984,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 83.29862,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 81.817423,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 83.153919,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 82.062355,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 81.655223,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 82.295335,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 83.3069,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 1,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 81.313371,
+      "rows": 2048,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 281.630169,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 217.337966,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 219.914737,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 273.222084,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 275.815334,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 215.89882,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 219.088213,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 275.573324,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 276.102806,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 225.275439,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 223.821003,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 278.757417,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 275.815805,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 4,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 222.385627,
+      "rows": 8192,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 0,
+      "reuse": false,
+      "wall_ms": 683.875068,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 0,
+      "reuse": true,
+      "wall_ms": 522.147579,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 1,
+      "reuse": true,
+      "wall_ms": 526.060225,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 1,
+      "reuse": false,
+      "wall_ms": 676.371168,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 2,
+      "reuse": false,
+      "wall_ms": 668.749586,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 2,
+      "reuse": true,
+      "wall_ms": 528.558855,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 3,
+      "reuse": true,
+      "wall_ms": 513.152212,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 3,
+      "reuse": false,
+      "wall_ms": 692.169552,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 4,
+      "reuse": false,
+      "wall_ms": 685.684085,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 4,
+      "reuse": true,
+      "wall_ms": 517.978832,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 5,
+      "reuse": true,
+      "wall_ms": 532.512951,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 5,
+      "reuse": false,
+      "wall_ms": 674.58957,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 6,
+      "reuse": false,
+      "wall_ms": 677.541432,
+      "rows": 20480,
+      "gemms": 256
+    },
+    {
+      "tokens": 2048,
+      "routes_per_token": 10,
+      "repeat": 6,
+      "reuse": true,
+      "wall_ms": 526.259156,
+      "rows": 20480,
+      "gemms": 256
+    }
+  ],
+  "date_utc": "2026-09-05",
+  "runtime_revision": "0059249",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 7800X3D",
+    "physical_cores": 8,
+    "logical_cpus": 16,
+    "torch": "2.11.0+cu130",
+    "cuda_toolkit": "13.0"
+  },
+  "validation": {
+    "command": "python -m pytest tests/moe/test_prefill_hot_overlap.py tests/moe/test_disk_tier.py tests/moe/test_cpu_moe_prefill_batch.py -q --disable-warnings --maxfail=2",
+    "result": "122 passed, 1 warning in 7.86s",
+    "test_log": "........................................................................ [ 59%]\n..................................................                       [100%]\n122 passed, 1 warning in 7.86s\n",
+    "measured_bitwise_pairs": 63
+  },
+  "interpretation": "Whole native CPU batches, including preparation, GEMMs, and scatter. Synthetic resident weights with 128 experts; no model, disk, transfer, or GPU work is measured. No serving throughput claim is made from this benchmark."
+}

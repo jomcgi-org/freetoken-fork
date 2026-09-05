@@ -38,5 +38,28 @@ token. Its results isolate CPU work. Model throughput must be assessed with
 paired client wall time, fixed placement, no prefix reuse, and diagnostic
 collection disabled before making a serving recommendation.
 
-Native validation and wall-time measurements are pending. This change is not
-deployed in the original serving checkout.
+## Native results, 2026-09-05
+
+All 122 focused checks passed on node-4, covering the CPU batch path, DISK
+prefill, and composition with the concurrent-prefill prototype. All 63
+measured native benchmark pairs produced identical BF16 output bits.
+
+For 2,048 tokens at Qwen's H=2560/I=640 dimensions, median whole-batch CPU
+times across seven pairs were:
+
+| Cold routes per token | Reference (ms) | Input reuse (ms) | Time reduction |
+| ---: | ---: | ---: | ---: |
+| 1 | 83.154 | 82.062 | 1.3% |
+| 4 | 275.816 | 219.915 | 20.3% |
+| 10 | 677.541 | 526.060 | 22.4% |
+
+Across all tested sizes, multiple cold routes showed 14.2% to 25.6% lower
+CPU time. A single cold route changed by only 0.6% to 1.3%. These timings
+include preparation, worker GEMMs, and scatter, with 14 workers on the
+Ryzen 7 7800X3D and 128 synthetic resident experts. They exclude model
+execution, disk reads, and GPU transfers. No workspace growth occurred.
+
+The [raw CPU record](../bench/results/4090-prefill-input-reuse-cpu-20260905.json)
+includes every measured call and the test log. Runtime revision: `0059249`.
+Non-debug model wall-time validation is pending. This change is not deployed
+in the original serving checkout.
