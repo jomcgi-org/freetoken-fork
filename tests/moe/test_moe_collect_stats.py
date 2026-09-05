@@ -150,3 +150,53 @@ def test_decode_classification_only_runs_with_diagnostics(
     assert recorded == classified
     assert len(cpu_work) == 1
     assert cpu_work[0].tolist() == [[-1, -1 if all_hot else 1]]
+
+
+@pytest.mark.parametrize("collect", [False, True])
+@pytest.mark.parametrize("executed_swaps", [0, 1])
+def test_idle_completion_gates_live_history_readback(
+    monkeypatch, collect, executed_swaps,
+):
+    from freetoken.moe import offload_cache
+    from freetoken.moe.hot_adapt import HotAdaptIntervalController
+
+    cache = _cache(collect_stats=collect)
+    cache._hot_adapt_interval_controller = HotAdaptIntervalController.create(
+        64, hot_budget_bytes=256, max_swap_bytes=64,
+    )
+    cache._hot_adapt_tick_interval_tokens = 64
+    cache._hot_adapt_tick_covered_seconds = 1.0
+    cache._hot_adapt_tick_boundary = "idle"
+    cache._hot_adapt_tick_planned_swaps = 1
+    cache._hot_adapt_tick_executed_swaps = executed_swaps
+    cache._hot_adapt_tick_rate_before = 0.25
+    events = []
+    completed = []
+    messages = []
+    monkeypatch.setattr(
+        cache, "_checkpoint_published_hot_slot_owners",
+        lambda: events.append("checkpoint"),
+    )
+    monkeypatch.setattr(cache, "snapshot_hot_plan", lambda: events.append("snapshot"))
+
+    def read_live_histories():
+        assert collect, "disabled diagnostics read live GPU histories"
+        events.append("readback")
+        return 0.75
+
+    monkeypatch.setattr(cache, "decayed_hot_pair_rate", read_live_histories)
+    monkeypatch.setattr(offload_cache.logger, "info_rank0", messages.append)
+    cache._hot_adapt_idle_tracker = SimpleNamespace(
+        tick_completed=lambda now, swaps: completed.append((now, swaps)),
+    )
+
+    cache._complete_hot_adaptation_tick(staging_seconds=0.0)
+
+    assert events == (
+        ["checkpoint"] + (["snapshot"] if executed_swaps else [])
+        + (["readback"] if collect else [])
+    )
+    assert len(completed) == 1 and completed[0][1] == executed_swaps
+    assert len(messages) == 1
+    assert f"executed_swaps={executed_swaps}" in messages[0]
+    assert ("decayed_hot_pair_rate=25.00%->75.00%" in messages[0]) is collect
