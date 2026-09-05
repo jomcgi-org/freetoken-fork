@@ -264,6 +264,7 @@ class OffloadMoeCache:
             raise ValueError("staged DISK prefill needs a positive token threshold")
         self._staged_prefill_active = False
         self._disk_prefill_staging = None
+        self.hot_expert_capacity: dict[int, int] = {}
         assert self.moe_prefill_coalesce in (
             "populate", "on", "off"
         ), self.moe_prefill_coalesce
@@ -333,7 +334,6 @@ class OffloadMoeCache:
         # older cache/test doubles that probe the attribute.
         self.hot_bank_sources: dict[str, list[torch.Tensor | None]] = {}
         self.hot_expert_ids: dict[int, tuple[int, ...]] = {}
-        self.hot_expert_capacity: dict[int, int] = {}
         self.hot_row_for_expert = torch.full(
             (self.num_layers, self.num_experts),
             -1,
