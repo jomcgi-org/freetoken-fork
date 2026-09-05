@@ -10,8 +10,9 @@ On node-4's RTX 4090, the balanced prototype comparison reduced mean client
 wall time from 17.57 to 9.45 seconds at 2,060 prompt tokens and from 34.93 to
 16.86 seconds at 4,108 tokens. Every long-prompt pair improved. At 524 tokens,
 staging was variable and approximately tied with CPU. The integrated serving
-comparison below supports a 1,024-token crossover. Long-completion throughput
-still needs its separate gate before an overall serving recommendation.
+comparison below supports a 1,024-token crossover for prefill. The longer-output
+gate found a 6.8% JSON response-time regression despite faster prefill. Keep
+this path experimental until that post-prefill decode behavior is understood.
 
 ## Execution and memory contract
 
@@ -130,6 +131,40 @@ questions passed. The original serving checkout was restored and returned a
 real `OK` completion. This run enables diagnostics for correctness evidence;
 its wall times are not performance measurements. Its complete
 [record](../bench/results/4090-disk-staged-adaptation-20260905.json) is retained.
+
+## Longer completions: a throughput regression remains
+
+Two starts at `30f8249` generated complete warmup responses in both modes,
+then reversed every measured prompt's order across starts. Serving code is
+identical to `99bfb4b`. The selector used a 1,024-token threshold, with
+diagnostics and adaptation off, fixed HOT placement, and no KV reuse.
+
+| Workload | Prompt tokens | Output tokens | CPU wall | Staged wall | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Copy 32 records into JSON | 1,844 | 383 | 38.060 s | 40.632 s | 6.8% slower |
+| Explain the source excerpt | 1,880 or 1,881 | 192 | 24.822 s | 18.588 s | 25.1% shorter |
+
+Each cell contains four measured responses. All twelve JSON responses,
+including warmups, preserve every value and the requested key order. All
+measured usage counts match within pairs. The four prose pairs differ in
+text, and this probe does not assign a broad prose-quality score.
+
+JSON first-token time improved from 17.283 to 12.108 seconds, but subsequent
+decode grew from 20.776 to 28.524 seconds. Its two first-start pairs improved;
+both reversed-start pairs regressed. Three of four prose pairs improved.
+This is why a prefill-only gain does not qualify overall throughput.
+
+The [long-output record](../bench/results/4090-disk-staged-long-output-20260905.json)
+retains all outputs and timings. The original clean serving checkout at
+`3a67403` was restored and returned `OK`; the final metadata includes that
+completion.
+
+The remaining gate is to diagnose post-prefill decode with optional
+statistics, then validate any change against non-debug whole-response wall
+time. Cache residency, page faults, and different decode expert traffic are
+candidate explanations, not established causes. Automatic HOT adaptation
+also needs a matched wall-time comparison. CPU remains the default, and this
+PR stays draft while that throughput question is open.
 
 ## Correctness validation
 

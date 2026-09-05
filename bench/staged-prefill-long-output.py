@@ -82,7 +82,7 @@ def main():
                 parsed = json.loads(result["text"])
             except ValueError:
                 parsed = None
-            row.update(expected=expected, passed=parsed == expected,
+            row.update(expected=expected, passed=parsed == expected and list(parsed) == list(expected),
                        correct_records=sum(isinstance(parsed, dict) and parsed.get(k) == v
                                            for k, v in expected.items()))
         out.write(json.dumps(row) + "\n")
