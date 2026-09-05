@@ -63,6 +63,9 @@ def test_materialized_hot_layers_survive_reuse_and_decode(experts, slots):
         for layer in (0, 1, 2, 0):
             cache.materialize_layer(layer)
             cache.copy_missing()
+            assert int(cache.num_indices) == experts
+            assert cache.src_indices[:experts].tolist() == list(range(experts))
+            assert cache.evict_slots[:experts].tolist() == list(range(experts))
             for name, bank in sources.items():
                 assert torch.equal(
                     cache.bank_caches[name][:experts].view(torch.uint8).cpu(),
