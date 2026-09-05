@@ -945,6 +945,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-staging-io",
+        choices=("mmap", "buffered"),
+        default=ServerArgs.moe_hot_staging_io,
+        help=(
+            "HOT staging source: mmap keeps tensor copies (default); buffered "
+            "experimentally reads native NVFP4 file rows into existing pinned buffers."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-boundary-cap-frac",
         type=float,
         default=ServerArgs.moe_hot_adapt_boundary_cap_frac,
