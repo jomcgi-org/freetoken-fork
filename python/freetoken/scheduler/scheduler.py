@@ -8,6 +8,7 @@ from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
 from freetoken.gpu_select import gpu_identity
+from freetoken.prefill_timing import PrefillTimings
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -352,6 +353,7 @@ class Scheduler(SchedulerIOMixin):
                     )
             logger.info_rank0(message)
 
+        self.prefill_timings = PrefillTimings()
         self.status_reporter = SchedulerStatusReporter(
             log=_status_log,
             decode_log_interval=config.decode_log_interval,
@@ -691,6 +693,9 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        if getattr(batch, "prefill_timing", None) is not None:
+            self.prefill_timings.complete(batch.prefill_timing)
+            batch.prefill_timing = None
         # getattr probe: overlap-loop test doubles predate the engine attribute.
         engine = getattr(self, "engine", None)
         if batch.is_decode and engine is not None and engine.moe_offload_cache is not None:
@@ -1315,6 +1320,7 @@ class Scheduler(SchedulerIOMixin):
             else:
                 try:
                     profile = cache.decode_miss_layer_profile()
+                    profile["prefill"] = self.prefill_timings.snapshot()
                 except Exception as exc:  # noqa: BLE001
                     self._reply_moe_layer_profile(
                         msg.request_id, "failed", error=f"could not read MoE stats: {exc!r}"

@@ -14,6 +14,7 @@ from freetoken.attention import AttnType, attention_backend_info, create_attenti
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
 from freetoken.gpu_select import assigned_visible_gpu, gpu_identity
+from freetoken.prefill_timing import begin_prefill
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
@@ -1523,6 +1524,8 @@ class Engine:
         )
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
+        if batch.is_prefill and self.config.moe_collect_stats:
+            batch.prefill_timing = begin_prefill(batch, torch.cuda.Event, self.stream)
         if self.cpu_moe_executor is not None:
             if batch.is_decode:
                 # Move madvise IO ahead of graph replay / the first eager submit. Each
@@ -1590,6 +1593,8 @@ class Engine:
             next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
             batch.generated_tokens = len(batch.reqs)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        if getattr(batch, "prefill_timing", None) is not None:
+            batch.prefill_timing[1].record(self.stream)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         if args.has_guided:
