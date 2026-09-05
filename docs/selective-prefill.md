@@ -4,10 +4,12 @@ Short prefills can transfer only their selected experts from pinned RAM into
 the existing GPU prefill buffers:
 
 ```sh
-FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS=512 ft serve <normal serving arguments>
+FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS=128 ft serve <normal serving arguments>
 ```
 
-The default is `0`, which preserves full-layer streaming. The limit applies to
+The default is `0`, which preserves full-layer streaming. Start with `128` on
+the 4090: the measured gain is concentrated in very short prompts; `512` did
+not consistently improve larger prompts. The limit applies to
 the actual prefill chunk, including chat-template tokens. Larger chunks retain
 the existing lookahead copies. A small remainder after a large chunk can use
 selective copies.
@@ -51,7 +53,9 @@ cache statistics or a cache rebuild.
 
 Use fresh servers in A/B/B/A order, with identical model, RAM/VRAM budgets,
 expert placement, prompt order, and concurrency. Set the environment limit to
-`0` for A and `512` for B. Disable diagnostics in both arms. For a fixed-work
+`0` for A and `512` for B to reproduce the exploratory measurements below.
+Use `128` for a conservative deployment trial. Disable diagnostics in both
+arms. For a fixed-work
 comparison, use `--moe-hot-adapt-interval-steps 0 --moe-hot-plan-persist off` with
 the same static expert profile, and `--kv-disk-cache-gib 0` to prevent disk
 prefix reuse. Those are benchmark controls, not production recommendations.
@@ -77,3 +81,56 @@ outputs bit for bit, including poisoned unused rows, sparse/dense unions,
 buffer reuse, and unavailable-API fallback. Separate CPU and CUDA tests verify
 that disabling diagnostic counters preserves both routes and adaptation
 histories.
+
+## RTX 4090 results, 2026-09-05
+
+The acceptance run used `--moe-collect-stats` off, the existing Qwen NVFP4
+checkpoint, 20 pinned layers (26.44 GiB), 28 DISK layers, 2,296 protected rows,
+3,753 expert slots, and 14 CPU threads. Each of four fresh servers ran the
+same ten measured prefill requests in A/B/B/A order. All reported cached
+prompt counts were zero. A is full copying; B uses the exploratory 512-token
+limit. Times below are mean client TTFT, excluding warmups.
+
+| Prompt tokens, including template | Fresh servers A / B (s) | Same server A / B (s) |
+| ---: | ---: | ---: |
+| 76 | 2.685 / 2.281 | 2.644 / 1.975 |
+| 140 | 3.508 / 3.522 | 3.114 / 2.904 |
+| 268 | 4.299 / 4.964 | 4.229 / 4.405 |
+| 524 | 7.525 / 7.790 | 6.169 / 6.213 |
+| 2,060 | 23.367 / 24.855 | 20.335 / 19.866 |
+
+The robust result is the 76-token case: 15.0% lower TTFT across fresh servers.
+The 524-token control uses the unchanged full-copy policy and illustrates the
+noise between starts. Larger prompts did not show a consistent benefit; the
+268-token case regressed. The conservative 128-token limit preserves the
+measured 76-token execution path and excludes the uncertain 140/268-token
+cases. It was not separately benchmarked as a complete serving configuration.
+
+The additional same-server experiment ran three adjacent pairs per size,
+with identical prompts and alternating policy order. It used the naive cache
+manager to prevent prefix reuse, which changed the GPU allocation to 4,045
+expert slots. Both policies shared that allocation. A benchmark-only wrapper
+read an eight-byte shared mmap at each prefill boundary to set the limit;
+there were no diagnostic counters, GPU timers, or profile polls. This measured
+a 25.3% reduction for the 76-token case and confirmed that broader gains are
+small or absent. Compare A with B within each column, not absolute times
+between the two cache configurations.
+
+All matched generated text and usage counts were identical. Decode measured
+17.56 versus 18.32 tokens/s after the first token in the restart experiment;
+the decode kernel is unchanged and this spread is insufficient to claim a
+decode improvement. Telemetry overhead was not isolated as an independent
+factor, so these results do not claim a separate speedup from its removal.
+
+The initial diagnostic pair, all non-debug requests, experiment configuration,
+and output hashes are retained in
+[the measurement record](../bench/results/4090-selective-prefill-20260905.json).
+The primary A/B/B/A run used revision `6ed99a4`; the paired run used `bd00a4a`.
+The intervening runtime change only gates diagnostics during KV pool growth,
+which did not occur in these runs.
+
+Validation on node-4: 245 focused CUDA/CPU regression tests passed. After the
+final KV growth diagnostic gate, all 31 KV ladder tests passed, including an
+assertion that disabled diagnostics never read the GPU/PLE statistics. The
+original serving checkout and configuration were restored and a real
+completion verified before delivery.
