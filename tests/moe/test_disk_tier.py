@@ -1323,7 +1323,10 @@ def _prefill_hot_split_fixture(
     gpu_output = torch.full((3, 8), 3.0, dtype=torch.bfloat16)
 
     class Executor:
-        def prefill(self, layer_id, hidden_states, topk_weights, topk_ids):
+        def prefill(self, layer_id, hidden_states, topk_weights, topk_ids, *, on_inputs_ready=None):
+            calls.append(("inputs",))
+            if on_inputs_ready is not None:
+                on_inputs_ready()
             calls.append(("cpu", topk_ids.clone(), hidden_states.clone()))
             return cpu_output
 
@@ -1648,6 +1651,53 @@ def test_prefill_hot_split_flag_off_preserves_full_cpu_path(monkeypatch):
 
     assert out is cpu_out
     assert next(call[1] for call in calls if call[0] == "prepare") == {0, 1, 2, 3}
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("hot_slots", [
+    [7, -1, 9, -1], [7, 8, 9, 10], [-1, -1, -1, -1],
+])
+def test_prefill_overlap_preserves_routes_and_orders_input_copies(monkeypatch, overlap, hot_slots):
+    from freetoken.layers import moe
+
+    monkeypatch.setattr(moe, "_PREFILL_HOT_OVERLAP", overlap)
+    layer, hidden, weights, ids, calls, cpu_out, gpu_out = _prefill_hot_split_fixture(
+        monkeypatch, hot_slots=hot_slots,
+    )
+    result = layer._prefill_routed(hidden, weights, ids)
+    names = [call[0] for call in calls]
+    if all(slot >= 0 for slot in hot_slots):
+        assert torch.equal(result, gpu_out)
+        assert "cpu" not in names
+    elif all(slot < 0 for slot in hot_slots):
+        assert torch.equal(result, cpu_out)
+        assert "gpu" not in names
+    else:
+        assert torch.equal(result, gpu_out + cpu_out)
+        assert names.index("inputs") < names.index("gpu") if overlap else names.index("gpu") < names.index("inputs")
+        assert names.index("gpu") < names.index("cpu")
+        assert names.index("cpu") < names.index("release") < names.index("schedule")
+        cpu_ids = next(call[1] for call in calls if call[0] == "cpu")
+        assert cpu_ids.tolist() == [[-1, 1], [-1, 3], [-1, 3]]
+
+
+def test_prefill_overlap_gpu_oom_releases_cold_lease_then_runs_full_cpu(monkeypatch):
+    from freetoken.layers import moe
+
+    monkeypatch.setattr(moe, "_PREFILL_HOT_OVERLAP", True)
+    layer, hidden, weights, ids, calls, cpu_out, _ = _prefill_hot_split_fixture(
+        monkeypatch, hot_slots=[7, -1, 9, -1], oom=True,
+    )
+    result = layer._prefill_routed(hidden, weights, ids)
+    assert result is cpu_out
+    assert [call[1] for call in calls if call[0] == "prepare"] == [{1, 3}, {0, 1, 2, 3}]
+    names = [call[0] for call in calls]
+    assert names.index("release") < len(names) - 1 - names[::-1].index("prepare")
+    assert names.count("release") == 2
+    assert names.count("cpu") == names.count("schedule") == 1
+    assert next(call[1] for call in calls if call[0] == "cpu").tolist() == [
+        [0, 1], [2, 3], [0, 3],
+    ]
     assert not any(call[0] in ("adapt", "gpu") for call in calls)
     stats = next(call for call in calls if call[0] == "stats")
     assert not bool(stats[2].any())
