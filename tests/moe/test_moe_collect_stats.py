@@ -103,3 +103,50 @@ def test_stats_line_reports_oracle_against_realized_coverage():
     )
     assert fragment == ", disk oracle_hit: 81.25% vs realized: 68.75%"
     assert _moe_oracle_status_fragment({"hot_pair_rate": 0.5}) == ""
+
+
+@pytest.mark.parametrize("collect,timing", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("all_hot", [False, True])
+def test_decode_classification_only_runs_with_diagnostics(
+    monkeypatch, collect, timing, all_hot,
+):
+    from freetoken.layers import moe
+
+    hidden = torch.ones(1, 8)
+    classified = []
+    recorded = []
+    cpu_work = []
+    original_classify = moe._all_hot
+
+    def classify(ids):
+        assert collect or timing, "disabled telemetry launched a route reduction"
+        result = original_classify(ids)
+        classified.append(bool(result))
+        return result
+
+    monkeypatch.setattr(moe, "_all_hot", classify)
+    executor = SimpleNamespace(
+        _step_timing=timing,
+        record_all_hot=lambda value: recorded.append(bool(value)),
+        decode_submit=lambda *args: cpu_work.append(args[3].clone()),
+        decode_sync=lambda *args, **kwargs: hidden * 2,
+    )
+    cache = SimpleNamespace(
+        collect_stats=collect, cpu_executor=executor,
+        copy_missing=lambda: None, bank_views=lambda: (),
+        alphas_for_slots=lambda layer_id: None,
+    )
+    layer = SimpleNamespace(
+        layer_id=0, _expert_gemm=lambda *args, **kwargs: hidden * 3,
+    )
+    raw = torch.tensor([[0, 1]], dtype=torch.int32)
+    slots = torch.tensor([[3, 4 if all_hot else -1]], dtype=torch.int32)
+    result = moe.OffloadMoELayer._decode_split_partials(
+        layer, cache, hidden, torch.ones(1, 2), slots, raw, count_all_hot=True,
+    )
+
+    assert torch.equal(result, hidden * 5)
+    assert classified == ([all_hot] if collect or timing else [])
+    assert recorded == classified
+    assert len(cpu_work) == 1
+    assert cpu_work[0].tolist() == [[-1, -1 if all_hot else 1]]

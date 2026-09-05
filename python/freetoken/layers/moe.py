@@ -499,7 +499,12 @@ class OffloadMoELayer(MoELayer):
         on_gpu, cpu_ids, gpu_slots, gpu_w = _split_hot_cold_routes(
             raw_ids, gpu_ids, topk_weights
         )
-        if count_all_hot:
+        if count_all_hot and (
+            getattr(cache, "collect_stats", False)
+            or getattr(executor, "_step_timing", False)
+        ):
+            # This classification feeds diagnostics only. Avoid capturing its
+            # reduction, cast, and counter update in ordinary decode graphs.
             executor.record_all_hot(_all_hot(cpu_ids))
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
 
