@@ -44,6 +44,23 @@ def process_io_delta(before, after):
     return {key: value - before["counters"][key] for key, value in after["counters"].items()}
 
 
+def score_json_response(text, expected):
+    try:
+        parsed = json.loads(text)
+        pairs = json.loads(text, object_pairs_hook=list)
+    except ValueError:
+        parsed, pairs = None, None
+    correct_records = sum(
+        isinstance(parsed, dict) and type(parsed.get(key)) is int and parsed[key] == value
+        for key, value in expected.items()
+    )
+    return dict(
+        passed=(isinstance(parsed, dict) and pairs == list(expected.items())
+                and correct_records == len(expected)),
+        correct_records=correct_records,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tokenizer", required=True)
@@ -58,9 +75,13 @@ def main():
                         help="Keep one policy for a whole server start, including warmup.")
     parser.add_argument("--io-pid", type=int,
                         help="Optional local Linux GPU worker PID for process I/O snapshots.")
+    parser.add_argument("--json-max-tokens", type=int, default=512,
+                        help="Output headroom for all 32 records, including pretty-printed JSON.")
     args = parser.parse_args()
     if args.io_pid is not None and args.io_pid <= 0:
         parser.error("--io-pid must be positive")
+    if args.json_max_tokens <= 0:
+        parser.error("--json-max-tokens must be positive")
     from transformers import AutoTokenizer
 
     client = sibling("wall_client", "selective-prefill.py")
@@ -85,7 +106,7 @@ def main():
                 "Use integer values. Include all 32 records exactly once, with no extra keys. "
                 "Output only the complete JSON object, without markdown or explanation.\n" + records
             )
-            return text, expected, 384
+            return text, expected, args.json_max_tokens
         text = (
             f"{nonce}. Read this source excerpt:\n<source>\n"
             + tokenizer.decode(document[:1800]) + "\n</source>\n"
@@ -108,20 +129,14 @@ def main():
         io_after = process_io_snapshot(args.io_pid) if args.io_pid is not None else None
         row = dict(kind=kind, repeat=repeat, warmup=warmup,
                    mode=args.mode_labels[int(selected)], order_offset=args.order_offset,
-                   prompt=text, **result)
+                   prompt=text, max_tokens=max_tokens, **result)
         if io_before is not None:
             row["process_io"] = dict(before=io_before, after=io_after,
                                      delta=process_io_delta(io_before, io_after))
         if result["usage"]["prompt_tokens"] < 1024:
-            raise RuntimeError("long output prompt did not exercise staged prefill")
+            raise RuntimeError("long output prompt must contain at least 1024 tokens")
         if expected is not None:
-            try:
-                parsed = json.loads(result["text"])
-            except ValueError:
-                parsed = None
-            row.update(expected=expected, passed=parsed == expected and list(parsed) == list(expected),
-                       correct_records=sum(isinstance(parsed, dict) and parsed.get(k) == v
-                                           for k, v in expected.items()))
+            row.update(expected=expected, **score_json_response(result["text"], expected))
         out.write(json.dumps(row) + "\n")
         out.flush()
         print(json.dumps({k: v for k, v in row.items() if k != "prompt"}), flush=True)

@@ -306,9 +306,10 @@ retains all outputs, journals, and the exact measured client and driver.
 
 ## Isolated HOT planning experiment
 
-Staged prefill uses scratch weights, so loading its working set into permanent
-HOT slots cannot accelerate that prefill computation. An experiment at
-`bfb0d73` instead ranked those slots from decode history during staged chunks,
+Before VRAM reuse was added, staged prefill read every selected weight from
+files into scratch, so permanent HOT weights did not accelerate its transport.
+An experiment at `bfb0d73` instead ranked those slots from decode history
+during staged chunks,
 retaining ordinary phase ranking during CPU fallback. The asynchronous planner
 received an immutable preference captured at dispatch. Routes, weights,
 arithmetic, observations, token clocks, and swap budgets were unchanged.
@@ -345,6 +346,54 @@ CPU remains the default, and the staged path remains experimental. The later
 HOT reuse comparison above retains the original phase policy and still finds
 mixed JSON response-time results. The original clean serving checkout was
 restored and returned `OK` after the fourth start.
+
+## Fixed adaptation cadence with CPU prefill
+
+Four isolated starts at `8e4ef5a` compared the existing automatic adaptation
+controller with the existing fixed 64-token interval, in auto/64/64/auto
+order. Every request used CPU DISK prefill. Placement, phase ranking, split
+histories, per-tick swap bytes, boundary byte cap, and precision options were
+unchanged. Diagnostics, GPU timing, persistence, and KV reuse were off.
+
+The shorter interval changes both prefill and decode cadence. It also
+bypasses automatic fill/steady transitions and bandwidth backoff. More due
+ticks can increase the actual prefill catch-up budget within the same byte
+cap, so this comparison does not isolate a decode-only scheduling change.
+The existing journals confirm 28 decode planner dispatches per fixed start
+versus one per automatic start, including warmup, timing, and fidelity.
+
+| Workload | Automatic wall | Fixed-64 wall | Result |
+| --- | ---: | ---: | --- |
+| 192-token prose, four pairs | 26.153 s | 35.168 s | 34.5% slower; every pair slower |
+| Complete 32-record JSON, two eligible pairs | 34.209 s | 42.035 s | 22.9% slower; both pairs slower |
+
+Two other JSON pairs are ineligible for a complete-response comparison. In
+both automatic starts, the same prompt produced identical pretty-printed
+output that reached the 384-token cap mid-object. The six fixed-mode JSON
+responses and four other automatic-mode responses completed correctly.
+Raw JSON means retain those incomplete responses and must not be interpreted
+as complete-task wall time. All four prose pairs contain the same 192 output
+tokens but differ in text and remain unscored.
+
+Mean whole-worker prose storage-read accounting increased from 5.395 to
+9.362 GiB per response. It includes PLE and other activity and cannot prove
+which expert transfers or page evictions caused the regression. The long
+fidelity checks scored 7/8 on every start. All seven correct answers match;
+the code-trace failure is `100` on the final automatic start and `108` on
+the other starts, versus expected `68`.
+
+This fixed-cadence configuration is rejected as a throughput improvement.
+The [complete record](../bench/results/4090-hot-cadence-cpu-wall-20260905.json)
+retains all four starts, including the truncated JSON, exact driver, client,
+I/O snapshots, analysis, and journals. The original service was restored and
+returned `OK`.
+
+Following this output-budget failure, the long-output client defaults to
+512 JSON output tokens, records the requested limit and streaming finish
+reason, and checks key multiplicity and integer types directly. Archived
+measurements retain their exact earlier clients and 384-token limits. Eight
+JSON edge cases, mocked stop/length SSE streams, and all 24 JSON responses
+from the preceding HOT-reuse gates passed the updated client checks.
 
 ## Cache advice review
 

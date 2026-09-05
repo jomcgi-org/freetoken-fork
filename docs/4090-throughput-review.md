@@ -42,8 +42,15 @@ three decode dispatches across the full timing and fidelity sequence. A
 192- or 383-token reply can finish before the next decode update, depending
 on where its prompt ended on that shared clock. This can make adaptation
 mostly optimize prefill residency even with split histories and phase aim.
-The existing fixed-interval option allows a controlled cadence experiment
-without changing routing, weights, ranking, or swap bounds.
+The existing fixed-interval option allowed a controlled cadence experiment
+without changing routing, weights, ranking, or swap bounds. A four-start
+auto/64/64/auto comparison with CPU prefill increased prose response time
+by 34.5%, with every pair slower. Two automatic-mode JSON outputs reached
+the benchmark's 384-token cap before finishing; the two complete JSON pairs
+were also slower with fixed-64 cadence. The
+[record](../bench/results/4090-hot-cadence-cpu-wall-20260905.json) preserves
+those failures. Faster cadence also increases prefill catch-up work and
+bypasses automatic backoff, so more frequent updates alone are unqualified.
 
 Other measured waste has concrete fixes: repeated CPU input quantization per
 route, serial HOT route preparation, unnecessary short-prefill transfers, and
