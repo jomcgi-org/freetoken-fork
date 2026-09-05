@@ -178,6 +178,8 @@ class Batch:
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the
     # PrefillManager; 0 on decode batches.
     log_new_tokens: int = field(default=0, init=False)
+    # CUDA timing marks and immutable request counters, resolved after copy_done.
+    prefill_timing: Any | None = field(default=None, init=False, repr=False)
     log_cached_tokens: int = field(default=0, init=False)
     # (uid, complete prompt length, prefix-cache hit) for requests entering their first
     # prepared prefill batch. The scheduler turns these into PromptAdmittedMsg only AFTER
