@@ -209,6 +209,24 @@ ranking during staged prefill is implemented at `bfb0d73`; its wall-time
 benefit is still unqualified. CPU remains the default, and this PR stays draft
 while the whole-response throughput question is open.
 
+## Cache advice review
+
+The existing `HostBank.release_rows()` NOREUSE branch opens a fresh file
+descriptor, applies advice, then closes it without reading or mapping from
+it. Linux 6.8's [fadvise implementation](https://github.com/torvalds/linux/blob/v6.8/mm/fadvise.c#L108)
+sets a flag on that open file description, rather than changing the supplied
+page range. The existing mapping therefore does not inherit the advice.
+This is a source-level finding; eager release is disabled in these benchmarks
+and does not explain their CPU/staged difference.
+
+Applying NOREUSE to the staging descriptor is also not an established remedy:
+upstream Linux 6.8's [buffered read path](https://github.com/torvalds/linux/blob/v6.8/mm/filemap.c#L2626)
+still marks read folios as accessed, while the
+[mapping recency check](https://github.com/torvalds/linux/blob/v6.8/include/linux/mm_inline.h#L580)
+consults the flag. Node-4 runs `6.8.0-138-generic`; these upstream sources do not
+audit every distribution patch. Any cache-advice or direct-I/O experiment
+needs its own whole-response gate, including warm decode after long prefill.
+
 ## Correctness validation
 
 At `99bfb4b`, 318 targeted Linux tests passed across staging, materialization,
