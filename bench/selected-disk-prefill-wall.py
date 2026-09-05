@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--model", default="qwen3.6-27b")
     parser.add_argument("--order-offset", type=int, choices=(0, 1), required=True)
     parser.add_argument("--repeats", type=int, default=4)
+    parser.add_argument("--prefill-sizes", type=int, nargs="+", default=[64, 512, 2048])
     args = parser.parse_args()
     from transformers import AutoTokenizer
 
@@ -71,10 +72,10 @@ def main():
 
     with args.output.open("w") as out:
         for selected in order(0):
-            for size in (64, 512, 2048):
+            for size in args.prefill_sizes:
                 one(out, selected, "warmup", size, -1,
                     prefill_prompt(size, -1, "warmup"), 4)
-        cases = [("prefill", size, rep) for rep in range(args.repeats) for size in (64, 512, 2048)]
+        cases = [("prefill", size, rep) for rep in range(args.repeats) for size in args.prefill_sizes]
         cases.extend(("multichunk", 4096, rep) for rep in range(2))
         cases.extend(("decode", 64, rep) for rep in range(2))
         random.Random(4090).shuffle(cases)
