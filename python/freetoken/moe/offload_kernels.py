@@ -79,6 +79,10 @@ def ensure_experts_hot(
     1-token decode step each age prior counts by one half-life step. New route
     counts remain unnormalized, so large prefill observations retain their
     proportional traffic weight.
+
+    ``record_stats`` suppresses warmup observations, including adaptation.
+    ``cache.collect_stats`` only controls diagnostic totals; disabling it must
+    not disable the histories used to choose the next HOT set.
     """
     if history not in ("decode", "prefill"):
         raise ValueError("HOT adaptation history must be 'decode' or 'prefill'")
