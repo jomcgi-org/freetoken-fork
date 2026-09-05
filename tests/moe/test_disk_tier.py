@@ -1539,7 +1539,11 @@ def test_prefill_hot_split_degrades_to_full_cpu(monkeypatch, hot_slots, oom):
     assert not bool(stats[2].any())
 
 
-def test_prefill_hot_split_rejects_slot_outside_bank_before_gemm(monkeypatch):
+@pytest.mark.parametrize("overlap", [False, True])
+def test_prefill_hot_split_rejects_slot_outside_bank_before_gemm(monkeypatch, overlap):
+    from freetoken.layers import moe
+
+    monkeypatch.setattr(moe, "_PREFILL_HOT_OVERLAP", overlap)
     layer, hidden, weights, ids, calls, _cpu_out, _gpu_out = _prefill_hot_split_fixture(
         monkeypatch, hot_slots=[12, -1, 9, -1], split_kernel="decode"
     )
@@ -1550,6 +1554,9 @@ def test_prefill_hot_split_rejects_slot_outside_bank_before_gemm(monkeypatch):
         layer._prefill_routed(hidden, weights, ids)
 
     assert not any(call[0] == "gpu" for call in calls)
+    if overlap:
+        assert sum(call[0] == "release" for call in calls) == 1
+        assert not any(call[0] in ("cpu", "schedule") for call in calls)
 
 
 def test_prefill_hot_split_decode_kernel_flag_preserves_ab_path(monkeypatch):
@@ -1567,9 +1574,13 @@ def test_prefill_hot_split_decode_kernel_flag_preserves_ab_path(monkeypatch):
     assert gpu[3:] == (None, False)
 
 
+@pytest.mark.parametrize("overlap", [False, True])
 def test_prefill_hot_split_grouped_assertion_falls_back_once_per_cache(
-    monkeypatch, caplog
+    monkeypatch, caplog, overlap
 ):
+    from freetoken.layers import moe
+
+    monkeypatch.setattr(moe, "_PREFILL_HOT_OVERLAP", overlap)
     layer, hidden, weights, ids, calls, _cpu_out, _gpu_out = (
         _prefill_hot_split_fixture(
             monkeypatch,
