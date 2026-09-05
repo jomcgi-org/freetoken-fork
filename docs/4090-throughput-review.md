@@ -8,7 +8,47 @@ experts per layer, top-10 routing, H=2560 and I=640. `qwen3.6-27b` is its API
 alias. Measurements use node-4's RTX 4090 and Ryzen 7 7800X3D with 61.91 GiB
 RAM and local NVMe. GLM is outside this performance qualification.
 
-## Combined wall time against the original checkout
+## Latest combined wall time against the original checkout
+
+Original `3a67403` with CPU DISK prefill is now compared directly against
+combined `78848ce` with staged GPU prefill, published HOT reuse, and
+`--moe-disk-prefill-io cached`. The real serving CLI selects the reader,
+without a constructor probe. Four isolated starts use
+original/optimized/optimized/original order, two full-response warmups per
+start, and four measured requests per start. Native binary identities and
+worker mappings are verified. Diagnostics, GPU timing, HOT persistence, and
+KV reuse are off, with identical placement and cache geometry.
+
+| Measured client response | Original | Combined | Wall-time reduction |
+| --- | ---: | ---: | ---: |
+| Complete JSON, mean of four requests | 36.703 s | 23.765 s | 35.3% |
+| Prose at a 192-token cap, mean of four requests | 28.192 s | 17.089 s | 39.4% |
+| Fixed mix, total of eight requests | 259.577 s | 163.413 s | 37.0% |
+
+All eight matched responses improve. The first matched start pair is 32.2%
+shorter; the reversed pair is 41.8% shorter. Mean first-token time falls from
+15.738 to 6.029 seconds for JSON and from 15.188 to 6.169 seconds for prose.
+Unlike the earlier combined CPU comparison below, both start orders favor
+the optimized configuration. This measures the full configuration and does
+not assign additive percentages to individual changes.
+
+All twelve JSON responses, including warmups, finish normally and pass strict
+value, integer-type, key-order, and multiplicity checks. One original response
+uses extra whitespace and 449 output tokens; the other eleven use 383.
+Seven measured pairs have matching usage, and that subset still takes 35.5%
+less wall time (220.144 to 141.901 seconds). Three JSON pairs have identical
+text. Every start scores 7/8 on the long fidelity questions, failing the same
+code trace: the first original start answers `100`, the others `108`, versus
+the correct `68`. Prose differs, reaches its output cap, and remains unscored.
+
+The [complete record](../bench/results/4090-combined-cached-wall-20260905.json)
+retains exact drivers and clients, source and native identities, raw outputs,
+matching geometry, journals, I/O snapshots, and reproducible analysis. The
+original service was restored and verified with a real completion. Retained
+host page cache and limited adaptation history still constrain a general
+production claim. Sustained serving-state qualification remains open.
+
+## Earlier combined CPU comparison
 
 The direct comparison of original `3a67403` against combined `4429203`
 measured eight requests per mode across four isolated starts in
@@ -184,8 +224,8 @@ paths. Switching placement can therefore change generated text. The transport
 tests compare exact bytes and BF16 GEMM output bits, while model checks compare
 scored tasks and complete responses. In the CPU-versus-staged gate, all JSON
 records were correct and both modes retained the same 7/8 long-fidelity score,
-including the same wrong code-trace answer. The combined comparison also
-retained 7/8 but changed that incorrect answer. Prose remains unscored;
+including the same wrong code-trace answer. The earlier combined CPU comparison
+also retained 7/8 but changed that incorrect answer. Prose remains unscored;
 this sample does not establish broad model-quality equivalence.
 
 Use `--moe-collect-stats` and `--moe-step-timing` only for diagnostic runs.
@@ -226,10 +266,10 @@ differs and remains unscored. The
 the measured source and raw evidence. The original service is restored and
 verified with a real completion.
 
-This is a comparison against buffered staging, not against the original CPU
-server. The percentages cannot be added to earlier results. The next gates
-are a fresh CPU-versus-cache-aware comparison and sustained adaptation with
-retained serving state. The source-selection option remains experimental
+This isolates the reader against buffered staging. The latest combined
+comparison above separately measures a 37.0% reduction against the original
+CPU server; these percentages cannot be added. The next gate is sustained
+adaptation with retained serving state. The source-selection option remains experimental
 and is selected with `--moe-disk-prefill staged --moe-disk-prefill-io cached`.
 A nonblocking buffered read is insufficient
 proof of avoiding cache insertion on this kernel; the direct-reader document

@@ -209,8 +209,9 @@ residency policy. The original service was restored and verified with a real
 
 The result qualifies this finite comparison against buffered staging. Host
 page cache is retained between starts, and each start has limited adaptation
-history. A fresh comparison against CPU prefill and a sustained run with
-retained serving state remain necessary before a general production claim.
+history. The later combined comparison below covers the original CPU server;
+a sustained run with retained serving state remains necessary before a
+general production claim.
 This 18.3% cannot be added to earlier gains against different baselines.
 
 ## Serving configuration validation
@@ -229,3 +230,42 @@ selected bytes and leave uncopied scratch rows unowned. The
 retains commands, revision, and a real completion from the restored original
 service. The direct original-versus-combined model comparison uses this
 frozen revision and the real CLI, without a constructor probe.
+
+## Combined configuration versus the original CPU server
+
+The completed four-start original/optimized/optimized/original comparison
+uses original `3a67403` with CPU DISK prefill and combined `78848ce` with
+`--moe-disk-prefill staged --moe-disk-prefill-io cached`. Both modes use the
+same automatic adaptation, placement, and cache geometry. Diagnostics, GPU
+timing, HOT persistence, and KV reuse are off. Exact native identities and
+worker mappings are verified. This includes the preceding optimization
+stack, so it does not isolate the contribution of the reader alone.
+
+| Measured client response | Original CPU | Combined cached staging | Wall-time reduction |
+| --- | ---: | ---: | ---: |
+| Complete JSON, mean of four requests | 36.703 s | 23.765 s | 35.3% |
+| Prose at a 192-token cap, mean of four requests | 28.192 s | 17.089 s | 39.4% |
+| Fixed eight-request mix, total | 259.577 s | 163.413 s | 37.0% |
+
+All eight pairs improve; the first matched start pair improves by 32.2% and
+the reversed pair by 41.8%. Mean first-token time falls from about 15 seconds
+to about 6 seconds. All twelve JSON responses finish normally and pass strict
+value/type/order/multiplicity checks. One original JSON response uses extra
+whitespace and 449 output tokens instead of 383. The seven timing pairs with
+matching usage still improve by 35.5% (220.144 to 141.901 seconds). Three of
+four measured JSON pairs have identical text.
+
+All four starts score 7/8 on the long fidelity questions, with the same
+code-trace failure. The first original start answers `100`; the other starts
+answer `108`, against the correct `68`. Prose differs, reaches its output cap,
+and remains unscored. These are limited model checks alongside exact byte
+and GEMM tests, not broad quality qualification.
+
+Whole-worker storage-read accounting is 5.669 versus 5.232 GiB per JSON
+response and 5.114 versus 5.198 GiB per prose response. This comparison does
+not measure expert-only traffic or establish particular page-eviction causes.
+The [complete record](../bench/results/4090-combined-cached-wall-20260905.json)
+retains the driver, clients, transport source, native identity, matching
+geometry, raw outputs, journals, and reproducible analysis. The original
+service was restored and verified with a real `OK` completion. Sustained
+adaptation with retained serving state remains the next qualification gate.
