@@ -44,6 +44,13 @@ outputs. Compare the early and late blocks, not just a grand mean. A gain in
 this finite continuous workload does not establish optimal throughput for all
 context lengths, concurrency levels, or production cache states.
 
+Also compare blocks 0-2 with blocks 3-5. Each half contains all three source
+files in the same proportions, unlike the narrower two-block early/middle/late
+windows. This reduces source-mix confounding when inspecting time within a
+run. Nonces and JSON values still differ, and all narrower windows remain in
+the record. The analysis does not attribute the entire time trend to HOT
+adaptation alone.
+
 At `132b629`, the client's ten pure Python protocol checks pass locally and
 on node-4's Linux environment. The [validation record](../bench/results/4090-sustained-client-validation-20260905.txt)
 also confirms no inference-code changes from the previously validated
