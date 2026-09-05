@@ -2057,13 +2057,20 @@ class OffloadMoeCache:
             self._checkpoint_published_hot_slot_owners()
             if self._hot_adapt_tick_executed_swaps:
                 self.snapshot_hot_plan()
-            after = self.decayed_hot_pair_rate()
+            rate_fragment = ""
+            if self.collect_stats:
+                # Reading the live GPU histories synchronizes and converts them
+                # to host lists. This post-publication rate feeds diagnostics only.
+                after = self.decayed_hot_pair_rate()
+                rate_fragment = (
+                    f", decayed_hot_pair_rate="
+                    f"{self._hot_adapt_tick_rate_before:.2%}->{after:.2%}"
+                )
             logger.info_rank0(
                 f"MoE HOT adaptation idle tick token={self.hot_adapt_routed_tokens}: "
                 f"planned_swaps={self._hot_adapt_tick_planned_swaps}, "
-                f"executed_swaps={self._hot_adapt_tick_executed_swaps}, "
-                f"decayed_hot_pair_rate="
-                f"{self._hot_adapt_tick_rate_before:.2%}->{after:.2%}"
+                f"executed_swaps={self._hot_adapt_tick_executed_swaps}"
+                f"{rate_fragment}"
             )
             tracker = getattr(self, "_hot_adapt_idle_tracker", None)
             if tracker is not None:

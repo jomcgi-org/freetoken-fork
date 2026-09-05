@@ -32,6 +32,19 @@ experts.
 
 ## Diagnostics
 
+The per-layer all-HOT decode classification requires either
+`--moe-collect-stats` or `--moe-step-timing`. With both flags off, decode graph
+capture omits its route reduction, scalar cast, and counter update. This count
+only feeds diagnostics; native empty-task skipping and expert execution retain
+their own functional checks. No separate wall-time gain is claimed for this
+additional gate.
+
+After an idle HOT adaptation tick, the live coverage-rate readback also
+requires `--moe-collect-stats`. Without the flag, completion still checkpoints
+published owners, persists changed plans when configured, updates the idle
+tracker, and reports the executed swap count. It skips the diagnostic-only
+GPU history synchronization and conversion to host lists.
+
 `--moe-collect-stats` enables diagnostic route counters, HOT/COLD prefill
 summaries, transfer counters, and periodic MoE/PLE statistics. These diagnostics
 can add GPU reductions, host reads, and CPU work. Omit the flag for performance
