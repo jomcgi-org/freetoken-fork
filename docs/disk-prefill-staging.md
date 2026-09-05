@@ -271,6 +271,15 @@ consults the flag. Node-4 runs `6.8.0-138-generic`; these upstream sources do no
 audit every distribution patch. Any cache-advice or direct-I/O experiment
 needs its own whole-response gate, including warm decode after long prefill.
 
+The long-output client also accepts optional `--io-pid` for a local Linux GPU
+worker. It snapshots process I/O before and after the existing client timing
+interval, without enabling server diagnostics, and checks process start time
+to reject PID reuse. The [kernel documentation](https://docs.kernel.org/filesystems/proc.html#proc-pid-io-display-the-io-accounting-fields)
+distinguishes logical read bytes (`rchar`, including cache hits) from storage
+read accounting (`read_bytes`). These are whole-process counters, including
+PLE and other worker I/O, rather than expert-only traffic or device bandwidth.
+The option defaults off and was not enabled in the `9b73b2a` reuse gate.
+
 ## Correctness validation
 
 At `99bfb4b`, 318 targeted Linux tests passed across staging, materialization,
