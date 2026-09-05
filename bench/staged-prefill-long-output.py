@@ -32,6 +32,8 @@ def main():
     parser.add_argument("--order-offset", type=int, choices=(0, 1), required=True)
     parser.add_argument("--mode-labels", nargs=2, default=("cpu", "selected"),
                         metavar=("CONTROL_0", "CONTROL_1"))
+    parser.add_argument("--only-mode", type=int, choices=(0, 1),
+                        help="Keep one policy for a whole server start, including warmup.")
     args = parser.parse_args()
     from transformers import AutoTokenizer
 
@@ -41,6 +43,8 @@ def main():
     document = tokenizer.encode(source.read_text(), add_special_tokens=False)
 
     def order(repeat):
+        if args.only_mode is not None:
+            return (bool(args.only_mode),)
         return (False, True) if (repeat + args.order_offset) % 2 == 0 else (True, False)
 
     def prompt(kind, repeat):
