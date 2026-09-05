@@ -1,0 +1,55 @@
+{
+  "worker_pid": 678490,
+  "source": "Linux statx STATX_DIOALIGN, UAPI struct statx offsets 0 and 152",
+  "mapped_model_files": [
+    {
+      "path": "/var/lib/longhorn/nvme-02/freetoken/models/flash.ftw/freetoken-00001.ftw",
+      "statx_mask": 14335,
+      "memory_alignment": 4,
+      "offset_alignment": 512
+    },
+    {
+      "path": "/var/lib/longhorn/nvme-02/freetoken/models/flash.ftw/freetoken-00002.ftw",
+      "statx_mask": 14335,
+      "memory_alignment": 4,
+      "offset_alignment": 512
+    },
+    {
+      "path": "/var/lib/longhorn/nvme-02/freetoken/models/flash.ftw/freetoken-00003.ftw",
+      "statx_mask": 14335,
+      "memory_alignment": 4,
+      "offset_alignment": 512
+    },
+    {
+      "path": "/var/lib/longhorn/nvme-02/freetoken/models/flash.ftw/freetoken-00005.ftw",
+      "statx_mask": 14335,
+      "memory_alignment": 4,
+      "offset_alignment": 512
+    },
+    {
+      "path": "/var/lib/longhorn/nvme-02/freetoken/models/flash.ftw/freetoken-00006.ftw",
+      "statx_mask": 14335,
+      "memory_alignment": 4,
+      "offset_alignment": 512
+    },
+    {
+      "path": "/var/lib/longhorn/nvme-02/freetoken/models/flash.ftw/freetoken-00007.ftw",
+      "statx_mask": 14335,
+      "memory_alignment": 4,
+      "offset_alignment": 512
+    },
+    {
+      "path": "/var/lib/longhorn/nvme-02/freetoken/models/flash.ftw/freetoken-00008.ftw",
+      "statx_mask": 14335,
+      "memory_alignment": 4,
+      "offset_alignment": 512
+    },
+    {
+      "path": "/var/lib/longhorn/nvme-02/freetoken/models/flash.ftw/freetoken-00009.ftw",
+      "statx_mask": 14335,
+      "memory_alignment": 4,
+      "offset_alignment": 512
+    }
+  ],
+  "all_support_4096_alignment": true
+}

@@ -72,9 +72,11 @@ class DiskPrefillStaging:
         Packed weights and all scale formats travel as bytes, without casting.
         The return value is the logical byte count, without a device readback.
         Experimental direct I/O rounds file reads outward to alignment blocks,
-        but copies only the requested bytes. Unsupported filesystems fail rather
-        than silently changing the measured transport. It must not run across
-        a concurrent fork; the serving worker owns the ring after spawning.
+        but copies only the requested bytes. I/O errors propagate without an
+        application fallback. The experiment must validate filesystem support
+        separately because the kernel can fall back for unsupported inodes.
+        It must not run across a concurrent fork; the serving worker owns the
+        ring after spawning.
         """
         bank = getattr(source, "_freetoken_host_bank", None)
         if bank is None or not bank._disk or bank._uffd or bank._file_path is None:

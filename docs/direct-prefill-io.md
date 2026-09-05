@@ -13,9 +13,9 @@ Only the exact selected row bytes reach GPU scratch. Published HOT reuse,
 router selections, scale bytes, and GPU arithmetic are unchanged.
 
 The implementation reuses the loader's aligned short-read helper. EOF before
-all requested payload bytes is an error. Unsupported direct I/O also fails
-explicitly, so a benchmark cannot silently measure buffered fallback. Buffer
-completion events retain the existing DMA lifetime contract.
+all requested payload bytes is an error. Application-level errors propagate
+without buffered fallback. Buffer completion events retain the existing DMA
+lifetime contract.
 
 Linux documents filesystem-specific [direct-I/O alignment and concurrency
 constraints](https://man7.org/linux/man-pages/man2/open.2.html). The target is
@@ -24,6 +24,16 @@ node-4's Linux 6.8 ext4 filesystem, using the existing loader's conservative
 not run concurrently with a fork. Direct reads can sacrifice useful cache
 hits and increase storage traffic, so correctness alone does not qualify
 this as a throughput improvement.
+
+The [ext4 read path](https://github.com/torvalds/linux/blob/v6.8/fs/ext4/file.c#L65)
+can itself fall back to buffered I/O for some unsupported inode features.
+Requesting `O_DIRECT` alone is therefore insufficient proof of transport.
+During the direct start, `STATX_DIOALIGN` on all eight model files mapped by
+the GPU worker reported 4-byte memory and 512-byte offset alignment, compatible
+with this reader's 4 KiB requests. The experiment targets these checked files;
+other filesystems and inode configurations are not qualified.
+The [metadata record](../bench/results/4090-direct-io-file-alignment-20260905.json)
+retains the worker PID, mapped paths, statx masks, and both alignment fields.
 
 Validation must cover exact packed bytes, partial source views, unaligned
 allocation addresses and file offsets, repeated asynchronous buffer reuse,
