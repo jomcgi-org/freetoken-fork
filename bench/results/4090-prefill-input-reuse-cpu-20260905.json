@@ -1157,5 +1157,18 @@
     "test_log": "........................................................................ [ 59%]\n..................................................                       [100%]\n122 passed, 1 warning in 7.86s\n",
     "measured_bitwise_pairs": 63
   },
-  "interpretation": "Whole native CPU batches, including preparation, GEMMs, and scatter. Synthetic resident weights with 128 experts; no model, disk, transfer, or GPU work is measured. No serving throughput claim is made from this benchmark."
+  "interpretation": "Whole native CPU batches, including preparation, GEMMs, and scatter. Synthetic resident weights with 128 experts; no model, disk, transfer, or GPU work is measured. No serving throughput claim is made from this benchmark.",
+  "final_validation": {
+    "revision": "a7492fe",
+    "command": "python -m pytest tests/moe/test_disk_tier.py tests/moe/test_cpu_moe_prefill_batch.py -q --disable-warnings --maxfail=2",
+    "result": "105 passed, 1 warning in 7.86s",
+    "log": "........................................................................ [ 68%]\n.................................                                        [100%]\n105 passed, 1 warning in 7.86s\n"
+  },
+  "service_restored": {
+    "revision": "3a67403a293be20836604bc25729329997848e09",
+    "checkout_clean": true,
+    "unit": "freetoken-serve",
+    "real_completion": "OK",
+    "benchmark_and_validation_units": "inactive"
+  }
 }
