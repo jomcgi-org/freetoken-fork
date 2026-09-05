@@ -277,7 +277,8 @@ The exploratory change at `bfb0d73` passed 111 targeted Linux tests across HOT
 adaptation, diagnostic gating, and DISK prefill policy. Its added cases checked
 decode-focused ranking, unchanged explicit blend behavior, immutable planner
 selection, and CPU fallback. Those exploratory runtime and test changes are
-reverted together; the validation log remains with the experiment.
+reverted together; the validation log remains with the experiment. After the
+revert at `b1f45f8`, all 100 retained tests in those three files passed again.
 
 ## Earlier transport gates
 

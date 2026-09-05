@@ -5,3 +5,11 @@ Command: python -m pytest tests/moe/test_hot_adapt.py tests/moe/test_moe_collect
 ........................................................................ [ 64%]
 .......................................                                  [100%]
 111 passed in 2.86s
+
+Retained phase-policy validation after reverting the exploratory runtime change:
+Revision: b1f45f8
+Command: python -m pytest tests/moe/test_hot_adapt.py tests/moe/test_moe_collect_stats.py tests/moe/test_disk_prefill_policy.py -q --disable-warnings --maxfail=4
+
+........................................................................ [ 72%]
+............................                                             [100%]
+100 passed in 2.79s
