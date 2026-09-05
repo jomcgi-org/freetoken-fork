@@ -1651,6 +1651,9 @@ def test_prefill_hot_split_flag_off_preserves_full_cpu_path(monkeypatch):
 
     assert out is cpu_out
     assert next(call[1] for call in calls if call[0] == "prepare") == {0, 1, 2, 3}
+    assert not any(call[0] in ("adapt", "gpu") for call in calls)
+    stats = next(call for call in calls if call[0] == "stats")
+    assert not bool(stats[2].any())
 
 
 @pytest.mark.parametrize("overlap", [False, True])
@@ -1674,7 +1677,10 @@ def test_prefill_overlap_preserves_routes_and_orders_input_copies(monkeypatch, o
         assert "gpu" not in names
     else:
         assert torch.equal(result, gpu_out + cpu_out)
-        assert names.index("inputs") < names.index("gpu") if overlap else names.index("gpu") < names.index("inputs")
+        if overlap:
+            assert names.index("inputs") < names.index("gpu")
+        else:
+            assert names.index("gpu") < names.index("inputs")
         assert names.index("gpu") < names.index("cpu")
         assert names.index("cpu") < names.index("release") < names.index("schedule")
         cpu_ids = next(call[1] for call in calls if call[0] == "cpu")
@@ -1698,7 +1704,6 @@ def test_prefill_overlap_gpu_oom_releases_cold_lease_then_runs_full_cpu(monkeypa
     assert next(call[1] for call in calls if call[0] == "cpu").tolist() == [
         [0, 1], [2, 3], [0, 3],
     ]
-    assert not any(call[0] in ("adapt", "gpu") for call in calls)
     stats = next(call for call in calls if call[0] == "stats")
     assert not bool(stats[2].any())
 
