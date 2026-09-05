@@ -1683,12 +1683,14 @@ struct CpuMoeExecutor {
   std::vector<int> grouped_routes;    // flattened route ids (token * top_k + k)
   std::vector<int> distinct_experts;  // experts with at least one valid route
   std::vector<float> route_y_scratch; // [num_tokens * top_k, H] unweighted down outputs
-  // NVFP4 prefill-only bounded workspace. The bf16 input gather buffer is reused
-  // in place for W4A8 activations after gathering. All
+  // NVFP4 prefill-only bounded workspace. The input allocation holds W4A8
+  // activations; its bf16-sized capacity also supports the reference gather path.
+  // All
   // route-indexed arrays are capped by prefill_capacity * top_k and allocated once
   // by setup_prefill_batch(), outside the per-layer hot path.
   int prefill_capacity = 0;
-  std::vector<bf16_t> prefill_x_scratch;  // [routes,H], compacted to int8 in-place
+  std::atomic<bool> prefill_input_reuse{true};
+  std::vector<bf16_t> prefill_x_scratch;  // [routes,H], int8 uses its first half
   std::vector<bf16_t> prefill_g_scratch;  // [routes,I] activated intermediate
   std::vector<int8_t> prefill_gi8_scratch;  // [routes,I] W4A8 down input
   std::vector<bf16_t> prefill_y_scratch;  // [routes,H] per-route down result
@@ -2534,6 +2536,35 @@ struct CpuMoeExecutor {
         rows > static_cast<size_t>(prefill_capacity) * top_k) {
       throw std::runtime_error("CPU MoE prefill batch exceeds configured capacity");
     }
+    if (prefill_input_reuse.load(std::memory_order_relaxed)) {
+      // Input quantization depends only on the token, before any router weight
+      // is applied. Quantize into its first valid route's grouped row, then
+      // copy those exact bytes and scales to the remaining routes. Grouped rows
+      // are disjoint even when a token selects the same expert more than once.
+      int8_t* xi8 = reinterpret_cast<int8_t*>(prefill_x_scratch.data());
+      const size_t scale_columns = H / 16;
+      for (int tok = 0; tok < t->num_tokens; ++tok) {
+        int first = -1;
+        for (int k = 0; k < top_k; ++k) {
+          const int pos = route_to_group[tok * top_k + k];
+          if (pos < 0) continue;
+          int8_t* output = xi8 + static_cast<size_t>(pos) * H;
+          float* scales = prefill_x_scale_scratch.data() + pos * scale_columns;
+          if (first < 0) {
+            quant_i8_bf16_pg16(
+                t->x + static_cast<size_t>(tok) * H, H, output, scales);
+            first = pos;
+          } else {
+            std::memcpy(output, xi8 + static_cast<size_t>(first) * H,
+                        static_cast<size_t>(H));
+            std::memcpy(scales,
+                        prefill_x_scale_scratch.data() + first * scale_columns,
+                        scale_columns * sizeof(float));
+          }
+        }
+      }
+      return;
+    }
     for (size_t pos = 0; pos < rows; ++pos) {
       const int route = grouped_routes[pos];
       const int tok = route / top_k;
@@ -3375,6 +3406,11 @@ struct CpuMoeExecutor {
     empty_skip.store(enabled, std::memory_order_relaxed);
   }
 
+  void set_prefill_input_reuse(bool enabled) {
+    // Sampled once at preparation entry. It does not affect an in-flight GEMM.
+    prefill_input_reuse.store(enabled, std::memory_order_relaxed);
+  }
+
   void gpufetch_with_cuda_stream(uintptr_t stream, uintptr_t task) {
     cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream),
                        &CpuMoeExecutor::gpufetch_cb,
@@ -3449,6 +3485,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("setup_prefill_batch", &CpuMoeExecutor::setup_prefill_batch,
            py::arg("max_prefill_tokens"))
       .def("prefill_batch_buffer_bytes", &CpuMoeExecutor::prefill_batch_buffer_bytes)
+      .def("set_prefill_input_reuse", &CpuMoeExecutor::set_prefill_input_reuse,
+           py::arg("enabled"))
       .def("run_prefill_batch_sync", &CpuMoeExecutor::run_prefill_batch_sync,
            py::arg("layer_id"), py::arg("num_tokens"), py::arg("x_ptr"),
            py::arg("ids_ptr"), py::arg("w_ptr"), py::arg("y_ptr"),
