@@ -294,6 +294,16 @@ selection, and CPU fallback. Those exploratory runtime and test changes are
 reverted together; the validation log remains with the experiment. After the
 revert at `b1f45f8`, all 100 retained tests in those three files passed again.
 
+Published HOT weight reuse at `9b73b2a` passed 163 targeted Linux tests across
+materialization, file staging, HOT adaptation, diagnostic gating, DISK policy,
+and the general offload cache. All 34 GPU transport/materialization cases also
+passed CUDA memcheck with zero reported errors. New cases compare raw NVFP4
+GEMM output bits at 16 and 512 tokens before retirement, after a real worker
+overwrites an unpublished slot, and after publication. Fused-copy fallback,
+the copy-ablation flag, untouched scratch ownership, and gated transfer counts
+are covered. The [validation log](../bench/results/4090-staged-hot-reuse-validation-20260905.txt)
+records both commands and their output.
+
 ## Earlier transport gates
 
 These initial single-start probes explain the chosen transport. They used

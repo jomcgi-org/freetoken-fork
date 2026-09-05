@@ -1,0 +1,16 @@
+Revision: 9b73b2a
+Environment: node-4 RTX 4090, Linux, CUDA 13, Python 3.12
+
+Command: python -m pytest tests/moe/test_materialize_hot_slots.py tests/moe/test_disk_prefill_staging.py tests/moe/test_hot_adapt.py tests/moe/test_moe_collect_stats.py tests/moe/test_disk_prefill_policy.py tests/moe/test_offload.py -q --disable-warnings --maxfail=3
+
+........................................................................ [ 44%]
+........................................................................ [ 88%]
+...................                                                      [100%]
+163 passed, 1 warning in 8.31s
+
+Command: compute-sanitizer --tool memcheck --error-exitcode 99 python -m pytest tests/moe/test_materialize_hot_slots.py tests/moe/test_disk_prefill_staging.py -q --disable-warnings --maxfail=2
+
+========= COMPUTE-SANITIZER
+..................................                                       [100%]
+34 passed, 1 warning in 4.46s
+========= ERROR SUMMARY: 0 errors

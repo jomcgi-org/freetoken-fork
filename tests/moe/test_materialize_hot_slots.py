@@ -172,9 +172,13 @@ def test_selected_staging_leaves_uncopied_rows_unowned(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("state", ["published", "retired", "republished"])
+@pytest.mark.parametrize("state", ["published", "retired", "republished", "rebuilt", "all_hot"])
 @pytest.mark.parametrize("tokens", [16, 512])
-def test_staged_hot_reuse_matches_nvfp4_gemm_across_publication(tmp_path, state, tokens):
+def test_staged_hot_reuse_matches_nvfp4_gemm_across_publication(
+    tmp_path, monkeypatch, state, tokens,
+):
+    import os
+
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
     from freetoken.moe.host_banks import HostBank
@@ -208,7 +212,7 @@ def test_staged_hot_reuse_matches_nvfp4_gemm_across_publication(tmp_path, state,
         max_swap_bytes=expert_bytes, expert_bytes=expert_bytes,
     )
     try:
-        if state != "published":
+        if state in ("retired", "republished", "rebuilt"):
             cache._retire_hot_adaptation_swaps((HotSwap(0, 0, 4, 1),), tick_count=2)
             # The real worker has replaced the bytes, but the request thread
             # has not published the new owner. slot_for_id still names expert 1.
@@ -221,10 +225,19 @@ def test_staged_hot_reuse_matches_nvfp4_gemm_across_publication(tmp_path, state,
                     destination[slot].view(torch.uint8).cpu(),
                     per_layer[0][4].view(torch.uint8),
                 )
-            if state == "republished":
+            if state in ("republished", "rebuilt"):
                 cache._poll_hot_adaptation()
                 assert cache._hot_slot_owners[0][0] == 4
                 assert cache.slot_for_id[0, 1].item() == -1
+            if state == "rebuilt":
+                previous_slots = cache._hot_slot_for_row[0]
+                cache.disk_prefill_staged_h2d_bytes = 17
+                cache.disk_prefill_staged_d2d_bytes = 19
+                cache.rebuild(32, preserve_hot_state=True)
+                assert cache._hot_slot_for_row[0] != previous_slots
+                assert cache._copy_dst_ptrs.tolist() == [b.data_ptr() for _, b in cache.banks]
+                assert cache.disk_prefill_staged_h2d_bytes == 0
+                assert cache.disk_prefill_staged_d2d_bytes == 0
 
         reference = []
         for per_layer, destination in cache.banks:
@@ -232,20 +245,27 @@ def test_staged_hot_reuse_matches_nvfp4_gemm_across_publication(tmp_path, state,
             cache._disk_prefill_staging.copy_bank(per_layer[0], full)
             reference.append(full)
             destination[:experts].fill_(255 if destination.dtype == torch.uint8 else float("nan"))
-        routes = torch.tensor([[1, 3], [4, 6]], dtype=torch.int32, device="cuda").repeat(tokens // 2, 1)
+        choices = [[1, 6], [6, 1]] if state == "all_hot" else [[1, 3], [4, 6]]
+        selected_rows = [1, 6] if state == "all_hot" else [1, 3, 4, 6]
+        routes = torch.tensor(choices, dtype=torch.int32, device="cuda").repeat(tokens // 2, 1)
         original_routes = routes.clone()
         owners = cache.hot_slot_owners()
         cache.collect_stats = True
+        if state == "all_hot":
+            def no_file_read(*_args):
+                raise AssertionError("an entirely published HOT union needs no file read")
+
+            monkeypatch.setattr(os, "preadv", no_file_read)
         cache.stage_disk_prefill_layer(0, routes)
         hot_rows = 1 if state == "retired" else 2
-        assert cache.disk_prefill_staged_h2d_bytes == (4 - hot_rows) * expert_bytes
+        assert cache.disk_prefill_staged_h2d_bytes == (len(selected_rows) - hot_rows) * expert_bytes
         assert cache.disk_prefill_staged_d2d_bytes == hot_rows * expert_bytes
         assert cache.hot_slot_owners() == owners
         assert torch.equal(routes, original_routes)
         assert cache.id_of_slot[:experts].tolist() == [-1] * experts
         actual_banks = [destination[:experts] for _, destination in cache.banks]
         for a, b in zip(actual_banks, reference):
-            assert torch.equal(a.view(torch.uint8)[[1, 3, 4, 6]], b.view(torch.uint8)[[1, 3, 4, 6]])
+            assert torch.equal(a.view(torch.uint8)[selected_rows], b.view(torch.uint8)[selected_rows])
         generator = torch.Generator().manual_seed(4090)
         x = (torch.randn(tokens, hidden, generator=generator) / 4).to("cuda", torch.bfloat16)
         router = torch.rand(tokens, 2, generator=generator).to("cuda")
