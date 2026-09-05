@@ -54,3 +54,23 @@ direct reads and all sixteen pages resident after buffered reads. This
 confirms the intended cache behavior on the target filesystem, without
 claiming a model speedup. The [log](../bench/results/4090-direct-io-validation-20260905.txt)
 includes exact commands and verification of the restored original service.
+
+## Cache-hit reuse candidates
+
+If direct reads lose too much useful cache reuse, a later experiment could
+read resident ranges from RAM and use direct I/O only for the rest. That is
+a source-selection policy; it must still execute every selected expert.
+
+`RWF_NOWAIT` is not by itself a cache-only read on the target kernel. Linux
+6.8's [generic file read path](https://github.com/torvalds/linux/blob/v6.8/mm/filemap.c#L2558)
+explicitly permits readahead with `IOCB_NOWAIT`, and its miss path can start
+readahead before returning `EAGAIN`. A successful nonblocking API call is
+therefore insufficient evidence that a policy avoids cache insertion.
+
+The [mincore implementation](https://github.com/torvalds/linux/blob/v6.8/mm/mincore.c#L147)
+provides a residency snapshot, but it can become stale immediately. It also
+reports every page resident when the caller lacks ownership or write access
+to the file. Any use as a transport hint must preserve correct reads when
+the hint is stale or unavailable, and must measure the cost of inspecting
+pages and splitting transfers. These candidates are not implemented or
+performance-qualified by the direct-reader tests.
