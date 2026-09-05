@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--model", default="qwen3.6-27b")
     parser.add_argument("--repeats", type=int, default=4)
     parser.add_argument("--decode-repeats", type=int, default=3)
+    parser.add_argument("--order-offset", type=int, choices=(0, 1), default=0)
     args = parser.parse_args()
     from transformers import AutoTokenizer
 
@@ -68,7 +69,9 @@ def main():
         # shuffled case index can put every decode control second, where expert
         # cache warming from the identical first request dominates its timing.
         for kind, size, rep in cases:
-            for parallel in ((False, True) if rep % 2 == 0 else (True, False)):
+            for parallel in (
+                (False, True) if (rep + args.order_offset) % 2 == 0 else (True, False)
+            ):
                 one(out, kind, size, rep, parallel)
 
 
