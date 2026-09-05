@@ -18,7 +18,8 @@ STATE = (
 
 def make_cache(*, experts=512, missing=False, device="cuda", collect=True, adapt=True):
     cache = OffloadMoeCache(
-        num_layers=3, num_experts=experts, cache_size=3 * experts + 7,
+        num_layers=3, num_experts=experts,
+        cache_size=3753 if experts == 512 else 3 * experts + 7,
         device=torch.device(device),
     )
     rng = torch.Generator().manual_seed(4090)
@@ -116,3 +117,16 @@ def test_graph_replay_keeps_changing_routes_and_histories(monkeypatch):
         torch.cuda.synchronize()
         assert torch.equal(ids_a, ids_b)
         assert_state_equal(a, b)
+
+
+@pytest.mark.parametrize("count", [64, 160, 1025, 20480])
+def test_production_geometry_without_diagnostic_reductions(monkeypatch, count):
+    a, b = make_cache(collect=False), make_cache(collect=False)
+    raw = torch.arange(count, device="cuda", dtype=torch.int32) % 512
+    expected, actual = raw.clone(), raw.clone()
+    monkeypatch.setattr(kernels, "_PARALLEL_HOT_ROUTING", False)
+    kernels.ensure_experts_hot(a, 1, expected, route_weight=0.1)
+    monkeypatch.setattr(kernels, "_PARALLEL_HOT_ROUTING", True)
+    kernels.ensure_experts_hot(b, 1, actual, route_weight=0.1)
+    assert torch.equal(actual, expected)
+    assert_state_equal(a, b)
