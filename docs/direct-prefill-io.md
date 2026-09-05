@@ -32,3 +32,15 @@ compares buffered and direct reads using `mincore` on a private test file.
 The performance gate uses whole client response time with diagnostics off,
 matching memory geometry, full warmups, reversed starts, complete JSON,
 and the existing long fidelity questions.
+
+## Initial validation
+
+At `2b6da47`, all 53 focused Linux CUDA checks in
+`test_disk_prefill_staging.py` and `test_materialize_hot_slots.py` passed.
+The same 53 checks passed under CUDA memcheck with zero errors. Direct and
+buffered transports retain identical BF16 GEMM output bits at 16 and 512
+tokens. The private-file residency check observed zero resident pages after
+direct reads and all sixteen pages resident after buffered reads. This
+confirms the intended cache behavior on the target filesystem, without
+claiming a model speedup. The [log](../bench/results/4090-direct-io-validation-20260905.txt)
+includes exact commands and verification of the restored original service.
