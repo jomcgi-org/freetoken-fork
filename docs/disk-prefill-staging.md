@@ -465,6 +465,15 @@ on node-4 after integration. It removes diagnostic-only work when collection
 and step timing are off. The preceding model wall measurements predate this
 cherry-pick, so no additional wall-time gain is attributed to it.
 
+The idle HOT coverage readback gate from #31 is also integrated at `ae8b98d`.
+All 99 focused diagnostic and HOT adaptation tests passed on its independent
+branch and again after integration at `4429203`. CUDA cases delay H2D copies
+and verify exact bank bytes when one pinned staging row serves consecutive
+idle ticks, with the diagnostic readback forbidden. The existing events
+preserve that lifetime without the diagnostic synchronization. The
+[combined log](../bench/results/4090-idle-hot-telemetry-validation-20260905.txt)
+records both runs. The cadence comparison predates this idle gate.
+
 ## Earlier transport gates
 
 These initial single-start probes explain the chosen transport. They used

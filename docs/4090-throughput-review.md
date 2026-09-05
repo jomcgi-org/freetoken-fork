@@ -98,7 +98,7 @@ kernel speedups and model wall time have separate meanings.
 | Parallel HOT route preparation | 20,480-route kernel: 1,719.7 to 39.3 microseconds; model-wide gain remains unquantified | [#28](https://github.com/jomcgi-org/freetoken-fork/pull/28), ready |
 | Concurrent CPU/GPU prefill | Ordering and placement confounded the early model gain | [#29](https://github.com/jomcgi-org/freetoken-fork/pull/29), draft |
 | Reuse CPU input quantization across routes | Whole-request reductions of 5.0%, 11.4%, 16.6% at 76, 524, 2,060 prompt tokens; all 48 prefill pairs faster and all 56 timing pairs identical in text and usage | [#30](https://github.com/jomcgi-org/freetoken-fork/pull/30), ready |
-| Gate diagnostic-only all-HOT decode classification | Removes its reduction, cast, and counter update from ordinary decode graphs; no independent wall-time claim | [#31](https://github.com/jomcgi-org/freetoken-fork/pull/31), ready; also included in #33 |
+| Gate diagnostic-only decode classification and idle history readback | Removes ordinary decode's reduction/counter work and idle coverage's GPU-to-CPU history synchronization; 99 focused Linux tests pass, with no independent wall-time claim | [#31](https://github.com/jomcgi-org/freetoken-fork/pull/31), ready; also included in #33 |
 | Correct temporary materialization ownership | Prevents sparse scratch from advertising uncopied experts as hits; protected HOT bytes retained | [#32](https://github.com/jomcgi-org/freetoken-fork/pull/32), ready |
 | Selected DISK staging and exact HOT VRAM reuse | Strong long-prefill gains, 31.6% lower prose response time in the latest CPU comparison, mixed JSON response-time results | [#33](https://github.com/jomcgi-org/freetoken-fork/pull/33), draft |
 
