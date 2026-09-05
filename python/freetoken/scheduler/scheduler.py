@@ -226,11 +226,18 @@ class Scheduler(SchedulerIOMixin):
             is_ple_status = is_decode_status or is_prefill_status
             disk = (
                 cache.disk_prefetch_stats(reset=True)
-                if cache is not None and (is_decode_status or is_prefill_status) else {}
+                if cache is not None
+                and getattr(config, "moe_collect_stats", False)
+                and (is_decode_status or is_prefill_status) else {}
             )
             ple_stats = (
                 self.engine.model.ple_disk_stats(reset=True)
-                if is_ple_status and hasattr(self.engine.model, "ple_disk_stats") else {}
+                if is_ple_status
+                and (
+                    getattr(config, "moe_collect_stats", False)
+                    or getattr(config, "ple_cache_profile_out", None)
+                )
+                and hasattr(self.engine.model, "ple_disk_stats") else {}
             )
             if disk:
                 message += (
@@ -1082,18 +1089,22 @@ class Scheduler(SchedulerIOMixin):
                     protected_count = sum(
                         self.engine.moe_offload_cache.hot_expert_capacity.values()
                     )
-                    disk = self.engine.moe_offload_cache.disk_prefetch_stats(
-                        reset=False
+                    collect = getattr(
+                        self.engine.moe_offload_cache, "collect_stats", False
+                    )
+                    disk = (
+                        self.engine.moe_offload_cache.disk_prefetch_stats(reset=False)
+                        if collect else {}
                     )
                     model = self.engine.model
                     ple = (
                         model.ple_disk_stats(reset=False)
-                        if hasattr(model, "ple_disk_stats") else {}
+                        if collect and hasattr(model, "ple_disk_stats") else {}
                     )
                     ple_faults = ple.get("ple_major_faults")
                     hot_rate = (
                         "n/a"
-                        if self.engine.moe_offload_cache.cpu_executor is None
+                        if not collect or self.engine.moe_offload_cache.cpu_executor is None
                         else f"{float(disk.get('hot_pair_rate', 0.0)) * 100.0:.2f}%"
                     )
                     logger.info_rank0(

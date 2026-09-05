@@ -1666,6 +1666,7 @@ def test_prefill_hot_split_stats_report_and_reset():
     cache.cpu_executor = SimpleNamespace(
         disk_prefetch_stats=lambda reset=False: {}
     )
+    cache.collect_stats = True
     raw = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
     cache.record_prefill_hot_split(
         raw, torch.tensor([[True, False], [True, False]])
@@ -2254,6 +2255,7 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
         prefill_overlap=False,
         decode_target="cpu",
     )
+    cache.collect_stats = True
     cache.cpu_layer_ids = frozenset({0})
     cache.set_bank_sources(
         banks.sources,
@@ -2345,6 +2347,7 @@ def test_disk_hot_cold_split_prefill_matches_pure_cpu_prefill(tmp_path):
         decode_target="cpu",
         moe_prefill_hot_split="on",
     )
+    cache.collect_stats = True
     cache.cpu_layer_ids = frozenset({0})
     cache.set_bank_sources(
         banks.sources,
