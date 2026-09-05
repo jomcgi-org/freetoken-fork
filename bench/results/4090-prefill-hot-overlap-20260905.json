@@ -715,5 +715,11 @@
     "checkout_clean": true,
     "real_completion": "OK",
     "new_code_deployed": false
+  },
+  "followup_order_audit": {
+    "status": "Performance unqualified. Original measured rows retained unchanged.",
+    "long_prefill_concurrent_second_pairs": 3,
+    "long_prefill_pairs": 4,
+    "limitation": "First/second order was globally alternated, not balanced per workload. Expert-cache warming can confound the observed scheduling means. See 4090-ram-placement-20260905.json for the repetition and a6a07aa for the benchmark fix."
   }
 }
