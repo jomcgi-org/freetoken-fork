@@ -69,3 +69,50 @@ def test_staging_retries_short_reads_and_rejects_eof(tmp_path, monkeypatch):
         assert torch.count_nonzero(target).item() == 0
     finally:
         staging.synchronize()
+
+
+@pytest.mark.parametrize("tokens", [16, 512])
+def test_selected_staging_matches_full_nvfp4_gemm(tmp_path, tokens):
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+
+    experts, hidden, intermediate = 8, 256, 128
+    generator = torch.Generator().manual_seed(4090)
+    layouts = [
+        ((experts, 2 * intermediate, hidden // 2), torch.uint8),
+        ((experts, 2 * intermediate, hidden // 16), torch.float8_e4m3fn),
+        ((experts, 2 * intermediate), torch.float16),
+        ((experts, hidden, intermediate // 2), torch.uint8),
+        ((experts, hidden, intermediate // 16), torch.float8_e4m3fn),
+        ((experts, hidden), torch.float16),
+    ]
+    device = torch.device("cuda", torch.cuda.current_device())
+    staging = DiskPrefillStaging(device, chunk_bytes=32768)
+    full, selected, sources = [], [], []
+    try:
+        for index, (shape, dtype) in enumerate(layouts):
+            if dtype == torch.uint8:
+                weights = torch.randint(0, 256, shape, generator=generator, dtype=dtype)
+            else:
+                weights = (torch.rand(shape, generator=generator) * 0.02 + 0.01).to(dtype)
+            path = tmp_path / f"bank-{index}.ftw"
+            path.write_bytes(weights.view(torch.uint8).numpy().tobytes())
+            source = HostBank(shape, dtype, backing="file", file_path=str(path))
+            sources.append(source)
+            a = torch.empty(shape, dtype=dtype, device=device)
+            b = torch.empty_like(a)
+            # Unselected rows must not enter the GEMM, even as padding operands.
+            b.fill_(255 if dtype == torch.uint8 else float("nan"))
+            staging.copy_bank(source.tensor, a)
+            staging.copy_bank(source.tensor, b, [1, 3, 6])
+            full.append(a)
+            selected.append(b)
+        x = (torch.randn(tokens, hidden, generator=generator) / 4).to(device, torch.bfloat16)
+        choices = torch.tensor([1, 3, 6], dtype=torch.int32)
+        ids = choices[torch.randint(0, 3, (tokens, 2), generator=generator)].to(device)
+        router = torch.rand(tokens, 2, generator=generator).to(device)
+        reference = fused_experts_nvfp4(x, *full, router, ids, experts, "silu", False)
+        actual = fused_experts_nvfp4(x, *selected, router, ids, experts, "silu", False)
+        assert torch.isfinite(actual).all()
+        assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
+    finally:
+        staging.synchronize()
