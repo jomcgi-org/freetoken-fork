@@ -26,11 +26,12 @@ class DiskPrefillStaging:
 
     def __init__(self, device: torch.device, *, chunk_bytes: int = 32 << 20):
         self.device = torch.device(device)
+        chunk_bytes = int(chunk_bytes)
         if self.device.type != "cuda" or chunk_bytes <= 0:
             raise ValueError("staging requires a CUDA device and a positive chunk size")
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
-        self.chunk_bytes = int(chunk_bytes)
+        self.chunk_bytes = chunk_bytes
         self.buffers = [
             alloc_pinned_tensor(self.chunk_bytes, dtype=torch.uint8) for _ in range(2)
         ]

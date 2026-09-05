@@ -136,3 +136,7 @@ CPU prefill with balanced prompt order across starts. Integrating sparse
 copies also requires correct ownership for non-HOT layers: their uncopied
 rows must not be advertised as cache hits. These probes used 28 HOT layers,
 whose scratch copies are already unowned through the preceding ownership fix.
+
+The original clean serving checkout at `3a67403` was restored after the
+experiments and final GPU tests, and returned a real `OK` completion. All
+three benchmark services are stopped. The prototype is not deployed there.
