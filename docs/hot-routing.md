@@ -49,7 +49,9 @@ failed before the slot initialization fix for both initial setup and rebuild.
 
 Compute-sanitizer memcheck reported zero errors for the complete kernel
 benchmark after the fixes. Sanitized timings are excluded from performance
-results.
+results. All 29 existing tests in `tests/moe/test_offload.py` also passed,
+including native NVFP4 materialization and cache rebuild checks, for 252
+passing tests in total.
 
 ## Kernel measurement
 
@@ -105,7 +107,44 @@ python bench/hot-routing-wall.py \
 ```
 
 The shared mmap read is present in both modes. It selects the prefill policy
-and collects no data. There are no server-side GPU timers, diagnostic counters,
-or profile polls. Exclude warmups, verify generated text and usage equality,
+and collects no data. MoE diagnostic collection and GPU timing are disabled;
+there are no profile polls. Exclude warmups, verify generated text and usage equality,
 and compare client first-token and whole-request wall times. Single-token
 decode retains the same synchronized scalar route kernel in both modes.
+
+## Non-debug results, 2026-09-05
+
+The acceptance run used the existing Qwen NVFP4 checkpoint, 19 pinned layers
+(25.12 GiB), 29 DISK layers (38.34 GiB), 2,320 protected rows, 4,045 expert
+slots, 65,536 KV tokens, and 14 CPU threads. Both modes shared this allocation.
+Six warmups preceded 24 measured prefill requests and six 192-token decode
+requests. Every one of the 15 matched pairs had identical text and usage.
+
+| Prompt tokens, including template | Serial TTFT (s) | Parallel TTFT (s) | Change |
+| ---: | ---: | ---: | ---: |
+| 76 | 2.443 | 2.451 | +0.3% |
+| 524 | 6.416 | 6.462 | +0.7% |
+| 2,060 | 21.418 | 21.569 | +0.7% |
+
+These means show no measurable prefill wall-time improvement in this small
+sample. The paired differences varied in both directions, with sample standard
+deviations of 0.103, 0.418, and 0.723 seconds, respectively. Whole-request
+prefill wall time has the same result: +0.4%, +0.7%, and +0.7%.
+
+Decode measured 18.78 versus 22.34 tokens/s after the first token, but both
+modes execute the same scalar decode kernel. The paired whole-request
+differences varied from 2.23 seconds slower to 5.87 seconds faster. This spread
+does not establish a decode gain from parallel routing.
+
+The faster routing operation removes about 49 milliseconds of diagnostic
+work across 29 large prefill layers. That is small beside a roughly 21-second
+first-token wait. CPU expert execution, disk access, transfers, and their
+scheduling remain the larger targets. In particular, HOT GPU work currently
+precedes blocking CPU input copies in `_prefill_hot_split`; overlapping those
+independent partials deserves a separate quality-preserving experiment.
+
+Raw requests, timings, configuration, and output comparisons are retained in
+[the measurement record](../bench/results/4090-hot-routing-20260905.json).
+The runtime revision was `a682019`. The original service was restored at
+`3a67403`, its checkout remained clean, and a real completion returned `OK`
+before delivery. The parallel routing change has not been deployed there.
