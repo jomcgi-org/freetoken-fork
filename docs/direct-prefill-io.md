@@ -137,9 +137,19 @@ serving user. Failed queries and other ownership use direct reads. It masks
 the defined residency bit, handles partial source views and rows larger than
 the probe window, and keeps all row data authoritative in the original file.
 The 64 MiB pinned allocation is unchanged. On the target's 4 KiB pages, the
-reusable bitmap and bounded snapshot copies consume less than 32 KiB of
-additional host metadata, independent of model size and request length.
+bitmap and bounded snapshot copies use about 32 KiB at peak, plus small
+Python objects, independent of model size and request length.
 
 The hint lookup and range planning are functional work included in wall time.
 No diagnostic counters or device readbacks are added. Default serving remains
-buffered while CUDA and whole-response qualification are pending.
+buffered while whole-response qualification is pending.
+
+At `25cdbff`, all 70 focused staging/materialization CUDA tests pass normally
+and under GPU memcheck, with zero errors. Mixed-residency cases check the
+actual descriptor flags and prove that fully resident rows use buffered reads,
+partially resident rows use direct reads, and initially cold pages remain
+uncached. Other cases cover failed queries, concealed residency, stale hints,
+undefined high residency bits, large rows, partial views, and exact NVFP4
+GEMM output bits. The [validation log](../bench/results/4090-cached-io-validation-20260905.txt)
+retains exact commands and restoration verification. Model wall-time
+qualification remains pending.
