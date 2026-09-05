@@ -32,6 +32,13 @@ experts.
 
 ## Diagnostics
 
+The per-layer all-HOT decode classification requires either
+`--moe-collect-stats` or `--moe-step-timing`. With both flags off, decode graph
+capture omits its route reduction, scalar cast, and counter update. This count
+only feeds diagnostics; native empty-task skipping and expert execution retain
+their own functional checks. No separate wall-time gain is claimed for this
+additional gate.
+
 `--moe-collect-stats` enables diagnostic route counters, HOT/COLD prefill
 summaries, transfer counters, and periodic MoE/PLE statistics. These diagnostics
 can add GPU reductions, host reads, and CPU work. Omit the flag for performance
