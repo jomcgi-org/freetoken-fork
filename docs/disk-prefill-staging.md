@@ -53,6 +53,20 @@ When statistics are enabled, `decode_miss_stats()` reports staged transfer
 bytes separately as `disk_prefill_staged_h2d_bytes`; pinned-overlap counters
 retain their existing meaning.
 
+Published HOT experts now reuse their existing GPU weights: one fused byte
+copy gathers all six banks into scratch, and only the remaining expert rows
+are read from disk. This adds small index metadata, with no weight workspace.
+The publication protocol clears host owners before a worker can overwrite a
+retired slot. Reuse consults those owners, since the ordinary slot map can
+still name the retired expert. Copies run on the current stream before the
+same GPU GEMM, retaining original expert IDs and arithmetic.
+
+Unavailable fused copy descriptors or the copy-ablation flag retain the full
+file-staging path. Optional `disk_prefill_staged_d2d_bytes` counts the reused
+bytes, while the H2D counter reports only bytes actually staged from files.
+Both counters are gated and reset together. This reuse change still needs
+its own non-debug whole-response gate; the earlier records below predate it.
+
 ## Balanced CPU comparison
 
 Two server starts used identical prompts, with each prompt's CPU/staging order

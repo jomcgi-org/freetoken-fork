@@ -6,8 +6,7 @@ import torch
 from freetoken.moe.offload_cache import OffloadMoeCache
 
 
-def nvfp4_banks(layers, experts):
-    hidden, intermediate = 64, 32
+def nvfp4_banks(layers, experts, *, hidden=64, intermediate=32):
     shapes = {
         "gate_up_packed": (2 * intermediate, hidden // 2),
         "gate_up_scale": (2 * intermediate, hidden // 16),
@@ -99,7 +98,10 @@ def test_materialized_hot_layers_survive_reuse_and_decode(experts, slots, route_
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("protected", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
-def test_selected_staging_leaves_uncopied_rows_unowned(tmp_path, protected, overlap):
+@pytest.mark.parametrize("reuse_backend", ["fused", "disabled", "ablation"])
+def test_selected_staging_leaves_uncopied_rows_unowned(
+    tmp_path, monkeypatch, protected, overlap, reuse_backend,
+):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.moe.host_banks import HostBank
 
@@ -130,6 +132,11 @@ def test_selected_staging_leaves_uncopied_rows_unowned(tmp_path, protected, over
         half_life_steps=2000, interval_steps=0,
         max_swap_bytes=expert_bytes, expert_bytes=expert_bytes,
     )
+    if reuse_backend == "disabled":
+        cache._copy_fused_ok = False
+    elif reuse_backend == "ablation":
+        monkeypatch.setenv("FREETOKEN_SKIP_FAST_INDEX_COPY", "1")
+    reused = int(protected and reuse_backend == "fused")
     try:
         # Prime ordinary cache ownership, then overwrite only two expert rows.
         cache.materialize_layer(1)
@@ -144,8 +151,9 @@ def test_selected_staging_leaves_uncopied_rows_unowned(tmp_path, protected, over
                 expected = previous.clone()
                 expected[[1, 3]] = per_layer[0].view(torch.uint8)[[1, 3]]
                 assert torch.equal(destination[:8].view(torch.uint8).cpu(), expected)
-                expected_bytes += 2 * per_layer[0][0].numel() * per_layer[0].element_size()
+                expected_bytes += (2 - reused) * per_layer[0][0].numel() * per_layer[0].element_size()
             assert cache.disk_prefill_staged_h2d_bytes == (expected_bytes if stats else 0)
+            assert cache.disk_prefill_staged_d2d_bytes == (reused * expert_bytes if stats else 0)
             assert cache.prefill_h2d_bytes == 0
             assert cache.id_of_slot[:8].tolist() == [-1] * 8
             assert cache.slot_for_id[0, 6].item() == -1
@@ -157,6 +165,94 @@ def test_selected_staging_leaves_uncopied_rows_unowned(tmp_path, protected, over
                 assert cache.usage[slot].item() == torch.iinfo(torch.int64).max
         cache.reset_stats()
         assert cache.disk_prefill_staged_h2d_bytes == 0
+        assert cache.disk_prefill_staged_d2d_bytes == 0
+    finally:
+        cache.synchronize_disk_prefill_staging()
+        cache.shutdown_hot_adaptation()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("state", ["published", "retired", "republished"])
+@pytest.mark.parametrize("tokens", [16, 512])
+def test_staged_hot_reuse_matches_nvfp4_gemm_across_publication(tmp_path, state, tokens):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
+    from freetoken.moe.host_banks import HostBank
+    from freetoken.moe.hot_adapt import HotSwap
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    experts, hidden, intermediate = 8, 256, 128
+    sources = nvfp4_banks(1, experts, hidden=hidden, intermediate=intermediate)
+    for name, layers in sources.items():
+        tensor = layers[0]
+        path = tmp_path / f"{name}.ftw"
+        path.write_bytes(tensor.view(torch.uint8).numpy().tobytes())
+        layers[0] = HostBank(
+            tensor.shape, tensor.dtype, backing="file", file_path=str(path),
+        ).tensor
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=experts, cache_size=24,
+        device=torch.device("cuda"), quant_format="nvfp4",
+        decode_target="cpu", prefill_overlap=False, moe_disk_prefill="staged",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    cache.set_bank_sources(
+        sources, layer_residency=["disk"],
+        hot_expert_ids={0: (1, 6)}, hot_expert_capacity={0: 2},
+    )
+    cache.init_disk_prefill_staging()
+    expert_bytes = sum(bank[0][0].numel() * bank[0].element_size() for bank in sources.values())
+    cache.configure_hot_adaptation(
+        half_life_steps=2000, interval_steps=1, idle_ms=0,
+        max_swap_bytes=expert_bytes, expert_bytes=expert_bytes,
+    )
+    try:
+        if state != "published":
+            cache._retire_hot_adaptation_swaps((HotSwap(0, 0, 4, 1),), tick_count=2)
+            # The real worker has replaced the bytes, but the request thread
+            # has not published the new owner. slot_for_id still names expert 1.
+            cache._hot_adapt_future.result(timeout=30)
+            slot = cache._hot_slot_for_row[0][0]
+            assert cache._hot_slot_owners[0][0] is None
+            assert cache.slot_for_id[0, 1].item() == slot
+            for per_layer, destination in cache.banks:
+                assert torch.equal(
+                    destination[slot].view(torch.uint8).cpu(),
+                    per_layer[0][4].view(torch.uint8),
+                )
+            if state == "republished":
+                cache._poll_hot_adaptation()
+                assert cache._hot_slot_owners[0][0] == 4
+                assert cache.slot_for_id[0, 1].item() == -1
+
+        reference = []
+        for per_layer, destination in cache.banks:
+            full = torch.empty_like(destination[:experts])
+            cache._disk_prefill_staging.copy_bank(per_layer[0], full)
+            reference.append(full)
+            destination[:experts].fill_(255 if destination.dtype == torch.uint8 else float("nan"))
+        routes = torch.tensor([[1, 3], [4, 6]], dtype=torch.int32, device="cuda").repeat(tokens // 2, 1)
+        original_routes = routes.clone()
+        owners = cache.hot_slot_owners()
+        cache.collect_stats = True
+        cache.stage_disk_prefill_layer(0, routes)
+        hot_rows = 1 if state == "retired" else 2
+        assert cache.disk_prefill_staged_h2d_bytes == (4 - hot_rows) * expert_bytes
+        assert cache.disk_prefill_staged_d2d_bytes == hot_rows * expert_bytes
+        assert cache.hot_slot_owners() == owners
+        assert torch.equal(routes, original_routes)
+        assert cache.id_of_slot[:experts].tolist() == [-1] * experts
+        actual_banks = [destination[:experts] for _, destination in cache.banks]
+        for a, b in zip(actual_banks, reference):
+            assert torch.equal(a.view(torch.uint8)[[1, 3, 4, 6]], b.view(torch.uint8)[[1, 3, 4, 6]])
+        generator = torch.Generator().manual_seed(4090)
+        x = (torch.randn(tokens, hidden, generator=generator) / 4).to("cuda", torch.bfloat16)
+        router = torch.rand(tokens, 2, generator=generator).to("cuda")
+        expected = fused_experts_nvfp4(x, *reference, router, routes, experts, "silu", False)
+        actual = fused_experts_nvfp4(x, *actual_banks, router, routes, experts, "silu", False)
+        assert torch.isfinite(actual).all()
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
     finally:
         cache.synchronize_disk_prefill_staging()
         cache.shutdown_hot_adaptation()

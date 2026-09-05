@@ -561,6 +561,7 @@ class OffloadMoeCache:
         self.prefill_selective_active = False
         self.prefill_h2d_bytes = 0
         self.disk_prefill_staged_h2d_bytes = 0
+        self.disk_prefill_staged_d2d_bytes = 0
         self.prefill_selective_layers = 0
         self.prefill_selective_rows = 0
         self.prefill_selective_dense_layers = 0
@@ -807,12 +808,57 @@ class OffloadMoeCache:
         # Sparse copies cannot advertise uncopied experts as cache hits. This
         # applies to layers without protected HOT slots as well as HOT layers.
         self.materialize_layer(layer_id, temporary=True)
+        rows = self._reuse_staged_prefill_hot_rows(layer_id, rows)
         for per_layer, destination in self.banks:
             copied = self._disk_prefill_staging.copy_bank(
                 per_layer[layer_id], destination[:self.num_experts], rows,
             )
             if self.collect_stats:
                 self.disk_prefill_staged_h2d_bytes += copied
+
+    def _reuse_staged_prefill_hot_rows(self, layer_id: int, rows: list[int]) -> list[int]:
+        """Copy published HOT weights to their original expert rows in scratch.
+
+        Return the remaining file rows. Publication happens at request-thread
+        boundaries. Retired owners are None while a worker can overwrite their
+        slots, so the ordinary slot map is not a safe source of reuse decisions.
+        The current stream orders this copy before file staging and the GEMM.
+        """
+        owners = self._hot_slot_owners.get(layer_id)
+        if not owners or not self._copy_fused_ok:
+            return rows
+        from freetoken.kernel.fast_index_copy import (
+            _skip_fast_index_copy_enabled,
+            fast_index_copy_multi_jit,
+        )
+
+        if _skip_fast_index_copy_enabled():
+            return rows
+        slots = {
+            expert: slot
+            for expert, slot in zip(owners, self._hot_slot_for_row[layer_id], strict=True)
+            if expert is not None
+        }
+        hot = [expert for expert in rows if expert in slots]
+        if not hot:
+            return rows
+        sources = [slots[expert] for expert in hot]
+        if any(slot < self.num_experts or slot >= self.cache_size for slot in sources):
+            raise RuntimeError("staged prefill HOT source overlaps scratch or exceeds cache")
+        # Only small index metadata is allocated. All weight and scale banks
+        # copy directly between disjoint regions of their existing GPU storage.
+        indices = torch.tensor([hot, sources], dtype=torch.int64, device=self.device)
+        fast_index_copy_multi_jit(
+            self._copy_dst_ptrs,
+            self._copy_dst_ptrs,
+            self._copy_feat_bytes,
+            indices[0],
+            indices[1],
+            blocks_per_bank=64,
+        )
+        if self.collect_stats:
+            self.disk_prefill_staged_d2d_bytes += len(hot) * sum(self._copy_feat_bytes_host)
+        return [expert for expert in rows if expert not in slots]
 
     def synchronize_disk_prefill_staging(self) -> None:
         if self._disk_prefill_staging is not None:
@@ -1152,6 +1198,7 @@ class OffloadMoeCache:
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         self.prefill_h2d_bytes = 0
         self.disk_prefill_staged_h2d_bytes = 0
+        self.disk_prefill_staged_d2d_bytes = 0
         self.prefill_selective_layers = 0
         self.prefill_selective_rows = 0
         self.prefill_selective_dense_layers = 0
@@ -3617,6 +3664,7 @@ class OffloadMoeCache:
         self.prefill_total_rows = 0
         self.prefill_h2d_bytes = 0
         self.disk_prefill_staged_h2d_bytes = 0
+        self.disk_prefill_staged_d2d_bytes = 0
         self.prefill_selective_layers = 0
         self.prefill_selective_rows = 0
         self.prefill_selective_dense_layers = 0
@@ -3684,6 +3732,7 @@ class OffloadMoeCache:
             "prefill_rows": self.prefill_total_rows,
             "prefill_overlap_h2d_bytes": self.prefill_h2d_bytes,
             "disk_prefill_staged_h2d_bytes": self.disk_prefill_staged_h2d_bytes,
+            "disk_prefill_staged_d2d_bytes": self.disk_prefill_staged_d2d_bytes,
             "prefill_selective_layers": self.prefill_selective_layers,
             "prefill_selective_rows": self.prefill_selective_rows,
             "prefill_selective_dense_layers": self.prefill_selective_dense_layers,
