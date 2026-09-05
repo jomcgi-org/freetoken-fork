@@ -457,6 +457,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
         layer_id,
         cache.num_experts,
         cache.cache_size,
+        TEMPORARY=layer_id in cache.hot_expert_capacity,
         BLOCK=block,
     )
 
@@ -514,6 +515,7 @@ def _materialize_layer_kernel(
     layer_id: tl.constexpr,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
+    TEMPORARY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     off = tl.arange(0, BLOCK)
@@ -523,19 +525,31 @@ def _materialize_layer_kernel(
 
     base = layer_id * num_experts
     old_id = tl.load(id_of_slot_ptr + slot, mask=slot_mask, other=-1)
-    # Flat ids make "belongs to this layer" a range check instead of a field compare.
-    same_layer = slot_mask & (old_id >= base) & (old_id < base + num_experts)
-    tl.store(id_of_slot_ptr + slot, -1, mask=same_layer)
-    tl.store(usage_ptr + slot, 0, mask=same_layer)
-
-    old_valid = expert_mask & (old_id >= 0) & (~same_layer)
-    tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid)
-
     step = tl.load(step_ptr) + 1
+    if TEMPORARY:
+        old_valid = expert_mask & (old_id >= 0)
+        old_mapping = tl.load(slot_for_id_ptr + old_id, mask=old_valid, other=-1)
+    # Small cache shapes can replicate reads across warps. Finish their ownership
+    # and timestamp snapshots before the elected writers mutate either table.
+    tl.debug_barrier()
+    if TEMPORARY:
+        # HOT experts already own permanent GPU slots. Whole-layer prefill only
+        # borrows [0, E), so leave these copies unowned: tagging duplicates here
+        # would let the next scratch overwrite invalidate the protected mapping.
+        tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid & (old_mapping == slot))
+        tl.store(id_of_slot_ptr + slot, -1, mask=expert_mask)
+        tl.store(usage_ptr + slot, 0, mask=expert_mask)
+    else:
+        # Flat ids make "belongs to this layer" a range check.
+        same_layer = slot_mask & (old_id >= base) & (old_id < base + num_experts)
+        tl.store(id_of_slot_ptr + slot, -1, mask=same_layer)
+        tl.store(usage_ptr + slot, 0, mask=same_layer)
+        old_valid = expert_mask & (old_id >= 0) & (~same_layer)
+        tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid)
+        tl.store(id_of_slot_ptr + slot, base + off, mask=expert_mask)
+        tl.store(slot_for_id_ptr + base + off, slot, mask=expert_mask)
+        tl.store(usage_ptr + slot, step, mask=expert_mask)
     tl.store(step_ptr, step)
-    tl.store(id_of_slot_ptr + slot, base + off, mask=expert_mask)
-    tl.store(slot_for_id_ptr + base + off, slot, mask=expert_mask)
-    tl.store(usage_ptr + slot, step, mask=expert_mask)
     tl.store(evict_slots_ptr + off, slot, mask=expert_mask)
     tl.store(src_indices_ptr + off, off, mask=expert_mask)  # layer-local row
     tl.store(num_indices_ptr, num_experts)
