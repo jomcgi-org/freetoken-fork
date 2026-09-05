@@ -14,8 +14,10 @@ comparison below supports a 1,024-token crossover for prefill. The longer-output
 gate before HOT reuse found a 6.8% JSON response-time regression despite faster
 prefill. Reusing published HOT weights subsequently reduced whole-response
 time versus file-only staging by 33.1% for JSON and 19.7% for prose. A fresh
-CPU comparison with automatic adaptation is still needed, so this path stays
-experimental.
+CPU comparison with automatic adaptation reduced prose wall time by 31.6%
+across all four pairs. JSON averaged 6.4% shorter but improved in only two of
+four pairs. This path stays experimental because the whole-response benefit
+still depends on workload and cache state.
 
 ## Execution and memory contract
 
@@ -67,8 +69,8 @@ same GPU GEMM, retaining original expert IDs and arithmetic.
 Unavailable fused copy descriptors or the copy-ablation flag retain the full
 file-staging path. Optional `disk_prefill_staged_d2d_bytes` counts the reused
 bytes, while the H2D counter reports only bytes actually staged from files.
-Both counters are gated and reset together. This reuse change still needs
-validation with automatic adaptation; its fixed-HOT wall-time gate follows.
+Both counters are gated and reset together. Fixed-HOT and automatic-adaptation
+validation follow.
 
 ## Published HOT reuse: whole-response wall time
 
@@ -105,6 +107,58 @@ retains both starts, exact prompts, outputs, journals, client, driver, and
 analysis script. The original serving checkout was restored and returned
 `OK`. The next gate compares this path directly with CPU prefill under
 automatic HOT adaptation and repeats the long fidelity checks.
+
+## HOT reuse against CPU with automatic adaptation
+
+Two starts at `a2a09f0` compare CPU prefill with the integrated staged path,
+including published HOT reuse. Each prompt receives both orders across starts,
+with complete warmup responses in both modes. Both arms reserve the same ring
+and retain the same placement, workers, split histories, and phase adaptation
+policy. Server diagnostics, GPU timing, HOT persistence, and KV reuse are off.
+Serving code is unchanged from `9b73b2a`.
+
+| Workload | CPU wall | Staged wall | Change | Faster pairs |
+| --- | ---: | ---: | ---: | ---: |
+| 1,844-token prompt, 383-token JSON | 26.607 s | 24.895 s | 6.4% shorter | 2/4 |
+| ~1,880-token prompt, 192-token prose | 19.842 s | 13.568 s | 31.6% shorter | 4/4 |
+
+JSON time to first token decreased from 11.521 to 7.573 seconds, but time
+after the first token increased from 15.086 to 17.322 seconds. One JSON pair
+was 30.0% slower; another was 0.4% slower. Prose first-token time decreased
+from 11.583 to 5.959 seconds, and subsequent decode from 8.259 to 7.609
+seconds. Four pairs per workload remain a small sample. Automatic HOT state
+carries between alternating modes, and page-cache state carries between
+starts, so these results do not isolate an adaptation-policy effect.
+
+All twelve JSON responses, including warmups, preserved all 32 values, key
+order, and key multiplicity. All eight measured pairs matched usage counts;
+JSON text matched exactly, while all four prose pairs differed and remain
+unscored. Eight long fidelity questions ran in both modes after each start's
+timing requests. Both modes scored 7/8 on both starts, with every answer
+matching: the known code-trace failure returned `108` instead of `68`.
+Every fidelity prompt crossed the GPU staging threshold.
+
+Optional Linux process I/O snapshots bracket each response outside the
+existing client timer. The worker PID is verified against the measured
+service's cgroup, and process start time guards against PID reuse.
+
+| Workload | CPU logical reads | Staged logical reads | CPU storage reads | Staged storage reads |
+| --- | ---: | ---: | ---: | ---: |
+| JSON | 25.186 GiB | 25.075 GiB | 3.566 GiB | 4.484 GiB |
+| Prose | 24.921 GiB | 24.855 GiB | 2.317 GiB | 1.780 GiB |
+
+These are mean whole-worker `rchar` and `read_bytes` deltas. Logical reads
+count read syscalls, excluding native mmap memory loads; storage accounting
+can include expert, PLE, metadata, and background activity. They do not
+measure expert-only traffic or device bandwidth. JSON's larger storage-read
+mean is consistent with residency remaining a bottleneck, but does not prove
+which reads or evictions caused its slower decode.
+
+The [complete record](../bench/results/4090-staged-hot-reuse-cpu-auto-20260905.json)
+contains the exact driver, client, analysis script, raw snapshots, prompts,
+outputs, journals, and fidelity results. The original serving checkout was
+restored and returned `OK`. CPU remains the default. A dependable gain for
+long JSON responses remains an open performance question.
 
 ## Balanced CPU comparison
 
@@ -185,7 +239,7 @@ real `OK` completion. This run enables diagnostics for correctness evidence;
 its wall times are not performance measurements. Its complete
 [record](../bench/results/4090-disk-staged-adaptation-20260905.json) is retained.
 
-## Longer completions: a throughput regression remains
+## Longer completions before HOT reuse
 
 Two starts at `30f8249` generated complete warmup responses in both modes,
 then reversed every measured prompt's order across starts. Serving code is
@@ -287,10 +341,10 @@ evidence before changing the user's phase policy automatically. Host page
 cache was not dropped between starts, so nonlinear residency effects remain
 possible even with the reversed start order.
 
-CPU remains the default, and the staged path remains experimental. A fresh
-comparison against CPU prefill, with a qualified adaptation policy and whole
-responses, is still needed. The original clean serving checkout was restored
-and returned `OK` after the fourth start.
+CPU remains the default, and the staged path remains experimental. The later
+HOT reuse comparison above retains the original phase policy and still finds
+mixed JSON response-time results. The original clean serving checkout was
+restored and returned `OK` after the fourth start.
 
 ## Cache advice review
 
