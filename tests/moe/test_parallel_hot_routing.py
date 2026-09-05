@@ -130,3 +130,44 @@ def test_production_geometry_without_diagnostic_reductions(monkeypatch, count):
     kernels.ensure_experts_hot(b, 1, actual, route_weight=0.1)
     assert torch.equal(actual, expected)
     assert_state_equal(a, b)
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("count", [10, 64, 160, 20480])
+def test_repeated_in_place_remapping_keeps_original_ids(monkeypatch, parallel, count):
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=512, cache_size=3753, device=torch.device("cuda"),
+    )
+    rng = torch.Generator().manual_seed(4090)
+    hot = torch.randperm(512, generator=rng)[:82].cuda()
+    slots = torch.arange(1024, 1106, device="cuda", dtype=torch.int32)
+    cache.hot_row_for_expert[0, hot] = torch.arange(82, device="cuda", dtype=torch.int32)
+    cache.slot_for_id[0, hot] = slots
+    cache.id_of_slot[slots.long()] = hot.to(torch.int32)
+    cache.hot_adapt_enabled = True
+    cache.collect_stats = False
+    raw = torch.randint(0, 512, (count,), generator=rng, dtype=torch.int32).cuda()
+    ids = torch.empty_like(raw)
+    expected = cache.slot_for_id[0, raw.long()].clone()
+    active_slots = expected[expected >= 0].unique().long()
+    monkeypatch.setattr(kernels, "_PARALLEL_HOT_ROUTING", parallel)
+
+    def step():
+        ids.copy_(raw)
+        kernels.ensure_experts_hot(cache, 0, ids, route_weight=0.1)
+
+    step()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        # No host synchronization between rewrites. A redundant scalar reader
+        # used to race with the elected writer and read a slot as an expert ID.
+        for _ in range(10):
+            step()
+    for replay in range(20):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(ids, expected)
+        timestamp = 1 + (replay + 1) * 10
+        assert int(cache.step) == timestamp
+        assert torch.all(cache.usage[active_slots] == timestamp)

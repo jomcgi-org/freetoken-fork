@@ -707,6 +707,9 @@ def _ensure_experts_hot_kernel(
     advance decay by one half-life step; this is the intentional production rule.
     """
     step = tl.load(step_ptr) + 1
+    # The scalar load is replicated across warps. Keep every timestamp reader
+    # ahead of the elected writer, just as for the in-place route rewrite below.
+    tl.debug_barrier()
     tl.store(step_ptr, step)
     base = layer_id * num_experts
     off_e = tl.arange(0, BLOCK_E)
