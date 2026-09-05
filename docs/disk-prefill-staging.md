@@ -10,8 +10,8 @@ On node-4's RTX 4090, the balanced prototype comparison reduced mean client
 wall time from 17.57 to 9.45 seconds at 2,060 prompt tokens and from 34.93 to
 16.86 seconds at 4,108 tokens. Every long-prompt pair improved. At 524 tokens,
 staging was variable and approximately tied with CPU. The integrated serving
-path still needs its crossover and adaptation model gates before a serving
-recommendation.
+comparison below supports a 1,024-token crossover. Long-completion throughput
+still needs its separate gate before an overall serving recommendation.
 
 ## Execution and memory contract
 
@@ -90,9 +90,50 @@ retains both starts, exact prompts, per-request results, arguments, journals,
 and the complete driver. `bench/selected-disk-prefill-wall.py` provides the
 streaming client and accepts explicit sizes for crossover measurements.
 
+## Integrated serving crossover and adaptation
+
+Two further starts at `3f0d438` exercised the integrated CLI, transport, memory
+governor, and buffer schedule. A benchmark selector changed only the chunk
+threshold: 512 in the staged arm, effectively infinite in the CPU arm. Both
+arms reserved the same ring. Each prompt's order was reversed across starts;
+each table cell contains four measured requests, excluding warmup.
+
+| Prompt tokens | CPU wall time | Staged wall time | Change |
+| ---: | ---: | ---: | ---: |
+| 76 | 2.104 s | 2.141 s | CPU in both arms |
+| 780 | 7.933 s | 7.043 s | Mixed: one prompt regressed in both orders |
+| 1,036 | 9.444 s | 6.621 s | 29.9% shorter, all pairs improved |
+| 1,548 | 13.959 s | 9.400 s | 32.7% shorter, all pairs improved |
+| 4,108 | 34.032 s | 15.339 s | 54.9% shorter, all pairs improved |
+
+These results select the default 1,024-token threshold. The 780-token mean
+improved, but the per-prompt regressions make it a poor default. All 24 timing
+pairs matched text and usage. The eight long fidelity probes again scored
+7/8 per mode per start, with the same `100` versus `108` code-trace failure.
+
+The short-prompt decode controls use CPU in both arms, yet their pooled wall
+mean was 35% worse in the arm labelled selected. First-occurrence and
+between-start effects remain substantial. These controls cannot establish
+decode performance after staged prefill. The long-output client warms complete
+responses in both modes and checks whole-response wall time separately.
+
+The [integrated record](../bench/results/4090-disk-staged-crossover-20260905.json)
+retains every request, including those unfavorable controls. The final runtime
+changes at `99bfb4b` select the measured threshold, validate source ownership
+earlier, and separate the gated DISK transfer counter from pinned counters.
+
+A real CLI run at `99bfb4b` then used automatic HOT adaptation, phase histories,
+and the 1,024-token threshold without an execution hook. Diagnostics confirmed
+prefill history updates, token-clock advancement, and adaptation ticks and
+swaps. The eight long questions scored 7/8, and all three short post-staging
+questions passed. The original serving checkout was restored and returned a
+real `OK` completion. This run enables diagnostics for correctness evidence;
+its wall times are not performance measurements. Its complete
+[record](../bench/results/4090-disk-staged-adaptation-20260905.json) is retained.
+
 ## Correctness validation
 
-At `3f0d438`, 309 targeted Linux tests passed across staging, materialization,
+At `99bfb4b`, 318 targeted Linux tests passed across staging, materialization,
 DISK dispatch, pinned prefill, offload, CLI/configuration, and host budgeting.
 Twenty GPU transport/materialization tests also passed CUDA memcheck with
 zero reported errors. They cover:
