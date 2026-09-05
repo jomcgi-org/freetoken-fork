@@ -1,142 +1,132 @@
 # Bounded file staging for GPU prefill
 
-This experiment investigates the whole-layer copy stall recorded in
-[disk-copy-prefill.md](disk-copy-prefill.md). It does not change the serving
-policy or enable a new path by default.
+`--moe-disk-prefill staged` adds an opt-in path for native NVFP4 expert banks:
+read exactly the router's selected expert union into two reusable pinned
+buffers, then run the existing GPU prefill GEMM. CPU prefill remains the
+default. Smaller chunks still use CPU execution, controlled by
+`--moe-disk-prefill-min-tokens` (currently 512).
 
-## Read preparation before pageable copy
+On node-4's RTX 4090, the balanced prototype comparison reduced mean client
+wall time from 17.57 to 9.45 seconds at 2,060 prompt tokens and from 34.93 to
+16.86 seconds at 4,108 tokens. Every long-prompt pair improved. At 524 tokens,
+staging was variable and approximately tied with CPU. The integrated serving
+path still needs its crossover and adaptation model gates before a serving
+recommendation.
 
-The first probe reused the CPU executor's existing populate-read machinery
-before whole-layer GPU copy. It reads every row consumed by the copy through
-the existing 32 MiB scratch buffer. A benchmark-only hook selects GPU copy
-for chunks of at least 512 tokens and CPU execution for smaller chunks.
-The hook also rebuilds the pinned-layer buffer schedule at each policy change.
+## Execution and memory contract
 
-This eliminated the preceding probe's 120-second first-token timeout. It did
-not establish a throughput gain over CPU execution:
+The transport preserves packed weights, all scale bytes, expert IDs, router
+weights, activation, and the GPU GEMM. It performs no expert substitution,
+route truncation, or extra quantization. GPU execution can differ numerically
+from CPU execution; the source checkpoint and router policy are unchanged.
 
-| Prompt tokens | CPU TTFT | Populate then copy TTFT |
-| ---: | ---: | ---: |
-| 2,060 | 24.431 s | 25.284 s |
-| 524 | 10.321 s | 18.446 s |
-| 76 | 1.790 s | 1.987 s |
+`DiskPrefillStaging` reads authoritative file ranges with `preadv` into two
+32 MiB pinned buffers. The allocation is fixed at 64 MiB, independent of layer
+size and request length. There is no whole-layer host mirror. A CUDA event
+prevents host reuse before each buffer's DMA copy finishes. Copies and the
+following GEMM use the caller's current stream. Engine shutdown synchronizes
+pending staging transfers before releasing the cache.
 
-Each cell is the mean of two requests in one server. The 76-token workload
-uses CPU execution in both modes because it is below the threshold. CPU/copy/
-copy/CPU order was used for the long workload; the smaller workloads used
-copy/CPU/CPU/copy order. These are initial gates, not a broad performance study.
-All six timing pairs returned the same text and usage. Both modes also matched
-all eight short fidelity answers, including the baseline's incorrect `108`
-answer to the code-trace question. Only the 1,968-token retrieval case is long
-enough to exercise GPU copy in that fidelity set; it returned `VIOLET-68243`
-in both modes. The other seven cases exercise the unchanged CPU path.
+The host governor charges the ring before fitting expert banks, alongside
+CPU fallback workspaces and the CPU populate-read buffer. This also applies
+when DISK placement is automatic and no HOT budget was explicitly supplied.
+Sparse copies borrow GPU slots `[0, E)` without assigning cache ownership,
+including on layers without HOT partitions. Uncopied experts remain misses;
+protected HOT rows retain their mappings and bytes. Startup and cache resizing
+validate enough unprotected space for the active prefill buffers.
 
-The model, GPU, CPU workers, and memory geometry match the preceding probe:
-Qwen Flash NVFP4 on node-4's RTX 4090, 14 CPU workers, 20 pinned expert layers
+At each chunk boundary, the threshold selects CPU or staged execution and
+updates the pinned-layer buffer schedule. This keeps later asynchronous
+pinned copies outside the staged layer's scratch buffer. The CPU fallback
+retains its batched executor, input reuse, coalescing, and task-size checks.
+Staging requires CUDA, native `nvfp4`, ordinary file-backed HostBanks, and CPU
+DISK decode. UFFD sources, alternate quantized layouts, and custom model cache
+factories are rejected for this path.
+
+When HOT adaptation is enabled, the staged path records the same original
+route observations, history selection, normalization, and prefill token clock
+as CPU/HOT split prefill. Only a scratch copy of IDs is remapped for that
+observation. Diagnostic route counts remain gated by their collection flags.
+The required selected-union readback is part of transport, not telemetry.
+
+## Balanced CPU comparison
+
+Two server starts used identical prompts, with each prompt's CPU/staging order
+reversed in the second start. Both orders occur within each workload in each
+start. Warmup requests are excluded from the table. Runtime: `8412464` plus
+the recorded prototype hook, before the serving integration.
+
+| Prompt tokens | Pairs | CPU wall time | Selected staging wall time | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 76 | 8 | 1.981 s | 1.930 s | CPU in both arms |
+| 524 | 8 | 6.152 s | 6.229 s | 1.3% slower, variable |
+| 2,060 | 8 | 17.573 s | 9.450 s | 46.2% shorter |
+| 4,108 | 4 | 34.933 s | 16.864 s | 51.7% shorter |
+
+The maximum chunk is 2,048 tokens, so the two larger workloads also exercise
+CPU fallback for their final 12-token chunks. All 32 timing pairs, including
+four short-prompt, 192-token decode controls, returned identical text and
+usage. Decode controls execute CPU prefill in both arms. They had large order
+effects; no decode throughput gain is claimed.
+
+Both modes passed 7/8 long fidelity checks in each start. Every fidelity
+prompt crossed the staging threshold. The code-trace question failed in both:
+CPU returned `100`, selected staging returned `108`, and the expected answer
+was `68`. The other seven answers matched. This is a small regression check,
+not evidence of unchanged quality across arbitrary prompts.
+
+The model was Qwen Flash NVFP4, with 14 CPU workers, 20 pinned expert layers
 (26.44 GiB), 28 DISK layers (37.02 GiB), and 82 protected experts per DISK
 layer. Diagnostic collection, GPU step timing, HOT adaptation and persistence,
-and disk KV reuse were off. The KV cache was naive, with no reused tokens.
-io_uring PLE, input reuse, and selective pinned transfers up to 128 tokens
-were enabled. Runtime revision: `c2c371b` plus the recorded benchmark hook.
+and disk KV reuse were off. Both arms allocated the same staging ring. The
+KV cache was naive, with no reused tokens. io_uring PLE, CPU input reuse, and
+selective pinned transfers up to 128 tokens were enabled.
 
-## Direct pinned staging prototype
+The [balanced record](../bench/results/4090-disk-cpu-balanced-20260905.json)
+retains both starts, exact prompts, per-request results, arguments, journals,
+and the complete driver. `bench/selected-disk-prefill-wall.py` provides the
+streaming client and accepts explicit sizes for crossover measurements.
 
-`DiskPrefillStaging` reads file ranges directly into two reusable pinned
-buffers, then copies those unchanged bytes to their original GPU row positions.
-The default allocation is 64 MiB total, independent of layer size and request
-length. There is no whole-layer host mirror. A completion event protects each
-buffer from host reuse until its previous DMA copy finishes. Transfers and
-subsequent GEMMs use the caller's current CUDA stream.
+## Correctness validation
 
-The helper supports all rows or an exact selected-row union. It preserves
-unaligned file offsets, joins adjacent selected rows, retries partial reads,
-and raises on EOF or out-of-range expert IDs. Negative padding IDs are ignored.
-Packed weights and scales are transferred as bytes without casts or arithmetic.
-The source remains the authoritative file-backed HostBank. UFFD sources are
-rejected because their pager owns residency.
+At `3f0d438`, 309 targeted Linux tests passed across staging, materialization,
+DISK dispatch, pinned prefill, offload, CLI/configuration, and host budgeting.
+Twenty GPU transport/materialization tests also passed CUDA memcheck with
+zero reported errors. They cover:
 
-Ten targeted GPU tests passed at revision `632f3f2`, including byte parity for
-uint8, float8, and float16 banks, unselected-row preservation, repeated reuse
-of a small ring, duplicate/empty/invalid row sets, partial reads, and EOF.
-All ten also passed CUDA memcheck with zero reported errors.
+- Exact uint8, float8, and float16 bytes, including unaligned file offsets.
+- Repeated small-ring reuse, duplicate/empty/invalid row sets, short reads,
+  and EOF errors.
+- Selected versus full staging followed by real NVFP4 GEMMs at 16 and 512
+  tokens: identical BF16 output bits, with NaNs in unselected scale rows.
+- Sparse ownership and protected HOT mappings, with and without overlap.
+- CPU fallback across chunk boundaries, scratch reservations, and preserved
+  adaptation observations without changing the GPU's routed IDs or weights.
 
-```sh
-python -m pytest tests/moe/test_disk_prefill_staging.py -q
-compute-sanitizer --tool memcheck --error-exitcode 99 \
-  python -m pytest tests/moe/test_disk_prefill_staging.py -q
-```
+## Earlier transport gates
 
-The helper is currently used only by a benchmark hook. Serving integration
-still needs memory-governor accounting, a measured chunk-size policy, and
-quality checks covering the GPU execution path. The owner must synchronize
-pending transfers before discarding the staging object.
+These initial single-start probes explain the chosen transport. They used
+only two timing requests per mode and size. Compare modes within each start;
+the changing CPU baselines make cross-start comparisons misleading.
 
-## Direct staging model gate
+| Policy comparison | 524-token TTFT | 2,060-token TTFT |
+| --- | ---: | ---: |
+| CPU to populate then pageable copy | 10.321 to 18.446 s | 24.431 to 25.284 s |
+| CPU to full-row pinned staging | 6.281 to 19.759 s | 24.292 to 22.061 s |
+| Full-row to selected-row pinned staging | 14.520 to 7.494 s | 18.385 to 16.977 s |
 
-A second server compared CPU prefill against direct pinned staging of all
-expert rows. Both arms allocated the same 64 MiB ring before warmup. The other
-flags, geometry, prompts, order, and 512-token threshold were unchanged.
-Runtime revision: `632f3f2` plus the recorded hook.
+Populate-read removed the earlier whole-pageable-copy 120-second timeout,
+but did not establish a win. Direct full-row staging still moved too many
+unneeded experts. Selected staging reduced that traffic while preserving
+the GPU computation.
 
-| Prompt tokens | CPU TTFT | Full-row staging TTFT |
-| ---: | ---: | ---: |
-| 2,060 | 24.292 s | 22.061 s |
-| 524 | 6.281 s | 19.759 s |
-| 76 | 1.811 s | 1.963 s |
+All 42 timing/fidelity pairs across these three early gates matched text and
+usage. Seven of the eight fidelity prompts were below the GPU threshold and
+therefore used CPU in both arms; only the long retrieval check exercised the
+GPU path. The subsequent balanced test above closes that coverage gap.
 
-The two long-prompt staging times were 25.227 and 18.894 seconds, against
-23.762 and 24.823 seconds on CPU. The mean is lower, but one pair regressed
-and the sample does not establish a repeatable win. Medium-prompt staging
-was substantially slower. The small workload remains CPU execution in both
-arms and is a control, not evidence of a staging effect.
-
-All six timing pairs and eight fidelity pairs matched text and usage. Both
-modes retained the same 7/8 answers, with the same caveat that only the long
-retrieval case exercised GPU prefill in the fidelity set.
-
-The [populate record](../bench/results/4090-disk-copy-populate-20260905.json)
-and [direct staging record](../bench/results/4090-disk-staging-wall-20260905.json)
-retain complete drivers, results, and journals. Compare policies within each
-server; the different CPU baselines show why comparing across these starts
-would be misleading.
-
-## Staging only the original routed expert union
-
-A third server held GPU computation fixed and changed only which rows were
-read and staged. Both arms used direct pinned staging for chunks of at least
-512 tokens. The selected arm copied exactly the original router's expert
-union into the original row positions. It did not substitute hot experts,
-change router weights, or change the GEMM. Runtime revision: `632f3f2` plus
-the recorded hook.
-
-| Prompt tokens | Full-row staging TTFT | Selected-row staging TTFT |
-| ---: | ---: | ---: |
-| 2,060 | 18.385 s | 16.977 s |
-| 524 | 14.520 s | 7.494 s |
-| 76 | 1.818 s | 2.094 s |
-
-Both medium-prompt pairs improved. The long-prompt pairs were mixed:
-19.658 to 15.174 seconds, then 17.113 to 18.779 seconds. The small workload
-again executes on CPU in both modes. This is a transport comparison, not
-proof of a CPU prefill throughput improvement.
-
-All six timing pairs and eight fidelity pairs matched text and usage. The
-long retrieval answer was correct in both arms (13.728 versus 9.471 seconds
-to first token); the other seven fidelity prompts used CPU in both arms.
-The [selected-row record](../bench/results/4090-disk-selected-staging-20260905.json)
-contains all results, drivers, and journals.
-
-The final GPU checks at `c5dc111` add full NVFP4 GEMM comparisons at 16 and
-512 tokens. Selected staging and full staging produced identical BF16 output
-bits, even with NaNs in every unselected scale row. All twelve tests pass,
-and all twelve pass CUDA memcheck with zero reported errors.
-
-Before a serving recommendation, compare selected staging directly against
-CPU prefill with balanced prompt order across starts. Integrating sparse
-copies also requires correct ownership for non-HOT layers: their uncopied
-rows must not be advertised as cache hits. These probes used 28 HOT layers,
-whose scratch copies are already unowned through the preceding ownership fix.
-
-The original clean serving checkout at `3a67403` was restored after the
-experiments and final GPU tests, and returned a real `OK` completion. All
-three benchmark services are stopped. The prototype is not deployed there.
+Raw records: [populate](../bench/results/4090-disk-copy-populate-20260905.json),
+[full staging](../bench/results/4090-disk-staging-wall-20260905.json),
+[selected staging](../bench/results/4090-disk-selected-staging-20260905.json).
+The preceding cache ownership fix is documented in
+[disk-copy-prefill.md](disk-copy-prefill.md).

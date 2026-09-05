@@ -1,5 +1,7 @@
 """Staged prefill selection, CLI validation, and scratch-slot reservations."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -62,3 +64,23 @@ def test_staging_rebuild_reserves_scratch_before_protected_rows(overlap):
     if overlap:
         with pytest.raises(ValueError, match="unprotected GPU slots"):
             cache.validate_rebuild(16)
+
+
+@pytest.mark.parametrize("disk,uffd,path", [
+    (False, False, "/weights.ftw"), (True, True, "/weights.ftw"), (True, False, None),
+])
+def test_staging_rejects_unsupported_bank_before_allocating_cuda_buffers(disk, uffd, path):
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=8, cache_size=24, device=torch.device("cpu"),
+        quant_format="nvfp4", moe_disk_prefill="staged",
+    )
+    # No CUDA allocation is needed to validate source ownership.
+    cache.device = torch.device("cuda")
+    cache.layer_residency = ["disk"]
+    source = SimpleNamespace(_freetoken_host_bank=SimpleNamespace(
+        _disk=disk, _uffd=uffd, _file_path=path,
+    ))
+    cache.banks = [([source], None)]
+    with pytest.raises(ValueError, match="ordinary file-backed banks"):
+        cache.init_disk_prefill_staging()
+    assert cache._disk_prefill_staging is None

@@ -788,7 +788,7 @@ class OffloadMoeCache:
                 if self.layer_residency[layer] != "disk":
                     continue
                 bank = getattr(source, "_freetoken_host_bank", None)
-                if bank is None or bank._uffd or bank._file_path is None:
+                if bank is None or not bank._disk or bank._uffd or bank._file_path is None:
                     raise ValueError("staged DISK prefill requires ordinary file-backed banks")
         if self._disk_prefill_staging is None:
             from freetoken.moe.disk_prefill_staging import DiskPrefillStaging
