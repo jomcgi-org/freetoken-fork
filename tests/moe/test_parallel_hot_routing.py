@@ -24,7 +24,9 @@ def make_cache(*, experts=512, missing=False, device="cuda", collect=True, adapt
     rng = torch.Generator().manual_seed(4090)
     owners = torch.randperm(3 * experts, generator=rng)
     cache.id_of_slot[:owners.numel()].copy_(owners)
-    cache.slot_for_id.view(-1)[owners.to(device)] = torch.arange(owners.numel(), device=device)
+    cache.slot_for_id.view(-1)[owners.to(device)] = torch.arange(
+        owners.numel(), device=device, dtype=torch.int32
+    )
     cache.usage.copy_(torch.randint(0, 25, (cache.cache_size,), generator=rng))
     cache.step.fill_(25)
     hot = sorted(set(range(0, experts, 6)) | {experts - 1})
@@ -96,7 +98,9 @@ def test_graph_replay_keeps_changing_routes_and_histories(monkeypatch):
     # Compile both variants outside capture, on separate scratch caches.
     for parallel in (False, True):
         monkeypatch.setattr(kernels, "_PARALLEL_HOT_ROUTING", parallel)
-        kernels.ensure_experts_hot(make_cache(), 1, host_routes.clone())
+        kernels.ensure_experts_hot(
+            make_cache(), 1, host_routes.clone(), route_weight=0.1, history="prefill"
+        )
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
