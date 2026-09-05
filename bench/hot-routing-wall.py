@@ -64,8 +64,11 @@ def main():
         cases = [("prefill", size, rep) for rep in range(args.repeats) for size in (64, 512, 2048)]
         cases.extend(("decode", 64, rep) for rep in range(args.decode_repeats))
         random.Random(4090).shuffle(cases)
-        for index, (kind, size, rep) in enumerate(cases):
-            for parallel in ((False, True) if index % 2 == 0 else (True, False)):
+        # Balance first/second position within each workload. Using the global
+        # shuffled case index can put every decode control second, where expert
+        # cache warming from the identical first request dominates its timing.
+        for kind, size, rep in cases:
+            for parallel in ((False, True) if rep % 2 == 0 else (True, False)):
                 one(out, kind, size, rep, parallel)
 
 
