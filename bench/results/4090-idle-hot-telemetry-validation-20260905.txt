@@ -1,0 +1,6 @@
+Runtime 6adcf92; validation revision 5aaea45, node-4 Linux RTX 4090
+Command: python -m pytest tests/moe/test_moe_collect_stats.py tests/moe/test_hot_adapt.py -q --disable-warnings --maxfail=3
+
+........................................................................ [ 72%]
+...........................                                              [100%]
+99 passed in 2.76s
