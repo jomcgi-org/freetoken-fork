@@ -118,7 +118,7 @@ class EngineConfig:
     # "staged" copies the original routed union through bounded pinned buffers.
     moe_disk_prefill: str = "cpu"
     # Staged GPU prefill keeps smaller chunks on the existing CPU path.
-    moe_disk_prefill_min_tokens: int = 512
+    moe_disk_prefill_min_tokens: int = 1024
     # Warm a CPU prefill layer's bounded routed union. "populate" reads the file,
     # "on" keeps advisory WILLNEED, and "off" preserves the original seam behavior.
     # The setting is inert for the DISK copy path.

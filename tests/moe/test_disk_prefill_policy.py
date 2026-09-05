@@ -11,13 +11,16 @@ from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.server.args import parse_args
 
 
-def test_staged_cli_accepts_an_explicit_crossover():
+@pytest.mark.parametrize("threshold", [None, 1536])
+def test_staged_cli_crossover_default_and_override(threshold):
     args, _ = parse_args([
         "--model", "/tmp/nonexistent-model", "--dtype", "bfloat16",
-        "--moe-disk-prefill", "staged", "--moe-disk-prefill-min-tokens", "1024",
-    ])
+        "--moe-disk-prefill", "staged",
+    ] + ([] if threshold is None else ["--moe-disk-prefill-min-tokens", str(threshold)]))
     assert args.moe_disk_prefill == "staged"
-    assert args.moe_disk_prefill_min_tokens == 1024
+    assert args.moe_disk_prefill_min_tokens == (1024 if threshold is None else threshold)
+    assert EngineConfig.__dataclass_fields__["moe_disk_prefill_min_tokens"].default == 1024
+    assert OffloadMoeCache.__dataclass_fields__["moe_disk_prefill_min_tokens"].default == 1024
 
 
 @pytest.mark.parametrize("kwargs,message", [

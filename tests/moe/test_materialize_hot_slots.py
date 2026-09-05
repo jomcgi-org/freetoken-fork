@@ -145,7 +145,8 @@ def test_selected_staging_leaves_uncopied_rows_unowned(tmp_path, protected, over
                 expected[[1, 3]] = per_layer[0].view(torch.uint8)[[1, 3]]
                 assert torch.equal(destination[:8].view(torch.uint8).cpu(), expected)
                 expected_bytes += 2 * per_layer[0][0].numel() * per_layer[0].element_size()
-            assert cache.prefill_h2d_bytes == (expected_bytes if stats else 0)
+            assert cache.disk_prefill_staged_h2d_bytes == (expected_bytes if stats else 0)
+            assert cache.prefill_h2d_bytes == 0
             assert cache.id_of_slot[:8].tolist() == [-1] * 8
             assert cache.slot_for_id[0, 6].item() == -1
             assert cache.slot_for_id[1].tolist() == [-1] * 8
@@ -154,6 +155,8 @@ def test_selected_staging_leaves_uncopied_rows_unowned(tmp_path, protected, over
                 assert cache.slot_for_id[0, 1].item() == slot
                 assert cache.id_of_slot[slot].item() == 1
                 assert cache.usage[slot].item() == torch.iinfo(torch.int64).max
+        cache.reset_stats()
+        assert cache.disk_prefill_staged_h2d_bytes == 0
     finally:
         cache.synchronize_disk_prefill_staging()
         cache.shutdown_hot_adaptation()

@@ -4,7 +4,7 @@
 read exactly the router's selected expert union into two reusable pinned
 buffers, then run the existing GPU prefill GEMM. CPU prefill remains the
 default. Smaller chunks still use CPU execution, controlled by
-`--moe-disk-prefill-min-tokens` (currently 512).
+`--moe-disk-prefill-min-tokens` (default 1,024).
 
 On node-4's RTX 4090, the balanced prototype comparison reduced mean client
 wall time from 17.57 to 9.45 seconds at 2,060 prompt tokens and from 34.93 to
@@ -48,6 +48,9 @@ route observations, history selection, normalization, and prefill token clock
 as CPU/HOT split prefill. Only a scratch copy of IDs is remapped for that
 observation. Diagnostic route counts remain gated by their collection flags.
 The required selected-union readback is part of transport, not telemetry.
+When statistics are enabled, `decode_miss_stats()` reports staged transfer
+bytes separately as `disk_prefill_staged_h2d_bytes`; pinned-overlap counters
+retain their existing meaning.
 
 ## Balanced CPU comparison
 

@@ -1101,7 +1101,7 @@ def parse_args(
         "--moe-disk-prefill-min-tokens",
         type=int,
         default=ServerArgs.moe_disk_prefill_min_tokens,
-        help="Minimum chunk size for staged DISK GPU prefill (default: 512 tokens).",
+        help="Minimum chunk size for staged DISK GPU prefill (default: %(default)s tokens).",
     )
 
     parser.add_argument(

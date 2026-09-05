@@ -219,7 +219,7 @@ class OffloadMoeCache:
     # DISK-only prefill policy. LOCKED/PAGEABLE layers always keep the whole-layer
     # pageable copy path.
     moe_disk_prefill: str = "cpu"
-    moe_disk_prefill_min_tokens: int = 512
+    moe_disk_prefill_min_tokens: int = 1024
     moe_prefill_coalesce: str = "populate"
     moe_prefill_hot_split: str = "on"
     moe_prefill_split_kernel: str = "grouped"
@@ -560,6 +560,7 @@ class OffloadMoeCache:
             raise ValueError("FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS must be non-negative")
         self.prefill_selective_active = False
         self.prefill_h2d_bytes = 0
+        self.disk_prefill_staged_h2d_bytes = 0
         self.prefill_selective_layers = 0
         self.prefill_selective_rows = 0
         self.prefill_selective_dense_layers = 0
@@ -811,7 +812,7 @@ class OffloadMoeCache:
                 per_layer[layer_id], destination[:self.num_experts], rows,
             )
             if self.collect_stats:
-                self.prefill_h2d_bytes += copied
+                self.disk_prefill_staged_h2d_bytes += copied
 
     def synchronize_disk_prefill_staging(self) -> None:
         if self._disk_prefill_staging is not None:
@@ -1150,6 +1151,7 @@ class OffloadMoeCache:
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
         self.prefill_h2d_bytes = 0
+        self.disk_prefill_staged_h2d_bytes = 0
         self.prefill_selective_layers = 0
         self.prefill_selective_rows = 0
         self.prefill_selective_dense_layers = 0
@@ -3614,6 +3616,7 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self.prefill_h2d_bytes = 0
+        self.disk_prefill_staged_h2d_bytes = 0
         self.prefill_selective_layers = 0
         self.prefill_selective_rows = 0
         self.prefill_selective_dense_layers = 0
@@ -3680,6 +3683,7 @@ class OffloadMoeCache:
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
             "prefill_overlap_h2d_bytes": self.prefill_h2d_bytes,
+            "disk_prefill_staged_h2d_bytes": self.disk_prefill_staged_h2d_bytes,
             "prefill_selective_layers": self.prefill_selective_layers,
             "prefill_selective_rows": self.prefill_selective_rows,
             "prefill_selective_dense_layers": self.prefill_selective_dense_layers,
