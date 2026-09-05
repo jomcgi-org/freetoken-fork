@@ -1089,18 +1089,22 @@ class Scheduler(SchedulerIOMixin):
                     protected_count = sum(
                         self.engine.moe_offload_cache.hot_expert_capacity.values()
                     )
-                    disk = self.engine.moe_offload_cache.disk_prefetch_stats(
-                        reset=False
+                    collect = getattr(
+                        self.engine.moe_offload_cache, "collect_stats", False
+                    )
+                    disk = (
+                        self.engine.moe_offload_cache.disk_prefetch_stats(reset=False)
+                        if collect else {}
                     )
                     model = self.engine.model
                     ple = (
                         model.ple_disk_stats(reset=False)
-                        if hasattr(model, "ple_disk_stats") else {}
+                        if collect and hasattr(model, "ple_disk_stats") else {}
                     )
                     ple_faults = ple.get("ple_major_faults")
                     hot_rate = (
                         "n/a"
-                        if self.engine.moe_offload_cache.cpu_executor is None
+                        if not collect or self.engine.moe_offload_cache.cpu_executor is None
                         else f"{float(disk.get('hot_pair_rate', 0.0)) * 100.0:.2f}%"
                     )
                     logger.info_rank0(
