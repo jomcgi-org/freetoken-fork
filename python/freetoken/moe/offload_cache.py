@@ -362,7 +362,6 @@ class OffloadMoeCache:
         self._hot_adapt_prefill_run_active = False
         self._hot_adapt_prefill_run_generation = 0
         self._hot_adapt_tick_prefill_run_generation: int | None = None
-        self._hot_adapt_tick_prefer_decode = False
         self._hot_adapt_after_prefill_pending = False
         self._hot_adapt_prefill_tokens_counted = 0
         self._hot_adapt_token_clock = None
@@ -1883,8 +1882,6 @@ class OffloadMoeCache:
         swap_budget_bytes: int | None,
         boundary: str,
         tick_count: int,
-        *,
-        prefer_decode: bool = False,
     ):
         if ready is not None:
             ready.synchronize()
@@ -1910,7 +1907,7 @@ class OffloadMoeCache:
                 for layer_id in self.hot_expert_capacity
             }
             if getattr(self, "hot_adapt_aim", "blend") == "phase":
-                if boundary == "prefill" and not prefer_decode:
+                if boundary == "prefill":
                     # Keep the active prefill covered while still retaining bounded
                     # evidence from the decode history.
                     counts = blend_histories(
@@ -1966,7 +1963,6 @@ class OffloadMoeCache:
                 f"max_swap_gib_per_tick="
                 f"{self.hot_adapt_max_swap_bytes / 2**30:.2f}, "
                 f"boundary_cap_frac={self.hot_adapt_boundary_cap_frac:.2f}"
-                + (", ranking=decode" if prefer_decode else "")
             )
         return swaps, rate, tick_count
 
@@ -2295,17 +2291,6 @@ class OffloadMoeCache:
     ) -> None:
         """Snapshot counters and submit one bounded planner boundary."""
         self._hot_adapt_tick_boundary = boundary
-        # Staged prefill reads its scratch rows and never consumes permanent HOT
-        # weights. Keep those slots useful for decode instead of replacing them
-        # with a prefill working set. Sample now, before the asynchronous planner
-        # runs: the next chunk can already have switched back to CPU execution.
-        self._hot_adapt_tick_prefer_decode = bool(
-            boundary == "prefill"
-            and getattr(self, "moe_disk_prefill", "cpu") == "staged"
-            and getattr(self, "_staged_prefill_active", False)
-            and getattr(self, "hot_adapt_histories", "shared") == "split"
-            and getattr(self, "hot_adapt_aim", "blend") == "phase"
-        )
         self._hot_adapt_tick_planned_swaps = 0
         self._hot_adapt_tick_executed_swaps = 0
         self._hot_adapt_tick_rate_before = 0.0
@@ -2384,7 +2369,6 @@ class OffloadMoeCache:
             swap_budget_bytes,
             boundary,
             tick_count,
-            **({"prefer_decode": True} if self._hot_adapt_tick_prefer_decode else {}),
         )
         self._hot_adapt_future.add_done_callback(
             lambda _future: self._hot_adapt_wake_event.set()
@@ -2618,10 +2602,7 @@ class OffloadMoeCache:
             decode_counts = dict(enumerate(counts))
             prefill_counts = dict(enumerate(self.decayed_prefill_freq.tolist()))
             if getattr(self, "hot_adapt_aim", "blend") == "phase":
-                if (
-                    getattr(self, "_hot_adapt_tick_boundary", None) == "prefill"
-                    and not getattr(self, "_hot_adapt_tick_prefer_decode", False)
-                ):
+                if getattr(self, "_hot_adapt_tick_boundary", None) == "prefill":
                     blended = blend_histories(
                         prefill_counts,
                         decode_counts,

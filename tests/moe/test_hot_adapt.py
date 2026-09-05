@@ -535,17 +535,15 @@ def test_split_blend_keeps_decode_heavy_experts_ranked_first():
 
 
 @pytest.mark.parametrize(
-    ("aim", "boundary", "prefer_decode", "expected"),
+    ("aim", "boundary", "expected"),
     [
-        ("phase", "prefill", False, {0: (2.0, 20.0, 0.5, 4.0)}),
-        ("phase", "prefill", True, {0: (8.0, 0.0, 2.0, 0.0)}),
-        ("phase", "decode", False, {0: (8.0, 0.0, 2.0, 0.0)}),
-        ("blend", "prefill", False, {0: (8.0, 5.0, 2.0, 1.0)}),
-        ("blend", "prefill", True, {0: (8.0, 5.0, 2.0, 1.0)}),
+        ("phase", "prefill", {0: (2.0, 20.0, 0.5, 4.0)}),
+        ("phase", "decode", {0: (8.0, 0.0, 2.0, 0.0)}),
+        ("blend", "prefill", {0: (8.0, 5.0, 2.0, 1.0)}),
     ],
 )
 def test_split_history_aim_counts_follow_boundary(
-    monkeypatch, aim, boundary, prefer_decode, expected,
+    monkeypatch, aim, boundary, expected,
 ):
     import torch
 
@@ -579,25 +577,20 @@ def test_split_history_aim_counts_follow_boundary(
         swap_budget_bytes=1,
         boundary=boundary,
         tick_count=1,
-        prefer_decode=prefer_decode,
     )
 
     assert captured["counts"] == expected
 
 
 @pytest.mark.parametrize(
-    ("aim", "boundary", "prefer_decode", "expected"),
+    ("aim", "boundary", "expected"),
     [
-        ("blend", "prefill", False, 0.5),
-        ("blend", "prefill", True, 0.5),
-        ("phase", "prefill", False, 2.0 / 26.5),
-        ("phase", "prefill", True, 0.8),
-        ("phase", "decode", False, 0.8),
+        ("blend", "prefill", 0.5),
+        ("phase", "prefill", 2.0 / 26.5),
+        ("phase", "decode", 0.8),
     ],
 )
-def test_decayed_hot_pair_rate_follows_active_aim(
-    monkeypatch, aim, boundary, prefer_decode, expected,
-):
+def test_decayed_hot_pair_rate_follows_active_aim(monkeypatch, aim, boundary, expected):
     import torch
 
     OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
@@ -607,7 +600,6 @@ def test_decayed_hot_pair_rate_follows_active_aim(
     cache.hot_adapt_aim = aim
     cache.hot_adapt_prefill_blend = 0.25
     cache._hot_adapt_tick_boundary = boundary
-    cache._hot_adapt_tick_prefer_decode = prefer_decode
     cache.decayed_decode_freq = torch.tensor([[8.0, 0.0, 2.0, 0.0]])
     cache.decayed_prefill_freq = torch.tensor([[0.0, 20.0, 0.0, 4.0]])
     cache._hot_slot_owners = {0: [0]}
@@ -759,66 +751,6 @@ def _post_prefill_boundary_cache(monkeypatch, *, enabled):
     cache._boost_protected_slots = lambda: None
     cache._poll_hot_adaptation = lambda: None
     return cache
-
-
-@pytest.mark.parametrize(
-    ("policy", "active", "histories", "aim", "boundary", "prefer_decode"),
-    [
-        ("staged", True, "split", "phase", "prefill", True),
-        ("staged", False, "split", "phase", "prefill", False),
-        ("cpu", True, "split", "phase", "prefill", False),
-        ("copy", True, "split", "phase", "prefill", False),
-        ("staged", True, "shared", "phase", "prefill", False),
-        ("staged", True, "split", "blend", "prefill", False),
-        ("staged", True, "split", "phase", "decode", False),
-    ],
-)
-def test_staged_prefill_freezes_hot_ranking_at_dispatch(
-    monkeypatch, policy, active, histories, aim, boundary, prefer_decode,
-):
-    from concurrent.futures import Future
-
-    import torch
-
-    cache = _post_prefill_boundary_cache(monkeypatch, enabled=False)
-    cache.moe_disk_prefill = policy
-    cache._staged_prefill_active = active
-    cache.hot_adapt_histories = histories
-    cache.hot_adapt_aim = aim
-    cache.decayed_decode_freq = torch.tensor([[3.0]])
-    cache.decayed_prefill_freq = torch.tensor([[17.0]])
-    cache._hot_adapt_prefill_snapshot_device = torch.zeros((1, 1))
-    cache._hot_adapt_prefill_snapshot_host = torch.zeros((1, 1))
-    captured = []
-
-    def submit(fn, *args, **kwargs):
-        captured.append((args, kwargs))
-        return Future()
-
-    cache._hot_adapt_executor = SimpleNamespace(submit=submit)
-    cache._start_hot_adaptation_tick(
-        token=20, boundary=boundary, tick_count=2, swap_budget_bytes=4,
-    )
-    # A following chunk may switch execution before this planner runs. Its
-    # immutable input must still describe the chunk that dispatched the plan.
-    cache._staged_prefill_active = not active
-
-    assert captured == [
-        ((None, 20, 4, boundary, 2), {"prefer_decode": True} if prefer_decode else {}),
-    ]
-    assert cache._hot_adapt_tick_boundary == boundary
-    assert cache._hot_adapt_tick_prefer_decode is prefer_decode
-    assert cache._hot_adapt_snapshot_host.item() == 3.0
-    assert cache._hot_adapt_prefill_snapshot_host.item() == 17.0
-
-    # A later CPU fallback must resume the prefill ranking and clear the
-    # previous tick's decode preference, without changing its clock or budget.
-    cache._staged_prefill_active = False
-    cache._start_hot_adaptation_tick(
-        token=30, boundary="prefill", tick_count=1, swap_budget_bytes=2,
-    )
-    assert captured[-1] == ((None, 30, 2, "prefill", 1), {})
-    assert cache._hot_adapt_tick_prefer_decode is False
 
 
 def test_post_prefill_tick_starts_immediately_and_consumes_clock(monkeypatch):
