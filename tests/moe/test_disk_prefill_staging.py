@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e4m3fn, torch.float16])
-@pytest.mark.parametrize("rows", [None, [7, 2, 3, 2, -1, 100], []])
+@pytest.mark.parametrize("rows", [None, [7, 2, 3, 2, -1], []])
 def test_staging_preserves_bank_bytes_and_unselected_rows(tmp_path, dtype, rows):
     shape = (8, 16, 32)
     nbytes = 8 * 16 * 32 * torch.empty((), dtype=dtype).element_size()
@@ -39,6 +39,8 @@ def test_staging_preserves_bank_bytes_and_unselected_rows(tmp_path, dtype, rows)
             assert copied == len(selected) * nbytes // 8
             assert [buffer.data_ptr() for buffer in staging.buffers] == pointers
             assert staging.pinned_bytes == 194
+        with pytest.raises(ValueError, match="exceeds bank size"):
+            staging.copy_bank(bank.tensor, target, [8])
     finally:
         staging.synchronize()
 
