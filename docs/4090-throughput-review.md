@@ -8,6 +8,43 @@ experts per layer, top-10 routing, H=2560 and I=640. `qwen3.6-27b` is its API
 alias. Measurements use node-4's RTX 4090 and Ryzen 7 7800X3D with 61.91 GiB
 RAM and local NVMe. GLM is outside this performance qualification.
 
+## Combined wall time against the original checkout
+
+The direct comparison of original `3a67403` against combined `4429203`
+measured eight requests per mode across four isolated starts in
+baseline/optimized/optimized/baseline order. Both used CPU DISK prefill,
+automatic HOT adaptation, identical cache geometry, and disabled diagnostics,
+GPU timing, HOT persistence, and KV reuse. This comparison includes both
+telemetry gates and CPU input reuse, but does not activate staged GPU prefill.
+
+| Measured whole response | Original | Combined | Wall-time reduction |
+| --- | ---: | ---: | ---: |
+| JSON, mean of four requests | 42.091 s | 41.925 s | 0.4%, effectively flat |
+| Prose, mean of four requests | 35.003 s | 27.994 s | 20.0% |
+| Fixed mix, total of eight requests | 308.374 s | 279.673 s | 9.3% |
+
+This aggregate is provisional. The first matched start pair was 3.2% slower;
+the reversed pair was 19.3% faster. Three of four pairs improved for each
+workload, but run order and retained host page cache remain material limits.
+The result does not establish a dependable general combined gain and cannot
+be added to the separate per-change percentages below.
+
+All twelve JSON responses, including warmups, completed normally and passed
+integer-value, key-order, and multiplicity checks. Two measured optimized
+responses used extra formatting, producing 449 tokens instead of 383. The
+whole-task times include those tokens; token throughput is not a substitute
+for task completion time. Prose used 192 output tokens in both modes and
+remains unscored. All four starts scored 7/8 on the long fidelity questions;
+the same code-trace question failed, with original answer `108` and combined
+answer `100`, both incorrect against `68`.
+
+The [complete record](../bench/results/4090-combined-cpu-wall-20260905.json)
+retains the exact driver, clients, source and native binary identities,
+worker mappings, all outputs, journals, and reproducible analysis. Startup
+checks confirm equal PIN/DISK placement, HOT capacity, activation dtype,
+adaptation settings, cache slots, KV pages, and fetch reserve. The original
+service was restored and verified with a real completion.
+
 ## Current bottlenecks
 
 The main remaining problem is the interaction between prefill and decode
@@ -17,7 +54,7 @@ in VRAM. Long prefill touches a large expert union, while the following
 decode needs a smaller, changing working set. Reducing first-token time can
 therefore make the rest of the response slower.
 
-The latest automatic-adaptation comparison makes this visible. Selected
+The separate CPU-versus-staged comparison makes this visible. Selected
 GPU staging with HOT reuse reduced JSON first-token time from 11.521 to
 7.573 seconds, but subsequent decode grew from 15.086 to 17.322 seconds.
 Whole-response JSON time improved by 6.4% on average with only two of four
@@ -37,7 +74,7 @@ execution. Diagnostic wall times are excluded from performance claims.
 
 The automatic adaptation cadence is another concrete mismatch to inspect.
 After filling, it advances to a 1,000-routed-token interval shared by prefill
-and decode. In each latest start, journals show 27 prefill dispatches and
+and decode. In each CPU-versus-staged start, journals show 27 prefill dispatches and
 three decode dispatches across the full timing and fidelity sequence. A
 192- or 383-token reply can finish before the next decode update, depending
 on where its prompt ended on that shared clock. This can make adaptation
@@ -120,9 +157,10 @@ Node-4 uses BF16 GPU activations because native NVFP4 activation mode requires
 SM120; the 4090 is SM89. CPU and GPU execution already have different numeric
 paths. Switching placement can therefore change generated text. The transport
 tests compare exact bytes and BF16 GEMM output bits, while model checks compare
-scored tasks and complete responses. In the latest direct gate, all JSON
+scored tasks and complete responses. In the CPU-versus-staged gate, all JSON
 records were correct and both modes retained the same 7/8 long-fidelity score,
-including the same known wrong code-trace answer. Prose remains unscored;
+including the same wrong code-trace answer. The combined comparison also
+retained 7/8 but changed that incorrect answer. Prose remains unscored;
 this sample does not establish broad model-quality equivalence.
 
 Use `--moe-collect-stats` and `--moe-step-timing` only for diagnostic runs.
@@ -131,8 +169,9 @@ fault guard still run when diagnostics are off. The selected-union host
 readback is required transport work. Optional `/proc` I/O snapshots run
 outside the client timer. Qualify performance with complete responses,
 matching placement and token counts, full warmups, and reversed request
-orders. The recorded wall measurements precede the final #31 cherry-pick;
-no additive throughput percentage is claimed for that gate.
+orders. The staged wall measurements precede the final #31 cherry-pick;
+the combined comparison includes it. No independent throughput percentage
+is claimed for that gate.
 
 ## Next performance gate
 

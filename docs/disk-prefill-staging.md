@@ -395,6 +395,31 @@ measurements retain their exact earlier clients and 384-token limits. Eight
 JSON edge cases, mocked stop/length SSE streams, and all 24 JSON responses
 from the preceding HOT-reuse gates passed the updated client checks.
 
+## Combined CPU-serving comparison against the original checkout
+
+The four-start comparison at `4429203` includes both diagnostic gates and
+CPU input reuse, with CPU DISK prefill in both arms. Original `3a67403` and
+the combined branch have identical startup geometry and automatic HOT
+adaptation settings. Diagnostics, GPU timing, HOT persistence, and KV reuse
+are off. Native binaries are identified by hashes and GPU-worker mappings.
+
+Across eight measured requests per mode, total client wall time is
+308.374 seconds on original and 279.673 seconds on combined, 9.3% shorter.
+Mean JSON response time is effectively flat, 42.091 to 41.925 seconds;
+mean prose time falls 20.0%, from 35.003 to 27.994 seconds. The first matched
+start pair is 3.2% slower and the reversed pair is 19.3% faster. This is a
+provisional observation with strong run-order effects, not a dependable
+general combined gain or a measurement of staged GPU prefill.
+
+All twelve JSON responses, including warmups, pass the strict scorer and
+finish normally. Two optimized measurements produce 449 output tokens
+versus 383 on original because of formatting; wall time includes the extra tokens.
+Every start scores 7/8 on long fidelity checks, with the same code-trace
+question failing. Prose differs and remains unscored. The
+[review](4090-throughput-review.md#combined-wall-time-against-the-original-checkout)
+and [full artifact](../bench/results/4090-combined-cpu-wall-20260905.json)
+record the per-pair results, limits, and original-service restoration check.
+
 ## Cache advice review
 
 The existing `HostBank.release_rows()` NOREUSE branch opens a fresh file
@@ -462,8 +487,9 @@ memcheck cases.
 The independent diagnostic all-HOT classification gate from #31 is included
 at `8e4ef5a`. All eleven tests in `tests/moe/test_moe_collect_stats.py` passed
 on node-4 after integration. It removes diagnostic-only work when collection
-and step timing are off. The preceding model wall measurements predate this
-cherry-pick, so no additional wall-time gain is attributed to it.
+and step timing are off. The staged model wall measurements predate this
+cherry-pick. The combined CPU-serving comparison includes it, but does not
+isolate its wall-time contribution.
 
 The idle HOT coverage readback gate from #31 is also integrated at `ae8b98d`.
 All 99 focused diagnostic and HOT adaptation tests passed on its independent
