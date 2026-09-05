@@ -78,8 +78,8 @@ def test_materialized_hot_layers_survive_reuse_and_decode(experts, slots):
             cache.ensure_experts_hot(layer, remapped)
             cache.copy_missing()
             for name, bank in sources.items():
-                actual = cache.bank_caches[name][remapped.long()].view(torch.uint8).cpu()
-                expected = bank[layer][original.cpu().long()].view(torch.uint8)
+                actual = cache.bank_caches[name].view(torch.uint8)[remapped.long()].cpu()
+                expected = bank[layer].view(torch.uint8)[original.cpu().long()]
                 assert torch.equal(actual, expected), f"decode read the wrong {name} rows"
             for expert in owners:
                 slot = protected[layer, expert]
