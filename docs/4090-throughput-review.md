@@ -127,7 +127,7 @@ not explain the CPU/staged difference.
 ## Earlier fork measurements that constrain the next experiment
 
 The fork's existing [results log](../bench/RESULTS.md) records useful negative
-controls. In its late-September-3 and early-September-4 rounds, moving the
+controls. In its September 3 and 4 rounds, moving the
 WILLNEED callback after worker notification reduced wake time but increased
 faults and total CPU windows. A decode-only worker cap and a spin-then-wait
 barrier also failed to beat the final warm control consistently. These
@@ -161,7 +161,7 @@ kernel speedups and model wall time have separate meanings.
 | Gate diagnostic-only decode classification and idle history readback | Removes ordinary decode's reduction/counter work and idle coverage's GPU-to-CPU history synchronization; 99 focused Linux tests pass, with no independent wall-time claim | [#31](https://github.com/jomcgi-org/freetoken-fork/pull/31), ready; also included in #33 |
 | Correct temporary materialization ownership | Prevents sparse scratch from advertising uncopied experts as hits; protected HOT bytes retained | [#32](https://github.com/jomcgi-org/freetoken-fork/pull/32), ready |
 | Selected DISK staging and exact HOT VRAM reuse | Strong long-prefill gains, 31.6% lower prose response time in the latest CPU comparison, mixed JSON response-time results | [#33](https://github.com/jomcgi-org/freetoken-fork/pull/33), draft |
-| Experimental direct-only staged reads | Exact byte/GEMM checks pass, but the fixed response mix is 1.3% slower, with six of eight pairs slower and substantially more storage reads | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; serving remains buffered |
+| Cache-aware staged reads | 18.3% shorter fixed-mix response time versus buffered staging; all eight pairs faster; 70 CUDA tests pass normally and under memcheck | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; constructor-only experiment, serving remains buffered |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
@@ -209,13 +209,30 @@ with only one of four pairs faster in each workload. Worker storage reads
 increase from about 5-6 GiB to about 27 GiB per response. The fixed mix is
 1.3% slower overall, so the reader remains an experimental comparison point.
 
-The next candidate should retain useful RAM cache hits while reducing
-insertion of cold prefill data. Placement budgets and reuse of resident
-weights remain possible improvements, with the router and checkpoint fixed.
-Each needs a fresh whole-response comparison with JSON and prose, plus the
-same quality checks. A nonblocking buffered read is insufficient proof of
-avoiding cache insertion on this kernel; the direct-reader document records
-the source review and constraints on residency hints.
+The cache-aware follow-up now retains useful RAM hits and uses direct reads
+for the remaining selected rows. Its four-start buffered/cached/cached/buffered
+gate at `25cdbff` reduces JSON response time from 29.872 to 23.894 seconds
+(20.0%) and prose from 22.587 to 18.956 seconds (16.1%). The fixed eight-request
+mix falls from 209.835 to 171.400 seconds, 18.3% shorter, with all eight pairs
+faster. The first matched start pair improves by 11.4%, the reversed pair by
+24.1%. Diagnostics and GPU timing are off; residency inspection is included
+in client wall time. Mean first-token time falls from about 9.8 to 6.2 seconds.
+
+All twelve JSON responses pass strict checks and finish normally. All four
+measured JSON pairs have identical text, all eight pairs have identical usage,
+and all four starts retain the same 7/8 fidelity score and answers. Prose
+differs and remains unscored. The
+[complete record](../bench/results/4090-cached-io-wall-20260905.json) retains
+the measured source and raw evidence. The original service is restored and
+verified with a real completion.
+
+This is a comparison against buffered staging, not against the original CPU
+server. The percentages cannot be added to earlier results. The next gates
+are a fresh CPU-versus-cache-aware comparison and sustained adaptation with
+retained serving state. The source-selection option remains experimental
+and has no CLI integration. A nonblocking buffered read is insufficient
+proof of avoiding cache insertion on this kernel; the direct-reader document
+records the source review and constraints on residency hints.
 
 The tested automatic decode-history preference was reverted: it improved
 JSON by 26.8% but slowed prose by 8.6%. That experiment changed only placement

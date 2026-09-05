@@ -142,7 +142,7 @@ Python objects, independent of model size and request length.
 
 The hint lookup and range planning are functional work included in wall time.
 No diagnostic counters or device readbacks are added. Default serving remains
-buffered while whole-response qualification is pending.
+buffered; this constructor option has no CLI integration.
 
 At `25cdbff`, all 70 focused staging/materialization CUDA tests pass normally
 and under GPU memcheck, with zero errors. Mixed-residency cases check the
@@ -151,5 +151,55 @@ partially resident rows use direct reads, and initially cold pages remain
 uncached. Other cases cover failed queries, concealed residency, stale hints,
 undefined high residency bits, large rows, partial views, and exact NVFP4
 GEMM output bits. The [validation log](../bench/results/4090-cached-io-validation-20260905.txt)
-retains exact commands and restoration verification. Model wall-time
-qualification remains pending.
+retains exact commands and restoration verification.
+
+## Whole-response result: cache-aware reads improve this gate
+
+Four isolated starts at runtime `25cdbff` compared
+buffered/cached/cached/buffered transport. Both modes used the same staged
+prefill implementation, published HOT reuse, native extension, memory
+geometry, and automatic adaptation. Diagnostics, GPU timing, HOT persistence,
+and KV reuse were off. Each start had two full-response warmups followed by
+four measured responses. Residency inspection and range planning are included
+in the client timer.
+
+| Mean client response time | Buffered | Cache-aware | Wall-time reduction |
+| --- | ---: | ---: | ---: |
+| 1,844-token prompt, 383-token JSON | 29.872 s | 23.894 s | 20.0% |
+| About 1,880-token prompt, 192-token prose | 22.587 s | 18.956 s | 16.1% |
+| Fixed eight-request mix, total | 209.835 s | 171.400 s | 18.3% |
+
+All eight matched responses are faster. The first matched start pair improves
+by 11.4% and the reversed pair by 24.1%. Mean first-token time falls from
+9.867 to 6.193 seconds for JSON and from 9.773 to 6.271 seconds for prose.
+JSON decode falls from 20.005 to 17.702 seconds; prose decode is nearly flat
+at 12.814 versus 12.685 seconds. This is primarily a prefill improvement, with
+no measured average decode penalty in this gate.
+
+Whole-worker storage-read accounting is 7.038 versus 6.174 GiB per JSON
+response and 5.844 versus 6.115 GiB per prose response. Unlike direct-only
+reads, the cache-aware mode avoids a large increase in this accounting.
+These are whole-worker counters, not expert-only traffic or proof that
+specific decode pages were protected from eviction.
+
+All twelve JSON responses, including warmups, finish normally and pass strict
+value, integer-type, key-order, and multiplicity checks. All four measured
+JSON pairs have identical text; all eight timing pairs have identical usage.
+Every start scores 7/8 on the long fidelity questions, with identical answers
+including the existing `108` code-trace failure (expected `68`). Prose differs
+and remains unscored. This is limited regression evidence, not broad quality
+qualification.
+
+The [complete record](../bench/results/4090-cached-io-wall-20260905.json)
+contains raw outputs, exact clients and driver, measured transport source,
+native identity, startup geometry, journals, I/O snapshots, and reproducible
+analysis. Separate metadata inspection confirms that all eight mapped model
+files are owned by the observed worker's effective user, allowing the
+residency policy. The original service was restored and verified with a real
+`OK` completion.
+
+The result qualifies this finite comparison against buffered staging. Host
+page cache is retained between starts, and each start has limited adaptation
+history. A fresh comparison against CPU prefill and a sustained run with
+retained serving state remain necessary before a general production claim.
+This 18.3% cannot be added to earlier gains against different baselines.
