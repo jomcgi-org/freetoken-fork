@@ -1505,6 +1505,9 @@ def test_staged_prefill_preserves_routes_weights_and_optional_hot_observations(
     cache.stage_disk_prefill_layer = lambda layer_id, routed: calls.append(
         ("stage", routed.clone())
     )
+    bank_views = cache.bank_views
+    cache.bank_views = lambda _experts: bank_views()
+    cache.alphas_for_layer = lambda _layer_id: None
     original = ids.clone()
     result = layer._prefill_routed(hidden, weights, ids)
     assert torch.equal(result, gpu_out)

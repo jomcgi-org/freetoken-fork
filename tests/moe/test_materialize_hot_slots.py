@@ -125,6 +125,11 @@ def test_selected_staging_leaves_uncopied_rows_unowned(tmp_path, protected, over
     )
     cache.init_disk_prefill_staging()
     assert cache._disk_prefill_staging.pinned_bytes == 64 << 20
+    expert_bytes = sum(bank[0][0].numel() * bank[0].element_size() for bank in sources.values())
+    cache.configure_hot_adaptation(
+        half_life_steps=2000, interval_steps=0,
+        max_swap_bytes=expert_bytes, expert_bytes=expert_bytes,
+    )
     try:
         # Prime ordinary cache ownership, then overwrite only two expert rows.
         cache.materialize_layer(1)
