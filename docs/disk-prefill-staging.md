@@ -70,3 +70,69 @@ The helper is currently used only by a benchmark hook. Serving integration
 still needs memory-governor accounting, a measured chunk-size policy, and
 quality checks covering the GPU execution path. The owner must synchronize
 pending transfers before discarding the staging object.
+
+## Direct staging model gate
+
+A second server compared CPU prefill against direct pinned staging of all
+expert rows. Both arms allocated the same 64 MiB ring before warmup. The other
+flags, geometry, prompts, order, and 512-token threshold were unchanged.
+Runtime revision: `632f3f2` plus the recorded hook.
+
+| Prompt tokens | CPU TTFT | Full-row staging TTFT |
+| ---: | ---: | ---: |
+| 2,060 | 24.292 s | 22.061 s |
+| 524 | 6.281 s | 19.759 s |
+| 76 | 1.811 s | 1.963 s |
+
+The two long-prompt staging times were 25.227 and 18.894 seconds, against
+23.762 and 24.823 seconds on CPU. The mean is lower, but one pair regressed
+and the sample does not establish a repeatable win. Medium-prompt staging
+was substantially slower. The small workload remains CPU execution in both
+arms and is a control, not evidence of a staging effect.
+
+All six timing pairs and eight fidelity pairs matched text and usage. Both
+modes retained the same 7/8 answers, with the same caveat that only the long
+retrieval case exercised GPU prefill in the fidelity set.
+
+The [populate record](../bench/results/4090-disk-copy-populate-20260905.json)
+and [direct staging record](../bench/results/4090-disk-staging-wall-20260905.json)
+retain complete drivers, results, and journals. Compare policies within each
+server; the different CPU baselines show why comparing across these starts
+would be misleading.
+
+## Staging only the original routed expert union
+
+A third server held GPU computation fixed and changed only which rows were
+read and staged. Both arms used direct pinned staging for chunks of at least
+512 tokens. The selected arm copied exactly the original router's expert
+union into the original row positions. It did not substitute hot experts,
+change router weights, or change the GEMM. Runtime revision: `632f3f2` plus
+the recorded hook.
+
+| Prompt tokens | Full-row staging TTFT | Selected-row staging TTFT |
+| ---: | ---: | ---: |
+| 2,060 | 18.385 s | 16.977 s |
+| 524 | 14.520 s | 7.494 s |
+| 76 | 1.818 s | 2.094 s |
+
+Both medium-prompt pairs improved. The long-prompt pairs were mixed:
+19.658 to 15.174 seconds, then 17.113 to 18.779 seconds. The small workload
+again executes on CPU in both modes. This is a transport comparison, not
+proof of a CPU prefill throughput improvement.
+
+All six timing pairs and eight fidelity pairs matched text and usage. The
+long retrieval answer was correct in both arms (13.728 versus 9.471 seconds
+to first token); the other seven fidelity prompts used CPU in both arms.
+The [selected-row record](../bench/results/4090-disk-selected-staging-20260905.json)
+contains all results, drivers, and journals.
+
+The final GPU checks at `c5dc111` add full NVFP4 GEMM comparisons at 16 and
+512 tokens. Selected staging and full staging produced identical BF16 output
+bits, even with NaNs in every unselected scale row. All twelve tests pass,
+and all twelve pass CUDA memcheck with zero reported errors.
+
+Before a serving recommendation, compare selected staging directly against
+CPU prefill with balanced prompt order across starts. Integrating sparse
+copies also requires correct ownership for non-HOT layers: their uncopied
+rows must not be advertised as cache hits. These probes used 28 HOT layers,
+whose scratch copies are already unowned through the preceding ownership fix.
