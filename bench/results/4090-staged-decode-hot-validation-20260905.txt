@@ -1,0 +1,7 @@
+Revision: bfb0d73
+Environment: node-4 Linux, shared CUDA 13 / Python 3.12 environment
+Command: python -m pytest tests/moe/test_hot_adapt.py tests/moe/test_moe_collect_stats.py tests/moe/test_disk_prefill_policy.py -q --disable-warnings --maxfail=4
+
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 2.86s

@@ -165,12 +165,49 @@ retains all outputs and timings. The original clean serving checkout at
 `3a67403` was restored and returned `OK`; the final metadata includes that
 completion.
 
-The remaining gate is to diagnose post-prefill decode with optional
-statistics, then validate any change against non-debug whole-response wall
-time. Cache residency, page faults, and different decode expert traffic are
-candidate explanations, not established causes. Automatic HOT adaptation
-also needs a matched wall-time comparison. CPU remains the default, and this
-PR stays draft while that throughput question is open.
+## Decode diagnostics and automatic adaptation
+
+A six-request replay at `593ddc9` enabled diagnostic collection while retaining
+fixed HOT placement. All JSON values and key order remained correct. Across
+the logged windows, HOT coverage averaged approximately 11%, while a
+retrospective oracle using the same capacity covered approximately 97%.
+CPU and staged arms had similar aggregate cold expert counts, approximately
+8.9 per DISK layer and token. Major page-fault rates varied substantially,
+including between repetitions of the same mode. PLE gather time stayed near
+0.5 milliseconds per decode step in most requests.
+
+These observations point toward cache residency as a useful next target.
+They do not isolate a cause: process page faults include more than expert I/O,
+window averages are unweighted, and the last tokens can fall outside the
+logged windows. Diagnostic timings are excluded from performance claims. The
+[replay record](../bench/results/4090-disk-staged-decode-diagnostic-20260905.json)
+includes exact request intervals, raw windows, and the parsing script.
+
+Two further starts at `593ddc9` enabled automatic HOT adaptation, with split
+histories and phase aim, and disabled diagnostics again. Every measured
+prompt received both request orders across starts, with complete warmup
+responses in both modes. Each table cell contains four measured responses.
+
+| Workload | CPU wall | Staged wall | Change |
+| --- | ---: | ---: | ---: |
+| 383-token JSON | 37.173 s | 34.602 s | 6.9% shorter |
+| 192-token prose | 24.331 s | 24.203 s | 0.5% shorter |
+
+All twelve JSON responses, including warmups, preserved all 32 records and
+key order. JSON improved in three of four measured pairs; prose improved in
+two of four. The reversed start had regressions in both workloads. Adaptive
+state also carries between alternating modes within a start. This result
+does not qualify a general throughput win or establish that adaptation
+caused the difference from the earlier fixed-HOT run. The
+[automatic-adaptation record](../bench/results/4090-disk-staged-auto-wall-20260905.json)
+retains all outputs, journals, and the exact measured client and driver.
+
+The next gate compares HOT planning policies in isolated server starts.
+Staged prefill uses scratch weights, so loading its working set into permanent
+HOT slots cannot help that path and can displace decode weights. Decode-focused
+ranking during staged prefill is implemented at `bfb0d73`; its wall-time
+benefit is still unqualified. CPU remains the default, and this PR stays draft
+while the whole-response throughput question is open.
 
 ## Correctness validation
 
@@ -187,6 +224,11 @@ zero reported errors. They cover:
 - Sparse ownership and protected HOT mappings, with and without overlap.
 - CPU fallback across chunk boundaries, scratch reservations, and preserved
   adaptation observations without changing the GPU's routed IDs or weights.
+
+At `bfb0d73`, 111 targeted Linux tests passed across HOT adaptation, diagnostic
+gating, and DISK prefill policy. Added cases check decode-focused ranking,
+unchanged explicit blend behavior, immutable asynchronous planner selection,
+and restoration of prefill ranking on CPU fallback.
 
 ## Earlier transport gates
 
