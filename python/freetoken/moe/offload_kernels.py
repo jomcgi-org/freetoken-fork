@@ -7,6 +7,10 @@ import triton
 import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
 
+# Measurement escape hatch. Decode-sized route sets keep the scalar path;
+# large sets count and remap tiles without changing the selected experts.
+_PARALLEL_HOT_ROUTING = os.getenv("FREETOKEN_PARALLEL_HOT_ROUTING", "1") != "0"
+
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
 # (LRU on the expert -> prioritizes recurring misses, lowering the steady miss rate);
@@ -289,6 +293,10 @@ def _ensure_experts_hot_gpu(
         RECORD_STATS=record_stats,
         COLLECT_STATS=record_stats and getattr(cache, "collect_stats", False),
         WEIGHTED=route_weight != 1.0,
+        ROUTE_BLOCK=(
+            min(1024, triton.next_power_of_2(expert_ids.numel()))
+            if _PARALLEL_HOT_ROUTING and expert_ids.numel() >= 64 else 0
+        ),
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         num_warps=8 if block_c >= 2048 else 4,
@@ -684,6 +692,7 @@ def _ensure_experts_hot_kernel(
     RECORD_STATS: tl.constexpr,
     COLLECT_STATS: tl.constexpr,
     WEIGHTED: tl.constexpr,
+    ROUTE_BLOCK: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -705,9 +714,17 @@ def _ensure_experts_hot_kernel(
     compact_row = tl.load(hot_row_ptr + base + off_e, mask=e_mask, other=-1)
     eligible = compact_row >= 0
     route_count = tl.zeros((BLOCK_E,), dtype=tl.int32)
-    for i in tl.range(num_active):
-        expert = tl.load(expert_ids_ptr + i)
-        route_count += (off_e == expert).to(tl.int32)
+    if ROUTE_BLOCK:
+        off_r = tl.arange(0, ROUTE_BLOCK)
+        for start in tl.range(0, num_active, ROUTE_BLOCK):
+            positions = start + off_r
+            valid = positions < num_active
+            experts = tl.load(expert_ids_ptr + positions, mask=valid, other=0)
+            route_count += tl.histogram(experts, BLOCK_E, mask=valid)
+    else:
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            route_count += (off_e == expert).to(tl.int32)
     is_active = (route_count > 0) & eligible
     if HOT_ADAPT and RECORD_STATS:
         decayed = tl.load(decayed_freq_ptr + base + off_e, mask=e_mask, other=0.0)
@@ -769,12 +786,26 @@ def _ensure_experts_hot_kernel(
             usage = tl.where(
                 off_c == victim, 9223372036854775807, usage
             )
+        if ROUTE_BLOCK:
+            # Victim installation writes the map from scalar lanes. All lanes
+            # must observe those writes before the parallel slot lookup.
+            tl.debug_barrier()
 
-    for i in tl.range(num_active):
-        expert = tl.load(expert_ids_ptr + i)
-        is_hot = tl.load(hot_row_ptr + base + expert) >= 0
-        result = tl.load(slot_for_id_ptr + base + expert)
-        tl.store(expert_ids_ptr + i, tl.where(is_hot, result, -1))
+    if ROUTE_BLOCK:
+        off_r = tl.arange(0, ROUTE_BLOCK)
+        for start in tl.range(0, num_active, ROUTE_BLOCK):
+            positions = start + off_r
+            valid = positions < num_active
+            experts = tl.load(expert_ids_ptr + positions, mask=valid, other=0)
+            is_hot = tl.load(hot_row_ptr + base + experts, mask=valid, other=-1) >= 0
+            result = tl.load(slot_for_id_ptr + base + experts, mask=valid, other=-1)
+            tl.store(expert_ids_ptr + positions, tl.where(is_hot, result, -1), mask=valid)
+    else:
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            is_hot = tl.load(hot_row_ptr + base + expert) >= 0
+            result = tl.load(slot_for_id_ptr + base + expert)
+            tl.store(expert_ids_ptr + i, tl.where(is_hot, result, -1))
 
 
 @triton.jit(do_not_specialize=["buffer_base"])
