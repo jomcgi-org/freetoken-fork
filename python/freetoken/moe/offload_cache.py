@@ -680,6 +680,9 @@ class OffloadMoeCache:
                 dtype=head.dtype,
                 device=self.device,
             )
+            # Split decode maps cold GPU routes to slot 0 with zero weight.
+            # Define that row before any real expert reaches it: NaN * 0 is NaN.
+            self.bank_caches[name][0].zero_()
             if hot_sources:
                 compact = hot_sources[name]
                 if len(compact) != self.num_layers:
@@ -1033,6 +1036,8 @@ class OffloadMoeCache:
             self.bank_caches[name] = torch.empty(
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
+            # Rebuild has the same cold, zero-weight fallback as initial setup.
+            self.bank_caches[name][0].zero_()
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         self._build_copy_plan()  # slot caches were reallocated -> refresh fused-copy addrs
         self._build_gpufetch_copy_plan()
