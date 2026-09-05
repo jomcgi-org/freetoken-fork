@@ -35,7 +35,8 @@ def nvfp4_banks(layers, experts):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("experts,slots", [(8, 32), (512, 4045)])
-def test_materialized_hot_layers_survive_reuse_and_decode(experts, slots):
+@pytest.mark.parametrize("route_repeats", [5, 40])
+def test_materialized_hot_layers_survive_reuse_and_decode(experts, slots, route_repeats):
     from freetoken.distributed import set_tp_info, try_get_tp_info
 
     if try_get_tp_info() is None:
@@ -75,8 +76,10 @@ def test_materialized_hot_layers_survive_reuse_and_decode(experts, slots):
             cache._invalidate_prefill_buffer(0)
 
         for layer, owners in seeds.items():
-            # Repeated routes exercise the tiled HOT remap as well as ownership.
-            original = torch.tensor(list(owners) * 40, device="cuda", dtype=torch.int32)
+            # Ten routes use scalar decode; eighty routes exercise the tiled remap.
+            original = torch.tensor(
+                list(owners) * route_repeats, device="cuda", dtype=torch.int32,
+            )
             remapped = original.clone()
             cache.ensure_experts_hot(layer, remapped)
             cache.copy_missing()
