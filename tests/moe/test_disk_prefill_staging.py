@@ -16,8 +16,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e4m3fn, torch.float16])
 @pytest.mark.parametrize("rows", [None, [7, 2, 3, 2, -1], []])
-@pytest.mark.parametrize("direct_io", [False, True])
-def test_staging_preserves_bank_bytes_and_unselected_rows(tmp_path, dtype, rows, direct_io):
+@pytest.mark.parametrize("direct_io,reuse_cached_rows", [(False, False), (True, False), (True, True)])
+def test_staging_preserves_bank_bytes_and_unselected_rows(tmp_path, dtype, rows, direct_io, reuse_cached_rows):
     shape = (8, 64, 64) if direct_io else (8, 16, 32)
     nbytes = torch.empty(shape, dtype=dtype).numel() * torch.empty((), dtype=dtype).element_size()
     payload = bytes((i * 17 + i // 97) % 256 for i in range(nbytes))
@@ -27,7 +27,7 @@ def test_staging_preserves_bank_bytes_and_unselected_rows(tmp_path, dtype, rows,
     bank = HostBank(shape, dtype, backing="file", file_path=str(path), file_offset=6)
     device = torch.device("cuda", torch.cuda.current_device())
     chunk_bytes = 8192 if direct_io else 97
-    staging = DiskPrefillStaging(device, chunk_bytes=chunk_bytes, direct_io=direct_io)
+    staging = DiskPrefillStaging(device, chunk_bytes=chunk_bytes, direct_io=direct_io, reuse_cached_rows=reuse_cached_rows)
     pointers = [buffer.data_ptr() for buffer in staging.buffers]
     try:
         for _ in range(3):
@@ -182,9 +182,122 @@ def test_direct_staging_does_not_populate_file_cache(tmp_path, direct_io):
         staging.synchronize()
 
 
+@pytest.mark.parametrize("row_bytes", [4096, 16384])
+def test_cached_staging_reuses_only_resident_rows_without_warming_cold_rows(tmp_path, monkeypatch, row_bytes):
+    payload = bytes((i * 17 + i // 4096) % 256 for i in range(16 * row_bytes))
+    path = tmp_path / "mixed.ftw"
+    with path.open("wb") as file:
+        file.write(payload)
+        file.flush()
+        os.fsync(file.fileno())
+        os.posix_fadvise(file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    bank = HostBank((16, row_bytes), torch.uint8, backing="file", file_path=str(path))
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+        for row in (1, 2, 5):
+            assert len(os.pread(fd, row_bytes, row * row_bytes)) == row_bytes
+        # A partially resident row must still use the direct path.
+        if row_bytes > 4096:
+            os.pread(fd, 4096, 8 * row_bytes)
+    finally:
+        os.close(fd)
+    libc = ctypes.CDLL(None, use_errno=True)
+    def residency():
+        bits = (ctypes.c_ubyte * (bank.nbytes // 4096))()
+        assert libc.mincore(ctypes.c_void_p(bank.addr), ctypes.c_size_t(bank.nbytes), bits) == 0
+        return bytes(bits)
+    before = residency()
+    assert sum(before) == 3 * row_bytes // 4096 + (row_bytes > 4096)
+    source = bank.tensor[1:15]
+    source._freetoken_host_bank = bank
+    device = torch.device("cuda", torch.cuda.current_device())
+    staging = DiskPrefillStaging(device, chunk_bytes=8192, direct_io=True, reuse_cached_rows=True)
+    original = os.preadv
+    reads = []
+    def read(fd, buffers, offset):
+        direct = bool(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_DIRECT)
+        reads.append((direct, offset, len(buffers[0])))
+        return original(fd, buffers, offset)
+    monkeypatch.setattr(os, "preadv", read)
+    try:
+        target = torch.full_like(source, 211, device=device)
+        reference = torch.frombuffer(bytearray(payload), dtype=torch.uint8).view(16, row_bytes)[1:15]
+        expected = torch.full_like(source, 211)
+        selected = [0, 1, 2, 4, 7, 9, 13]
+        expected[selected] = reference[selected]
+        torch.cuda._sleep(2_000_000)
+        assert staging.copy_bank(source, target, selected) == len(selected) * row_bytes
+        assert torch.equal(target.cpu(), expected)
+        assert sum(size for direct, _, size in reads if direct) == 4 * row_bytes
+        assert sum(size for direct, _, size in reads if not direct) == 3 * row_bytes
+        assert residency() == before
+        assert staging.pinned_bytes == 16384
+        assert len(staging._residency) == 4
+    finally:
+        staging.synchronize()
+
+
+@pytest.mark.parametrize("hint", ["failed", "unowned", "stale", "extra_bits"])
+def test_cached_staging_hints_cannot_change_payload(tmp_path, monkeypatch, hint):
+    from types import SimpleNamespace
+
+    payload = bytes((i * 7 + i // 67) % 256 for i in range(8192))
+    path = tmp_path / "hint.ftw"
+    with path.open("wb") as file:
+        file.write(payload)
+        file.flush()
+        os.fsync(file.fileno())
+    bank = HostBank((2, 4096), torch.uint8, backing="file", file_path=str(path))
+    device = torch.device("cuda", torch.cuda.current_device())
+    staging = DiskPrefillStaging(device, chunk_bytes=8192, direct_io=True, reuse_cached_rows=True)
+    original_probe = staging._residency_snapshot
+    def probe(address, length):
+        if hint == "unowned":
+            raise AssertionError("unowned file must not trust mincore's masked response")
+        bits, head = original_probe(address, length)
+        if hint == "failed":
+            assert bits is None
+            return bits, head
+        assert bits is not None and 0 not in bits
+        if hint == "stale":
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        return bits, head
+    monkeypatch.setattr(staging, "_residency_snapshot", probe)
+    if hint == "failed":
+        monkeypatch.setattr(staging, "_mincore", lambda *_args: -1)
+    if hint == "unowned":
+        monkeypatch.setattr(os, "fstat", lambda _fd: SimpleNamespace(st_uid=os.geteuid() + 1))
+    if hint == "extra_bits":
+        original_mincore = staging._mincore
+        def extra_bits(*args):
+            result = original_mincore(*args)
+            for i in range(len(staging._residency)):
+                staging._residency[i] |= 2
+            return result
+        monkeypatch.setattr(staging, "_mincore", extra_bits)
+    original_read = os.preadv
+    modes = []
+    def read(fd, buffers, offset):
+        modes.append(bool(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_DIRECT))
+        return original_read(fd, buffers, offset)
+    monkeypatch.setattr(os, "preadv", read)
+    try:
+        target = torch.empty_like(bank.tensor, device=device)
+        assert staging.copy_bank(bank.tensor, target) == len(payload)
+        assert torch.equal(target.cpu().view(-1), torch.frombuffer(bytearray(payload), dtype=torch.uint8))
+        assert modes and all(mode == (hint in ("failed", "unowned")) for mode in modes)
+    finally:
+        staging.synchronize()
+
+
 @pytest.mark.parametrize("tokens", [16, 512])
-@pytest.mark.parametrize("direct_io", [False, True])
-def test_selected_staging_matches_full_nvfp4_gemm(tmp_path, tokens, direct_io):
+@pytest.mark.parametrize("direct_io,reuse_cached_rows", [(False, False), (True, False), (True, True)])
+def test_selected_staging_matches_full_nvfp4_gemm(tmp_path, tokens, direct_io, reuse_cached_rows):
     from freetoken.moe.fused_nvfp4 import fused_experts_nvfp4
 
     experts, hidden, intermediate = 8, 256, 128
@@ -198,7 +311,7 @@ def test_selected_staging_matches_full_nvfp4_gemm(tmp_path, tokens, direct_io):
         ((experts, hidden), torch.float16),
     ]
     device = torch.device("cuda", torch.cuda.current_device())
-    staging = DiskPrefillStaging(device, chunk_bytes=32768, direct_io=direct_io)
+    staging = DiskPrefillStaging(device, chunk_bytes=32768, direct_io=direct_io, reuse_cached_rows=reuse_cached_rows)
     full, selected, sources = [], [], []
     try:
         for index, (shape, dtype) in enumerate(layouts):

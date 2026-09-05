@@ -72,8 +72,8 @@ provides a residency snapshot, but it can become stale immediately. It also
 reports every page resident when ownership and permission checks disallow
 exposing residency. Any use as a transport hint must preserve correct reads when
 the hint is stale or unavailable, and must measure the cost of inspecting
-pages and splitting transfers. These candidates are not implemented or
-performance-qualified by the direct-reader tests.
+pages and splitting transfers. The original direct-reader tests do not
+performance-qualify these candidates.
 
 ## Whole-response result: direct-only reads do not qualify
 
@@ -121,3 +121,25 @@ the measured transport source, I/O snapshots, and reproducible analysis.
 All four measured JSON pairs have identical text; all eight pairs have
 identical usage counts. The original service was restored and verified
 with a real `OK` completion.
+
+## Experimental reuse of resident rows
+
+`DiskPrefillStaging(..., direct_io=True, reuse_cached_rows=True)` adds an
+experimental source-selection policy. It inspects small groups of rows with
+`mincore`, then uses buffered reads for fully resident rows and aligned direct
+reads for the rest. Adjacent selected rows using the same source are coalesced.
+The buffered descriptor requests random-access advice to limit readahead;
+stale residency can still cause buffered reads to fetch missing pages. This
+is an advisory performance policy, never permission to skip a required read.
+
+The policy conservatively trusts residency only for files owned by the
+serving user. Failed queries and other ownership use direct reads. It masks
+the defined residency bit, handles partial source views and rows larger than
+the probe window, and keeps all row data authoritative in the original file.
+The 64 MiB pinned allocation is unchanged. On the target's 4 KiB pages, the
+reusable bitmap and bounded snapshot copies consume less than 32 KiB of
+additional host metadata, independent of model size and request length.
+
+The hint lookup and range planning are functional work included in wall time.
+No diagnostic counters or device readbacks are added. Default serving remains
+buffered while CUDA and whole-response qualification are pending.
