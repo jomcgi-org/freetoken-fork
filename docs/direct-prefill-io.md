@@ -1,9 +1,17 @@
 # Direct file reads for selected DISK prefill
 
 This experiment tests whether bypassing page-cache insertion during staged
-prefill leaves more useful RAM residency for subsequent CPU decode. It adds
-`DiskPrefillStaging(..., direct_io=True)` for controlled tests. Serving still
-constructs the default buffered reader; there is no automatic policy change.
+prefill leaves more useful RAM residency for subsequent CPU decode. Serving
+keeps buffered reads by default. The cache-aware follow-up can be selected
+with `--moe-disk-prefill staged --moe-disk-prefill-io cached`. It requires
+Linux ordinary file banks supporting direct I/O and native NVFP4 CUDA staging
+with CPU decode. The staged token threshold still applies. There is no
+automatic policy change.
+
+`--moe-disk-prefill-io buffered` retains the existing reader. The unsuccessful
+direct-only reader remains available through the constructor for ablations;
+it is not a CLI policy. Startup logs identify the selected file I/O policy,
+token threshold, and fixed ring allocation, without adding request telemetry.
 
 The reader opens each ordinary file bank with `O_DIRECT`. It aligns a view
 inside each existing pinned allocation, reducing usable chunk capacity when
@@ -142,7 +150,7 @@ Python objects, independent of model size and request length.
 
 The hint lookup and range planning are functional work included in wall time.
 No diagnostic counters or device readbacks are added. Default serving remains
-buffered; this constructor option has no CLI integration.
+buffered; the `cached` CLI policy enables both constructor options.
 
 At `25cdbff`, all 70 focused staging/materialization CUDA tests pass normally
 and under GPU memcheck, with zero errors. Mixed-residency cases check the
@@ -161,7 +169,8 @@ prefill implementation, published HOT reuse, native extension, memory
 geometry, and automatic adaptation. Diagnostics, GPU timing, HOT persistence,
 and KV reuse were off. Each start had two full-response warmups followed by
 four measured responses. Residency inspection and range planning are included
-in the client timer.
+in the client timer. This gate selected the constructor options through a
+startup probe before CLI integration; it does not validate the later CLI path.
 
 | Mean client response time | Buffered | Cache-aware | Wall-time reduction |
 | --- | ---: | ---: | ---: |

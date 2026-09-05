@@ -161,7 +161,7 @@ kernel speedups and model wall time have separate meanings.
 | Gate diagnostic-only decode classification and idle history readback | Removes ordinary decode's reduction/counter work and idle coverage's GPU-to-CPU history synchronization; 99 focused Linux tests pass, with no independent wall-time claim | [#31](https://github.com/jomcgi-org/freetoken-fork/pull/31), ready; also included in #33 |
 | Correct temporary materialization ownership | Prevents sparse scratch from advertising uncopied experts as hits; protected HOT bytes retained | [#32](https://github.com/jomcgi-org/freetoken-fork/pull/32), ready |
 | Selected DISK staging and exact HOT VRAM reuse | Strong long-prefill gains, 31.6% lower prose response time in the latest CPU comparison, mixed JSON response-time results | [#33](https://github.com/jomcgi-org/freetoken-fork/pull/33), draft |
-| Cache-aware staged reads | 18.3% shorter fixed-mix response time versus buffered staging; all eight pairs faster; 70 CUDA tests pass normally and under memcheck | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; constructor-only experiment, serving remains buffered |
+| Cache-aware staged reads | 18.3% shorter fixed-mix response time versus buffered staging; all eight pairs faster; 70 CUDA transport tests pass normally and under memcheck | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; explicit opt-in, serving remains buffered |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
@@ -230,7 +230,8 @@ This is a comparison against buffered staging, not against the original CPU
 server. The percentages cannot be added to earlier results. The next gates
 are a fresh CPU-versus-cache-aware comparison and sustained adaptation with
 retained serving state. The source-selection option remains experimental
-and has no CLI integration. A nonblocking buffered read is insufficient
+and is selected with `--moe-disk-prefill staged --moe-disk-prefill-io cached`.
+A nonblocking buffered read is insufficient
 proof of avoiding cache insertion on this kernel; the direct-reader document
 records the source review and constraints on residency hints.
 

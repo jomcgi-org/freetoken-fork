@@ -6,6 +6,12 @@ buffers, then run the existing GPU prefill GEMM. CPU prefill remains the
 default. Smaller chunks still use CPU execution, controlled by
 `--moe-disk-prefill-min-tokens` (default 1,024).
 
+Staged reads use the page cache by default. The experimental
+`--moe-disk-prefill-io cached` option reuses fully resident file rows and uses
+direct I/O for the remaining selected rows, with the same pinned allocation
+and expert routing. See the [transport qualification](direct-prefill-io.md)
+for platform requirements, complete-response results, and remaining limits.
+
 On node-4's RTX 4090, the balanced prototype comparison reduced mean client
 wall time from 17.57 to 9.45 seconds at 2,060 prompt tokens and from 34.93 to
 16.86 seconds at 4,108 tokens. Every long-prompt pair improved. At 524 tokens,

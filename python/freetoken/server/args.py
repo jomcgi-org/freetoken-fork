@@ -1103,6 +1103,17 @@ def parse_args(
         default=ServerArgs.moe_disk_prefill_min_tokens,
         help="Minimum chunk size for staged DISK GPU prefill (default: %(default)s tokens).",
     )
+    parser.add_argument(
+        "--moe-disk-prefill-io",
+        choices=["buffered", "cached"],
+        default=ServerArgs.moe_disk_prefill_io,
+        help=(
+            "File reads for staged DISK prefill: 'buffered' uses the page cache "
+            "(default); experimental 'cached' reuses resident rows and uses direct "
+            "I/O for cold rows. Requires --moe-disk-prefill staged and Linux "
+            "file banks supporting direct I/O. Expert routing is unchanged."
+        ),
+    )
 
     parser.add_argument(
         "--moe-prefill-coalesce",

@@ -99,8 +99,9 @@ def test_materialized_hot_layers_survive_reuse_and_decode(experts, slots, route_
 @pytest.mark.parametrize("protected", [False, True])
 @pytest.mark.parametrize("overlap", [False, True])
 @pytest.mark.parametrize("reuse_backend", ["fused", "disabled", "ablation"])
+@pytest.mark.parametrize("file_io", ["buffered", "cached"])
 def test_selected_staging_leaves_uncopied_rows_unowned(
-    tmp_path, monkeypatch, protected, overlap, reuse_backend,
+    tmp_path, monkeypatch, protected, overlap, reuse_backend, file_io,
 ):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.moe.host_banks import HostBank
@@ -117,7 +118,7 @@ def test_selected_staging_leaves_uncopied_rows_unowned(
     cache = OffloadMoeCache(
         num_layers=2, num_experts=8, cache_size=24, device=torch.device("cuda"),
         quant_format="nvfp4", decode_target="cpu", prefill_overlap=overlap,
-        moe_disk_prefill="staged",
+        moe_disk_prefill="staged", moe_disk_prefill_io=file_io,
     )
     cache.cpu_layer_ids = frozenset({0, 1})
     cache.set_bank_sources(
@@ -127,6 +128,8 @@ def test_selected_staging_leaves_uncopied_rows_unowned(
     )
     cache.init_disk_prefill_staging()
     assert cache._disk_prefill_staging.pinned_bytes == 64 << 20
+    assert cache._disk_prefill_staging.direct_io == (file_io == "cached")
+    assert cache._disk_prefill_staging.reuse_cached_rows == (file_io == "cached")
     expert_bytes = sum(bank[0][0].numel() * bank[0].element_size() for bank in sources.values())
     cache.configure_hot_adaptation(
         half_life_steps=2000, interval_steps=0,

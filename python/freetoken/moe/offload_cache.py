@@ -220,6 +220,7 @@ class OffloadMoeCache:
     # pageable copy path.
     moe_disk_prefill: str = "cpu"
     moe_disk_prefill_min_tokens: int = 1024
+    moe_disk_prefill_io: str = "buffered"
     moe_prefill_coalesce: str = "populate"
     moe_prefill_hot_split: str = "on"
     moe_prefill_split_kernel: str = "grouped"
@@ -262,6 +263,10 @@ class OffloadMoeCache:
         assert self.moe_disk_prefill in ("cpu", "copy", "staged"), self.moe_disk_prefill
         if self.moe_disk_prefill_min_tokens < 1:
             raise ValueError("staged DISK prefill needs a positive token threshold")
+        if self.moe_disk_prefill_io not in ("buffered", "cached"):
+            raise ValueError("moe_disk_prefill_io must be 'buffered' or 'cached'")
+        if self.moe_disk_prefill_io == "cached" and self.moe_disk_prefill != "staged":
+            raise ValueError("cached file reads require staged DISK prefill")
         self._staged_prefill_active = False
         self._disk_prefill_staging = None
         self.hot_expert_capacity: dict[int, int] = {}
@@ -795,10 +800,14 @@ class OffloadMoeCache:
         if self._disk_prefill_staging is None:
             from freetoken.moe.disk_prefill_staging import DiskPrefillStaging
 
-            self._disk_prefill_staging = DiskPrefillStaging(self.device)
+            cached = self.moe_disk_prefill_io == "cached"
+            self._disk_prefill_staging = DiskPrefillStaging(
+                self.device, direct_io=cached, reuse_cached_rows=cached,
+            )
             logger.info_rank0(
                 f"DISK staged prefill: ring={self._disk_prefill_staging.pinned_bytes / 2**20:.0f} MiB, "
-                f"minimum_chunk={self.moe_disk_prefill_min_tokens} tokens"
+                f"minimum_chunk={self.moe_disk_prefill_min_tokens} tokens, "
+                f"file_io={self.moe_disk_prefill_io}"
             )
 
     def stage_disk_prefill_layer(self, layer_id: int, expert_ids: torch.Tensor) -> None:
