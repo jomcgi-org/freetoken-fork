@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--base-url", default="http://127.0.0.1:18090")
     parser.add_argument("--model", default="qwen3.6-27b")
     parser.add_argument("--order-offset", type=int, choices=(0, 1), required=True)
+    parser.add_argument("--mode-labels", nargs=2, default=("cpu", "selected"),
+                        metavar=("CONTROL_0", "CONTROL_1"))
     args = parser.parse_args()
     from transformers import AutoTokenizer
 
@@ -73,7 +75,7 @@ def main():
             chat_template_kwargs=dict(enable_thinking=False),
         ))
         row = dict(kind=kind, repeat=repeat, warmup=warmup,
-                   mode="selected" if selected else "cpu", order_offset=args.order_offset,
+                   mode=args.mode_labels[int(selected)], order_offset=args.order_offset,
                    prompt=text, **result)
         if result["usage"]["prompt_tokens"] < 1024:
             raise RuntimeError("long output prompt did not exercise staged prefill")

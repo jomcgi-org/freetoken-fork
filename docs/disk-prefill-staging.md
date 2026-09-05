@@ -48,6 +48,12 @@ When HOT adaptation is enabled, the staged path records the same original
 route observations, history selection, normalization, and prefill token clock
 as CPU/HOT split prefill. Only a scratch copy of IDs is remapped for that
 observation. Diagnostic route counts remain gated by their collection flags.
+With split histories and phase aim, a staged chunk ranks permanent HOT slots
+from decode history. Staged prefill reads scratch rows and cannot benefit
+from replacing those permanent slots with its own working set. CPU fallback
+chunks retain prefill ranking. The planner captures this choice at dispatch,
+so a subsequent chunk cannot change an in-flight plan's history selection.
+This adaptation change still requires a matched wall-time gate.
 The required selected-union readback is part of transport, not telemetry.
 When statistics are enabled, `decode_miss_stats()` reports staged transfer
 bytes separately as `disk_prefill_staged_h2d_bytes`; pinned-overlap counters
