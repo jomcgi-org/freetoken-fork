@@ -283,6 +283,7 @@ def _ensure_experts_hot_gpu(
         float(route_weight),
         HOT_ADAPT=cache.hot_adapt_enabled,
         RECORD_STATS=record_stats,
+        COLLECT_STATS=record_stats and getattr(cache, "collect_stats", False),
         WEIGHTED=route_weight != 1.0,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
@@ -410,7 +411,6 @@ def _ensure_experts_hot_cpu(
         cache.evict_slots[idx] = victim
         cache.src_indices[idx] = hot_row[expert]
 
-    hot_pairs = sum(hot_row[expert] >= 0 for expert in raw)
     if cache.hot_adapt_enabled and record_stats:
         counts = torch.bincount(
             torch.tensor(raw, dtype=torch.long), minlength=cache.num_experts
@@ -420,7 +420,8 @@ def _ensure_experts_hot_cpu(
         if decayed_freq is None:
             decayed_freq = cache.decayed_decode_freq
         decayed_freq[layer_id].mul_(cache._hot_decay_factor).add_(counts)
-    if record_stats:
+    if record_stats and getattr(cache, "collect_stats", False):
+        hot_pairs = sum(hot_row[expert] >= 0 for expert in raw)
         cache.stat_hot_pairs += hot_pairs
         cache.stat_hot_total_pairs += len(raw)
     flat = expert_ids.view(-1)
@@ -677,6 +678,7 @@ def _ensure_experts_hot_kernel(
     route_weight,
     HOT_ADAPT: tl.constexpr,
     RECORD_STATS: tl.constexpr,
+    COLLECT_STATS: tl.constexpr,
     WEIGHTED: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
@@ -703,7 +705,6 @@ def _ensure_experts_hot_kernel(
         expert = tl.load(expert_ids_ptr + i)
         route_count += (off_e == expert).to(tl.int32)
     is_active = (route_count > 0) & eligible
-    hot_pairs = tl.sum(tl.where(eligible, route_count, 0))
     if HOT_ADAPT and RECORD_STATS:
         decayed = tl.load(decayed_freq_ptr + base + off_e, mask=e_mask, other=0.0)
         route_count_fp32 = route_count.to(tl.float32)
@@ -721,7 +722,8 @@ def _ensure_experts_hot_kernel(
     num_missing = tl.sum(is_missing.to(tl.int32))
     tl.store(num_indices_ptr, num_missing.to(tl.int64))
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
-    if RECORD_STATS:
+    if COLLECT_STATS:
+        hot_pairs = tl.sum(tl.where(eligible, route_count, 0))
         tl.store(stat_hot_pairs_ptr, tl.load(stat_hot_pairs_ptr) + hot_pairs.to(tl.int64))
         tl.store(
             stat_total_pairs_ptr,

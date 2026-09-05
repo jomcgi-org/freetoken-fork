@@ -558,6 +558,13 @@ class OffloadMoeCache:
         self.prefill_selective_layers = 0
         self.prefill_selective_rows = 0
         self.prefill_selective_dense_layers = 0
+        if self.prefill_selective_max_tokens:
+            logger.info_rank0(
+                "MoE selective prefill: max_tokens=%d, dense_union=75%%, "
+                "requires pinned overlap buffers and CUDA batch memcpy; "
+                "hit-D2D takes precedence",
+                self.prefill_selective_max_tokens,
+            )
 
     def set_bank_sources(
         self,
@@ -1075,6 +1082,11 @@ class OffloadMoeCache:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
+        self.prefill_h2d_bytes = 0
+        self.prefill_selective_layers = 0
+        self.prefill_selective_rows = 0
+        self.prefill_selective_dense_layers = 0
+        self.prefill_selective_active = False
         # 5. Re-evaluate prefill overlap against the new size.
         if self.prefill_overlap and cache_size < 2 * self.num_experts:
             logger.warning(
@@ -3026,6 +3038,8 @@ class OffloadMoeCache:
         self, raw_ids: torch.Tensor, hot_mask: torch.Tensor
     ) -> None:
         """Account actual GPU-served pairs and distinct cold experts per chunk."""
+        if not self.collect_stats:
+            return
         hot_pairs = int(hot_mask.sum().item())
         cold_ids = raw_ids.masked_select(~hot_mask)
         cold_ids = cold_ids[cold_ids >= 0]
@@ -3180,7 +3194,10 @@ class OffloadMoeCache:
             self._invalidate_prefill_buffer(buffer_id)
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
-                self.prefill_h2d_bytes += per_layer[layer_id].numel() * per_layer[layer_id].element_size()
+                if self.collect_stats:
+                    self.prefill_h2d_bytes += (
+                        per_layer[layer_id].numel() * per_layer[layer_id].element_size()
+                    )
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -3211,15 +3228,20 @@ class OffloadMoeCache:
         assert self.prefill_selective_active
         assert self.prefill_overlap_for_layer(layer_id)
         buffer_id = self._prefill_overlap_buffer_ids[layer_id]
-        assert self._prefill_buffer_layer[buffer_id] is None or self._prefill_buffer_released[buffer_id]
+        assert (
+            self._prefill_buffer_layer[buffer_id] is None
+            or self._prefill_buffer_released[buffer_id]
+        ), "Prefill overlap buffer is being reused before release"
         rows = torch.unique(expert_ids).cpu().numpy().astype(np.int64, copy=False)
         if rows.size and (rows[0] < 0 or rows[-1] >= self.num_experts):
             raise ValueError("prefill routes must index the source expert bank")
-        self.prefill_selective_layers += 1
-        self.prefill_selective_rows += int(rows.size)
+        if self.collect_stats:
+            self.prefill_selective_layers += 1
+            self.prefill_selective_rows += int(rows.size)
         # Dense unions do not justify hundreds of separate DMA descriptors.
         if rows.size * 4 >= self.num_experts * 3:
-            self.prefill_selective_dense_layers += 1
+            if self.collect_stats:
+                self.prefill_selective_dense_layers += 1
             self.prefetch_prefill_layer(layer_id)
             return
 
@@ -3247,7 +3269,8 @@ class OffloadMoeCache:
                     torch.tensor(nbytes, dtype=torch.int64),
                     self.prefill_copy_stream.cuda_stream,
                 )
-                self.prefill_h2d_bytes += int(sum(nbytes))
+                if self.collect_stats:
+                    self.prefill_h2d_bytes += int(sum(nbytes))
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
         self._prefill_buffer_layer[buffer_id] = layer_id
         self._prefill_buffer_released[buffer_id] = False
@@ -3291,7 +3314,7 @@ class OffloadMoeCache:
 
                 self._batch_memcpy = load_batch_memcpy()
             except Exception as exc:  # noqa: BLE001 -- any build/runtime gap => legacy path
-                logger.warning(f"MoE prefill hit-D2D disabled ({exc}); using full-layer copies")
+                logger.warning(f"MoE batched prefill copies unavailable ({exc}); using full-layer copies")
                 self._batch_memcpy = False
         return self._batch_memcpy is not False
 
@@ -3365,7 +3388,8 @@ class OffloadMoeCache:
                     torch.tensor(nbytes, dtype=torch.int64),
                     torch.cuda.current_stream(self.device).cuda_stream,
                 )
-                self.prefill_h2d_bytes += int(sum(nbytes))
+                if self.collect_stats:
+                    self.prefill_h2d_bytes += int(sum(nbytes))
             self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
     def wait_prefill_layer(self, layer_id: int) -> tuple[torch.Tensor, ...]:

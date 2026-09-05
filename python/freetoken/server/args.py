@@ -1078,8 +1078,10 @@ def parse_args(
         action="store_true",
         default=ServerArgs.moe_collect_stats,
         help=(
-            "Collect per-layer realized decode traffic for GET /v1/moe-layer-profile "
-            "and report protected-slot oracle versus realized route coverage on status lines."
+            "Enable diagnostic MoE route/transfer counters and periodic MoE/PLE "
+            "statistics, including GET /v1/moe-layer-profile and protected-slot "
+            "oracle coverage. Adds GPU reductions and host reads; benchmark client "
+            "wall time without this flag. Cache adaptation remains active without it."
         ),
     )
 

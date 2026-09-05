@@ -226,11 +226,18 @@ class Scheduler(SchedulerIOMixin):
             is_ple_status = is_decode_status or is_prefill_status
             disk = (
                 cache.disk_prefetch_stats(reset=True)
-                if cache is not None and (is_decode_status or is_prefill_status) else {}
+                if cache is not None
+                and getattr(config, "moe_collect_stats", False)
+                and (is_decode_status or is_prefill_status) else {}
             )
             ple_stats = (
                 self.engine.model.ple_disk_stats(reset=True)
-                if is_ple_status and hasattr(self.engine.model, "ple_disk_stats") else {}
+                if is_ple_status
+                and (
+                    getattr(config, "moe_collect_stats", False)
+                    or getattr(config, "ple_cache_profile_out", None)
+                )
+                and hasattr(self.engine.model, "ple_disk_stats") else {}
             )
             if disk:
                 message += (

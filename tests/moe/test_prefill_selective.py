@@ -41,6 +41,7 @@ def _cache(monkeypatch):
         device=torch.device("cuda"), quant_format="nvfp4", prefill_overlap=True,
     )
     cache.set_bank_sources(sources)
+    cache.collect_stats = True
     return cache, sources
 
 
@@ -127,3 +128,50 @@ def test_unavailable_batch_api_preserves_full_copy(monkeypatch):
     for view, source in zip(cache.wait_prefill_layer(0), sources.values()):
         assert torch.equal(view.view(torch.uint8).cpu(), source[0].view(torch.uint8))
     cache.release_prefill_layer(0)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_debug_counters_do_not_change_routes_or_adaptation(device):
+    from freetoken.moe.offload_kernels import ensure_experts_hot
+
+    results = []
+    for collect in (False, True):
+        cache = OffloadMoeCache(
+            num_layers=1, num_experts=4, cache_size=4,
+            device=torch.device(device),
+        )
+        cache.collect_stats = collect
+        cache.hot_adapt_enabled = True
+        cache._hot_decay_factor = 0.5
+        cache.hot_row_for_expert[0].copy_(torch.tensor([0, -1, 1, -1]))
+        cache.slot_for_id[0].copy_(torch.tensor([0, -1, 2, -1]))
+        cache.id_of_slot.copy_(torch.tensor([0, -1, 2, -1]))
+        cache.decayed_decode_freq.fill_(2)
+        cache.decayed_prefill_freq = torch.full_like(cache.decayed_decode_freq, 4)
+        routes = []
+        for history, weight in (("decode", 1.0), ("prefill", 0.1)):
+            ids = torch.tensor([[0, 1], [2, 0]], dtype=torch.int32, device=device)
+            ensure_experts_hot(cache, 0, ids, history=history, route_weight=weight)
+            routes.append(ids.cpu())
+        results.append((routes, cache.decayed_decode_freq.cpu(), cache.decayed_prefill_freq.cpu()))
+        assert int(cache.stat_hot_pairs) == (6 if collect else 0)
+        assert int(cache.stat_hot_total_pairs) == (8 if collect else 0)
+    for index in range(2):
+        assert torch.equal(results[0][0][index], results[1][0][index])
+    for index in (1, 2):
+        assert torch.equal(results[0][index], results[1][index])
+    torch.testing.assert_close(results[0][1], torch.tensor([[3., 2., 2., 1.]]))
+    torch.testing.assert_close(results[0][2], torch.tensor([[2.2, 2.1, 2.1, 2.]]))
+
+
+def test_disabled_prefill_diagnostics_do_not_read_route_tensors():
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=4, cache_size=4, device=torch.device("cpu"),
+    )
+
+    class Unreadable:
+        def __getattr__(self, name):
+            raise AssertionError(f"diagnostics touched route tensor: {name}")
+
+    cache.record_prefill_hot_split(Unreadable(), Unreadable())
+    assert cache._prefill_hot_pairs == cache._prefill_route_pairs == 0

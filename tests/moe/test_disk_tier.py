@@ -1666,6 +1666,7 @@ def test_prefill_hot_split_stats_report_and_reset():
     cache.cpu_executor = SimpleNamespace(
         disk_prefetch_stats=lambda reset=False: {}
     )
+    cache.collect_stats = True
     raw = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
     cache.record_prefill_hot_split(
         raw, torch.tensor([[True, False], [True, False]])
