@@ -1,0 +1,814 @@
+{
+  "date_utc": "2026-09-05",
+  "runtime_revision": "a682019",
+  "kernel_revision": "ccae42a",
+  "base_pr": "https://github.com/jomcgi-org/freetoken-fork/pull/27",
+  "hardware": {
+    "host": "node-4",
+    "gpu": "RTX 4090 24GB",
+    "ram_gib": 61.91,
+    "torch": "2.11.0+cu130",
+    "triton": "3.6.0",
+    "cuda_toolkit": "13.0"
+  },
+  "model": "existing flash-e2m1.ftw, native NVFP4 experts",
+  "wall_configuration": {
+    "mode": "one server, adjacent matched pairs, alternating order",
+    "moe_collect_stats": false,
+    "moe_step_timing": false,
+    "ple_profile_polling": false,
+    "hot_adapt_interval_steps": 0,
+    "hot_plan_persist": "off",
+    "kv_disk_cache_gib": 0,
+    "cache_type": "naive",
+    "selective_prefill_max_tokens": 0,
+    "cpu_threads": 14,
+    "cpu_prefill_kernel": "vnni_rows32",
+    "max_extend_length": 2048,
+    "max_running_requests": 1,
+    "kv_tokens": 65536,
+    "pinned_layers": 19,
+    "pinned_gib": 25.12,
+    "disk_layers": 29,
+    "disk_gib": 38.34,
+    "protected_rows": 2320,
+    "hot_rows_per_disk_layer": 80,
+    "expert_slots": 4045,
+    "control": "8-byte shared mmap read at begin_prefill in both modes; no timer/counter/profile instrumentation added"
+  },
+  "kernel_configuration": {
+    "experts": 512,
+    "slots": 3753,
+    "hot_rows": 82,
+    "hot_adaptation": true,
+    "collect_stats": false,
+    "route_weight": 0.1,
+    "graph_operations": 10,
+    "samples": 9,
+    "includes_input_reset": true,
+    "both_modes_include_correctness_barriers": true
+  },
+  "kernel_measurements": [
+    {
+      "routes": 10,
+      "parallel": false,
+      "median_us": 3.7888001650571823
+    },
+    {
+      "routes": 10,
+      "parallel": true,
+      "median_us": 3.7888001650571823
+    },
+    {
+      "routes": 40,
+      "parallel": false,
+      "median_us": 6.348799914121628
+    },
+    {
+      "routes": 40,
+      "parallel": true,
+      "median_us": 6.3391998410224915
+    },
+    {
+      "routes": 64,
+      "parallel": false,
+      "median_us": 8.479999750852585
+    },
+    {
+      "routes": 64,
+      "parallel": true,
+      "median_us": 3.7888001650571823
+    },
+    {
+      "routes": 160,
+      "parallel": false,
+      "median_us": 16.793599724769592
+    },
+    {
+      "routes": 160,
+      "parallel": true,
+      "median_us": 3.763199970126152
+    },
+    {
+      "routes": 640,
+      "parallel": false,
+      "median_us": 59.39199924468994
+    },
+    {
+      "routes": 640,
+      "parallel": true,
+      "median_us": 4.604800045490265
+    },
+    {
+      "routes": 2560,
+      "parallel": false,
+      "median_us": 227.839994430542
+    },
+    {
+      "routes": 2560,
+      "parallel": true,
+      "median_us": 8.294399827718735
+    },
+    {
+      "routes": 5120,
+      "parallel": false,
+      "median_us": 451.7888069152832
+    },
+    {
+      "routes": 5120,
+      "parallel": true,
+      "median_us": 12.355200201272964
+    },
+    {
+      "routes": 20480,
+      "parallel": false,
+      "median_us": 1719.7023391723633
+    },
+    {
+      "routes": 20480,
+      "parallel": true,
+      "median_us": 39.28000032901764
+    }
+  ],
+  "wall_summary": [
+    {
+      "kind": "prefill",
+      "requested_size": 64,
+      "pairs": 4,
+      "ttft_s": {
+        "serial_mean": 2.4434361064995755,
+        "parallel_mean": 2.4508773639972787,
+        "change_percent": 0.3045407030660252,
+        "paired_deltas": [
+          -0.10603933699894696,
+          0.057022485008928925,
+          -0.0464503180119209,
+          0.1252321999927517
+        ],
+        "paired_delta_sample_sd": 0.10346521395073549
+      },
+      "wall_s": {
+        "serial_mean": 2.5031379480060423,
+        "parallel_mean": 2.512071867247869,
+        "change_percent": 0.3569087851887254,
+        "paired_deltas": [
+          -0.10370493002119474,
+          0.07127969901193865,
+          -0.06401365401688963,
+          0.1321745619934518
+        ],
+        "paired_delta_sample_sd": 0.11118169976605927
+      }
+    },
+    {
+      "kind": "prefill",
+      "requested_size": 512,
+      "pairs": 4,
+      "ttft_s": {
+        "serial_mean": 6.41640536300838,
+        "parallel_mean": 6.462370706998627,
+        "change_percent": 0.7163721957974323,
+        "paired_deltas": [
+          -0.5773948330024723,
+          0.1935966349847149,
+          0.2685081999807153,
+          0.29915137399802916
+        ],
+        "paired_delta_sample_sd": 0.4179319708934232
+      },
+      "wall_s": {
+        "serial_mean": 6.486539480254578,
+        "parallel_mean": 6.5339044462525635,
+        "change_percent": 0.7302039267959026,
+        "paired_deltas": [
+          -0.5880163710098714,
+          0.19206397898960859,
+          0.2714045379834715,
+          0.3140077180287335
+        ],
+        "paired_delta_sample_sd": 0.42659087926045036
+      }
+    },
+    {
+      "kind": "prefill",
+      "requested_size": 2048,
+      "pairs": 4,
+      "ttft_s": {
+        "serial_mean": 21.41829758475069,
+        "parallel_mean": 21.568830627737043,
+        "change_percent": 0.7028245003633193,
+        "paired_deltas": [
+          1.121923783008242,
+          -0.5274733890255447,
+          0.24854619198595174,
+          -0.24086441402323544
+        ],
+        "paired_delta_sample_sd": 0.7225167214628248
+      },
+      "wall_s": {
+        "serial_mean": 21.483167392500036,
+        "parallel_mean": 21.641501850739587,
+        "change_percent": 0.7370163595840529,
+        "paired_deltas": [
+          1.1287600189971272,
+          -0.5288438310089987,
+          0.24831992300460115,
+          -0.214898278034525
+        ],
+        "paired_delta_sample_sd": 0.7214198568290718
+      }
+    },
+    {
+      "kind": "decode",
+      "requested_size": 64,
+      "pairs": 3,
+      "ttft_s": {
+        "serial_mean": 2.2816934429962807,
+        "parallel_mean": 2.222310022994255,
+        "change_percent": -2.6026029125123973,
+        "paired_deltas": [
+          -0.26937286599422805,
+          -0.04496941503020935,
+          0.1361920210183598
+        ],
+        "paired_delta_sample_sd": 0.20316629161570812
+      },
+      "wall_s": {
+        "serial_mean": 12.452565102323812,
+        "parallel_mean": 10.773739869327983,
+        "change_percent": -13.481762345354353,
+        "paired_deltas": [
+          -5.867862161016092,
+          -1.3941911039873958,
+          2.2255775660159998
+        ],
+        "paired_delta_sample_sd": 4.054220528575452
+      },
+      "after_first_token_tps": {
+        "False": 18.779118093072896,
+        "True": 22.33544605197081
+      }
+    }
+  ],
+  "request_parity": {
+    "matched_pairs": 15,
+    "identical_text_and_usage": 15
+  },
+  "interpretation": "Routing operation is about 44x faster at 20480 routes; non-debug prefill wall time shows no measurable improvement in this sample. Decode uses the same scalar kernel in both arms; apparent throughput spread is not attributed to parallel routing.",
+  "validation": {
+    "focused_tests_passed": 223,
+    "compute_sanitizer_memcheck_errors": 0,
+    "poisoned_bank_regression_before_fix": "2 failures, initial allocation and rebuild",
+    "original_serial_benchmark": "repeated illegal memory accesses, resolved in unchanged harness by synchronizing replicated readers before in-place writes",
+    "offload_tests_passed": 29,
+    "total_tests_passed": 252
+  },
+  "requests": [
+    {
+      "kind": "warmup",
+      "size": 64,
+      "repeat": -1,
+      "parallel": false,
+      "ttft_s": 4.626746691996232,
+      "wall_s": 4.798336662002839,
+      "decode_s": 0.17158997000660747,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 512,
+      "repeat": -1,
+      "parallel": false,
+      "ttft_s": 9.08903011897928,
+      "wall_s": 9.165697792981518,
+      "decode_s": 0.07666767400223762,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 2048,
+      "repeat": -1,
+      "parallel": false,
+      "ttft_s": 25.711589567014016,
+      "wall_s": 25.80858243900002,
+      "decode_s": 0.09699287198600359,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 64,
+      "repeat": -1,
+      "parallel": true,
+      "ttft_s": 2.8255024679820053,
+      "wall_s": 2.9059312869794667,
+      "decode_s": 0.08042881899746135,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 512,
+      "repeat": -1,
+      "parallel": true,
+      "ttft_s": 7.111846665997291,
+      "wall_s": 7.193245269998442,
+      "decode_s": 0.0813986040011514,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "warmup",
+      "size": 2048,
+      "repeat": -1,
+      "parallel": true,
+      "ttft_s": 22.712320509017445,
+      "wall_s": 22.78359310000087,
+      "decode_s": 0.0712725909834262,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 0,
+      "parallel": false,
+      "ttft_s": 6.810011150024366,
+      "wall_s": 6.8947420790209435,
+      "decode_s": 0.08473092899657786,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 0,
+      "parallel": true,
+      "ttft_s": 6.232616317021893,
+      "wall_s": 6.306725708011072,
+      "decode_s": 0.07410939098917879,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 0,
+      "parallel": true,
+      "ttft_s": 21.706995515007293,
+      "wall_s": 21.787788007990457,
+      "decode_s": 0.08079249298316427,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 0,
+      "parallel": false,
+      "ttft_s": 20.58507173199905,
+      "wall_s": 20.65902798899333,
+      "decode_s": 0.0739562569942791,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 3,
+      "parallel": false,
+      "ttft_s": 21.075140171014937,
+      "wall_s": 21.147164407011587,
+      "decode_s": 0.07202423599665053,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 3,
+      "parallel": true,
+      "ttft_s": 20.547666781989392,
+      "wall_s": 20.61832057600259,
+      "decode_s": 0.0706537940131966,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 3,
+      "parallel": true,
+      "ttft_s": 6.355202387989266,
+      "wall_s": 6.42636348499218,
+      "decode_s": 0.07116109700291418,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 3,
+      "parallel": false,
+      "ttft_s": 6.161605753004551,
+      "wall_s": 6.234299506002571,
+      "decode_s": 0.0726937529980205,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 1,
+      "parallel": false,
+      "ttft_s": 2.532908588007558,
+      "wall_s": 2.6036459850147367,
+      "decode_s": 0.07073739700717852,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 1,
+      "parallel": true,
+      "ttft_s": 2.426869251008611,
+      "wall_s": 2.499941054993542,
+      "decode_s": 0.07307180398493074,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 1,
+      "parallel": true,
+      "ttft_s": 6.510533064982155,
+      "wall_s": 6.582789056992624,
+      "decode_s": 0.07225599201046862,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 1,
+      "parallel": false,
+      "ttft_s": 6.24202486500144,
+      "wall_s": 6.311384519009152,
+      "decode_s": 0.06935965400771238,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 2,
+      "parallel": false,
+      "ttft_s": 2.5130088159930892,
+      "wall_s": 16.783165019005537,
+      "decode_s": 14.270156203012448,
+      "text": "The Roman Republic, spanning from 509 BCE to 27 BCE, represents a pivotal era in Western history, characterized by complex political structures, relentless expansion, and eventual internal collapse. Part two of this historical narrative focuses on the period from the mid-3rd century BCE to the fall of the Republic, a time defined by the Punic Wars, social upheaval, and the rise of military strongmen.\n\nThe defining conflict of this era was the struggle for Mediterranean dominance against Carthage. The First Punic War (264\u2013241 BCE) transformed Rome from a land power into a naval force, securing Sicily as its first overseas province. However, it was the Second Punic War (218\u2013201 BCE) that tested the Republic\u2019s resilience. Hannibal Barca\u2019s audacious crossing of the Alps and his devastating victory at Cannae brought Rome to the brink of destruction. Yet, Roman",
+      "usage": {
+        "prompt_tokens": 50,
+        "completion_tokens": 192,
+        "total_tokens": 242
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 2,
+      "parallel": true,
+      "ttft_s": 2.243635949998861,
+      "wall_s": 10.915302857989445,
+      "decode_s": 8.671666907990584,
+      "text": "The Roman Republic, spanning from 509 BCE to 27 BCE, represents a pivotal era in Western history, characterized by complex political structures, relentless expansion, and eventual internal collapse. Part two of this historical narrative focuses on the period from the mid-3rd century BCE to the fall of the Republic, a time defined by the Punic Wars, social upheaval, and the rise of military strongmen.\n\nThe defining conflict of this era was the struggle for Mediterranean dominance against Carthage. The First Punic War (264\u2013241 BCE) transformed Rome from a land power into a naval force, securing Sicily as its first overseas province. However, it was the Second Punic War (218\u2013201 BCE) that tested the Republic\u2019s resilience. Hannibal Barca\u2019s audacious crossing of the Alps and his devastating victory at Cannae brought Rome to the brink of destruction. Yet, Roman",
+      "usage": {
+        "prompt_tokens": 50,
+        "completion_tokens": 192,
+        "total_tokens": 242
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 2,
+      "parallel": true,
+      "ttft_s": 6.751131058001192,
+      "wall_s": 6.819739535014378,
+      "decode_s": 0.06860847701318562,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 512,
+      "repeat": 2,
+      "parallel": false,
+      "ttft_s": 6.451979684003163,
+      "wall_s": 6.505731816985644,
+      "decode_s": 0.05375213298248127,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 524,
+        "completion_tokens": 2,
+        "total_tokens": 526
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 1,
+      "parallel": false,
+      "ttft_s": 2.25899200400454,
+      "wall_s": 11.033144572982565,
+      "decode_s": 8.774152568978025,
+      "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE. This transition marked a profound shift from monarchical rule to a complex system of representative government, driven by the aristocratic desire to prevent the concentration of power in a single individual. The traditional narrative attributes the founding of the Republic to the overthrow of the last king, Tarquin the Proud, following the infamous rape of Lucretia by his son. While historical accuracy of this specific event is debated, the underlying political reality was clear: the patrician class sought to dismantle the monarchy to secure their own political dominance and establish a system where power was shared among the elite.\n\nThe early Republic was characterized by a rigid social hierarchy and a unique constitutional structure designed to balance power. At its core were two consuls, elected annually, who held supreme executive authority but could veto each other\u2019s decisions, ensuring no single leader could dominate.",
+      "usage": {
+        "prompt_tokens": 51,
+        "completion_tokens": 192,
+        "total_tokens": 243
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 1,
+      "parallel": true,
+      "ttft_s": 2.2140225889743306,
+      "wall_s": 9.638953468995169,
+      "decode_s": 7.424930880020838,
+      "text": "The Roman Republic, a pivotal era in Western history, emerged from the ashes of the Roman Kingdom around 509 BCE. This transition marked a profound shift from monarchical rule to a complex system of representative government, driven by the aristocratic desire to prevent the concentration of power in a single individual. The traditional narrative attributes the founding of the Republic to the overthrow of the last king, Tarquin the Proud, following the infamous rape of Lucretia by his son. While historical accuracy of this specific event is debated, the underlying political reality was clear: the patrician class sought to dismantle the monarchy to secure their own political dominance and establish a system where power was shared among the elite.\n\nThe early Republic was characterized by a rigid social hierarchy and a unique constitutional structure designed to balance power. At its core were two consuls, elected annually, who held supreme executive authority but could veto each other\u2019s decisions, ensuring no single leader could dominate.",
+      "usage": {
+        "prompt_tokens": 51,
+        "completion_tokens": 192,
+        "total_tokens": 243
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 3,
+      "parallel": true,
+      "ttft_s": 2.479839309002273,
+      "wall_s": 2.543319543998223,
+      "decode_s": 0.06348023499595001,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 3,
+      "parallel": false,
+      "ttft_s": 2.422816823993344,
+      "wall_s": 2.472039844986284,
+      "decode_s": 0.04922302099294029,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 1,
+      "parallel": false,
+      "ttft_s": 21.740056557988282,
+      "wall_s": 21.79684991398244,
+      "decode_s": 0.056793355994159356,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 1,
+      "parallel": true,
+      "ttft_s": 21.988602749974234,
+      "wall_s": 22.045169836987043,
+      "decode_s": 0.05656708701280877,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 0,
+      "parallel": true,
+      "ttft_s": 2.2092715300095733,
+      "wall_s": 11.766963280999335,
+      "decode_s": 9.557691750989761,
+      "text": "The history of the Roman Republic is a foundational narrative in Western civilization, marking a pivotal transition from monarchy to a complex system of representative governance. This era, traditionally dated from 509 BCE to 27 BCE, represents not merely a political shift but a profound evolution in legal, social, and military structures that would define the Mediterranean world for centuries. The genesis of the Republic was rooted in the overthrow of the last Roman king, Tarquinius Superbus, an event driven by aristocratic discontent and a desire to prevent the concentration of power in a single individual. This revolution established the principle of *res publica*, or \"public affair,\" emphasizing that the state belonged to the people rather than a sovereign ruler.\n\nIn its earliest phases, the Republic was characterized by a delicate balance of power among various institutions. The Senate, composed of patrician elders, served as the advisory body with immense influence over foreign policy and finance. However, executive power",
+      "usage": {
+        "prompt_tokens": 49,
+        "completion_tokens": 192,
+        "total_tokens": 241
+      }
+    },
+    {
+      "kind": "decode",
+      "size": 64,
+      "repeat": 0,
+      "parallel": false,
+      "ttft_s": 2.0730795089912135,
+      "wall_s": 9.541385714983335,
+      "decode_s": 7.468306205992121,
+      "text": "The history of the Roman Republic is a foundational narrative in Western civilization, marking a pivotal transition from monarchy to a complex system of representative governance. This era, traditionally dated from 509 BCE to 27 BCE, represents not merely a political shift but a profound evolution in legal, social, and military structures that would define the Mediterranean world for centuries. The genesis of the Republic was rooted in the overthrow of the last Roman king, Tarquinius Superbus, an event driven by aristocratic discontent and a desire to prevent the concentration of power in a single individual. This revolution established the principle of *res publica*, or \"public affair,\" emphasizing that the state belonged to the people rather than a sovereign ruler.\n\nIn its earliest phases, the Republic was characterized by a delicate balance of power among various institutions. The Senate, composed of patrician elders, served as the advisory body with immense influence over foreign policy and finance. However, executive power",
+      "usage": {
+        "prompt_tokens": 49,
+        "completion_tokens": 192,
+        "total_tokens": 241
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 0,
+      "parallel": false,
+      "ttft_s": 2.432097087003058,
+      "wall_s": 2.5015297580102924,
+      "decode_s": 0.0694326710072346,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 0,
+      "parallel": true,
+      "ttft_s": 2.385646768991137,
+      "wall_s": 2.437516103993403,
+      "decode_s": 0.05186933500226587,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 2,
+      "parallel": true,
+      "ttft_s": 2.511154126987094,
+      "wall_s": 2.5675107660063077,
+      "decode_s": 0.05635663901921362,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 64,
+      "repeat": 2,
+      "parallel": false,
+      "ttft_s": 2.3859219269943424,
+      "wall_s": 2.435336204012856,
+      "decode_s": 0.04941427701851353,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 76,
+        "completion_tokens": 2,
+        "total_tokens": 78
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 2,
+      "parallel": false,
+      "ttft_s": 22.27292187800049,
+      "wall_s": 22.329627260012785,
+      "decode_s": 0.05670538201229647,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    },
+    {
+      "kind": "prefill",
+      "size": 2048,
+      "repeat": 2,
+      "parallel": true,
+      "ttft_s": 22.032057463977253,
+      "wall_s": 22.11472898197826,
+      "decode_s": 0.08267151800100692,
+      "text": "OK",
+      "usage": {
+        "prompt_tokens": 2060,
+        "completion_tokens": 2,
+        "total_tokens": 2062
+      }
+    }
+  ],
+  "service_restored": {
+    "revision": "3a67403a293be20836604bc25729329997848e09",
+    "checkout_clean": true,
+    "real_completion": "OK",
+    "new_code_deployed": false
+  }
+}

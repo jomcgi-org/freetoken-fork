@@ -2219,7 +2219,8 @@ def test_disk_gpufetch_decode_matches_cpu_executor(tmp_path):
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path, monkeypatch, rebuild):
     from freetoken.checkpoint.ftw import load_ftw_banks
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer
@@ -2257,12 +2258,24 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
     )
     cache.collect_stats = True
     cache.cpu_layer_ids = frozenset({0})
-    cache.set_bank_sources(
-        banks.sources,
-        layer_residency=banks.layer_residency,
-        hot_sources=banks.hot_sources,
-        hot_expert_ids=banks.hot_expert_ids,
-    )
+    original_empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if tensor.is_cuda and tensor.dtype == torch.bfloat16 and tensor.ndim == 3:
+            tensor.fill_(float("nan"))
+        return tensor
+
+    # Allocator reuse must not decide whether zero-weight cold routes stay
+    # finite. Force untouched GPU bank rows to contain NaNs deterministically.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", poisoned_empty)
+        cache.set_bank_sources(
+            banks.sources,
+            layer_residency=banks.layer_residency,
+            hot_sources=banks.hot_sources,
+            hot_expert_ids=banks.hot_expert_ids,
+        )
     row_bytes = sum(
         source[0][0].numel() * source[0].element_size()
         for source in banks.sources.values()
@@ -2271,6 +2284,10 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
         half_life_steps=2, interval_steps=0,
         max_swap_bytes=row_bytes, expert_bytes=row_bytes,
     )
+    if rebuild:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", poisoned_empty)
+            cache.rebuild(cache_size=experts + 2)
     executor = CpuMoeExecutor(
         cache,
         top_k=top_k,
