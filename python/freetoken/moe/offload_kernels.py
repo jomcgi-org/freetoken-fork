@@ -136,8 +136,8 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     )
 
 
-def materialize_layer(cache, layer_id: int) -> None:
-    _materialize_layer_gpu(cache, layer_id)
+def materialize_layer(cache, layer_id: int, *, temporary: bool = False) -> None:
+    _materialize_layer_gpu(cache, layer_id, temporary=temporary)
 
 
 def reset_cache(cache) -> None:
@@ -444,7 +444,7 @@ def _ensure_experts_hot_cpu(
         )
 
 
-def _materialize_layer_gpu(cache, layer_id: int) -> None:
+def _materialize_layer_gpu(cache, layer_id: int, *, temporary: bool = False) -> None:
     block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
     _materialize_layer_kernel[(1,)](
         cache.slot_for_id,
@@ -457,7 +457,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
         layer_id,
         cache.num_experts,
         cache.cache_size,
-        TEMPORARY=layer_id in cache.hot_expert_capacity,
+        TEMPORARY=temporary or layer_id in cache.hot_expert_capacity,
         BLOCK=block,
     )
 
@@ -533,9 +533,9 @@ def _materialize_layer_kernel(
     # and timestamp snapshots before the elected writers mutate either table.
     tl.debug_barrier()
     if TEMPORARY:
-        # HOT experts already own permanent GPU slots. Whole-layer prefill only
-        # borrows [0, E), so leave these copies unowned: tagging duplicates here
-        # would let the next scratch overwrite invalidate the protected mapping.
+        # Prefill only borrows [0, E). Leave copies unowned so later scratch
+        # reuse preserves permanent HOT mappings. Sparse staging also needs this
+        # rule on ordinary layers: uncopied rows must never become cache hits.
         tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid & (old_mapping == slot))
         tl.store(id_of_slot_ptr + slot, -1, mask=expert_mask)
         tl.store(usage_ptr + slot, 0, mask=expert_mask)

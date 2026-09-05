@@ -744,7 +744,7 @@ def test_external_reservation_refuses_zero_gpu_prefill_layers(tmp_path, monkeypa
         auto_layers(config, 4, reserved=200)
 
 
-@pytest.mark.parametrize("mode", ["cpu", "copy"])
+@pytest.mark.parametrize("mode", ["cpu", "copy", "staged"])
 def test_engine_config_accepts_disk_prefill_modes(mode):
     import torch
 
