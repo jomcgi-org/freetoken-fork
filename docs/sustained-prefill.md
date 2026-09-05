@@ -54,10 +54,86 @@ adaptation alone.
 At `132b629`, the client's ten pure Python protocol checks pass locally and
 on node-4's Linux environment. The [validation record](../bench/results/4090-sustained-client-validation-20260905.txt)
 also confirms no inference-code changes from the previously validated
-`78848ce` runtime. The model run and full prose review remain pending.
+`78848ce` runtime. The model run and reference-based prose review are complete;
+the results below retain the limits of both measurements.
 
 The detached driver has a two-hour runtime limit and a recovery command that
 stops its benchmark server and starts the original system service on exit.
 The normal driver finalizer also waits for readiness and verifies a real
 completion. Each model start has a separate 45-minute limit. The driver is
 observed through its systemd unit and must not be restarted while active.
+
+The driver finished successfully and is inactive. Its benchmark server is
+inactive, the original service is active, and the normal finalizer verified
+a real `OK` completion. Final systemd state and the completion are retained
+in the [complete record](../bench/results/4090-sustained-cached-wall-20260905.json).
+
+The sustained timing sequence at `132b629` is complete. Each policy has two
+starts, four warmups per start, and twelve measured responses per start.
+The aggregate below covers 24 responses per policy and excludes warmups.
+It includes every measured response, including individual regressions.
+
+| Client response | Original CPU | Combined cached staging | Less wall time |
+| --- | ---: | ---: | ---: |
+| Complete JSON, mean | 30.062 s | 24.475 s | 18.6% |
+| Complete prose, mean | 22.812 s | 19.003 s | 16.7% |
+| Fixed 24-request mix, total | 634.481 s | 521.738 s | 17.8% |
+
+The fixed workload finishes about 1.22 times as quickly overall. The first
+matched start pair improves by 16.8%; the reversed pair improves by 18.7%.
+This longer result qualifies the earlier 37.0% short-sequence observation:
+it does not support extrapolating that larger percentage to sustained traffic.
+
+First-token time falls from 12.837 to 6.276 seconds for JSON and from 11.651
+to 6.123 seconds for prose. Time after the first token rises from 17.225 to
+18.199 seconds for JSON and from 11.161 to 12.879 seconds for prose. The
+prefill improvement outweighs the generation penalty on this workload.
+All measured JSON responses use 448 output tokens on average in both modes;
+mean prose output is 253.417 versus 253.500 tokens. The raw pairs retain
+individual answer-length and text differences.
+
+The source-balanced first half improves by 23.1%, the second half by 11.4%.
+The narrower final two-block window improves by 5.7%, but uses a different
+source subset than the first two blocks. Whole-worker mean storage reads
+fall from 3.126 to 1.145 GiB per response between the original's balanced
+halves, versus 5.465 to 5.071 GiB for cached staging. These counters cover
+all worker I/O; they cannot attribute reads to prefill, decode, or particular
+expert rows. The cache-aware reader bypasses insertion of cold selected rows,
+so insufficient admission of recurring useful weights is a candidate cause,
+not an established explanation of the generation penalty. A sustained
+comparison between buffered and cached GPU staging, holding the inference
+runtime fixed, should isolate the reader before changing admission policy.
+Any admission change must preserve the router's choices and contributions.
+
+Twenty of 24 matched responses improve. All twelve JSON pairs have identical
+text and token usage, and their combined wall time improves by 18.6%. Every
+prose pair differs in text and token usage; all raw pairs are retained. All
+32 JSON responses, including warmups, finish normally and pass strict value,
+type, order, and multiplicity checks. All 32 prose responses finish normally
+and have three paragraphs. All four starts score 7/8 on the eight fidelity
+questions, with identical answers including the same code-trace failure
+(`108`, expected `68`).
+
+The assistant reviewed all 32 prose responses against the seven constraints
+in each prompt's reference specification. Among measured responses, the
+original explicitly covers 78 of 84 constraint instances and the optimized
+mode covers 81 of 84. Five original responses and two optimized responses
+have omissions. Review notes flag omissions or unsupported explanatory
+connections in six original and eight optimized responses; neither group
+contains an identified direct contradiction of a core constraint. These
+coverage counts are an audit of this small reference-based task, not a
+model-quality score or evidence of statistical equivalence. All eight warmup
+prose responses cover all seven constraints. The record retains each review,
+notes, coverage decisions, and the hash of its response. Formatting checks
+are kept separate from semantic review.
+
+The artifact validates all four prompt manifests, 64 main responses, native
+identities and worker mappings, identical startup memory geometry, final
+service restoration, and hash-matched coverage of all prose responses. It
+also retains automatic adaptation's actual fill-completion and bandwidth
+back-off logs. These transitions are observations under unchanged settings;
+they are not fixed or replayed across the original and optimized processes.
+The previous 99 focused CUDA checks and zero-error memcheck still cover the
+unchanged inference runtime. No new inference code is introduced by this
+results update. The PR remains draft because reader isolation, the generation
+penalty, and broader serving and quality qualification remain open.

@@ -210,8 +210,8 @@ residency policy. The original service was restored and verified with a real
 The result qualifies this finite comparison against buffered staging. Host
 page cache is retained between starts, and each start has limited adaptation
 history. The later combined comparison below covers the original CPU server;
-a sustained run with retained serving state remains necessary before a
-general production claim.
+the [sustained follow-up](sustained-prefill.md) measures a smaller gain and a
+generation penalty. A general production claim remains unqualified.
 This 18.3% cannot be added to earlier gains against different baselines.
 
 ## Serving configuration validation
@@ -267,5 +267,12 @@ not measure expert-only traffic or establish particular page-eviction causes.
 The [complete record](../bench/results/4090-combined-cached-wall-20260905.json)
 retains the driver, clients, transport source, native identity, matching
 geometry, raw outputs, journals, and reproducible analysis. The original
-service was restored and verified with a real `OK` completion. Sustained
-adaptation with retained serving state remains the next qualification gate.
+service was restored and verified with a real `OK` completion.
+
+The [completed sustained follow-up](sustained-prefill.md) at `132b629`, with
+unchanged inference code, measures 17.8% less wall time across 24 responses
+per policy (634.481 to 521.738 seconds). Complete prose replaces the earlier
+capped task. The source-balanced gain falls from 23.1% in the first half to
+11.4% in the second half, and generation after the first token is slower on
+average. The earlier 37.0% result applies to its short sequence. Sustained
+reader isolation, cache admission, and broader quality remain open.
