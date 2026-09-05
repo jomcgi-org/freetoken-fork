@@ -31,7 +31,7 @@ Unsupported grouped GPU geometry retains its existing decode-kernel fallback.
 
 ## Validation
 
-The focused checks run on node-4 with its existing native extensions:
+All 118 focused checks passed on node-4 with its existing native extensions:
 
 ```sh
 python -m pytest \
@@ -65,3 +65,35 @@ These settings isolate the scheduling change. They are benchmark controls,
 not production recommendations. Judge the change by client first-token and
 whole-request wall time, excluding warmups, and verify text and usage equality
 for every matched pair.
+
+## First RTX 4090 results, 2026-09-05
+
+One server ran six warmups, 24 measured prefill requests, and six 192-token
+decode requests. It held 20 pinned layers (26.44 GiB), 28 DISK layers
+(37.02 GiB), 2,296 protected HOT rows, 4,045 expert slots, and 65,536 KV
+tokens, with 14 CPU threads. Every one of the 15 matched pairs produced
+identical text and usage.
+
+| Prompt tokens, including template | Serial TTFT (s) | Concurrent TTFT (s) | Mean reduction |
+| ---: | ---: | ---: | ---: |
+| 76 | 2.533 | 2.434 | 3.9% |
+| 524 | 6.572 | 6.339 | 3.6% |
+| 2,060 | 20.805 | 20.284 | 2.5% |
+
+Whole-request prefill wall times improved by 2.0%, 3.3%, and 2.4%, respectively.
+These are encouraging first-run means, not a replicated gain. Each size has
+only four pairs, and paired TTFT differences have sample standard deviations
+of 0.104, 0.666, and 0.717 seconds. In the 524-token case, one faster pair
+drives the mean while the other three are slightly slower. The switch remains
+off by default pending replication across restarts and workload conditions.
+
+Decode measured 19.24 versus 22.75 tokens/s after the first token. Its code is
+unchanged, and paired whole-request differences ranged from 2.44 seconds
+slower to 6.14 seconds faster, so this is not evidence of a decode improvement.
+
+The runtime revision was `72df522`; subsequent changes added test coverage and
+documentation. Raw requests, configuration, timings, and output comparisons
+are retained in [the measurement record](../bench/results/4090-prefill-hot-overlap-20260905.json).
+The original serving checkout at `3a67403` remained clean. Its service was
+restored and a real completion returned `OK` before delivery. This scheduling
+change has not been deployed there.
