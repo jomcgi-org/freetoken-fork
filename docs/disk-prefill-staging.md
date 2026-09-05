@@ -11,8 +11,11 @@ wall time from 17.57 to 9.45 seconds at 2,060 prompt tokens and from 34.93 to
 16.86 seconds at 4,108 tokens. Every long-prompt pair improved. At 524 tokens,
 staging was variable and approximately tied with CPU. The integrated serving
 comparison below supports a 1,024-token crossover for prefill. The longer-output
-gate found a 6.8% JSON response-time regression despite faster prefill. Keep
-this path experimental until that post-prefill decode behavior is understood.
+gate before HOT reuse found a 6.8% JSON response-time regression despite faster
+prefill. Reusing published HOT weights subsequently reduced whole-response
+time versus file-only staging by 33.1% for JSON and 19.7% for prose. A fresh
+CPU comparison with automatic adaptation is still needed, so this path stays
+experimental.
 
 ## Execution and memory contract
 
@@ -65,7 +68,43 @@ Unavailable fused copy descriptors or the copy-ablation flag retain the full
 file-staging path. Optional `disk_prefill_staged_d2d_bytes` counts the reused
 bytes, while the H2D counter reports only bytes actually staged from files.
 Both counters are gated and reset together. This reuse change still needs
-its own non-debug whole-response gate; the earlier records below predate it.
+validation with automatic adaptation; its fixed-HOT wall-time gate follows.
+
+## Published HOT reuse: whole-response wall time
+
+Two starts at `9b73b2a` compared the same selected expert union with and
+without GPU reuse. The baseline reads every selected row from its file; reuse
+gathers selected published HOT rows from VRAM. Each prompt received both
+request orders across starts, with complete warmup responses in both modes.
+HOT placement was fixed from the same profile. Diagnostic collection, GPU
+timing, adaptation, persistence, and KV reuse were off. Each cell contains
+four measured responses.
+
+| Workload | Selected rows from files | HOT reused from VRAM | Change |
+| --- | ---: | ---: | ---: |
+| 1,844-token prompt, 383-token JSON | 39.646 s | 26.517 s | 33.1% shorter |
+| ~1,880-token prompt, 192-token prose | 18.767 s | 15.072 s | 19.7% shorter |
+
+All four JSON pairs and three of four prose pairs improved. One first-start
+prose pair was 16.4% slower. Every measured pair returned identical text and
+usage, and all twelve JSON responses including warmups retained every value,
+key order, and key multiplicity. JSON time after the first token decreased
+from 26.513 to 19.266 seconds; prose decode time was slightly higher. The
+transport changes neither routing nor expert arithmetic. This is still a
+small workload sample, and prose has no independent quality score.
+
+Both starts used the same 20 pinned layers (26.44 GiB), 28 DISK layers
+(37.02 GiB), 82 protected experts per DISK layer, 14 CPU workers, 64 MiB staging
+ring, and 1,024-token crossover. Fewer logical file ranges and H2D bytes are
+requested by construction. Physical I/O was not measured in this run, so
+improved page-cache residency remains an explanation to test rather than an
+established cause of the larger whole-response gain.
+
+The [complete record](../bench/results/4090-staged-hot-reuse-wall-20260905.json)
+retains both starts, exact prompts, outputs, journals, client, driver, and
+analysis script. The original serving checkout was restored and returned
+`OK`. The next gate compares this path directly with CPU prefill under
+automatic HOT adaptation and repeats the long fidelity checks.
 
 ## Balanced CPU comparison
 
@@ -311,7 +350,11 @@ GEMM output bits at 16 and 512 tokens before retirement, after a real worker
 overwrites an unpublished slot, and after publication. Fused-copy fallback,
 the copy-ablation flag, untouched scratch ownership, and gated transfer counts
 are covered. The [validation log](../bench/results/4090-staged-hot-reuse-validation-20260905.txt)
-records both commands and their output.
+records both commands and their output. Four additional cases at `a2a09f0`
+passed normally and under memcheck: GPU cache rebuilding refreshes pointers
+and ownership, and an entirely HOT union performs no file read. Runtime is
+unchanged from `9b73b2a`; the combined coverage is 167 checks and 38 GPU
+memcheck cases.
 
 ## Earlier transport gates
 
