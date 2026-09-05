@@ -410,6 +410,12 @@ and ownership, and an entirely HOT union performs no file read. Runtime is
 unchanged from `9b73b2a`; the combined coverage is 167 checks and 38 GPU
 memcheck cases.
 
+The independent diagnostic all-HOT classification gate from #31 is included
+at `8e4ef5a`. All eleven tests in `tests/moe/test_moe_collect_stats.py` passed
+on node-4 after integration. It removes diagnostic-only work when collection
+and step timing are off. The preceding model wall measurements predate this
+cherry-pick, so no additional wall-time gain is attributed to it.
+
 ## Earlier transport gates
 
 These initial single-start probes explain the chosen transport. They used

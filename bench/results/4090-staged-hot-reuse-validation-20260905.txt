@@ -28,3 +28,8 @@ Repeat under compute-sanitizer --tool memcheck --error-exitcode 99.
 ========= ERROR SUMMARY: 0 errors
 
 Optional process I/O helper: local fixtures checked comm parsing, deltas, and worker restart rejection. A live Linux self-PID check read 4096 bytes and observed rchar delta 4498, syscr delta 6, read_bytes delta 0 (cached read), with matching worker identity.
+
+Integration of diagnostic all-HOT classification gate at 8e4ef5a
+Command: python -m pytest tests/moe/test_moe_collect_stats.py -q --disable-warnings --maxfail=2
+...........                                                              [100%]
+11 passed in 1.95s
