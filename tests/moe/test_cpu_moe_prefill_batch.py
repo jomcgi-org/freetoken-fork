@@ -330,3 +330,58 @@ def test_server_cli_defaults_batch_on_and_accepts_off():
         "--moe-cpu-prefill-batch", "off",
     ])
     assert args.moe_cpu_prefill_batch == "off"
+
+
+@pytest.mark.parametrize("hidden,intermediate,threads,activation,apply_on_input", [
+    (64, 64, 1, "silu", False),
+    (64, 64, 3, "silu", True),
+    (64, 64, 3, "swigluoai", False),
+    (2560, 640, 14, "silu", False),
+])
+def test_native_input_reuse_is_bitwise_equal_with_changing_routes(
+    hidden, intermediate, threads, activation, apply_on_input,
+):
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        pytest.skip("Linux CPU MoE extension is not built")
+    if not hasattr(_cpu_moe.CpuMoeExecutor, "set_prefill_input_reuse"):
+        pytest.fail("rebuild CPU MoE extension to validate input reuse")
+
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    experts, top_k, capacity = 16, 10, 65
+    cache = _make_nvfp4_cache(experts, hidden, intermediate, seed=207)
+    executor = CpuMoeExecutor(
+        cache, top_k=top_k, activation=activation,
+        apply_router_weight_on_input=apply_on_input, num_threads=threads,
+        max_tokens=1, max_prefill_tokens=capacity, device=torch.device("cpu"),
+        prefill_batch="on",
+    )
+    assert executor._prefill_batch_enabled
+    before = executor._ext.prefill_batch_buffer_bytes()
+    for index, tokens in enumerate((17, capacity, 5, 11)):
+        x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+        x[0].zero_()
+        ids = torch.randint(0, experts, (tokens, top_k), dtype=torch.int32)
+        if index == 1:
+            ids[::2, :8] = -1  # Leading absent routes, then valid input reuse.
+            ids[1, :] = experts  # An entirely absent token among live tokens.
+            ids[3, :] = 7  # Duplicate expert routes must stay separate rows.
+        elif index == 2:
+            ids.fill_(-1)  # Erase previous partials when every route is absent.
+        weights = torch.rand(tokens, top_k)
+        weights[:, 0] = 0
+        original = (x.clone(), ids.clone(), weights.clone())
+        outputs = {}
+        for enabled in ((False, True) if index % 2 == 0 else (True, False)):
+            executor._ext.set_prefill_input_reuse(enabled)
+            outputs[enabled] = executor.prefill(0, x, weights, ids).clone()
+        assert torch.isfinite(outputs[True]).all()
+        assert torch.equal(outputs[True].view(torch.int16), outputs[False].view(torch.int16))
+        if index == 2:
+            assert torch.count_nonzero(outputs[True]) == 0
+        for value, saved in zip((x, ids, weights), original):
+            assert torch.equal(value, saved)
+        assert executor._ext.prefill_batch_buffer_bytes() == before
+        assert executor._prefill_batch_enabled  # Parity must use the batch path.
