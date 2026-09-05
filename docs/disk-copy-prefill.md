@@ -80,3 +80,7 @@ page faults, pageable-copy overhead, or GPU compute as the individual cause.
 
 The [raw record](../bench/results/4090-disk-copy-20260905.json) retains the
 request, client results, driver, journal, and before/after regression logs.
+
+The original clean serving checkout at `3a67403` was restored and returned
+a real `OK` completion. The benchmark service is stopped; this change is not
+deployed in the original checkout.
