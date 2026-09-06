@@ -31,7 +31,7 @@ def test_existing_original_service_survives_recovery(monkeypatch, tmp_path):
     monkeypatch.setattr(gate, 'ready', lambda port: {'port': port})
     monkeypatch.setattr(gate, 'completion', lambda port: {'verified_port': port})
     result = gate.remote_main(SimpleNamespace(run_id='test', action='restore'))
-    assert calls == [gate.SERVER]
+    assert calls == [gate.ACTION, gate.SERVER]
     assert result['verified'] and result['completion']['verified_port'] == 8090
     assert json.loads((tmp_path / 'results/test/restoration.json').read_text())['verified']
 
@@ -47,7 +47,8 @@ def test_recovery_waits_for_gpu_before_starting_original(monkeypatch, tmp_path):
     monkeypatch.setattr(gate, 'completion', lambda port: calls.append(('completion', port)))
     result = gate.remote_main(SimpleNamespace(run_id='test', action='restore'))
     assert result['verified']
-    assert calls[:3] == [('stop', gate.SERVER), ('gpu',), ('sudo', '-n', 'systemctl', 'start', 'freetoken-serve')]
+    assert calls[:4] == [('stop', gate.ACTION), ('stop', gate.SERVER), ('gpu',),
+                         ('sudo', '-n', 'systemctl', 'start', 'freetoken-serve')]
     assert calls[-2:] == [('ready', 8090), ('completion', 8090)]
 
 
@@ -171,3 +172,48 @@ def test_failed_or_incomplete_task_cannot_qualify(failure):
     else:
         arms[3]['client_returncode'] = 1
     assert not gate.all_tasks_passed(arms)
+
+
+def test_scripted_client_can_use_controller_without_pi(monkeypatch, tmp_path):
+    monkeypatch.setattr(gate.sys, 'argv', ['driver', '--fixed-continuation', '--preflight',
+                        '--run-id', 'astra-pi-agentic-fixed-test', '--output-dir', str(tmp_path)])
+    seen = []
+    monkeypatch.setattr(gate, 'local_main', lambda args: seen.append(args) or 0)
+    assert gate.main() == 0
+    assert seen[0].fixed_continuation and seen[0].preflight and seen[0].pi is None
+
+
+def test_pi_client_still_requires_its_executable(monkeypatch, tmp_path):
+    monkeypatch.setattr(gate.sys, 'argv', ['driver', '--run-id', 'astra-pi-agentic-fixed-test',
+                        '--output-dir', str(tmp_path)])
+    monkeypatch.setattr(gate, 'local_main', lambda _: pytest.fail('invalid client must not run'))
+    with pytest.raises(SystemExit) as failure:
+        gate.main()
+    assert failure.value.code == 2
+
+
+@pytest.mark.parametrize('action', ['start', 'end'])
+def test_remote_mutating_actions_share_the_lease_lifetime(action):
+    command = gate.remote_command('/tmp/driver.py', action, 'astra-pi-agentic-test', 'r1')
+    assert '--property=BindsTo=' + gate.LEASE + '.service' in command
+    assert '--property=After=' + gate.LEASE + '.service' in command
+    assert '--property=KillMode=control-group' in command
+    assert '--property=RuntimeMaxSec=660' in command
+    assert '--unit=' + gate.ACTION in command
+    assert command[-8:] == ['/usr/bin/python3', '/tmp/driver.py', '--remote', action,
+                            '--run-id', 'astra-pi-agentic-test', '--arm', 'r1']
+
+
+def test_restore_can_run_after_lease_termination():
+    command = gate.remote_command('/tmp/driver.py', 'restore', 'astra-pi-agentic-test')
+    assert command == ['/usr/bin/python3', '/tmp/driver.py', '--remote', 'restore',
+                       '--run-id', 'astra-pi-agentic-test']
+
+
+def test_orphan_action_prevents_starting_a_new_comparison(monkeypatch):
+    monkeypatch.setattr(gate, 'server_command', lambda mode: ['same'])
+    monkeypatch.setattr(gate, 'server_env', lambda mode: {
+        'FREETOKEN_DECODE_PREFIX_SNAPSHOT': '1' if mode == 'on' else '0'})
+    monkeypatch.setattr(gate, 'live', lambda unit: unit == gate.ACTION)
+    with pytest.raises(AssertionError, match='another benchmark is live'):
+        gate.preflight()

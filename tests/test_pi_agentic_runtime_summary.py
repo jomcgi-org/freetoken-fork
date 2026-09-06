@@ -12,6 +12,11 @@ spec = importlib.util.spec_from_file_location(
 summary = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(summary)
 
+fixed_spec = importlib.util.spec_from_file_location(
+    'fixed_client', Path(__file__).parents[1] / 'bench/fixed-continuation-wall.py')
+fixed_client = importlib.util.module_from_spec(fixed_spec)
+fixed_spec.loader.exec_module(fixed_client)
+
 
 def write(root, name, value):
     path = root / name
@@ -215,3 +220,102 @@ def test_snapshot_start_marker_must_match_the_arm(snapshot_records):
     change(snapshot_records, 'r2-server-start.json', lambda d: d.update(snapshot_enabled=False))
     with pytest.raises(ValueError, match='wrong snapshot marker'):
         summary.summarize(snapshot_records, decode_prefix_snapshot=True)
+
+
+@pytest.fixture
+def fixed_records(snapshot_records):
+    root = snapshot_records
+    change(root, 'driver.json', lambda d: d['preflight'].update(client_kind='fixed-continuation'))
+    change(root, 'driver.json', lambda d: [command.append('--enable-cache-report')
+           for command in d['preflight']['commands'].values()])
+    for arm, _mode in summary.SNAPSHOT_ARMS:
+        change(root, arm + '-server-start.json', lambda d: d['command'].append('--enable-cache-report'))
+        start = json.loads((root / (arm + '-server-start.json')).read_text())
+        change(root, arm + '/metadata.json', lambda d: d.update(
+            sources={'fixed-continuation-wall.py': 'client'}, fixture_sha256='fixture', server_metadata=start))
+        for ordinal in (1, 2, 3):
+            def mutate(row):
+                row['event_metrics']['model_usage'] = [dict(input=1936, output=400, cacheRead=64,
+                                                           cacheWrite=0) for _ in (1, 2, 3)]
+                for stage, case in zip(row['stages'], fixed_client.fixture(ordinal)):
+                    stage['attempts'][0]['response'] = dict(
+                        wall_s=5,
+                        request={'messages': [{'role': 'user', 'content': case['prompt']}]},
+                        completion=dict(choices=[dict(finish_reason='stop', message=dict(
+                            role='assistant', content=json.dumps(case['expected'], indent=2)))],
+                            usage=dict(prompt_tokens=2000, completion_tokens=400,
+                                       prompt_tokens_details={'cached_tokens': 64})))
+            change(root, f'{arm}/session-{ordinal}/result.json', mutate)
+    return root
+
+
+def test_fixed_work_keeps_warmups_and_both_orders(fixed_records):
+    result = summary.summarize(fixed_records, fixed_continuation=True)
+    assert result['fixed_work_qualified'] and result['fixed_work_mismatches'] == []
+    assert result['comparison']['wall_reduction_percent'] == pytest.approx(20)
+    assert len(result['sessions']) == 12 and len(result['orders']) == 2
+    assert result['request_phases']['off']['first_request']['attempted_request_wall_s'] == 20
+    assert result['request_phases']['off']['continuations']['attempted_request_wall_s'] == 40
+    assert result['request_phases']['on']['continuations']['completed_requests'] == 8
+
+
+@pytest.mark.parametrize('ordinal', [1, 2])
+@pytest.mark.parametrize('field', ['text', 'length'])
+def test_fixed_work_rejects_drift_in_warmups_or_measurements(fixed_records, ordinal, field):
+    def mutate(row):
+        completion = row['stages'][0]['attempts'][0]['response']['completion']
+        if field == 'text':
+            completion['choices'][0]['message']['content'] += '\n'
+        else:
+            completion['usage']['completion_tokens'] += 1
+            row['event_metrics']['model_usage'][0]['output'] += 1
+    change(fixed_records, f'r2/session-{ordinal}/result.json', mutate)
+    result = summary.summarize(fixed_records, fixed_continuation=True)
+    assert result['all_tasks_passed_including_warmups'] and not result['fixed_work_qualified']
+    assert result['comparison']['wall_reduction_percent'] is None
+    assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+    assert result['comparison']['modes']['on']['attempted_task_wall_s'] == 320
+
+
+def test_scripted_work_cannot_be_reported_as_a_pi_comparison(fixed_records):
+    with pytest.raises(ValueError, match='use --fixed-continuation'):
+        summary.summarize(fixed_records, decode_prefix_snapshot=True)
+
+
+def test_fixed_work_rechecks_answers_instead_of_trusting_pass_flag(fixed_records):
+    def mutate(row):
+        row['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message']['content'] = '{}'
+    change(fixed_records, 'r2/session-2/result.json', mutate)
+    with pytest.raises(ValueError, match='ordered integer records'):
+        summary.summarize(fixed_records, fixed_continuation=True)
+
+
+def test_fixed_work_rechecks_usage_instead_of_trusting_totals(fixed_records):
+    change(fixed_records, 'r2/session-2/result.json',
+           lambda d: d['event_metrics']['model_usage'][0].update(output=1))
+    with pytest.raises(ValueError, match='reported usage differs'):
+        summary.summarize(fixed_records, fixed_continuation=True)
+
+
+def test_fixed_work_keeps_incomplete_response_cost(fixed_records):
+    def mutate(row):
+        row.update(passed=False, verified_task_wall_s=None, error='HTTP response has no usage')
+        row['stages'][0]['attempts'][0]['response']['completion'] = {'error': 'failure'}
+        row['stages'] = row['stages'][:1]
+        row['stages'][0]['passed'] = False
+    change(fixed_records, 'r2/session-2/result.json', mutate)
+    change(fixed_records, 'driver.json', lambda d: (
+        d['arms'][1].update(client_returncode=1), d.update(all_tasks_passed=False)))
+    result = summary.summarize(fixed_records, fixed_continuation=True)
+    assert not result['fixed_work_qualified']
+    assert result['comparison']['wall_reduction_percent'] is None
+    assert result['comparison']['modes']['on']['attempted_task_wall_s'] == 320
+    phase = result['request_phases']['on']['first_request']
+    assert phase['attempted_request_wall_s'] == 20 and phase['usage_records'] == 3
+
+
+def test_omitted_zero_hits_cannot_hide_disabled_cache_reporting(fixed_records):
+    change(fixed_records, 'driver.json', lambda d:
+           d['preflight']['commands']['on'].remove('--enable-cache-report'))
+    with pytest.raises(ValueError, match='enabled cache reporting'):
+        summary.summarize(fixed_records, fixed_continuation=True)
