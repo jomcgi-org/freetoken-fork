@@ -12,7 +12,8 @@ chains, vector reduction, scalar remainder, final global-scale multiplication,
 and prefetch distance. The existing prefill batch kernel scales and reduces in
 a different order, so it is not used for this path. Gate/up activation handling,
 per-route intermediate rounding, and the final original top-k reduction remain
-the same. These are implementation intentions pending native bitwise validation.
+the same. The native and CUDA checks below validate exact output bits for the
+tested geometries and transport paths.
 
 The experiment defaults off. Set
 `FREETOKEN_CPU_MOE_DECODE_WEIGHT_REUSE=1` before constructing the native executor
@@ -41,8 +42,30 @@ modes, reverses their order on alternate repeats, checks exact output bits, and
 retains source and native identities. Its synthetic resident weights isolate
 native task work; they do not establish end-to-end gains or disk behavior.
 
-Native compilation, the targeted Linux tests, and paired performance validation
-are pending. They must wait until the live `astra-concurrent-wall-driver` unit
-is terminal so they do not interfere with the complete-response comparison.
-Even a passing native result requires a separate non-debug model wall-time and
-quality gate before enabling this experiment by default or claiming a gain.
+Native validation at `b8ac3f7` passes all 69 focused Linux/CUDA checks, including
+all 44 new cases without skips. The paired benchmark records 352 exact-output
+pairs across 32 cases. Every timed pair has identical BF16 output bits; the
+separate direct-kernel tests compare FP32 bits before intermediate rounding.
+
+At batch size four with ten active routes per token:
+
+| Shared experts per token | Existing native task | Reuse native task | Less task time |
+| --- | ---: | ---: | ---: |
+| None | 1.256 ms | 1.256 ms | Effectively flat |
+| Five | 1.235 ms | 0.973 ms | 21.2% |
+| Ten | 1.235 ms | 0.694 ms | 43.8% |
+
+These resident-weight measurements isolate native CPU work. Actual expert
+sharing, disk faults, GPU execution, and serving adaptation can change the
+end-to-end result. A separate non-debug complete-response wall-time and quality
+gate remains required before enabling this experiment by default or claiming
+a model throughput gain.
+
+The [complete native validation record](../bench/results/4090-decode-weight-reuse-native-20260906.json)
+retains sources, native identities, commands, test XML, paired timings, and
+service restoration evidence. The first attempt stopped before compilation
+because the GPU still reported a process immediately after the service stopped.
+Its recovery verified the original service. The second attempt retained that
+failure, waited for GPU release, passed compilation/tests/timings, and again
+verified a real completion from the restored original service. All native work
+started after the concurrent model wall-time driver had exited successfully.
