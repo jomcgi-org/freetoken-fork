@@ -43,3 +43,12 @@ completion checks and separate non-debug wall measurements remain required.
 Gather/scatter operations may add component cost and graph-pool allocations.
 This experiment claims no serving speedup and leaves serving startup unchanged.
 Detailed model records and measured payloads stay private.
+
+Validation completed with 118 focused Mac checks and 229 focused Linux checks
+passing. The three exclusive CUDA checks passed, including the real GDN kernel
+with changing slots and overwritten activation inputs. Full-model verification
+then passed every required logit, token, committed-state and rejection-prefix
+comparison while reusing each graph across adjacent windows in one allocated
+page. Both experiments ended with verified original-serving recovery and a real
+completion. Full-model relocation to other request slots and across page
+boundaries remains unqualified, so serving integration is still pending.
