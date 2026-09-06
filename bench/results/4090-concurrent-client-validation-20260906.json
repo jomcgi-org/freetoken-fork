@@ -1,0 +1,77 @@
+{
+  "revision": "c0775ea48b108dcf31d80091a8d36c81d5239edf",
+  "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.39",
+  "before": {
+    "astra-sustained-hot-staging-wall-driver": {
+      "MainPID": "0",
+      "Result": "success",
+      "ExecMainStatus": "0",
+      "Id": "astra-sustained-hot-staging-wall-driver.service",
+      "ActiveState": "inactive",
+      "InvocationID": ""
+    },
+    "freetoken-serve": {
+      "MainPID": "735162",
+      "Result": "success",
+      "ExecMainStatus": "0",
+      "Id": "freetoken-serve.service",
+      "ActiveState": "active",
+      "InvocationID": "a7a7630f8b3e45cda674fccbfabcfa64"
+    }
+  },
+  "args": [
+    "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python",
+    "-m",
+    "pytest",
+    "-q",
+    "tests/test_concurrent_prefill_client.py"
+  ],
+  "returncode": 0,
+  "wall_s": 0.19276608800282702,
+  "stdout": "..................                                                       [100%]\n18 passed in 0.04s\n",
+  "stderr": "",
+  "source_sha256": {
+    "bench/concurrent-prefill-wall.py": "5b6e7b316442510048e510a149da45573125241c8356ab9e2bc036f4721a9e4e",
+    "tests/test_concurrent_prefill_client.py": "d3789105590a55e1ce4d44faada10e77f25e4e3085a434156b0891db075eb7dc"
+  },
+  "after": {
+    "astra-sustained-hot-staging-wall-driver": {
+      "MainPID": "0",
+      "Result": "success",
+      "ExecMainStatus": "0",
+      "Id": "astra-sustained-hot-staging-wall-driver.service",
+      "ActiveState": "inactive",
+      "InvocationID": ""
+    },
+    "freetoken-serve": {
+      "MainPID": "735162",
+      "Result": "success",
+      "ExecMainStatus": "0",
+      "Id": "freetoken-serve.service",
+      "ActiveState": "active",
+      "InvocationID": "a7a7630f8b3e45cda674fccbfabcfa64"
+    }
+  },
+  "prior_original_serving_restoration": {
+    "id": "chatcmpl-0",
+    "object": "chat.completion",
+    "created": 1788656498,
+    "model": "qwen3.6-27b",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "OK"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 17,
+      "completion_tokens": 2,
+      "total_tokens": 19
+    }
+  },
+  "driver_source": "import hashlib, json, os, pathlib, platform, subprocess, time\nR=pathlib.Path('/var/lib/longhorn/nvme-02/freetoken')\nW=R/'wt-astra-concurrent-wall-client'; S=R/'wt-plegather'\nunit='astra-sustained-hot-staging-wall-driver'\ndef status(name):\n p=subprocess.run(['systemctl','show',name,'--property=Id,ActiveState,MainPID,Result,ExecMainStatus,InvocationID'],check=True,capture_output=True,text=True)\n return dict(line.split('=',1) for line in p.stdout.splitlines() if '=' in line)\nbefore={name:status(name) for name in (unit,'freetoken-serve')}\nassert before[unit]['ActiveState']=='inactive',before\nassert before[unit]['Result']=='success' and before[unit]['ExecMainStatus']=='0',before\nassert before[unit]['InvocationID'] in ('','681b7edf0c07456e89e4ba087014022d'),before\nassert before['freetoken-serve']['ActiveState']=='active',before\nlast=json.loads((R/'results/astra-sustained-hot-staging-wall-r4-metadata.json').read_text())\nassert last['completed']\nassert last['original_serving_restoration']['choices'][0]['message']['content'].strip()=='OK'\nassert not W.exists(),W\nsubprocess.run(['git','-C',str(R/'FreeToken'),'fetch',str(R/'tmp/astra-concurrent-wall-client.bundle'),'perf/4090-concurrent-wall-client:refs/heads/bench/astra-concurrent-wall-client'],check=True,capture_output=True,text=True)\nsubprocess.run(['git','-C',str(R/'FreeToken'),'worktree','add',str(W),'bench/astra-concurrent-wall-client'],check=True,capture_output=True,text=True)\nrevision=subprocess.check_output(['git','-C',str(W),'rev-parse','HEAD'],text=True).strip()\nassert revision=='c0775ea48b108dcf31d80091a8d36c81d5239edf'\nassert not subprocess.check_output(['git','-C',str(W),'status','--porcelain'],text=True).strip()\nfiles=['bench/concurrent-prefill-wall.py','tests/test_concurrent_prefill_client.py']\ncmd=[str(S/'.venv/bin/python'),'-m','pytest','-q','tests/test_concurrent_prefill_client.py']\nstarted=time.monotonic()\np=subprocess.run(cmd,cwd=W,env=dict(os.environ,PYTHONPATH=str(W/'python')),capture_output=True,text=True,timeout=120)\nreport=dict(revision=revision,platform=platform.platform(),before=before,args=cmd,returncode=p.returncode,wall_s=time.monotonic()-started,stdout=p.stdout,stderr=p.stderr,source_sha256={name:hashlib.sha256((W/name).read_bytes()).hexdigest() for name in files},after={name:status(name) for name in before},prior_original_serving_restoration=last['original_serving_restoration'],driver_source=pathlib.Path(__file__).read_text())\n(R/'results/astra-concurrent-wall-client-linux-validation.json').write_text(json.dumps(report,indent=2)+'\\n')\nprint(json.dumps(report,indent=2))\nassert p.returncode==0,p.stdout+p.stderr\nassert report['after']['freetoken-serve']['ActiveState']=='active'\nassert report['after']['freetoken-serve']['MainPID']==before['freetoken-serve']['MainPID']\n"
+}
