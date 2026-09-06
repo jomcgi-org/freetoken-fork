@@ -90,3 +90,24 @@ capacity, FP8 K/V, and successful readiness completion. Prefix caching leaves
 differs from the earlier naive-cache experiments. Later arms must match this
 geometry before comparison. The record is partial, with no measured speedup
 yet; the controller and recovery lease were confirmed live at capture.
+
+After all four arms finish and serving is restored, summarize the archived records:
+
+```sh
+python3 bench/pi-agentic-runtime-summary.py \
+  /private/tmp/astra-pi-agentic-runtime-20260906 >pi-runtime-summary.json
+```
+
+The summarizer rejects incomplete schedules, mismatched client configuration,
+server identities or geometry, enabled diagnostics, and inconsistent successful
+checks. It retains all twelve sessions, reports the eight measured sessions and
+both start orders, and omits speedup and checked-task throughput when measured
+tasks fail. Worker storage reads include warmup and are labelled accordingly.
+Input hashes make the summary traceable to its raw records. Review the full
+journals, model outputs, and final files separately; arithmetic and fixture checks
+cannot establish broad quality equivalence. This analysis runs after collection
+and changes neither the frozen client nor the runtime controller.
+
+Fifteen focused summarizer tests pass on macOS. Its CLI also refuses to summarize
+the live incomplete gate. Linux validation remains pending until the timed model
+comparison ends, to avoid competing with the measured worker.
