@@ -405,3 +405,11 @@ first baseline start has 3753 expert slots and 1024 KV pages. This geometry
 differs from the earlier naive-cache gates, and later arms must match it.
 Nine focused controller tests and live EOF/heartbeat-expiry recovery probes
 pass. The first arm is running; no agentic optimization result is available yet.
+
+A [source review of the existing MTP graph branch](mtp-4090-review.md) identifies
+prerequisites for a separate sequential-decode experiment. The deployed FTW index
+contains no MTP tensors. The branch also records six CUDA timing events per
+verification step without a diagnostic guard, while host PLE staging, state
+snapshots, rejected-seed replay, and draft-head VRAM compete with any verification
+gain. Gate the timing instrumentation and retain target-equivalence checks before
+qualifying MTP. The current Pi comparison keeps MTP off and remains unchanged.
