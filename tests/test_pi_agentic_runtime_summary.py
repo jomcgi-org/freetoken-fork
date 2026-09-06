@@ -334,7 +334,10 @@ def carry_records(fixed_records):
     for mode in ('off', 'on'):
         plan['identities'][mode] = dict(revision=gate.PREFILL_CARRY_REVISIONS[mode],
                                        tree='/runtime/' + mode, native='/same/native.so',
-                                       native_sha256='native', cpp_sha256='cpp')
+                                       native_sha256='native', cpp_sha256='cpp',
+                                       native_extensions={name: dict(path='/same/' + name,
+                                           sha256='binary', source_sha256='source')
+                                           for name in gate.EXTENSION_SOURCES})
         plan['env'][mode].update(PYTHONPATH='/runtime/' + mode + '/python',
                                  FREETOKEN_DECODE_PREFIX_SNAPSHOT='0')
     for arm, mode in summary.SNAPSHOT_ARMS:
@@ -383,3 +386,17 @@ def test_prefill_carry_still_rejects_answer_drift(carry_records):
     assert not result['fixed_work_qualified']
     assert result['comparison']['wall_reduction_percent'] is None
     assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+
+
+@pytest.mark.parametrize('change_kind', ['missing', 'changed'])
+def test_prefill_carry_requires_matching_ple_native_identity(carry_records, change_kind):
+    def mutate(driver):
+        ids = driver['preflight']['identities']
+        if change_kind == 'missing':
+            for row in ids.values():
+                row['native_extensions'].pop('_ple_uring')
+        else:
+            ids['on']['native_extensions']['_ple_uring']['sha256'] = 'other'
+    change(carry_records, 'driver.json', mutate)
+    with pytest.raises(ValueError, match='native extension identity missing or changed'):
+        summary.summarize(carry_records, prefill_snapshot_carry=True)

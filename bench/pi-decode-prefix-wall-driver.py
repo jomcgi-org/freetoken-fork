@@ -28,6 +28,12 @@ SRC = R / 'wt-plegather'
 OPT = R / 'wt-astra-decode-prefix-snapshot'
 CARRY = R / 'wt-astra-prefill-snapshot-carry'
 PREFILL_CARRY = False
+EXTENSION_SOURCES = {
+    '_cpu_moe': 'cpu_moe/cpu_moe_ext.cpp',
+    '_pinned_tensor': 'pinned_tensor.cpp',
+    '_ple_uring': 'ple_uring/ple_uring_ext.cpp',
+    '_uffd_pager': 'uffd_pager.cpp',
+}
 SERVER = 'astra-pi-agentic-server'
 LEASE = 'astra-pi-agentic-lease'
 ACTION = 'astra-pi-agentic-action'
@@ -125,18 +131,30 @@ def runtime_revision(mode):
     return PREFILL_CARRY_REVISIONS[mode] if PREFILL_CARRY and mode != 'original' else REVISIONS[mode]
 
 
+def native_extensions(tree):
+    kernel = tree / 'python/freetoken/kernel'
+    result = {}
+    for name, source in EXTENSION_SOURCES.items():
+        binaries = list(kernel.glob(name + '.*.so'))
+        assert len(binaries) == 1, ('missing or ambiguous native extension', name)
+        native = binaries[0].resolve(strict=True)
+        result[name] = dict(path=str(native), sha256=sha(native),
+                            source_sha256=sha(kernel / 'csrc' / source))
+    return result
+
+
 def identities():
     result = {}
     for mode, tree in [('original', SRC), *[(m, runtime_tree(m)) for m in MODES]]:
         revision = run('git', '-C', str(tree), 'rev-parse', 'HEAD').stdout.strip()
         assert revision == runtime_revision(mode), (mode, revision)
         assert not run('git', '-C', str(tree), 'status', '--porcelain').stdout.strip(), tree
-        binaries = list((tree / 'python/freetoken/kernel').glob('_cpu_moe.*.so'))
-        assert len(binaries) == 1
-        native = binaries[0].resolve()
+        extensions = native_extensions(tree)
+        native = Path(extensions['_cpu_moe']['path'])
         assert sha(native) == BINARIES[mode], native
         result[mode] = dict(revision=revision, tree=str(tree), native=str(native), native_sha256=sha(native),
-                            cpp_sha256=sha(tree / 'python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp'))
+                            cpp_sha256=sha(tree / 'python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp'),
+                            native_extensions=extensions)
     return result
 
 
@@ -185,7 +203,7 @@ def preflight(allow_lease=False):
     assert len(workers) == 1 and original['ControlGroup'] in Path(f'/proc/{workers[0]}/cgroup').read_text()
     runtime_ids = identities()
     if PREFILL_CARRY:
-        for key in ('native', 'native_sha256', 'cpp_sha256'):
+        for key in ('native', 'native_sha256', 'cpp_sha256', 'native_extensions'):
             assert runtime_ids['off'][key] == runtime_ids['on'][key], key
         changed = run('git', '-C', str(CARRY), 'diff', '--name-only',
                       PREFILL_CARRY_REVISIONS['off'], PREFILL_CARRY_REVISIONS['on'],
@@ -307,6 +325,12 @@ def remote_main(args):
         assert unit['ControlGroup'] in Path(f'/proc/{worker}/cgroup').read_text()
         maps = [line for line in Path(f'/proc/{worker}/maps').read_text().splitlines() if '_cpu_moe.' in line]
         assert maps and all(line.split()[-1] == plan['identities'][mode]['native'] for line in maps)
+        all_maps = Path(f'/proc/{worker}/maps').read_text().splitlines()
+        for name, identity in plan['identities'][mode]['native_extensions'].items():
+            loaded = [line.split()[-1] for line in all_maps if '/' + name + '.' in line]
+            if name in ('_cpu_moe', '_ple_uring'):
+                assert loaded, ('required extension not mapped', name)
+            assert all(path == identity['path'] for path in loaded), ('native mapping changed', name)
         actual_env = dict(item.split(b'=', 1) for item in Path(f'/proc/{worker}/environ').read_bytes().split(b'\0') if b'=' in item)
         assert all(actual_env[k.encode()].decode() == v for k, v in server_env(mode).items())
         text = journal(unit['InvocationID'])

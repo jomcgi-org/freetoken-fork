@@ -127,6 +127,12 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
             require(all(ids['off'].get(k) and ids['off'][k] == ids['on'].get(k)
                         for k in ('native', 'native_sha256', 'cpp_sha256')),
                     'prefill carry native binary or source changed')
+            extensions = ids['off'].get('native_extensions', {})
+            require(set(extensions) == set(gate.EXTENSION_SOURCES)
+                    and extensions == ids['on'].get('native_extensions')
+                    and all(all(row.get(k) for k in ('path', 'sha256', 'source_sha256'))
+                            for row in extensions.values()),
+                    'prefill carry native extension identity missing or changed')
         else:
             require(plan['identities']['off'] == plan['identities']['on'],
                     'snapshot arms used different runtime identities')

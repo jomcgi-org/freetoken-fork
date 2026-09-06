@@ -40,3 +40,8 @@ First-request and continuation-request totals are retained separately.
 Review server journals and restored GPU ownership as well. This synthetic
 workload can isolate continuation cost; matching its outputs does not establish
 broad model quality equivalence. No performance result is included here.
+
+Preflight requires all serving native extensions, including the io_uring PLE
+backend, and records each binary's path, hash and source hash. The two arms
+must share those identities. Startup also checks the loaded CPU and PLE maps.
+Missing artifacts are rejected before serving is stopped.

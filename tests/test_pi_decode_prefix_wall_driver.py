@@ -249,3 +249,23 @@ def test_prefill_carry_rejects_decode_snapshot_confounds_before_service_access(m
     monkeypatch.setattr(gate, 'state', lambda _: pytest.fail('must reject before accessing services'))
     with pytest.raises(AssertionError):
         gate.preflight()
+
+
+@pytest.mark.parametrize('missing', [None, *gate.EXTENSION_SOURCES])
+def test_native_identity_requires_every_serving_extension(tmp_path, missing):
+    kernel = tmp_path / 'python/freetoken/kernel'
+    for name, source in gate.EXTENSION_SOURCES.items():
+        code = kernel / 'csrc' / source
+        code.parent.mkdir(parents=True, exist_ok=True)
+        code.write_bytes(b'synthetic source')
+        if name != missing:
+            (kernel / (name + '.test.so')).write_bytes(b'synthetic extension')
+    if missing:
+        with pytest.raises(AssertionError, match='missing or ambiguous native extension'):
+            gate.native_extensions(tmp_path)
+    else:
+        result = gate.native_extensions(tmp_path)
+        assert set(result) == set(gate.EXTENSION_SOURCES)
+        for name, row in result.items():
+            assert row['sha256'] == gate.sha(kernel / (name + '.test.so'))
+            assert row['source_sha256'] == gate.sha(kernel / 'csrc' / gate.EXTENSION_SOURCES[name])
