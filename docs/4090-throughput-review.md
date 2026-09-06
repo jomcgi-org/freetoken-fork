@@ -8,9 +8,57 @@ experts per layer, top-10 routing, H=2560 and I=640. `qwen3.6-27b` is its API
 alias. Measurements use node-4's RTX 4090 and Ryzen 7 7800X3D with 61.91 GiB
 RAM and local NVMe. GLM is outside this performance qualification.
 
-## Latest combined wall time against the original checkout
+Performance evidence updated on 2026-09-06 after both sustained comparisons.
 
-Original `3a67403` with CPU DISK prefill is now compared directly against
+## Sustained wall time and the reader regression
+
+The strongest sustained combined result is 17.8% less client wall time for
+the fixed workload, about 1.22 times the request throughput. Original
+`3a67403` uses CPU DISK prefill; optimized `132b629` uses staged GPU prefill,
+published HOT reuse, and the cache-aware reader. Inference code is unchanged
+from `78848ce`. Four original/optimized/optimized/original starts each run
+four warmups, twelve measured complete responses, and eight fidelity cases.
+Diagnostics, GPU timing, HOT persistence, and KV reuse are off.
+
+| Measured client response | Original CPU | Combined cached staging | Less wall time |
+| --- | ---: | ---: | ---: |
+| Complete JSON, mean | 30.062 s | 24.475 s | 18.6% |
+| Complete prose, mean | 22.812 s | 19.003 s | 16.7% |
+| Fixed 24-request mix, total | 634.481 s | 521.738 s | 17.8% |
+
+Both matched start orders improve, by 16.8% and 18.7%. The source-balanced
+first halves improve by 23.1%, the second halves by 11.4%. This qualifies
+the earlier short comparison's 37.0% observation below: that larger gain
+does not describe sustained traffic. First-token time roughly halves, but
+subsequent generation is 5.7% slower for JSON and 15.4% slower for prose.
+All twelve measured JSON pairs have identical text and usage. All four
+starts retain the same 7/8 fidelity score and identical answers, including
+the same code-trace failure. The [sustained protocol and complete record](sustained-prefill.md)
+retain every output, the reference-based prose review, and limitations.
+
+The following reader isolation holds runtime `132b629` and staged GPU
+prefill fixed. Only the buffered/cached file policy changes, in
+buffered/cached/cached/buffered start order, using the same sustained client:
+
+| Measured client response | Buffered staging | Cached staging | Cached wall-time increase |
+| --- | ---: | ---: | ---: |
+| Complete JSON, mean | 24.320 s | 24.701 s | 1.6% |
+| Complete prose, mean | 17.221 s | 19.647 s | 14.1% |
+| Fixed 24-request mix, total | 498.493 s | 532.174 s | 6.8% |
+
+Cached staging regresses in both matched orders, by 5.6% and 7.9%.
+Source-balanced first halves are tied; cached staging is 15.7% slower in
+the second halves. Eighteen of 24 matched responses regress, including an
+aggregate 2.3% penalty among thirteen identical-text pairs. Keep buffered
+GPU staging for this sustained workload. The
+[reader-isolation record](sustained-reader.md) retains all checks and raw
+evidence. These two experiments have different baselines; their percentages
+cannot be added or treated as a direct original-versus-buffered comparison.
+Both completed gates restored and verified the original system service.
+
+## Earlier combined short-sequence wall time
+
+The short comparison used original `3a67403` with CPU DISK prefill against
 combined `78848ce` with staged GPU prefill, published HOT reuse, and
 `--moe-disk-prefill-io cached`. The real serving CLI selects the reader,
 without a constructor probe. Four isolated starts use
@@ -46,7 +94,8 @@ retains exact drivers and clients, source and native identities, raw outputs,
 matching geometry, journals, I/O snapshots, and reproducible analysis. The
 original service was restored and verified with a real completion. Retained
 host page cache and limited adaptation history still constrain a general
-production claim. Sustained serving-state qualification remains open.
+production claim. The completed sustained result above measures a smaller
+gain with longer serving-state history and complete prose responses.
 
 ## Earlier combined CPU comparison
 
@@ -94,15 +143,30 @@ in VRAM. Long prefill touches a large expert union, while the following
 decode needs a smaller, changing working set. Reducing first-token time can
 therefore make the rest of the response slower.
 
-The separate CPU-versus-staged comparison makes this visible. Selected
-GPU staging with HOT reuse reduced JSON first-token time from 11.521 to
-7.573 seconds, but subsequent decode grew from 15.086 to 17.322 seconds.
-Whole-response JSON time improved by 6.4% on average with only two of four
-pairs faster. Prose improved by 31.6%, with all four pairs faster. Worker
-storage-read accounting also increased for JSON, from 3.566 to 4.484 GiB per
-response. Those counters include other worker I/O, so they support further
-residency investigation without attributing a specific eviction cause. See
-the [complete direct comparison](../bench/results/4090-staged-hot-reuse-cpu-auto-20260905.json).
+The sustained combined comparison makes this visible. JSON first-token time
+falls from 12.837 to 6.276 seconds, but subsequent generation grows from
+17.225 to 18.199 seconds. Prose first-token time falls from 11.651 to 6.123
+seconds, while subsequent generation grows from 11.161 to 12.879 seconds.
+Complete-response wall time is the gate because prefill and generation move
+in opposite directions.
+
+The sustained reader isolation identifies a reader-policy regression. In its
+second halves, mean whole-worker storage reads are 1.055 GiB per response
+with buffered staging versus 5.679 GiB with cached staging. Those counters
+do not separate prefill, decode, PLE, or adaptation. The cache-aware reader
+direct-reads an entire expert row if any part is nonresident, so redundant
+reads of resident bytes and reduced admission of recurring weights remain
+candidates to investigate.
+
+HOT updates expose another concrete cost. One warmup in the first cached
+start stages 0.50 GiB in 5.5 seconds and triggers automatic bandwidth
+backoff. For this single batch, the timer excludes the initial GPU readiness
+wait and later GPU installation. It includes host copies from file-mapped
+tensors under concurrent serving; it does not isolate faults, CPU scheduling,
+or memory copying. The experimental buffered HOT reader in
+[#35](https://github.com/jomcgi-org/freetoken-fork/pull/35) targets this work
+without changing the selected experts or adding a weight buffer. Its model
+wall-time qualification remains pending.
 
 A separate diagnostic replay found approximately 11% fixed-HOT decode
 coverage versus approximately 97% retrospective coverage with the same
@@ -180,17 +244,17 @@ settings; they are not measurements of the current benchmark. In particular,
 the fixed-HOT diagnostic's 11% coverage above must not be treated as typical
 of an adapted production server.
 
-The new transport gates deliberately disable plan persistence and KV reuse,
-use full warmups, retain automatic adaptation, and reverse server order.
-They still measure a limited number of requests after startup. A candidate
-that passes should also be checked after sustained adaptation with retained
-serving state before making a general production-throughput claim. The
-existing source-path tests separately establish byte and arithmetic parity.
+The completed sustained gates disable plan persistence and KV reuse, use
+full warmups, retain automatic adaptation, and reverse server order. They
+cover a finite continuous workload and do not qualify idle convergence,
+very long contexts, concurrency, or production prefix reuse. The source-path
+tests separately establish byte and arithmetic parity.
 
 ## Changes and evidence
 
-PR states below describe this review date. Percentages are time reductions;
-kernel speedups and model wall time have separate meanings.
+PR states below describe this evidence update. Positive percentages are time
+reductions unless explicitly labeled as regressions; kernel speedups and
+model wall time have separate meanings.
 
 | Change | Evidence | Delivery |
 | --- | --- | --- |
@@ -200,14 +264,15 @@ kernel speedups and model wall time have separate meanings.
 | Reuse CPU input quantization across routes | Whole-request reductions of 5.0%, 11.4%, 16.6% at 76, 524, 2,060 prompt tokens; all 48 prefill pairs faster and all 56 timing pairs identical in text and usage | [#30](https://github.com/jomcgi-org/freetoken-fork/pull/30), ready |
 | Gate diagnostic-only decode classification and idle history readback | Removes ordinary decode's reduction/counter work and idle coverage's GPU-to-CPU history synchronization; 99 focused Linux tests pass, with no independent wall-time claim | [#31](https://github.com/jomcgi-org/freetoken-fork/pull/31), ready; also included in #33 |
 | Correct temporary materialization ownership | Prevents sparse scratch from advertising uncopied experts as hits; protected HOT bytes retained | [#32](https://github.com/jomcgi-org/freetoken-fork/pull/32), ready |
-| Selected DISK staging and exact HOT VRAM reuse | Strong long-prefill gains, 31.6% lower prose response time in the latest CPU comparison, mixed JSON response-time results | [#33](https://github.com/jomcgi-org/freetoken-fork/pull/33), draft |
-| Cache-aware staged reads | 18.3% shorter fixed-mix response time versus buffered staging; all eight pairs faster; 70 CUDA transport tests pass normally and under memcheck | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; explicit opt-in, serving remains buffered |
+| Selected DISK staging and exact HOT VRAM reuse | Earlier direct CPU comparison: 31.6% lower prose wall time, mixed JSON gains; included in the sustained combined 17.8% result | [#33](https://github.com/jomcgi-org/freetoken-fork/pull/33), draft |
+| Cache-aware staged reads | Short reader gate: 18.3% less wall time; sustained isolation: 6.8% slower overall and 15.7% slower in second halves; 99 CUDA checks pass normally and under memcheck | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; keep buffered staging for the sustained workload |
+| Buffered reads into HOT staging rows | 164 focused Linux/CUDA checks pass; 25 new checks pass under memcheck with zero errors; model wall-time qualification pending | [#35](https://github.com/jomcgi-org/freetoken-fork/pull/35), draft; default remains mmap |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
-#34 evaluates a transport option on top of #33.
-The original serving checkout is restored after every model gate; these
-changes are delivered in PRs.
+#34 evaluates a DISK prefill reader on top of #33; #35 evaluates HOT staging
+on top of #34. The original serving checkout is restored and verified after
+every completed model gate; these changes are delivered in PRs.
 
 ## Quality and measurement contract
 
@@ -225,14 +290,23 @@ tests compare exact bytes and BF16 GEMM output bits, while model checks compare
 scored tasks and complete responses. In the CPU-versus-staged gate, all JSON
 records were correct and both modes retained the same 7/8 long-fidelity score,
 including the same wrong code-trace answer. The earlier combined CPU comparison
-also retained 7/8 but changed that incorrect answer. Prose remains unscored;
-this sample does not establish broad model-quality equivalence.
+also retained 7/8 but changed that incorrect answer. Prose from the earlier
+192-token-cap probes remains unscored. Both sustained comparisons generate
+complete prose with a 1,024-token ceiling. Their artifacts include an
+assistant review of all responses against the seven-constraint reference
+specification. Both modes have omissions or unsupported explanatory
+connections. These small audits do not establish broad model-quality
+equivalence or statistical noninferiority.
 
 Use `--moe-collect-stats` and `--moe-step-timing` only for diagnostic runs.
 Functional HOT histories, session-prefetch observations, and the WILLNEED
 fault guard still run when diagnostics are off. The selected-union host
 readback is required transport work. Optional `/proc` I/O snapshots run
-outside the client timer. Qualify performance with complete responses,
+outside the client timer when the new `--phase-io` diagnostic is off, as it
+is in both sustained gates. That diagnostic adds a snapshot at first text,
+labels its rows, and includes observation cost in wall time. Functional
+staging timers still drive automatic backoff; the ordinary runtime is not
+free of all timing calls. Qualify performance with complete responses,
 matching placement and token counts, full warmups, and reversed request
 orders. The staged wall measurements precede the final #31 cherry-pick;
 the combined comparison includes it. No independent throughput percentage
@@ -240,40 +314,26 @@ is claimed for that gate.
 
 ## Next performance gate
 
-Keep CPU DISK prefill as the default and use staged execution as an opt-in
-for the measured long-prefill workloads. The next larger opportunity is
-protecting useful decode residency while reducing prefill's storage traffic.
-The [direct-only staging experiment](direct-prefill-io.md#whole-response-result-direct-only-reads-do-not-qualify)
-is now measured: JSON takes 4.8% longer, while prose averages 3.3% shorter
-with only one of four pairs faster in each workload. Worker storage reads
-increase from about 5-6 GiB to about 27 GiB per response. The fixed mix is
-1.3% slower overall, so the reader remains an experimental comparison point.
+Keep CPU DISK prefill as the serving default while broader qualification
+remains open. For the measured sustained workload, the preferred opt-in is
+`--moe-disk-prefill staged --moe-disk-prefill-io buffered`. The cache-aware
+reader's short 18.3% gain failed to carry into sustained use. The
+[direct-only negative control](direct-prefill-io.md#whole-response-result-direct-only-reads-do-not-qualify)
+was also slower overall and increased worker storage reads to about 27 GiB
+per response. These results favor preserving useful RAM residency over
+unconditional cache bypass on this machine.
 
-The cache-aware follow-up now retains useful RAM hits and uses direct reads
-for the remaining selected rows. Its four-start buffered/cached/cached/buffered
-gate at `25cdbff` reduces JSON response time from 29.872 to 23.894 seconds
-(20.0%) and prose from 22.587 to 18.956 seconds (16.1%). The fixed eight-request
-mix falls from 209.835 to 171.400 seconds, 18.3% shorter, with all eight pairs
-faster. The first matched start pair improves by 11.4%, the reversed pair by
-24.1%. Diagnostics and GPU timing are off; residency inspection is included
-in client wall time. Mean first-token time falls from about 9.8 to 6.2 seconds.
-
-All twelve JSON responses pass strict checks and finish normally. All four
-measured JSON pairs have identical text, all eight pairs have identical usage,
-and all four starts retain the same 7/8 fidelity score and answers. Prose
-differs and remains unscored. The
-[complete record](../bench/results/4090-cached-io-wall-20260905.json) retains
-the measured source and raw evidence. The original service is restored and
-verified with a real completion.
-
-This isolates the reader against buffered staging. The latest combined
-comparison above separately measures a 37.0% reduction against the original
-CPU server; these percentages cannot be added. The next gate is sustained
-adaptation with retained serving state. The source-selection option remains experimental
-and is selected with `--moe-disk-prefill staged --moe-disk-prefill-io cached`.
-A nonblocking buffered read is insufficient
-proof of avoiding cache insertion on this kernel; the direct-reader document
-records the source review and constraints on residency hints.
+The next comparison isolates buffered file reads into existing HOT staging
+rows, using the frozen, validated `878d723` runtime for both modes. It keeps
+buffered GPU DISK prefill, cache geometry, native binaries, automatic HOT
+adaptation settings, and every routed contribution unchanged. Four starts
+use mmap/buffered/buffered/mmap HOT staging order, each with four warmups,
+twelve measured complete responses, and eight fidelity cases. Diagnostics
+and GPU timing are off. The
+[#35 protocol](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-hot-staging-io/docs/hot-staging-io.md)
+requires both matched orders, source-balanced halves, output checks, and
+reference-based prose review before claiming a response wall-time gain.
+Faster host staging alone is insufficient.
 
 The tested automatic decode-history preference was reverted: it improved
 JSON by 26.8% but slowed prose by 8.6%. That experiment changed only placement
