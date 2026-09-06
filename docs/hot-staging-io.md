@@ -84,3 +84,22 @@ The driver and recovery script pass syntax checks. The
 passes with identical frozen revisions and native binaries, buffered GPU
 DISK prefill, and diagnostic stats disabled. Its driver SHA-256 matches the
 committed script. Preflight does not measure model performance.
+
+The tested reader also changes implicit readahead behavior. `HostBank`
+requests `MADV_RANDOM` for ordinary-file mappings, whereas `HotRowFileReader`
+at `878d723` opens ordinary descriptors without `posix_fadvise`. Linux 6.8
+stores [madvise random behavior in VMA flags](https://github.com/torvalds/linux/blob/v6.8/mm/madvise.c#L984),
+which the [mmap fault path](https://github.com/torvalds/linux/blob/v6.8/mm/filemap.c#L2908)
+uses to suppress ordinary synchronous and asynchronous readahead. A new
+descriptor does not inherit that mapping flag.
+
+By contrast, [`POSIX_FADV_RANDOM`](https://github.com/torvalds/linux/blob/v6.8/mm/fadvise.c#L80)
+sets state on the open file. Its
+[synchronous read path](https://github.com/torvalds/linux/blob/v6.8/mm/readahead.c#L633)
+uses forced reads for the requested range instead of normal readahead
+prediction. This is not a cache-insertion ban or proof of zero extra I/O.
+The distinction is a candidate explanation to investigate if the buffered
+HOT reader loses. Whole-worker counters cannot establish readahead as the
+cause, and the frozen wall-time experiment does not contain an advice change.
+Any follow-up must preserve the same bytes and validate complete response
+wall time with diagnostics off.
