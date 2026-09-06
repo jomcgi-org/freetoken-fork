@@ -11,7 +11,8 @@ _ACTIVE = None
 
 
 class SeedCheckpoint:
-    def __init__(self, views, *, gdn_sources, ple_layers, qsa_layers, width=2):
+    def __init__(self, views, *, gdn_sources, ple_layers, qsa_layers, width=2,
+                 retain_recurrent=True):
         import torch
 
         required = {"conv", "recurrent", "slot/ple_conv", "slot/ple_ngram_ctx", "qsa_pending"}
@@ -21,7 +22,8 @@ class SeedCheckpoint:
             raise ValueError("checkpoint width must be two, three or five")
         self.width = width
         self.views = views
-        self.prefixes = [{name: torch.empty_like(value) for name, value in views.items()}
+        self.prefixes = [{name: torch.empty_like(value) for name, value in views.items()
+                          if retain_recurrent or name != "recurrent"}
                          for _ in range(width - 1)]
         self.saved = self.prefixes[0]
         self.gdn_sources, self.ple_layers, self.qsa_layers = gdn_sources, ple_layers, qsa_layers
@@ -57,7 +59,7 @@ class SeedCheckpoint:
         self.counts[key] = count + 1
         return count
 
-    def capture_gdn(self, state_source):
+    def capture_gdn(self, state_source, *, args=None, kwargs=None, update=None):
         index = self.gdn_sources[state_source.data_ptr()]
         step = self._visit("gdn", index)
         if step < self.width - 1:
@@ -104,6 +106,10 @@ class SeedCheckpoint:
         for name, value in self.views.items():
             value.copy_(self.prefixes[prefix_len - 1][name])
 
+    def owned_tensor_bytes(self):
+        return sum(value.numel() * value.element_size()
+                   for prefix in self.prefixes for value in prefix.values())
+
 
 @contextmanager
 def capture_context(checkpoint):
@@ -142,7 +148,7 @@ def install():
     def recurrent(*args, **kwargs):
         result = original_gdn(*args, **kwargs)
         if _ACTIVE is not None:
-            _ACTIVE.capture_gdn(kwargs["state_source"])
+            _ACTIVE.capture_gdn(kwargs["state_source"], args=args, kwargs=kwargs, update=original_gdn)
         return result
 
     def conv(layer, x, meta, states):

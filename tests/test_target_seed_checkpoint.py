@@ -148,7 +148,7 @@ def test_hooks_preserve_outputs_and_only_capture_inside_explicit_context(monkeyp
     network = fake_model.Qwen4ExpModel()
     assert network.forward(token_ids, batch) is output
     assert calls == []
-    cp = SimpleNamespace(**{name: (lambda *a, name=name: calls.append((name, a)))
+    cp = SimpleNamespace(**{name: (lambda *a, name=name, **kw: calls.append((name, a)))
                             for name in ("begin", "finish", "capture_gdn", "capture_ple",
                                          "capture_qsa", "capture_ngram")})
     cp.width = 2

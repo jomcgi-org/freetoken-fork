@@ -21,12 +21,14 @@ TRACE_ENV = "FREETOKEN_TARGET_VERIFY_LAYER_TRACE"
 SERIAL_LINEAR_ENV = "FREETOKEN_TARGET_VERIFY_SERIAL_LINEAR"
 CHECKPOINT_ENV = "FREETOKEN_TARGET_VERIFY_SEED_CHECKPOINT"
 WIDTH_ENV = "FREETOKEN_TARGET_VERIFY_WIDTH"
+COMPACT_ENV = "FREETOKEN_TARGET_VERIFY_COMPACT_ROLLBACK"
 MODES = ("graph_one", "graph_two", "snapshot", "accept", "reject")
 GRAPH_MODES = ("accept_graph", "reject_graph")
 CHECKPOINT_MODES = ("accept_checkpoint", "reject_checkpoint")
 _ACTIVATIONS = {}
 _CHECKPOINT_API = None
 _MULTI_API = None
+_COMPACT_API = None
 
 
 def verification_width():
@@ -735,7 +737,7 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
 
 def install(engine_class):
     """Provision the diagnostic before Engine initializes CUDA; no draft head."""
-    global _CHECKPOINT_API, _MULTI_API
+    global _CHECKPOINT_API, _MULTI_API, _COMPACT_API
     import torch
     from freetoken.kvcache.qsa_pool import QSAKVCache
     from freetoken.moe.cpu_executor import CpuMoeExecutor
@@ -745,6 +747,8 @@ def install(engine_class):
     if torch.cuda.is_initialized():
         raise RuntimeError("install the probe before Engine initializes CUDA")
     width = verification_width()
+    if os.environ.get(COMPACT_ENV) == "1" and width == 2:
+        raise RuntimeError("compact rollback comparison requires a wider target graph")
     if width > 2 and (os.environ.get(GRAPH_ENV) != "1" or os.environ.get(SERIAL_LINEAR_ENV) != "1"
                       or os.environ.get(CHECKPOINT_ENV) != "1" or os.environ.get(TRACE_ENV) == "1"):
         raise RuntimeError("wider verification requires graphs, serial linears and checkpoints, with tracing off")
@@ -767,6 +771,10 @@ def install(engine_class):
         import runpy
         _MULTI_API = runpy.run_path(str(Path(__file__).with_name("target_multitoken.py")))
         _MULTI_API["install"](width)
+    if os.environ.get(COMPACT_ENV) == "1":
+        import runpy
+        _COMPACT_API = runpy.run_path(str(Path(__file__).with_name("target_compact_rollback.py")))
+        _COMPACT_API["Checkpoint"] = _COMPACT_API["make_checkpoint_type"](_CHECKPOINT_API["SeedCheckpoint"])
     directory = Path(os.environ[OUTPUT_ENV])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     original_cpu_init = CpuMoeExecutor.__init__

@@ -12,11 +12,13 @@ def eligible_window(position, page_size, width, remaining):
     return remaining >= width + 3 and position // page_size == (position + width + 2) // page_size
 
 
-def modes(width):
-    return ("graph_one", "graph_all", "accept") + tuple(f"reject_{i}" for i in range(width - 1))
+def modes(width, compact_enabled=False):
+    outcomes = ("accept",) + tuple(f"reject_{i}" for i in range(width - 1))
+    return (("graph_one", "graph_all") + outcomes
+            + (tuple("compact_" + name for name in outcomes) if compact_enabled else ()))
 
 
-def summarize(records, width):
+def summarize(records, width, compact_enabled=False):
     cases = {}
     for row in records:
         cases.setdefault(row["case"], []).append(row)
@@ -27,13 +29,28 @@ def summarize(records, width):
             if not row["warmup"]:
                 values.setdefault(row["mode"], []).append(row["wall_s"])
         medians = {name: statistics.median(costs) for name, costs in values.items()}
-        valid = set(values) == set(modes(width)) and all(row["checks_passed"] for row in rows)
+        valid = set(values) == set(modes(width, compact_enabled)) and all(row["checks_passed"] for row in rows)
         result[case] = dict(checks_passed=valid, median_component_s=medians,
                             model_wall_qualified=False)
         if valid:
             result[case]["component_cost_over_one"] = {
                 name: cost / medians["graph_one"] for name, cost in medians.items()}
     return result
+
+
+def numerical_failures(value, path=""):
+    if not isinstance(value, dict):
+        return []
+    if "exact" in value:
+        return [] if value["exact"] else [path]
+    errors = []
+    for name, child in value.items():
+        child_path = path + "/" + name
+        if name.endswith("tokens_equal") and not child:
+            errors.append(child_path)
+        else:
+            errors.extend(numerical_failures(child, child_path))
+    return errors
 
 
 def configure_fused(batch, ids, positions, locations, width):
@@ -114,7 +131,7 @@ def install(width):
 
 
 def run_window(engine, source, position, seed, host_prefix, *, width, base, seed_api,
-               report, directory, repeats, warmup):
+               report, directory, repeats, warmup, compact_type=None):
     import torch
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.core import Batch
@@ -136,8 +153,10 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
     host_seed = seed.cpu().reshape(1).to(host_prefix.dtype)
     req.input_ids = torch.cat((host_prefix, host_seed.repeat(width)))
     graph = None
+    compact_graph = None
+    compact_checkpoint = None
 
-    def forward(step=None, *, captured=False, with_logits=False):
+    def forward(step=None, *, captured=False, with_logits=False, compact=False):
         if step is None:
             configure_fused(batch, ids, positions, window.locations, width)
             batch.active_table_idx = fused_rows
@@ -149,9 +168,10 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
         engine.cpu_moe_executor.begin_decode_step()
         with engine.ctx.forward_batch(batch):
             if captured:
-                if graph is None or step is not None:
+                selected_graph = compact_graph if compact else graph
+                if selected_graph is None or step is not None:
                     raise RuntimeError("verification graph is unavailable")
-                logits = graph.replay(batch)
+                logits = selected_graph.replay(batch)
             elif step is None:
                 logits = engine.model.forward(select_last=False)
             else:
@@ -200,31 +220,59 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
                   prefix_state={str(length): {name: metrics(value, states[length - 1][name])
                                              for name, value in prefix.items()}
                                 for length, prefix in enumerate(checkpoint.prefixes, 1)})
-    errors = []
-    for name, value in checks.items():
-        if name.endswith("tokens_equal"):
-            if not value:
-                errors.append(name)
-        elif name.endswith("logits"):
-            if not value["exact"]:
-                errors.append(name)
-        elif name == "prefix_state":
-            errors += ["prefix/" + length + "/" + key for length, entries in value.items()
-                       for key, metric in entries.items() if not metric["exact"]]
-        else:
-            errors += [name + "/" + key for key, metric in value.items() if not metric["exact"]]
+    if compact_type is not None:
+        report["stage"] = "capturing compact target and rollback graphs at " + case
+        base["save"](directory, report)
+        window.reset(initial)
+        engine.stream.synchronize()
+        def allocator_state():
+            return dict(allocated_bytes=torch.cuda.memory_allocated(engine.device),
+                        reserved_bytes=torch.cuda.memory_reserved(engine.device))
+
+        allocator = dict(before_compact=allocator_state())
+        compact_checkpoint = compact_type.from_engine(
+            engine, req, base["state_views"](engine, req), width=width)
+        with seed_api["capture_context"](compact_checkpoint):
+            compact_graph = base["FusedGraph"](engine, batch)
+        allocator["after_compact_target"] = allocator_state()
+        compact_checkpoint.capture_restore_graphs(engine.stream)
+        allocator["after_rollback_graphs"] = allocator_state()
+        window.reset(initial)
+        compact_tokens, compact_logits = forward(captured=True, compact=True, with_logits=True)
+        compact_checks = dict(tokens_equal=equal(compact_tokens, reference_tokens),
+                              logits=metrics(compact_logits, reference_logits),
+                              state=window.metrics(states[-1], committed_end=position + width),
+                              restored_prefix_state={})
+        for length in range(1, width):
+            compact_checkpoint.restore(length)
+            # Compare all state, including reconstructed recurrence, not only
+            # the smaller tensors physically retained in compact.prefixes.
+            compact_checks["restored_prefix_state"][str(length)] = window.metrics(
+                states[length - 1], committed_end=position + length)
+        checks["compact"] = compact_checks
+        report.setdefault("checkpoint_storage", {})[case] = dict(
+            full_tensor_bytes=checkpoint.owned_tensor_bytes(),
+            compact_tensor_bytes=compact_checkpoint.owned_tensor_bytes(),
+            rollback_graphs=len(compact_checkpoint.restore_graphs),
+            excludes_graph_pool_allocations=True,
+            process_allocator_snapshots=allocator)
+    errors = numerical_failures(checks)
     report["stage"] = "measuring wider checkpoint graph at " + case
     base["save"](directory, report)
 
     for repeat in range(-warmup, repeats):
-        order = modes(width) if repeat % 2 == 0 else tuple(reversed(modes(width)))
+        candidates = modes(width, compact_type is not None)
+        order = candidates if repeat % 2 == 0 else tuple(reversed(candidates))
         for mode in order:
+            is_compact = mode.startswith("compact_")
+            outcome = mode.removeprefix("compact_")
+            selected_checkpoint = compact_checkpoint if is_compact else checkpoint
             window.reset(initial)
             ids.copy_(good_ids)
             req.input_ids.copy_(good_history)
             expected_match = width - 1
-            if mode.startswith("reject_"):
-                expected_match = int(mode.split("_")[1])
+            if outcome.startswith("reject_"):
+                expected_match = int(outcome.split("_")[1])
                 wrong = (int(good_ids[expected_match + 1].item()) + 1) % engine.config.model_config.vocab_size
                 ids[expected_match + 1] = wrong
                 req.input_ids[position + expected_match + 1] = wrong
@@ -232,31 +280,36 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
             import time
             started = time.perf_counter()
             matched = None
-            if mode == "graph_one":
+            if outcome == "graph_one":
                 output = forward(0)
                 count = 1
-            elif mode == "graph_all":
+            elif outcome == "graph_all":
                 output = torch.cat([forward(step) for step in range(width)])
                 count = width
             else:
-                target = forward(captured=True)
+                target = forward(captured=True, compact=is_compact)
                 output, matched = greedy_accept_prefix(ids[1:], target)
                 count = matched + 1
                 if matched < width - 1:
-                    checkpoint.restore(count)
+                    selected_checkpoint.restore(count)
             engine.stream.synchronize()
             elapsed = time.perf_counter() - started
             mismatches = list(errors)
             if not equal(output, reference_tokens[:count]):
                 mismatches.append("output_tokens")
             mismatches += window.compare(states[count - 1], committed_end=position + count)
-            if mode not in ("graph_one", "graph_all"):
+            if outcome not in ("graph_one", "graph_all"):
                 if matched != expected_match:
                     mismatches.append("accepted_prefix_length")
                 for length in range(1, min(count, width - 1) + 1):
-                    mismatches += [f"prefix/{length}/" + name
-                                   for name, value in checkpoint.prefixes[length - 1].items()
-                                   if not equal(value, states[length - 1][name])]
+                    if is_compact:
+                        selected_checkpoint.restore(length)
+                        mismatches += [f"restored_prefix/{length}/" + name for name in
+                                       window.compare(states[length - 1], committed_end=position + length)]
+                    else:
+                        mismatches += [f"prefix/{length}/" + name
+                                       for name, value in checkpoint.prefixes[length - 1].items()
+                                       if not equal(value, states[length - 1][name])]
                 if count < width:
                     ids.copy_(good_ids)
                     req.input_ids.copy_(good_history)
@@ -272,6 +325,9 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
     window.reset(states[0])
     engine.stream.synchronize()
     graph.close()
+    if compact_graph is not None:
+        compact_graph.close()
+        compact_checkpoint.close(engine.stream)
     return tokens[0], torch.cat((host_prefix, host_seed))
 
 
@@ -282,9 +338,11 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
     from freetoken.kernel import _cpu_moe
 
     root = Path(__file__).resolve().parents[1]
+    compact_type = base["_COMPACT_API"]["Checkpoint"] if base["_COMPACT_API"] else None
     report = dict(completed=False, diagnostic_only=True, model_wall_qualified=False,
                   width=width, draft_tokens=width - 1, graph_enabled=True, trace_only=False,
                   checkpoint_enabled=True, serial_linear=True, records=[],
+                  compact_enabled=compact_type is not None,
                   cpu_max_tokens=engine.cpu_moe_executor.max_tokens,
                   ring_capacity=engine.kv_cache.ring_capacity,
                   native_sha256=hashlib.sha256(Path(_cpu_moe.__file__).read_bytes()).hexdigest(),
@@ -307,8 +365,9 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
         for offset in range(4):
             seed, prefix = run_window(engine, batch, position + offset, seed, prefix,
                                       width=width, base=base, seed_api=seed_api, report=report,
-                                      directory=directory, repeats=repeats, warmup=warmup)
-        report["summary"] = summarize(report["records"], width)
+                                      directory=directory, repeats=repeats, warmup=warmup,
+                                      compact_type=compact_type)
+        report["summary"] = summarize(report["records"], width, compact_type is not None)
         report["checks_passed"] = all(row["checks_passed"] for row in report["records"])
         report["completed"] = True
     except BaseException as exc:
