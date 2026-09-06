@@ -293,6 +293,12 @@ float dot_nvfp4_scalar(const uint8_t* packed, const uint8_t* scale, float global
 using nvi8dot_fn = float (*)(const uint8_t*, const uint8_t*, float, const int8_t*, int,
                              const float*, const float*);
 
+// Small decode groups use existing, potentially noncontiguous activation rows.
+// No repacking or extra activation quantization is required.
+using nvi8decode_fn = void (*)(float*, const uint8_t*, const uint8_t*, float,
+                               const int8_t* const*, int, int, const float*,
+                               const float* const*);
+
 // Row-batched W4A8 entry point. ``acts`` contains M quantized activation rows and
 // ``act_scales`` contains their per-16 scales. The weight block is decoded once,
 // then reused across every row before the kernel advances through the packed
@@ -720,6 +726,99 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
     s += (e4m3[scale[b]] * asb[b]) * (float)isum;
   }
   return s * (0.5f * global);
+}
+
+// Decode keeps the serial kernel's four accumulator chains and final global
+// multiplication. The prefill batch kernel below has a different reduction order
+// and cannot be used as a bit-exact replacement for persistent decode tasks.
+template <int M>
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+static inline void nvfp4_i8_decode_group4(
+    __m512* accum, const uint8_t* packed, const uint8_t* scale,
+    const int8_t* const* acts, const float* e4m3, const float* const* scales,
+    int b, __m512i lut, __m512i idx, __m512i mask0F, __m512i idxsc) {
+  const __m256i raw = _mm256_loadu_si256(
+      reinterpret_cast<const __m256i*>(packed + static_cast<size_t>(b) * 8));
+  const __m512i src = _mm512_permutexvar_epi64(idx, _mm512_castsi256_si512(raw));
+  const __m512i lo = _mm512_and_si512(src, mask0F);
+  const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(src, 4), mask0F);
+  const __m512i w = _mm512_shuffle_epi8(
+      lut, _mm512_mask_blend_epi8(0xFF00FF00FF00FF00ULL, lo, hi));
+  const __m512i aw = _mm512_abs_epi8(w);
+  const __mmask64 neg = _mm512_movepi8_mask(w);
+  int sc_raw;
+  memcpy(&sc_raw, scale + b, 4);
+  const __m128i sc4 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(sc_raw));
+  const __m128 ws = _mm_i32gather_ps(e4m3, sc4, 4);
+  for (int m = 0; m < M; ++m) {
+    const __m512i a = _mm512_loadu_si512(
+        reinterpret_cast<const __m512i*>(acts[m] + static_cast<size_t>(b) * 16));
+    const __m512i sa = _mm512_mask_sub_epi8(a, neg, _mm512_setzero_si512(), a);
+    const __m512i di = _mm512_dpbusd_epi32(_mm512_setzero_si512(), aw, sa);
+    const __m128 s4 = _mm_mul_ps(ws, _mm_loadu_ps(scales[m] + b));
+    const __m512 scv = _mm512_permutexvar_ps(idxsc, _mm512_castps128_ps512(s4));
+    accum[m] = _mm512_add_ps(accum[m], _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv));
+  }
+}
+
+template <int M>
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+static void dot_nvfp4_i8_decode_group(
+    float* out, const uint8_t* packed, const uint8_t* scale, float global,
+    const int8_t* const* acts, int K, const float* e4m3, const float* const* scales) {
+  const __m512i lut = _mm512_broadcast_i32x4(
+      _mm_loadu_si128(reinterpret_cast<const __m128i*>(kE2M1x2)));
+  const __m512i idx = _mm512_set_epi64(3, 3, 2, 2, 1, 1, 0, 0);
+  const __m512i mask0F = _mm512_set1_epi8(0x0F);
+  const __m512i idxsc = _mm512_set_epi32(3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0);
+  __m512 acc0[M], acc1[M], acc2[M], acc3[M];
+  for (int m = 0; m < M; ++m)
+    acc0[m] = acc1[m] = acc2[m] = acc3[m] = _mm512_setzero_ps();
+  const int nb = K / 16;
+  const int pfb = nvfp4_pf_blocks();
+  const int pf = pfb < 0 ? std::min(512, 2 * nb) : pfb;
+  int b = 0;
+  for (; b + 16 <= nb; b += 16) {
+    if (pf > 0) {
+      _mm_prefetch(reinterpret_cast<const char*>(packed + (static_cast<size_t>(b) + pf) * 8), _MM_HINT_T0);
+      _mm_prefetch(reinterpret_cast<const char*>(packed + (static_cast<size_t>(b) + pf) * 8 + 64), _MM_HINT_T0);
+    }
+    nvfp4_i8_decode_group4<M>(acc0, packed, scale, acts, e4m3, scales, b, lut, idx, mask0F, idxsc);
+    nvfp4_i8_decode_group4<M>(acc1, packed, scale, acts, e4m3, scales, b + 4, lut, idx, mask0F, idxsc);
+    nvfp4_i8_decode_group4<M>(acc2, packed, scale, acts, e4m3, scales, b + 8, lut, idx, mask0F, idxsc);
+    nvfp4_i8_decode_group4<M>(acc3, packed, scale, acts, e4m3, scales, b + 12, lut, idx, mask0F, idxsc);
+  }
+  for (; b + 4 <= nb; b += 4)
+    nvfp4_i8_decode_group4<M>(acc0, packed, scale, acts, e4m3, scales, b, lut, idx, mask0F, idxsc);
+  for (int m = 0; m < M; ++m) {
+    float sum = _mm512_reduce_add_ps(
+        _mm512_add_ps(_mm512_add_ps(acc0[m], acc1[m]), _mm512_add_ps(acc2[m], acc3[m])));
+    for (int tail = b; tail < nb; ++tail) {
+      const uint8_t* pk = packed + static_cast<size_t>(tail) * 8;
+      const int8_t* ae = acts[m] + static_cast<size_t>(tail) * 16;
+      const int8_t* ao = ae + 8;
+      int isum = 0;
+      for (int j = 0; j < 8; ++j)
+        isum += static_cast<int>(kE2M1x2[pk[j] & 0xF]) * ae[j] +
+                static_cast<int>(kE2M1x2[pk[j] >> 4]) * ao[j];
+      sum += (e4m3[scale[tail]] * scales[m][tail]) * static_cast<float>(isum);
+    }
+    out[m] = sum * (0.5f * global);
+  }
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vnni,avx2")))
+void dot_nvfp4_i8_decode_dispatch(
+    float* out, const uint8_t* packed, const uint8_t* scale, float global,
+    const int8_t* const* acts, int M, int K, const float* e4m3, const float* const* scales) {
+  switch (M) {
+    case 2: return dot_nvfp4_i8_decode_group<2>(out, packed, scale, global, acts, K, e4m3, scales);
+    case 3: return dot_nvfp4_i8_decode_group<3>(out, packed, scale, global, acts, K, e4m3, scales);
+    case 4: return dot_nvfp4_i8_decode_group<4>(out, packed, scale, global, acts, K, e4m3, scales);
+    default:
+      for (int m = 0; m < M; ++m)
+        out[m] = dot_nvfp4_i8_avx512vnni(packed, scale, global, acts[m], K, e4m3, scales[m]);
+  }
 }
 
 // AVX-512 counterpart of the expert-prefill kernel. Keep the decoded weight group
@@ -1652,6 +1751,9 @@ struct CpuMoeExecutor {
   dot_fn dot;
   nvdot_fn nvdot;
   nvi8dot_fn nvi8dot = nullptr;  // AVX-VNNI W4A8 nvfp4 dot (nullptr -> use fp32 nvdot)
+  nvi8decode_fn nvi8decode = nullptr;
+  std::atomic<bool> decode_weight_reuse{false};
+  bool decode_weight_reuse_active = false;  // submit-time snapshot, read by workers
   nvi8batch_rows_fn nvi8batch_rows = nullptr;  // R_w weight rows x M activations
   const char* nvi8batch_name = "scalar";
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
@@ -1828,6 +1930,11 @@ struct CpuMoeExecutor {
     const Nvi8Dispatch nvi8_dispatch = select_nvi8_dispatch(nvi8_tier);
     nvi8batch_rows = nvi8_dispatch.batch_rows;
     nvi8batch_name = nvi8_dispatch.batch_name;
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+    if (nvi8_tier == NVI8_AVX512VNNI) nvi8decode = dot_nvfp4_i8_decode_dispatch;
+#endif
+    const char* decode_reuse_env = getenv("FREETOKEN_CPU_MOE_DECODE_WEIGHT_REUSE");
+    decode_weight_reuse.store(decode_reuse_env && std::strcmp(decode_reuse_env, "1") == 0);
     dsdot = select_dsdot();
     mxgemv = select_mxgemv();
     q4dot = select_q4dot();
@@ -2426,10 +2533,83 @@ struct CpuMoeExecutor {
   // writes independent fp32 route outputs, then pass 3 weights and sums them in the
   // token's original top-k order, preserving the old deterministic reduction.
 
+  void do_pass1_nvfp4_reuse(const MoeTask* t, int e, int ib) {
+    const uint8_t* packed = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const uint8_t* scales = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    const uint16_t* globals = reinterpret_cast<const uint16_t*>(tbl_at(gu_global_tbl, t->layer_id));
+    const int i0 = ib * IBLK, i1 = std::min(I, i0 + IBLK);
+    const bool swigluoai = act == ACT_SWIGLUOAI;
+    const bool clamped_silu = act == ACT_CLAMPED_SILU;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
+    for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; pos += 4) {
+      const int count = std::min(4, expert_offsets[e + 1] - pos);
+      const int8_t* inputs[4];
+      const float* input_scales[4];
+      for (int m = 0; m < count; ++m) {
+        const int token = grouped_routes[pos + m] / top_k;
+        inputs[m] = xi8_scratch.data() + static_cast<size_t>(token) * H;
+        input_scales[m] = xas_scratch.data() + static_cast<size_t>(token) * (H / 16);
+      }
+      for (int i = i0; i < i1; ++i) {
+        float gates[4], ups[4];
+        const size_t gr = static_cast<size_t>(e) * (2 * I) + i;
+        const size_t ur = gr + I;
+        nvi8decode(gates, packed + gr * (H / 2), scales + gr * (H / 16),
+                    fp16_to_f32(globals[gr]), inputs, count, H, e4m3_lut, input_scales);
+        nvi8decode(ups, packed + ur * (H / 2), scales + ur * (H / 16),
+                    fp16_to_f32(globals[ur]), inputs, count, H, e4m3_lut, input_scales);
+        for (int m = 0; m < count; ++m) {
+          const int route = grouped_routes[pos + m];
+          const float w_in = apply_on_input ? t->w[route] : 1.0f;
+          float gate = gates[m] * w_in, up = ups[m] * w_in;
+          bf16_t* g_row = g_scratch.data() + static_cast<size_t>(route) * I;
+          if (swigluoai || clamped_silu) {
+            if (gate > lim) gate = lim;
+            if (up > lim) up = lim;
+            else if (up < -lim) up = -lim;
+            const float glu = gate / (1.0f + std::exp(-gate * (swigluoai ? alpha : 1.0f)));
+            g_row[i] = f32_to_bf16(glu * (swigluoai ? up + 1.0f : up));
+          } else {
+            g_row[i] = f32_to_bf16(act_apply(act, gate) * up);
+          }
+        }
+      }
+    }
+  }
+
+  void do_pass2_nvfp4_reuse(const MoeTask* t, int e, int hb) {
+    const uint8_t* packed = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    const uint8_t* scales = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+    const uint16_t* globals = reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
+    const int h0 = hb * HBLK, h1 = std::min(H, h0 + HBLK);
+    for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; pos += 4) {
+      const int count = std::min(4, expert_offsets[e + 1] - pos);
+      const int8_t* inputs[4];
+      const float* input_scales[4];
+      for (int m = 0; m < count; ++m) {
+        const int route = grouped_routes[pos + m];
+        inputs[m] = gi8_scratch.data() + static_cast<size_t>(route) * I;
+        input_scales[m] = gas_scratch.data() + static_cast<size_t>(route) * (I / 16);
+      }
+      for (int h = h0; h < h1; ++h) {
+        float outputs[4];
+        const size_t row = static_cast<size_t>(e) * H + h;
+        nvi8decode(outputs, packed + row * (I / 2), scales + row * (I / 16),
+                    fp16_to_f32(globals[row]), inputs, count, I, e4m3_lut, input_scales);
+        for (int m = 0; m < count; ++m)
+          route_y_scratch[static_cast<size_t>(grouped_routes[pos + m]) * H + h] = outputs[m];
+      }
+    }
+  }
+
   void do_pass1_grouped(const MoeTask* t, int64_t p) {
     const int ib = static_cast<int>(p % n_iblk);
     const int di = static_cast<int>(p / n_iblk);
     const int e = distinct_experts[di];
+    if (decode_weight_reuse_active && expert_offsets[e + 1] - expert_offsets[e] > 1) {
+      do_pass1_nvfp4_reuse(t, e, ib);
+      return;
+    }
     for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; ++pos)
       do_pass1_route(t, grouped_routes[pos], ib);
   }
@@ -2501,6 +2681,10 @@ struct CpuMoeExecutor {
     const int hb = static_cast<int>(p % n_hblk);
     const int di = static_cast<int>(p / n_hblk);
     const int e = distinct_experts[di];
+    if (decode_weight_reuse_active && expert_offsets[e + 1] - expert_offsets[e] > 1) {
+      do_pass2_nvfp4_reuse(t, e, hb);
+      return;
+    }
     for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; ++pos)
       do_pass2_grouped_route(t, grouped_routes[pos], e, hb);
   }
@@ -2966,6 +3150,8 @@ struct CpuMoeExecutor {
   void submit(MoeTask* t, bool run_pre_callback = true,
               bool coordinator_submission = false) {
     t->empty_step = false;
+    decode_weight_reuse_active = t->group_routes && !t->prefill_batch &&
+        decode_weight_reuse_available() && decode_weight_reuse.load(std::memory_order_relaxed);
     // Persistent group_routes tasks are decode tasks. Prefill remains outside the
     // per-step snapshot even when diagnostics are enabled.
     const bool time_task = t->group_routes &&
@@ -3411,6 +3597,15 @@ struct CpuMoeExecutor {
     prefill_input_reuse.store(enabled, std::memory_order_relaxed);
   }
 
+  bool decode_weight_reuse_available() const {
+    return fmt == WF_NVFP4 && use_vnni && nvi8decode != nullptr;
+  }
+
+  void set_decode_weight_reuse(bool enabled) {
+    // submit() snapshots the setting before waking any worker for this task.
+    decode_weight_reuse.store(enabled, std::memory_order_relaxed);
+  }
+
   void gpufetch_with_cuda_stream(uintptr_t stream, uintptr_t task) {
     cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream),
                        &CpuMoeExecutor::gpufetch_cb,
@@ -3487,6 +3682,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("prefill_batch_buffer_bytes", &CpuMoeExecutor::prefill_batch_buffer_bytes)
       .def("set_prefill_input_reuse", &CpuMoeExecutor::set_prefill_input_reuse,
            py::arg("enabled"))
+      .def("set_decode_weight_reuse", &CpuMoeExecutor::set_decode_weight_reuse,
+           py::arg("enabled"))
+      .def("decode_weight_reuse_available", &CpuMoeExecutor::decode_weight_reuse_available)
       .def("run_prefill_batch_sync", &CpuMoeExecutor::run_prefill_batch_sync,
            py::arg("layer_id"), py::arg("num_tokens"), py::arg("x_ptr"),
            py::arg("ids_ptr"), py::arg("w_ptr"), py::arg("y_ptr"),
@@ -3568,6 +3766,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           return std::string(d.batch_name);
         },
         py::arg("rows_out_ptr"), py::arg("singles_out_ptr"),
+        py::arg("packed_ptr"), py::arg("scale_ptr"), py::arg("globals_ptr"),
+        py::arg("acts_ptr"), py::arg("act_scales_ptr"), py::arg("rows"),
+        py::arg("activation_rows"), py::arg("hidden_size"));
+  // FP32 parity seam uses reversed activation rows to exercise pointer indexing.
+  // This compares against the decode GEMV, not the differently ordered prefill kernel.
+  m.def("run_decode_weight_reuse_parity",
+        [](uintptr_t grouped_out_ptr, uintptr_t singles_out_ptr,
+           uintptr_t packed_ptr, uintptr_t scale_ptr, uintptr_t globals_ptr,
+           uintptr_t acts_ptr, uintptr_t act_scales_ptr, int R, int M, int K) {
+          if (R <= 0 || M < 1 || M > 4 || K <= 0 || K % 16 != 0)
+            throw std::invalid_argument("decode parity requires positive rows/K, M in [1,4], and K divisible by 16");
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+          if (detect_nvi8_tier() != NVI8_AVX512VNNI)
+            throw std::runtime_error("decode weight reuse requires AVX-512 VNNI");
+          float e4m3[256];
+          for (int i = 0; i < 256; ++i) e4m3[i] = e4m3_decode(static_cast<uint8_t>(i));
+          const uint8_t* packed = reinterpret_cast<const uint8_t*>(packed_ptr);
+          const uint8_t* scales = reinterpret_cast<const uint8_t*>(scale_ptr);
+          const uint16_t* globals = reinterpret_cast<const uint16_t*>(globals_ptr);
+          const int8_t* acts[4];
+          const float* act_scales[4];
+          for (int m = 0; m < M; ++m) {
+            acts[m] = reinterpret_cast<const int8_t*>(acts_ptr) + static_cast<size_t>(M - 1 - m) * K;
+            act_scales[m] = reinterpret_cast<const float*>(act_scales_ptr) + static_cast<size_t>(M - 1 - m) * (K / 16);
+          }
+          float* grouped = reinterpret_cast<float*>(grouped_out_ptr);
+          float* singles = reinterpret_cast<float*>(singles_out_ptr);
+          for (int r = 0; r < R; ++r) {
+            const uint8_t* pk = packed + static_cast<size_t>(r) * (K / 2);
+            const uint8_t* sc = scales + static_cast<size_t>(r) * (K / 16);
+            const float global = fp16_to_f32(globals[r]);
+            dot_nvfp4_i8_decode_dispatch(grouped + static_cast<size_t>(r) * M,
+                                         pk, sc, global, acts, M, K, e4m3, act_scales);
+            for (int m = 0; m < M; ++m)
+              singles[static_cast<size_t>(r) * M + m] =
+                  dot_nvfp4_i8_avx512vnni(pk, sc, global, acts[m], K, e4m3, act_scales[m]);
+          }
+#else
+          throw std::runtime_error("decode weight reuse requires an AVX-512 VNNI build");
+#endif
+        }, py::arg("grouped_out_ptr"), py::arg("singles_out_ptr"),
         py::arg("packed_ptr"), py::arg("scale_ptr"), py::arg("globals_ptr"),
         py::arg("acts_ptr"), py::arg("act_scales_ptr"), py::arg("rows"),
         py::arg("activation_rows"), py::arg("hidden_size"));
