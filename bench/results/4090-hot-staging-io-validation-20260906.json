@@ -1,0 +1,89 @@
+{
+  "report": {
+    "revision": "878d72376220537d158f8c1db5d553e0188e662c",
+    "commands": [
+      {
+        "args": [
+          "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/test_sustained_prefill_client.py"
+        ],
+        "returncode": 0,
+        "wall_s": 0.2137684299959801
+      },
+      {
+        "args": [
+          "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/moe/test_hot_staging_io.py",
+          "tests/moe/test_hot_adapt.py",
+          "tests/moe/test_materialize_hot_slots.py",
+          "tests/moe/test_disk_prefill_policy.py"
+        ],
+        "returncode": 0,
+        "wall_s": 12.130658465001034
+      },
+      {
+        "args": [
+          "/usr/local/cuda-13.0/bin/compute-sanitizer",
+          "--tool",
+          "memcheck",
+          "--target-processes",
+          "all",
+          "--error-exitcode",
+          "99",
+          "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python",
+          "-m",
+          "pytest",
+          "-q",
+          "tests/moe/test_hot_staging_io.py"
+        ],
+        "returncode": 0,
+        "wall_s": 2.918619022006169
+      }
+    ],
+    "checks_passed": true,
+    "original_serving_restoration": {
+      "id": "chatcmpl-0",
+      "object": "chat.completion",
+      "created": 1788653068,
+      "model": "qwen3.6-27b",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "OK"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 2,
+        "total_tokens": 19
+      }
+    }
+  },
+  "final_state": {
+    "timestamp_utc": "2026-09-06T00:09:51.380947+00:00",
+    "validation": {
+      "MainPID": "0",
+      "Result": "success",
+      "ExecMainStatus": "0",
+      "ActiveState": "inactive"
+    },
+    "production": {
+      "MainPID": "725193",
+      "Result": "success",
+      "ExecMainStatus": "0",
+      "ActiveState": "active"
+    }
+  },
+  "log": "COMMAND [\"/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python\", \"-m\", \"pytest\", \"-q\", \"tests/test_sustained_prefill_client.py\"]\n...............                                                          [100%]\n15 passed in 0.03s\nCOMMAND [\"/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python\", \"-m\", \"pytest\", \"-q\", \"tests/moe/test_hot_staging_io.py\", \"tests/moe/test_hot_adapt.py\", \"tests/moe/test_materialize_hot_slots.py\", \"tests/moe/test_disk_prefill_policy.py\"]\n........................................................................ [ 43%]\n........................................................................ [ 87%]\n....................                                                     [100%]\n=============================== warnings summary ===============================\ntests/moe/test_materialize_hot_slots.py::test_staged_hot_reuse_matches_nvfp4_gemm_across_publication[16-published]\n  /var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/lib/python3.12/site-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.\n    from cutlass.base_dsl.arch import Arch\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n164 passed, 1 warning in 11.26s\nCOMMAND [\"/usr/local/cuda-13.0/bin/compute-sanitizer\", \"--tool\", \"memcheck\", \"--target-processes\", \"all\", \"--error-exitcode\", \"99\", \"/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python\", \"-m\", \"pytest\", \"-q\", \"tests/moe/test_hot_staging_io.py\"]\n========= COMPUTE-SANITIZER\n.........................                                                [100%]\n25 passed in 2.27s\n========= ERROR SUMMARY: 0 errors\nPRODUCTION VERIFIED {\"id\": \"chatcmpl-0\", \"object\": \"chat.completion\", \"created\": 1788653068, \"model\": \"qwen3.6-27b\", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": \"OK\"}, \"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\": 17, \"completion_tokens\": 2, \"total_tokens\": 19}}\n",
+  "driver": "import json,os,pathlib,signal,subprocess,time,urllib.error,urllib.request\nR=pathlib.Path('/var/lib/longhorn/nvme-02/freetoken')\nW=R/'wt-astra-hot-staging-io'; S=R/'wt-plegather'; OUT=R/'results/astra-hot-staging-validation.json'\nreport=dict(revision=subprocess.check_output(['git','-C',str(W),'rev-parse','HEAD'],text=True).strip(),commands=[])\nassert report['revision'].startswith('878d723')\nassert not subprocess.check_output(['git','-C',str(W),'status','--porcelain'],text=True).strip()\nassert subprocess.check_output(['systemctl','show','astra-sustained-reader-wall-driver','-p','ActiveState','--value'],text=True).strip()=='inactive'\nenv=dict(os.environ,PYTHONPATH=str(W/'python'),CUDA_HOME='/usr/local/cuda-13.0',PATH=f'{S}/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin',TMPDIR=str(R/'tmp'))\n\ndef save(): OUT.write_text(json.dumps(report,indent=2)+'\\n')\ndef command(args,timeout=600):\n print('COMMAND '+json.dumps(args),flush=True)\n started=time.monotonic()\n p=subprocess.run(args,cwd=W,env=env,timeout=timeout)\n report['commands'].append(dict(args=args,returncode=p.returncode,wall_s=time.monotonic()-started));save()\n if p.returncode: raise RuntimeError(f'validation command failed: {p.returncode}')\ndef interrupted(*args): raise RuntimeError('validation interrupted')\nfor sig in [signal.SIGTERM,signal.SIGHUP,signal.SIGINT]: signal.signal(sig,interrupted)\ntry:\n subprocess.run(['sudo','-n','systemctl','stop','freetoken-serve'],check=True)\n command([str(S/'.venv/bin/python'),'-m','pytest','-q','tests/test_sustained_prefill_client.py'])\n command([str(S/'.venv/bin/python'),'-m','pytest','-q','tests/moe/test_hot_staging_io.py','tests/moe/test_hot_adapt.py','tests/moe/test_materialize_hot_slots.py','tests/moe/test_disk_prefill_policy.py'])\n command(['/usr/local/cuda-13.0/bin/compute-sanitizer','--tool','memcheck','--target-processes','all','--error-exitcode','99',str(S/'.venv/bin/python'),'-m','pytest','-q','tests/moe/test_hot_staging_io.py'])\n report['checks_passed']=True;save()\nfinally:\n subprocess.run(['sudo','-n','systemctl','start','freetoken-serve'],check=True)\n deadline=time.monotonic()+420\n while True:\n  try:\n   with urllib.request.urlopen('http://127.0.0.1:8090/health',timeout=3) as response: health=json.load(response)\n   if health.get('status')=='ok':break\n   if health.get('status')=='error':raise RuntimeError(health)\n  except (urllib.error.URLError,TimeoutError,ConnectionError):pass\n  if time.monotonic()>deadline:raise RuntimeError('original service readiness timeout')\n  time.sleep(3)\n payload=dict(model='qwen3.6-27b',messages=[dict(role='user',content='Reply with only OK.')],max_tokens=8,temperature=0,chat_template_kwargs=dict(enable_thinking=False))\n req=urllib.request.Request('http://127.0.0.1:8090/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})\n with urllib.request.urlopen(req,timeout=120) as response: result=json.load(response)\n assert result['choices'][0]['message']['content'].strip()=='OK',result\n report['original_serving_restoration']=result;save()\n print('PRODUCTION VERIFIED '+json.dumps(result),flush=True)\n"
+}
