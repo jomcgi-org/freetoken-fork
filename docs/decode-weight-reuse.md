@@ -85,3 +85,19 @@ It waits for GPU release before each benchmark start and restores the original
 service with a real completion afterward. `--preflight` checks frozen sources,
 the completed native validation record, and binary identity without stopping
 the current service. This model comparison remains pending.
+
+The controller and its `ExecStopPost` hook now share
+`decode-weight-reuse-wall-lifecycle.py`. Preflight rejects active benchmark
+controllers, servers, leases and startup helpers, and requires the original
+service to own the sole GPU process. Recovery preserves another benchmark's
+serving pause when this job was refused before starting. Otherwise it stops
+only its own server, waits for GPU release before starting the original, and
+verifies readiness, a real completion and GPU ownership. An already healthy
+original process is preserved.
+
+Keep the controller, lifecycle helper and restore script together in a clean
+benchmark worktree. Point both the detached controller command and its
+`ExecStopPost` at that worktree. The controller continues to serve the pinned
+`b8ac3f7` runtime from its separate worktree; installing the harness must not
+modify that runtime checkout. Native compilation or timing must wait until any
+other benchmark lease has finished.
