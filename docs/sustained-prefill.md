@@ -102,7 +102,7 @@ expert rows. The cache-aware reader bypasses insertion of cold selected rows,
 so insufficient admission of recurring useful weights is a candidate cause,
 not an established explanation of the generation penalty. A sustained
 comparison between buffered and cached GPU staging, holding the inference
-runtime fixed, should isolate the reader before changing admission policy.
+runtime fixed, is reported in the [completed reader follow-up](sustained-reader.md).
 Any admission change must preserve the router's choices and contributions.
 
 Twenty of 24 matched responses improve. All twelve JSON pairs have identical
@@ -135,8 +135,10 @@ back-off logs. These transitions are observations under unchanged settings;
 they are not fixed or replayed across the original and optimized processes.
 The previous 99 focused CUDA checks and zero-error memcheck still cover the
 unchanged inference runtime. No new inference code is introduced by this
-results update. The PR remains draft because reader isolation, the generation
-penalty, and broader serving and quality qualification remain open.
+results update. The later reader-isolation comparison finds cached staging
+6.8% slower overall than buffered staging, with a 15.7% penalty in its second
+halves. The PR remains draft while the cache behavior and broader serving
+and quality qualification remain open.
 
 The client now supports an optional `--phase-io` diagnostic for follow-up
 investigation. It snapshots the worker's I/O counters at the first nonempty
@@ -144,7 +146,7 @@ generated text, in addition to the before/after snapshots. Empty role events
 and keepalives do not trigger it. Records set `diagnostic_phase_io=true` and
 retain `first_text`, `before_first_text_delta`, and `after_first_text_delta`
 inside `process_io`. The flag defaults off. Neither the completed comparison
-above nor the running reader-isolation gate uses this newer diagnostic.
+above nor the completed reader-isolation gate uses this newer diagnostic.
 
 TTFT is recorded before the diagnostic snapshot, and its cost remains in total
 client wall time and time after first text. The boundary includes network
@@ -154,9 +156,12 @@ approximate client-observed split, not exact prefill/decode or expert-only
 attribution. Use it to locate a cause, then verify any candidate with the flag
 off. Reject diagnostic records from the non-debug wall-time summary.
 
-All fifteen targeted pure Python client checks pass locally. They verify
+All fifteen targeted pure Python client checks pass locally and on Linux.
+They verify
 default-off sampling, a single observation at first content or reasoning,
 empty-event handling, visible observer cost, and identity changes at the
-intermediate snapshot even when the outer identities match. Linux validation
-of these added client checks is pending until the active model gate finishes.
+intermediate snapshot even when the outer identities match. The
+[Linux validation record](../bench/results/4090-phase-io-client-validation-20260906.json)
+confirms the exact client files are unchanged from `031c377` in the tested
+checkout and records successful original-service restoration.
 No serving runtime or source excerpt is changed by the client diagnostic.

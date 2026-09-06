@@ -274,5 +274,12 @@ unchanged inference code, measures 17.8% less wall time across 24 responses
 per policy (634.481 to 521.738 seconds). Complete prose replaces the earlier
 capped task. The source-balanced gain falls from 23.1% in the first half to
 11.4% in the second half, and generation after the first token is slower on
-average. The earlier 37.0% result applies to its short sequence. Sustained
-reader isolation, cache admission, and broader quality remain open.
+average. The earlier 37.0% result applies to its short sequence.
+
+The [sustained reader-isolation comparison](sustained-reader.md) then compares
+buffered and cached staging on the identical optimized runtime. Cached reads
+are 6.8% slower overall (498.493 versus 532.174 seconds), regress in both
+matched start orders, and are 15.7% slower in the source-balanced second
+halves. Buffered staging is preferred for that workload. Cache admission,
+redundant reads, and broader serving quality remain open; these percentages
+cannot be added to the comparisons against the original CPU server.
