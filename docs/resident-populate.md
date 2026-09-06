@@ -42,7 +42,7 @@ and no native or model wall-time result is available.
 
 The running Pi runtime comparison uses its frozen sources and does not enable this
 experiment. Once it finishes, run the focused Linux checks and then compare
-population off/on on the same prepared sources, mapping geometry and native
+the resident-skip flag off/on on the same prepared sources, mapping geometry and native
 binary. Use complete requests in both start orders, retain all failures, and
 include both cache warmth and worker storage traffic. Keep this option disabled
 until the complete wall-time and output checks justify using it.
