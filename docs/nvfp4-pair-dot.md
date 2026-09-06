@@ -40,3 +40,10 @@ The same exclusive ownership and recovery requirements apply.
 Kernel parity and component cost are preliminary gates. A serving change still
 requires full expert-output parity, model verification and separate non-debug
 wall measurements. No serving throughput gain is claimed by this experiment.
+
+The focused Linux checks pass for both the dot and complete expert schedules.
+Both cost probes completed in both execution orders with exact outputs, followed
+by verified original-serving recovery. Native checks skip in the Mac environment
+where Torch is absent. Full-model verification and serving wall qualification
+remain pending, and the explicit pair setting remains disabled at startup.
+Detailed timing payloads stay private.
