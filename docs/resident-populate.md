@@ -107,5 +107,27 @@ actual server prompt usage to require 2-1023 tokens for the short band and at
 least 1024 for the long band. A wrong band retains the full response and time,
 but marks that request ineligible through its completion field. Prefix caching
 must stay disabled for this gate so the full prompt length describes prefill
-work. Twenty-four focused protocol checks pass on macOS; Linux validation and
-actual tokenizer-band checks remain pending. No model run has used this mode yet.
+work. Twenty-four focused protocol checks pass on Linux and macOS. The
+[complete validation record](../bench/results/4090-populate-mixed-client-validation-20260906.json)
+retains the first incorrect offline token-count check and its correction to the
+server render-then-encode path. Verified prompts contain 424-575 tokens in the
+short band and 1700-1844 in the long band. No model run has used this mode yet.
+
+The [model driver](../bench/resident-populate-wall-driver.py) is prepared for
+four starts with the resident flag off/on/on/off. Each uses the same frozen
+`e865d19` runtime and existing input-reuse native binary. The driver uses the
+frozen recovery helper installed by #39, verifies its hash, and records both
+sources in the resulting artifact. Capacity one, graph one, 64K FP8 K/V,
+buffered staged GPU prefill, mmap HOT staging, and automatic HOT adaptation
+remain fixed. Prefix caches and diagnostic flags are disabled. Each start runs
+four warmups, twelve measured complete responses and eight fidelity questions.
+Actual prompt lengths, source identities, native mappings, execution geometry
+and HTTP request counts must match before a result can qualify.
+
+Before launching, use `--preflight` and execute the exact recorded recovery
+command through a systemd `ExecStopPost` while original serving remains active.
+Retain the successful completion as `recovery-probe.json` in the run directory.
+The driver refuses a prior model run and requires the probe's serving invocation
+to match current serving. The enclosing driver unit must use that same recovery
+command, a four-hour runtime bound and a 600-second stop timeout. This preparation
+is not yet a model performance result.
