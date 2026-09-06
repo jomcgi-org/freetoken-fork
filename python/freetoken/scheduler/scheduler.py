@@ -30,6 +30,7 @@ from freetoken.utils import (
 )
 
 from .cache import CacheManager
+from .continuation_trace import from_env as continuation_trace_from_env
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
@@ -159,6 +160,8 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
+        self.continuation_trace = continuation_trace_from_env()
+        self.cache_manager.continuation_trace = self.continuation_trace
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
             self.cache_manager,
@@ -691,6 +694,9 @@ class Scheduler(SchedulerIOMixin):
         if self.disk_prefix_store is not None:
             self.disk_prefix_store.close(wait=True)
         self.engine.shutdown()
+        trace = getattr(self, "continuation_trace", None)
+        if trace is not None:
+            trace.close()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
@@ -812,6 +818,9 @@ class Scheduler(SchedulerIOMixin):
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
+                    trace = getattr(self, "continuation_trace", None)
+                    if trace is not None:
+                        trace.completed(req, finish_reason)
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
@@ -1744,6 +1753,10 @@ class Scheduler(SchedulerIOMixin):
         """
         if not batch.is_prefill or not batch.prompt_admissions:
             return
+        trace = getattr(self, "continuation_trace", None)
+        if trace is not None:
+            for uid, prompt_tokens, cached_tokens in batch.prompt_admissions:
+                trace.admitted(uid, prompt_tokens, cached_tokens)
         self.send_result(
             [
                 PromptAdmittedMsg(uid=uid, prompt_tokens=prompt_tokens, cached_tokens=cached_tokens)
