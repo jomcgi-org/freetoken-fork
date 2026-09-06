@@ -31,7 +31,12 @@ target and its restore graphs across different slots, including the real GDN
 kernel with new inputs. Run those only with exclusive GPU ownership and automatic
 original-serving recovery, after source staging and focused CPU validation.
 
-The current full-model cost harness still captures each token window separately.
+With the relocation flag, the full-model cost harness captures each target graph
+once and reuses it across the subsequent token windows. Qualification requires
+one capture per variant and reuse in every later window, in addition to the
+existing exact numerical and prefix-state checks. Other cost modes keep their
+existing per-window capture protocol.
+
 CPU address-copy tests alone do not qualify full-model graph reuse across requests
 or page boundaries. Those model checks, a serving proposer and scheduler, task
 completion checks and separate non-debug wall measurements remain required.

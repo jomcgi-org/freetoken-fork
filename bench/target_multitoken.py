@@ -82,6 +82,23 @@ def numerical_failures(value, path=""):
     return errors
 
 
+def graph_reuse_qualified(records, captures, compact_enabled):
+    cases = {}
+    for row in records:
+        cases.setdefault(row["case"], set()).add(row.get("graph_reused"))
+    expected = {"full": 1, "compact": 1 if compact_enabled else 0}
+    return captures == expected and list(cases.values()) == [{False}, {True}, {True}, {True}]
+
+
+def close_graphs(graphs, stream):
+    for name in ("graph", "compact_graph"):
+        if graphs.get(name) is not None:
+            graphs[name].close()
+    if graphs.get("compact_checkpoint") is not None:
+        graphs["compact_checkpoint"].close(stream)
+    graphs.clear()
+
+
 def configure_fused(batch, ids, positions, locations, width):
     if ids.numel() != width or positions.numel() != width or locations.numel() != width:
         raise ValueError("fused inputs must match the configured verification width")
@@ -161,7 +178,7 @@ def install(width):
 
 def run_window(engine, source, position, seed, host_prefix, *, width, base, seed_api,
                report, directory, repeats, warmup, compact_type=None, pair_compare=False,
-               relocatable_state=False):
+               relocatable_state=False, graphs=None):
     import torch
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.core import Batch
@@ -184,9 +201,13 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
     ids = seed.reshape(1).repeat(width).to(torch.int32)
     host_seed = seed.cpu().reshape(1).to(host_prefix.dtype)
     req.input_ids = torch.cat((host_prefix, host_seed.repeat(width)))
-    graph = None
-    compact_graph = None
-    compact_checkpoint = None
+    if graphs is not None and not relocatable_state:
+        raise ValueError("graph reuse requires explicit relocatable state bindings")
+    graph = graphs.get("graph") if graphs is not None else None
+    checkpoint = graphs.get("checkpoint") if graphs is not None else None
+    compact_graph = graphs.get("compact_graph") if graphs is not None else None
+    compact_checkpoint = graphs.get("compact_checkpoint") if graphs is not None else None
+    graph_reused = graph is not None
 
     def forward(step=None, *, captured=False, with_logits=False, compact=False):
         if step is None:
@@ -238,11 +259,15 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
     base["save"](directory, report)
     window.reset(initial)
     engine.stream.synchronize()
-    checkpoint = seed_api["SeedCheckpoint"].from_engine(
-        engine, req, base["state_views"](engine, req), width=width)
-    with seed_api["capture_context"](checkpoint):
-        graph = base["FusedGraph"](engine, batch,
-                                   state_checkpoint=checkpoint if relocatable_state else None)
+    if graph is None:
+        checkpoint = seed_api["SeedCheckpoint"].from_engine(
+            engine, req, base["state_views"](engine, req), width=width)
+        with seed_api["capture_context"](checkpoint):
+            graph = base["FusedGraph"](engine, batch,
+                                       state_checkpoint=checkpoint if relocatable_state else None)
+        report.setdefault("graph_captures", {"full": 0, "compact": 0})["full"] += 1
+        if graphs is not None:
+            graphs.update(graph=graph, checkpoint=checkpoint)
     window.reset(initial)
     graph_tokens, graph_logits = forward(captured=True, with_logits=True)
     checks.update(graph_logits=metrics(graph_logits, reference_logits),
@@ -263,13 +288,19 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
                         reserved_bytes=torch.cuda.memory_reserved(engine.device))
 
         allocator = dict(before_compact=allocator_state())
-        compact_checkpoint = compact_type.from_engine(
-            engine, req, base["state_views"](engine, req), width=width)
-        with seed_api["capture_context"](compact_checkpoint):
-            compact_graph = base["FusedGraph"](
-                engine, batch, state_checkpoint=compact_checkpoint if relocatable_state else None)
+        capture_compact = compact_graph is None
+        if capture_compact:
+            compact_checkpoint = compact_type.from_engine(
+                engine, req, base["state_views"](engine, req), width=width)
+            with seed_api["capture_context"](compact_checkpoint):
+                compact_graph = base["FusedGraph"](
+                    engine, batch, state_checkpoint=compact_checkpoint if relocatable_state else None)
+            report.setdefault("graph_captures", {"full": 0, "compact": 0})["compact"] += 1
+            if graphs is not None:
+                graphs.update(compact_graph=compact_graph, compact_checkpoint=compact_checkpoint)
         allocator["after_compact_target"] = allocator_state()
-        compact_checkpoint.capture_restore_graphs(engine.stream)
+        if capture_compact:
+            compact_checkpoint.capture_restore_graphs(engine.stream)
         allocator["after_rollback_graphs"] = allocator_state()
         window.reset(initial)
         compact_tokens, compact_logits = forward(captured=True, compact=True, with_logits=True)
@@ -381,16 +412,16 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
             report["records"].append(dict(case=case, mode=mode, repeat=repeat, warmup=repeat < 0,
                                            wall_s=elapsed, matched=matched, output_tokens=count,
                                            cpu_pair_enabled=paired,
+                                           graph_reused=graph_reused,
                                            checks_passed=not mismatches, mismatches=mismatches))
             base["save"](directory, report)
     window.reset(states[0])
     engine.stream.synchronize()
     if pair_compare:
         set_cpu_pair(engine, False)
-    graph.close()
-    if compact_graph is not None:
-        compact_graph.close()
-        compact_checkpoint.close(engine.stream)
+    if graphs is None:
+        close_graphs(dict(graph=graph, compact_graph=compact_graph,
+                          compact_checkpoint=compact_checkpoint), engine.stream)
     return tokens[0], torch.cat((host_prefix, host_seed))
 
 
@@ -403,6 +434,7 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
 
     root = Path(__file__).resolve().parents[1]
     compact_type = base["_COMPACT_API"]["Checkpoint"] if base["_COMPACT_API"] else None
+    graphs = {} if relocatable_state else None
     report = dict(completed=False, diagnostic_only=True, model_wall_qualified=False,
                   width=width, draft_tokens=width - 1, graph_enabled=True, trace_only=False,
                   checkpoint_enabled=True, serial_linear=True, records=[],
@@ -433,13 +465,19 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
                                       width=width, base=base, seed_api=seed_api, report=report,
                                       directory=directory, repeats=repeats, warmup=warmup,
                                       compact_type=compact_type, pair_compare=pair_compare,
-                                      relocatable_state=relocatable_state)
+                                      relocatable_state=relocatable_state, graphs=graphs)
         report["summary"] = summarize(report["records"], width, compact_type is not None, pair_compare)
         report["checks_passed"] = (len(report["summary"]) == 4
                                    and all(case["checks_passed"] for case in report["summary"].values()))
+        if relocatable_state:
+            report["graph_reuse_qualified"] = graph_reuse_qualified(
+                report["records"], report.get("graph_captures"), compact_type is not None)
+            report["checks_passed"] &= report["graph_reuse_qualified"]
         report["completed"] = True
     except BaseException as exc:
         report["error"] = type(exc).__name__ + ": " + str(exc)
         raise
     finally:
+        if graphs is not None:
+            close_graphs(graphs, engine.stream)
         base["save"](directory, report)

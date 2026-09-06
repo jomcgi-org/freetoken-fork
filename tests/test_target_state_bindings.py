@@ -19,7 +19,36 @@ def load(name, filename):
 seed = load("binding_seed", "target_seed_checkpoint.py")
 compact = load("binding_compact", "target_compact_rollback.py")
 base = load("binding_graph", "target-verify-cost.py")
+multi = load("binding_multi", "target_multitoken.py")
 Compact = compact.make_checkpoint_type(seed.SeedCheckpoint)
+
+
+@pytest.mark.parametrize("compact_enabled", [False, True])
+@pytest.mark.parametrize("failure", [None, "recaptured", "missing", "mixed", "wrong_first"])
+def test_model_qualification_requires_one_graph_reused_in_every_later_window(compact_enabled, failure):
+    rows = [dict(case=str(i), graph_reused=i > 0) for i in range(4) for _ in range(3)]
+    captures = {"full": 1, "compact": int(compact_enabled)}
+    if failure == "recaptured":
+        captures["full"] = 2
+    elif failure == "missing":
+        rows = rows[:-3]
+    elif failure == "mixed":
+        rows[-1]["graph_reused"] = False
+    elif failure == "wrong_first":
+        rows[0]["graph_reused"] = True
+    assert multi.graph_reuse_qualified(rows, captures, compact_enabled) is (failure is None)
+
+
+def test_reused_graph_cleanup_releases_each_graph_and_rollback_owner():
+    calls = []
+    graphs = dict(graph=SimpleNamespace(close=lambda: calls.append("full")),
+                  checkpoint=object(), compact_graph=SimpleNamespace(close=lambda: calls.append("compact")),
+                  compact_checkpoint=SimpleNamespace(close=lambda stream: calls.append(stream)))
+    multi.close_graphs(graphs, "stream")
+    assert calls == ["full", "compact", "stream"]
+    assert graphs == {}
+    multi.close_graphs(graphs, "stream")
+    assert calls == ["full", "compact", "stream"]
 
 
 def slabs_on(torch, device="cpu"):
