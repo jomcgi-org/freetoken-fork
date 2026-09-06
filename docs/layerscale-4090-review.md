@@ -1,7 +1,8 @@
 # LayerScale ideas for the 4090 workload
 
 Reviewed 2026-09-06 against the public documentation and the completed Pi
-comparison. The current resident-populate experiment continues unchanged.
+comparison. The resident-populate experiment completed separately with its
+runtime frozen throughout.
 
 LayerScale's [session API](https://docs.layerscale.ai/sessions/) keeps token
 history and KV across turns, ingests data ahead of queries, and prepares known
@@ -51,6 +52,9 @@ There is a concrete gap worth measuring in
 recurrent state is donated only when its token boundary is page aligned.
 Otherwise the next request may resume from the older prefill snapshot. A
 tool-call anchor can preserve another boundary, but it also requires alignment.
+The Pi gate left `--enable-special-token-ckpt` disabled. This existing option
+protects the state just after the tool-call opener; rewriting the call body
+still invalidates continuation beyond the first changed token.
 The latest recurrent state cannot be attached to an earlier token boundary:
 that would change the model's continuation.
 

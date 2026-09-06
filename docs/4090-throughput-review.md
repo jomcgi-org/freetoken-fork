@@ -9,7 +9,7 @@ alias. Measurements use node-4's RTX 4090 and Ryzen 7 7800X3D with 61.91 GiB
 RAM and local NVMe. GLM is outside this performance qualification.
 
 Performance evidence updated on 2026-09-06 after the completed Pi agentic gate,
-concurrency gate, resident-populate component timing and continuation-state review.
+concurrency gate, completed resident-populate model timing and continuation-state review.
 
 ## Sustained wall time and the reader regression
 
@@ -306,7 +306,7 @@ model wall time have separate meanings.
 | Reuse weight unpacking across shared decode routes | At batch four and ten active routes, resident-weight native task time falls 21.2% with five shared experts and 43.8% with ten; 69 Linux/CUDA checks and 352 bitwise-equal timing pairs pass; model wall time pending | [#37](https://github.com/jomcgi-org/freetoken-fork/pull/37), draft; defaults off |
 | Multi-turn Pi task benchmark | All three independent task stages pass in a live integration, 18 model calls and two recovered test failures; 18 focused client checks pass; completed runtime comparison is reported separately in #39 | [#38](https://github.com/jomcgi-org/freetoken-fork/pull/38), ready as benchmark tooling |
 | Complete Pi runtime comparison | Four measured tasks per mode: 1506.667 to 1158.016 seconds, 23.1% less wall time; both orders improve, all checks pass, but generated work differs; 9 controller and 15 summary checks pass | [#39](https://github.com/jomcgi-org/freetoken-fork/pull/39), ready as benchmark and evidence |
-| Skip resident CPU populate reads | Eleven Linux correctness checks pass; component population plus mapped-byte consumption improves 15.0% warm and 2.8% mixed, regresses 1.0% cold; full-model comparison running, no inference gain yet | [#40](https://github.com/jomcgi-org/freetoken-fork/pull/40), draft; defaults off |
+| Skip resident CPU populate reads | Full-model off/on/on/off comparison regresses 15.3% overall and in both orders; twelve identical-text pairs regress 11.8%; keep disabled despite the warm-file component gain | [#40](https://github.com/jomcgi-org/freetoken-fork/pull/40), draft; defaults off |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
@@ -428,13 +428,20 @@ retain buffered reads. This preserves routing and packed weight bytes. All
 and unchanged mapped bytes. The completed private-file component comparison
 includes population and later checksum consumption of mapped bytes. Wall time
 improves 15.0% warm and 2.8% mixed, and regresses 1.0% cold, with all checksums
-matching. These are component effects. The full-model off/on/on/off comparison
-is running on one frozen runtime with mixed short and long prefill, diagnostic
-flags off and identical memory geometry. Its first startup failed before any
-timed response because a native PLE dependency was missing; that failure and
-verified service recovery are retained. The repaired run is detached under
-systemd and must finish both orders, output review and recovery before an
-inference gain can qualify. The option remains disabled. The pending native
+matching. These are component effects. The completed full-model comparison on
+one frozen runtime takes 518.987 seconds with the flag off and 598.375 seconds
+with it on, **15.3% more wall time**. Both orders regress, by 23.8% and 7.9%,
+and twelve identical-text pairs regress 11.8%. Short-prompt first-text time
+improves but subsequent generation slows. Whole-worker logical reads fall from
+514.00 to 341.07 GiB while physical reads rise from 64.18 to 92.74 GiB overall;
+physical-read direction differs between orders, so this does not isolate a
+cache-eviction mechanism. Diagnostic flags stay off and all starts match memory
+geometry, manifests and native binaries. All JSON checks pass and every start
+retains identical 7/8 fidelity answers. Prose review records omissions and
+unsupported claims; broad quality equivalence remains unproven. All one hundred
+expected requests complete, original serving is restored and verified, and the
+driver terminates successfully. The initial missing-PLE startup failure remains
+recorded separately. Keep the option disabled. The pending native
 decode reuse experiment targets shared experts across multiple routes and does
 not accelerate the single-route case by itself.
 
