@@ -217,3 +217,35 @@ def test_orphan_action_prevents_starting_a_new_comparison(monkeypatch):
     monkeypatch.setattr(gate, 'live', lambda unit: unit == gate.ACTION)
     with pytest.raises(AssertionError, match='another benchmark is live'):
         gate.preflight()
+
+
+def test_prefill_carry_changes_only_runtime_path_with_decode_snapshots_off(monkeypatch):
+    monkeypatch.setattr(gate, 'PREFILL_CARRY', True)
+    off, on = (gate.server_env(mode) for mode in gate.MODES)
+    assert off.pop('PYTHONPATH') == str(gate.OPT / 'python')
+    assert on.pop('PYTHONPATH') == str(gate.CARRY / 'python')
+    assert off == on and off['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0'
+    assert gate.runtime_revision('off') == gate.REVISIONS['off']
+    assert gate.runtime_revision('on') != gate.runtime_revision('off')
+    assert gate.runtime_revision('original') == gate.REVISIONS['original']
+
+
+@pytest.mark.parametrize('action', ['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
+def test_prefill_carry_selection_reaches_every_remote_action(monkeypatch, action):
+    monkeypatch.setattr(gate, 'PREFILL_CARRY', True)
+    command = gate.remote_command('/tmp/driver.py', action, 'astra-pi-agentic-carry-test')
+    assert command.count('--prefill-snapshot-carry') == 1
+    if action in ('start', 'end'):
+        assert '--property=BindsTo=' + gate.LEASE + '.service' in command
+    else:
+        assert command[0] == '/usr/bin/python3'
+
+
+def test_prefill_carry_rejects_decode_snapshot_confounds_before_service_access(monkeypatch):
+    monkeypatch.setattr(gate, 'PREFILL_CARRY', True)
+    monkeypatch.setattr(gate, 'server_command', lambda _: ['same'])
+    monkeypatch.setattr(gate, 'server_env', lambda mode: {
+        'PYTHONPATH': mode, 'FREETOKEN_DECODE_PREFIX_SNAPSHOT': '1'})
+    monkeypatch.setattr(gate, 'state', lambda _: pytest.fail('must reject before accessing services'))
+    with pytest.raises(AssertionError):
+        gate.preflight()
