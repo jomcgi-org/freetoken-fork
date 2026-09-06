@@ -54,6 +54,78 @@ def test_summary_requires_every_partial_acceptance_and_keeps_warmup_failures():
     assert not failed["checks_passed"] and "component_cost_over_one" not in failed
 
 
+def test_pair_trial_order_compares_neighbors_and_reverses_execution_order():
+    even = multi.trial_order(5, True, True, 0)
+    odd = multi.trial_order(5, True, True, 1)
+    assert even[:4] == ("graph_one", "pair_graph_one", "graph_all", "pair_graph_all")
+    assert odd == tuple(reversed(even))
+    assert set(even) == set(multi.modes(5, True, True))
+    assert len(even) == len(set(even))
+    for ordinary, paired in zip(even[::2], even[1::2]):
+        assert paired == "pair_" + ordinary
+
+
+@pytest.mark.parametrize("failure", [None, "missing", "dispatch", "warmup"])
+def test_pair_summary_requires_both_dispatches_and_retains_failures(failure):
+    rows = [dict(case="2", mode=name, warmup=False, checks_passed=True,
+                 cpu_pair_enabled=name.startswith("pair_"),
+                 wall_s=3. if name.startswith("pair_") else 4.)
+            for name in multi.modes(5, True, True)]
+    if failure == "missing":
+        rows.pop()
+    elif failure == "dispatch":
+        rows[-1]["cpu_pair_enabled"] = False
+    elif failure == "warmup":
+        rows.append(dict(rows[-1], warmup=True, checks_passed=False))
+    result = multi.summarize(rows, 5, True, True)["2"]
+    assert result["checks_passed"] is (failure is None)
+    assert not result["model_wall_qualified"]
+    if failure is None:
+        assert set(result["cpu_pair_reduction_percent"].values()) == {25.}
+    else:
+        assert "cpu_pair_reduction_percent" not in result
+
+
+@pytest.mark.parametrize("elapsed", [0., -1., float("nan"), float("inf")])
+def test_invalid_component_time_cannot_qualify(elapsed):
+    rows = [dict(case="2", mode=name, warmup=False, checks_passed=True, wall_s=1.)
+            for name in multi.modes(5)]
+    rows[0]["wall_s"] = elapsed
+    result = multi.summarize(rows, 5)["2"]
+    assert not result["checks_passed"]
+    assert "component_cost_over_one" not in result
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_cpu_pair_switch_waits_for_inflight_graph_and_rejects_unsupported_native(supported):
+    events = []
+
+    def setter(value):
+        events.append(("setter", value))
+        return supported
+
+    engine = SimpleNamespace(stream=SimpleNamespace(synchronize=lambda: events.append("sync")),
+                             cpu_moe_executor=SimpleNamespace(_ext=SimpleNamespace(set_nvfp4_pair_dot=setter)))
+    if supported:
+        multi.set_cpu_pair(engine, True)
+    else:
+        with pytest.raises(RuntimeError, match="AVX-512 NVFP4"):
+            multi.set_cpu_pair(engine, True)
+    assert events == ["sync", ("setter", True)]
+
+
+def test_missing_pair_native_fails_before_measurement():
+    engine = SimpleNamespace(cpu_moe_executor=SimpleNamespace(_ext=SimpleNamespace()))
+    with pytest.raises(RuntimeError, match="native setter"):
+        multi.set_cpu_pair(engine, True)
+
+
+def test_pair_prefix_state_failure_is_numerically_load_bearing():
+    checks = {"cpu_pair": {"compact": {"tokens_equal": True, "logits": {"exact": True},
+               "restored_prefix_state": {"3": {"recurrent": {"exact": False}}}}}}
+    assert multi.numerical_failures(checks) == ["/cpu_pair/compact/restored_prefix_state/3/recurrent"]
+
+
 def test_fused_configuration_keeps_one_request_with_multiple_positions():
     tensor = lambda n: SimpleNamespace(numel=lambda: n)
     req = SimpleNamespace(cached_len=0, device_len=0)
