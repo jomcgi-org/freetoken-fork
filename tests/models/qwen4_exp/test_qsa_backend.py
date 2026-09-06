@@ -20,6 +20,36 @@ from .common import Fixture, requires_cuda, parsed_config, selection_spy
 QSA_LAYER = 3
 
 
+@requires_cuda
+@pytest.mark.parametrize("boundary", [64, 2112])
+def test_aligned_resume_on_new_table_slot_ignores_old_partial_ring(boundary):
+    """Page-owned KV/index rows suffice at a closed QSA group boundary."""
+    fixture = Fixture(parsed_config(), num_pages=128)
+    attn = fixture.layer(QSA_LAYER)
+    hidden = _inputs(fixture, [boundary + 4], seed=53)[0]
+    req = fixture.req(0, 0, boundary - 1)
+    attn.forward(hidden[:boundary - 1], fixture.batch([req], "prefill"))
+    fixture.step(req)
+    attn.forward(hidden[boundary - 1:boundary], fixture.batch([req], "decode"))
+
+    # Advance the original request beyond the retained prefix, dirtying its
+    # table-local ring. The original continuation at the boundary is the oracle.
+    expected = None
+    for position in range(boundary, boundary + 3):
+        fixture.step(req)
+        out = attn.forward(hidden[position:position + 1], fixture.batch([req], "decode"))
+        if position == boundary:
+            expected = out.clone()
+    shared = fixture.page_table[0, :boundary].clone()
+    fixture.page_table[1, :boundary].copy_(shared)
+    fixture.pool._pending_ring[1].fill_(float("nan"))
+    resumed = fixture.req(1, boundary, boundary + 1)
+    actual = attn.forward(hidden[boundary:boundary + 1], fixture.batch([resumed], "prefill"))
+    assert torch.isfinite(actual).all()
+    assert torch.equal(actual, expected)
+    assert torch.equal(fixture.page_table[1, :boundary], shared)
+
+
 def test_qsa_rejects_non_unit_kv_scales_before_launch():
     from freetoken.kernel.kv_scale import require_unit_kv_scales
 
