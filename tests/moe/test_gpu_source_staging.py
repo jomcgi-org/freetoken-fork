@@ -235,7 +235,7 @@ def test_nvfp4_staged_gpu_layers_match_pinned_prefill_and_captured_decode(tmp_pa
         cache.init_disk_gpufetch(executor, max_tokens=batch, top_k=top_k)
         assert set(executor._gpufetch_tasks) == ({1, 2} if staged else set())
         layers = []
-        for layer_id in (1, 2):
+        for layer_id in (0, 1, 2):
             layer = OffloadMoELayer(layer_id=layer_id, num_experts=experts, top_k=top_k,
                                    hidden_size=hidden, intermediate_size=inter)
             layer.offload_cache = cache
@@ -253,7 +253,7 @@ def test_nvfp4_staged_gpu_layers_match_pinned_prefill_and_captured_decode(tmp_pa
             outputs = []
             for cache, _executor, layers in rigs:
                 cache.begin_prefill(tokens)
-                outputs.append([layer._prefill_routed(x, weights, ids.clone()) for layer in layers])
+                outputs.append([layer._prefill_routed(x, weights, ids.clone()) for layer in layers[1:]])
             torch.cuda.synchronize()
             for direct, staged in zip(*outputs, strict=True):
                 assert torch.isfinite(direct).all()
@@ -264,6 +264,8 @@ def test_nvfp4_staged_gpu_layers_match_pinned_prefill_and_captured_decode(tmp_pa
         weights = torch.full((batch, top_k), 0.5, device=device)
         captured = []
         for cache, _executor, layers in rigs:
+            # The HOT layer uses both real CPU and GPU partials, followed by
+            # two staged GPU layers. All share the same native coordinator.
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
