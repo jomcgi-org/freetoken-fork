@@ -71,7 +71,10 @@ def checked_answer(completion, expected):
     for field in ('prompt_tokens', 'completion_tokens'):
         if type(usage.get(field)) is not int or usage[field] <= 0:
             raise ValueError('missing or invalid token usage')
-    cached = usage.get('prompt_tokens_details', {}).get('cached_tokens')
+    # FreeToken's _usage omits the entire details object for a zero-token hit.
+    # The controller/summary must separately verify --enable-cache-report.
+    details = usage.get('prompt_tokens_details', {'cached_tokens': 0})
+    cached = details.get('cached_tokens') if isinstance(details, dict) else None
     if type(cached) is not int or not 0 <= cached <= usage['prompt_tokens']:
         raise ValueError('missing or invalid cached-token accounting')
     return text, dict(input=usage['prompt_tokens'] - cached,

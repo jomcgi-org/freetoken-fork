@@ -105,6 +105,8 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False):
     plan = driver['preflight']
     if fixed_continuation:
         require(plan.get('client_kind') == 'fixed-continuation', 'wrong continuation client')
+        require(all('--enable-cache-report' in command for command in plan['commands'].values()),
+                'fixed continuation requires enabled cache reporting')
     else:
         require(plan.get('client_kind', 'pi') == 'pi', 'use --fixed-continuation for scripted requests')
     if decode_prefix_snapshot:

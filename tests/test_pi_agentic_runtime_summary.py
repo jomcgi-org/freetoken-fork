@@ -226,9 +226,13 @@ def test_snapshot_start_marker_must_match_the_arm(snapshot_records):
 def fixed_records(snapshot_records):
     root = snapshot_records
     change(root, 'driver.json', lambda d: d['preflight'].update(client_kind='fixed-continuation'))
+    change(root, 'driver.json', lambda d: [command.append('--enable-cache-report')
+           for command in d['preflight']['commands'].values()])
     for arm, _mode in summary.SNAPSHOT_ARMS:
+        change(root, arm + '-server-start.json', lambda d: d['command'].append('--enable-cache-report'))
+        start = json.loads((root / (arm + '-server-start.json')).read_text())
         change(root, arm + '/metadata.json', lambda d: d.update(
-            sources={'fixed-continuation-wall.py': 'client'}, fixture_sha256='fixture'))
+            sources={'fixed-continuation-wall.py': 'client'}, fixture_sha256='fixture', server_metadata=start))
         for ordinal in (1, 2, 3):
             def mutate(row):
                 row['event_metrics']['model_usage'] = [dict(input=1936, output=400, cacheRead=64,
@@ -308,3 +312,10 @@ def test_fixed_work_keeps_incomplete_response_cost(fixed_records):
     assert result['comparison']['modes']['on']['attempted_task_wall_s'] == 320
     phase = result['request_phases']['on']['first_request']
     assert phase['attempted_request_wall_s'] == 20 and phase['usage_records'] == 3
+
+
+def test_omitted_zero_hits_cannot_hide_disabled_cache_reporting(fixed_records):
+    change(fixed_records, 'driver.json', lambda d:
+           d['preflight']['commands']['on'].remove('--enable-cache-report'))
+    with pytest.raises(ValueError, match='enabled cache reporting'):
+        summary.summarize(fixed_records, fixed_continuation=True)

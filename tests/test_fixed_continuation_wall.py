@@ -55,10 +55,19 @@ def test_invalid_answers_and_accounting_are_rejected(fault):
     if fault == 'truncated': result['choices'][0]['finish_reason'] = 'length'
     if fault == 'reasoning': message['reasoning_content'] = 'extra work'
     if fault == 'missing_usage': result['usage'].pop('completion_tokens')
-    if fault == 'missing_cache_usage': result['usage'].pop('prompt_tokens_details')
+    if fault == 'missing_cache_usage': result['usage']['prompt_tokens_details'].pop('cached_tokens')
     if fault == 'invalid_cache_usage': result['usage']['prompt_tokens_details']['cached_tokens'] = 9999
     with pytest.raises(ValueError):
         client.checked_answer(result, expected)
+
+
+def test_omitted_cache_details_mean_zero_hits_as_in_the_server_wire_format():
+    expected = {'a': 1, 'b': 2}
+    result = reply(expected)
+    result['usage'].pop('prompt_tokens_details')
+    text, usage = client.checked_answer(result, expected)
+    assert json.loads(text) == expected
+    assert usage == dict(input=2000, output=400, cacheRead=0, cacheWrite=0)
 
 
 def test_failure_keeps_attempt_response_and_wall_time_without_fabricating_later_turns():

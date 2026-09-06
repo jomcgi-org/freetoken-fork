@@ -36,6 +36,11 @@ completion status and token accounting. Complete responses and failed attempts
 are retained. Correct JSON with different whitespace may pass copying checks
 but does not qualify as matched work.
 
+FreeToken omits `prompt_tokens_details` for zero cache hits. The client interprets
+that omission as zero, while the summary separately requires
+`--enable-cache-report` in both pinned server command lines. A malformed details
+object is still rejected.
+
 After completion and verified restoration:
 
 ```sh
