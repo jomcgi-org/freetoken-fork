@@ -71,3 +71,9 @@ seed logits from the original mapping. Borrowed state, page contents and mapping
 are restored on exit or failure. The scheduler allocator is untouched. These
 aliased request rows are confined to the serial diagnostic worker, and its
 request is aborted after the probe. This is not an allocation policy for serving.
+
+Borrowed-storage backups and inactive-state snapshots use host RAM. Their copies
+and comparisons run outside the forward timer, preserving the model's existing
+VRAM geometry for the graph and checkpoint experiment. The first boundary run
+exhausted VRAM with device-resident diagnostic backups before any timing trials;
+the host-backup revision requires a fresh full-model qualification.

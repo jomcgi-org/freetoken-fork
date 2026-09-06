@@ -134,7 +134,9 @@ class RelocationLease:
         if self.entered or self.closed:
             raise RuntimeError("relocation lease can only be entered once")
         self.engine.stream.synchronize()
-        self.saved = [(value, value.clone()) for value in self.restore_views]
+        # These backups live for the whole destructive probe, outside every
+        # measured forward. Keep them off the graph/checkpoint VRAM budget.
+        self.saved = [(value, value.detach().to("cpu", copy=True)) for value in self.restore_views]
         self.entered = True
         try:
             self.reserved_kv.copy_(self.old_kv)

@@ -106,6 +106,8 @@ def test_lease_rotates_prefix_pages_moves_both_slot_spaces_and_restores_borrowed
     original_table = f.engine.page_table.clone()
     seen = []
     with lease:
+        assert all(saved.device.type == "cpu" and saved.data_ptr() != value.data_ptr()
+                   for value, saved in lease.saved)
         assert f.engine.page_table[0, :16].tolist() == list(range(32, 40)) + list(range(16, 24))
         assert f.torch.equal(f.engine.page_table[0], f.engine.page_table[1])
         assert f.torch.equal(f.engine.kv_cache._kv_buffer[:, :, 4], original_kv[:, :, 2])

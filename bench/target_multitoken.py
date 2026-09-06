@@ -201,11 +201,13 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
                                  allow_reserved_page=relocation is not None)
     initial = window.capture()
     neighbours = relocation.neighbours() if relocation is not None else {}
-    neighbour_state = {name: value.clone() for name, value in neighbours.items()}
+    # Inactive-slot checks are diagnostic work outside the forward timer.
+    # Host snapshots also keep their comparison temporaries out of VRAM.
+    neighbour_state = {name: value.detach().to("cpu", copy=True) for name, value in neighbours.items()}
 
     def neighbour_errors():
         return ["neighbour/" + name for name, value in neighbours.items()
-                if not equal(value, neighbour_state[name])]
+                if not equal(value.cpu(), neighbour_state[name])]
     ids = seed.reshape(1).repeat(width).to(torch.int32)
     host_seed = seed.cpu().reshape(1).to(host_prefix.dtype)
     req.input_ids = torch.cat((host_prefix, host_seed.repeat(width)))
@@ -355,7 +357,7 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
         checks["cpu_pair"] = pair_checks
         set_cpu_pair(engine, False)
     if relocation is not None:
-        checks["neighbour_state"] = {name: metrics(value, neighbour_state[name])
+        checks["neighbour_state"] = {name: metrics(value.cpu(), neighbour_state[name])
                                      for name, value in neighbours.items()}
     errors = numerical_failures(checks)
     report["stage"] = "measuring wider checkpoint graph at " + case
