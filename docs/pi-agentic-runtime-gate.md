@@ -133,3 +133,10 @@ without inference errors. Its two measured tasks total 633.515 seconds, versus
 start order remains pending. The optimized log omits the legacy disk-statistics
 fields. Review distinguishes implementation errors from mistaken model-written
 test expectations; both kinds of repair remain in the elapsed task time.
+
+The [second optimized arm review](../bench/results/4090-pi-runtime-r3-review-20260906.json)
+retains another three successful tasks and 52 expected requests without inference
+errors. Its measured tasks total 524.501 seconds, with fewer generated tokens and
+model calls than the first optimized arm. That shorter unpaired time is not a
+new runtime gain. The final baseline start matches the same geometry; its results
+and the complete paired analysis remain pending.
