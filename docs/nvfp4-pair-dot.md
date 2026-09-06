@@ -13,9 +13,10 @@ executor before submitting tasks, with no task in flight. The setter rejects
 unsupported formats and ISAs. Pair dispatch defaults off and the serving startup
 path does not enable it. An enabled grouped decode task pairs routes within each
 expert, preserves the existing route quantization and activation, and leaves the
-final top-k reduction unchanged. Unpaired routes use the ordinary dot.
-The existing batched
-prefill dot uses a different reduction order and is not the exact reference.
+final top-k reduction unchanged. Unpaired routes use the ordinary dot. Single-token
+tasks retain the ordinary route loop even when the setting is enabled.
+The existing batched prefill dot uses a different reduction order and is not the
+exact reference.
 
 `tests/moe/test_nvfp4_pair_dot.py` compares FP32 bit patterns against two ordinary
 decode dots. Cases cover vector and scalar tails, both model inner dimensions,
@@ -38,12 +39,22 @@ activation preparation, both projections and ordered route reduction are inside.
 The same exclusive ownership and recovery requirements apply.
 
 Kernel parity and component cost are preliminary gates. A serving change still
-requires full expert-output parity, model verification and separate non-debug
-wall measurements. No serving throughput gain is claimed by this experiment.
+requires representative task validation and separate non-debug wall measurements.
+No serving throughput gain is claimed by this experiment.
 
 The focused Linux checks pass for both the dot and complete expert schedules.
 Both cost probes completed in both execution orders with exact outputs, followed
 by verified original-serving recovery. Native checks skip in the Mac environment
-where Torch is absent. Full-model verification and serving wall qualification
-remain pending, and the explicit pair setting remains disabled at startup.
-Detailed timing payloads stay private.
+where Torch is absent.
+
+The companion full-model target diagnostic in PR #62 also completed with exact
+logits, greedy tokens, committed state, retained rejection prefixes and subsequent
+ordinary decode. Its latest source, including the single-token bypass, passed
+202 focused Linux checks and the exclusive CUDA rollback check. Original serving
+was restored and verified after each model experiment.
+
+Model component timings remain sensitive to execution order and the ordinary
+decode controls vary. These checks establish correctness for the tested windows,
+not a stable serving gain. Separate non-debug wall qualification remains pending,
+and the explicit pair setting remains disabled at startup. Detailed timing
+payloads stay private.
