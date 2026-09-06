@@ -98,6 +98,7 @@ class EngineConfig:
     moe_hot_adapt_interval_steps: str | int = "auto"
     moe_hot_adapt_max_swap_gib: float = 0.5
     moe_hot_staging_io: str = "mmap"
+    moe_hot_host_cache: str = "retain"
     moe_hot_adapt_boundary_cap_frac: float = 0.5
     moe_hot_adapt_prefill_weight: float = 1.0
     moe_hot_adapt_histories: str = "shared"
@@ -339,6 +340,17 @@ class EngineConfig:
             raise ValueError("--moe-disk-prefill-io must be 'buffered' or 'cached'")
         if self.moe_hot_staging_io not in ("mmap", "buffered"):
             raise ValueError("--moe-hot-staging-io must be 'mmap' or 'buffered'")
+        if self.moe_hot_host_cache not in ("retain", "reclaim"):
+            raise ValueError("--moe-hot-host-cache must be 'retain' or 'reclaim'")
+        if self.moe_hot_host_cache == "reclaim" and (
+            self.moe_backend != "offload" or self.moe_disk_prefill != "staged"
+            or self.moe_disk_decode != "cpu" or self.moe_prefill_hot_split != "on"
+            or self.moe_disk_pager != "madvise" or self.moe_bank_hugepages_tmpfs is not None
+        ):
+            raise ValueError(
+                "HOT host-cache reclamation requires offload, staged DISK prefill, "
+                "CPU DISK decode, HOT prefill splitting, madvise paging and no tmpfs mirror"
+            )
         if self.moe_disk_prefill_io == "cached" and self.moe_disk_prefill != "staged":
             raise ValueError("--moe-disk-prefill-io cached requires --moe-disk-prefill staged")
         if self.moe_disk_prefill == "staged" and self.moe_disk_decode != "cpu":

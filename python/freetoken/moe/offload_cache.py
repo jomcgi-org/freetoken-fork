@@ -222,6 +222,7 @@ class OffloadMoeCache:
     moe_disk_prefill_min_tokens: int = 1024
     moe_disk_prefill_io: str = "buffered"
     moe_hot_staging_io: str = "mmap"
+    moe_hot_host_cache: str = "retain"
     moe_prefill_coalesce: str = "populate"
     moe_prefill_hot_split: str = "on"
     moe_prefill_split_kernel: str = "grouped"
@@ -270,6 +271,11 @@ class OffloadMoeCache:
             raise ValueError("moe_hot_staging_io must be 'mmap' or 'buffered'")
         if self.moe_hot_staging_io == "buffered" and self.quant_format != "nvfp4":
             raise ValueError("buffered HOT staging requires native NVFP4 banks")
+        if self.moe_hot_host_cache not in ("retain", "reclaim"):
+            raise ValueError("moe_hot_host_cache must be 'retain' or 'reclaim'")
+        if self.moe_hot_host_cache == "reclaim" and self.quant_format != "nvfp4":
+            raise ValueError("HOT host-cache reclamation requires native NVFP4 banks")
+        self._hot_host_reclaim_warned = False
         if self.moe_disk_prefill_io == "cached" and self.moe_disk_prefill != "staged":
             raise ValueError("cached file reads require staged DISK prefill")
         self._staged_prefill_active = False
@@ -1477,6 +1483,7 @@ class OffloadMoeCache:
             )
         self.hot_staging_bytes = budget_bytes
         logger.info_rank0(f"MoE HOT staging: file_io={self.moe_hot_staging_io}")
+        logger.info_rank0(f"MoE HOT host cache: {self.moe_hot_host_cache}")
         # These pools use daemon workers omitted from concurrent.futures' atexit
         # join registry. Explicit shutdown still cleans up responsive workers,
         # while process exit may abandon a wedged copy, fsync, or temporary file.
@@ -1665,6 +1672,33 @@ class OffloadMoeCache:
             for layer_id, owners in self._hot_slot_owners.items()
         }
 
+    def _reclaim_hot_host_rows(self, swaps) -> int:
+        """Release redundant file pages after complete staging and publication.
+
+        GPU installation reads the separate pinned stage, so file reclamation
+        needs no additional CUDA wait. Later demotion or concurrent CPU readers
+        may fault the immutable source bytes back without changing arithmetic.
+        """
+        from freetoken.moe.host_banks import _tensor_host_bank
+
+        rows: dict[int, set[int]] = {}
+        for swap in swaps:
+            if self._hot_slot_owners[swap.layer_id][swap.row] == swap.incoming_expert:
+                rows.setdefault(swap.layer_id, set()).add(swap.incoming_expert)
+        advised = 0
+        try:
+            for layer_id, experts in rows.items():
+                for name in self.bank_schema:
+                    source = self.bank_sources[name][layer_id]
+                    owner = _tensor_host_bank(source)
+                    if owner is not None:
+                        advised += owner.reclaim_file_rows(experts, tensor=source)
+        except OSError as exc:
+            if not self._hot_host_reclaim_warned:
+                logger.warning_rank0(f"HOT host-cache reclamation skipped: {exc}")
+                self._hot_host_reclaim_warned = True
+        return advised
+
     def _reload_hot_slots(self) -> None:
         """Stream every published/seeded HOT row through the bounded stage."""
         from freetoken.moe.hot_adapt import HotSwap, finish_hot_swaps
@@ -1689,6 +1723,8 @@ class OffloadMoeCache:
         self.id_of_slot.fill_(-1)
         self._replace_hot_mapping(mapping)
         self._restore_hot_slot_metadata()
+        if self.moe_hot_host_cache == "reclaim":
+            self._reclaim_hot_host_rows(items)
 
     def configure_session_profiles(
         self,
@@ -2126,6 +2162,8 @@ class OffloadMoeCache:
             for layer_id, owners in self._hot_slot_owners.items()
         }
         self._checkpoint_published_hot_slot_owners()
+        if self.moe_hot_host_cache == "reclaim":
+            self._reclaim_hot_host_rows(executed)
         if getattr(self, "_hot_adapt_tick_boundary", None) == "idle":
             self.hot_adapt_idle_swaps += len(executed)
         else:
