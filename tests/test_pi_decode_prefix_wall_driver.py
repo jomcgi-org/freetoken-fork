@@ -470,3 +470,43 @@ def test_hot_host_commands_reject_confounds(change):
         commands['on'].pop()
     with pytest.raises(AssertionError):
         gate.qualify_hot_host_commands(commands)
+
+
+@pytest.mark.parametrize('action', ['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
+def test_original_baseline_selects_qualified_runtime_and_recovery(monkeypatch, tmp_path, action):
+    monkeypatch.setattr(gate, 'ORIGINAL_BASELINE', True)
+    service = tmp_path / 'original.service'
+    service.write_text('ExecStart=/bin/ft --port 8090 --moe-disk-prefill cpu '
+                       '--max-running-requests 1 --kv-disk-cache-gib 1 --moe-collect-stats')
+    monkeypatch.setattr(gate, 'SERVICE', service)
+    commands = {mode: gate.server_command(mode) for mode in gate.MODES}
+    gate.qualify_original_commands(commands)
+    env = {mode: gate.server_env(mode) for mode in gate.MODES}
+    assert {k for k in env['off'] if env['off'][k] != env['on'][k]} == {'PYTHONPATH'}
+    assert all(e['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0' for e in env.values())
+    assert all(e['FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR'] == '' for e in env.values())
+    assert gate.runtime_tree('off') == gate.SRC
+    assert gate.runtime_tree('on') == gate.CARRY
+    assert gate.runtime_revision('off') == gate.REVISIONS['original']
+    assert gate.runtime_revision('on') == gate.PREFILL_CARRY_REVISIONS['on']
+    command = gate.remote_command('/tmp/driver.py', action, 'astra-pi-agentic-original-test')
+    assert command.count('--original-baseline') == 1
+
+
+@pytest.mark.parametrize('change', ['baseline_reader', 'duplicate', 'unrelated', 'wrong', 'missing_value'])
+def test_original_baseline_commands_reject_confounds(change):
+    commands = {'off': ['ft', '--moe-disk-prefill', 'cpu'],
+                'on': ['ft', '--moe-disk-prefill', 'staged', '--moe-disk-prefill-io', 'buffered',
+                       '--moe-hot-staging-io', 'mmap']}
+    if change == 'baseline_reader':
+        commands['off'] += ['--moe-disk-prefill-io', 'buffered']
+    elif change == 'duplicate':
+        commands['on'] += ['--moe-disk-prefill', 'staged']
+    elif change == 'unrelated':
+        commands['on'] += ['--extra']
+    elif change == 'wrong':
+        commands['on'][-1] = 'buffered'
+    else:
+        commands['on'].pop()
+    with pytest.raises(AssertionError):
+        gate.qualify_original_commands(commands)

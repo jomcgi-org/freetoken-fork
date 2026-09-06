@@ -28,6 +28,7 @@ SRC = R / 'wt-plegather'
 OPT = R / 'wt-astra-decode-prefix-snapshot'
 CARRY = R / 'wt-astra-prefill-snapshot-carry'
 PREFILL_CARRY = False
+ORIGINAL_BASELINE = False
 PROFILE = R / 'wt-astra-hybrid-profile-retention'
 PROFILE_RETENTION = False
 GPU_SOURCE = R / 'wt-astra-gpu-source-staging'
@@ -134,6 +135,8 @@ def completion(port):
 
 
 def runtime_tree(mode):
+    if ORIGINAL_BASELINE:
+        return SRC if mode == 'off' else CARRY
     if HOT_HOST_RECLAIM:
         return HOT_HOST
     if GPU_SOURCE_STAGING:
@@ -144,6 +147,8 @@ def runtime_tree(mode):
 
 
 def runtime_revision(mode):
+    if ORIGINAL_BASELINE and mode != 'original':
+        return REVISIONS['original'] if mode == 'off' else PREFILL_CARRY_REVISIONS['on']
     if HOT_HOST_RECLAIM and mode != 'original':
         return HOT_HOST_REVISION
     if GPU_SOURCE_STAGING and mode != 'original':
@@ -157,11 +162,17 @@ def runtime_pair():
     return PREFILL_CARRY or PROFILE_RETENTION
 
 
+def different_runtimes():
+    return runtime_pair() or ORIGINAL_BASELINE
+
+
 def same_runtime_policy():
     return GPU_SOURCE_STAGING or HOT_HOST_RECLAIM
 
 
 def experiment_name():
+    if ORIGINAL_BASELINE:
+        return 'original-continuation'
     if HOT_HOST_RECLAIM:
         return 'hot-host-cache-reclaim'
     if GPU_SOURCE_STAGING:
@@ -191,7 +202,7 @@ def identities():
         assert not run('git', '-C', str(tree), 'status', '--porcelain').stdout.strip(), tree
         extensions = native_extensions(tree)
         native = Path(extensions['_cpu_moe']['path'])
-        assert sha(native) == BINARIES[mode], native
+        assert sha(native) == BINARIES['original' if ORIGINAL_BASELINE and mode == 'off' else mode], native
         result[mode] = dict(revision=revision, tree=str(tree), native=str(native), native_sha256=sha(native),
                             cpp_sha256=sha(tree / 'python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp'),
                             native_extensions=extensions)
@@ -203,13 +214,14 @@ def server_command(mode):
     service = SERVICE.read_text().replace('\\\n', ' ')
     args = shlex.split(next(line[10:] for line in service.splitlines() if line.startswith('ExecStart=')))
     args[0] = str(SRC / '.venv/bin/ft')
-    for flag, value in [('--port', '18090'), ('--moe-disk-prefill', 'staged'),
+    for flag, value in [('--port', '18090'), ('--moe-disk-prefill', 'cpu' if ORIGINAL_BASELINE and mode == 'off' else 'staged'),
                         ('--max-running-requests', '1'), ('--kv-disk-cache-gib', '0')]:
         args[args.index(flag) + 1] = value
     args.remove('--moe-collect-stats')
     args.extend(['--moe-hot-plan-persist', 'off', '--cache-type', 'radix', '--kv-ladder', 'off',
                  '--kv-reserve-tokens', '65536', '--cuda-graph-max-bs', '1'])
-    args.extend(['--moe-disk-prefill-io', 'buffered', '--moe-hot-staging-io', 'mmap'])
+    if not (ORIGINAL_BASELINE and mode == 'off'):
+        args.extend(['--moe-disk-prefill-io', 'buffered', '--moe-hot-staging-io', 'mmap'])
     if PROFILE_RETENTION:
         for flag, value in [('--session-expert-prefetch', 'on'), ('--session-protect-experts', '64')]:
             if flag in args:
@@ -231,7 +243,7 @@ def server_env(mode):
     return dict(CUDA_HOME='/usr/local/cuda-13.0',
                 PATH=f'{SRC}/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin', TMPDIR=str(R / 'tmp'),
                 PYTHONPATH=str(runtime_tree(mode) / 'python'),
-                FREETOKEN_DECODE_PREFIX_SNAPSHOT='1' if mode == 'on' and not runtime_pair() and not same_runtime_policy() else '0',
+                FREETOKEN_DECODE_PREFIX_SNAPSHOT='1' if mode == 'on' and not different_runtimes() and not same_runtime_policy() else '0',
                 FREETOKEN_CONTINUATION_TRACE_DIR='', FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR='',
                 FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS='128', FREETOKEN_PREFILL_HOT_OVERLAP='0')
 
@@ -260,23 +272,64 @@ def qualify_hot_host_commands(commands):
     assert normalized[0] == normalized[1], 'unrelated HOT host cache command difference'
 
 
+def qualify_original_commands(commands):
+    normalized = []
+    for mode, prefill in [('off', 'cpu'), ('on', 'staged')]:
+        command = commands[mode].copy()
+        flags = [('--moe-disk-prefill', prefill)]
+        if mode == 'on':
+            flags += [('--moe-disk-prefill-io', 'buffered'), ('--moe-hot-staging-io', 'mmap')]
+        else:
+            assert '--moe-disk-prefill-io' not in command and '--moe-hot-staging-io' not in command
+        for flag, value in flags:
+            assert command.count(flag) == 1, 'missing or duplicate combined-runtime flag'
+            index = command.index(flag)
+            assert command[index + 1:index + 2] == [value], 'wrong combined-runtime flag'
+            del command[index:index + 2]
+        normalized.append(command)
+    assert normalized[0] == normalized[1], 'unrelated combined-runtime command difference'
+
+
+def qualify_original_identities(ids):
+    assert ids['off'] == ids['original'], 'baseline is not the original serving identity'
+    for mode, tree, revision, binary in [
+        ('off', SRC, REVISIONS['original'], BINARIES['original']),
+        ('on', CARRY, PREFILL_CARRY_REVISIONS['on'], BINARIES['on']),
+    ]:
+        row = ids[mode]
+        assert row['tree'] == str(tree) and row['revision'] == revision, 'wrong combined-runtime revision or tree'
+        assert row['native_sha256'] == binary, 'wrong combined-runtime CPU binary'
+        extensions = row['native_extensions']
+        assert set(extensions) == set(EXTENSION_SOURCES), 'missing combined-runtime native extension'
+        assert all(all(e.get(k) for k in ('path', 'sha256', 'source_sha256'))
+                   for e in extensions.values()), 'incomplete combined-runtime native identity'
+        cpu = extensions['_cpu_moe']
+        assert (cpu['path'], cpu['sha256'], cpu['source_sha256']) == (
+            row['native'], row['native_sha256'], row['cpp_sha256']), 'CPU identity disagrees with manifest'
+    for name in EXTENSION_SOURCES.keys() - {'_cpu_moe'}:
+        assert all(ids['off']['native_extensions'][name][k] == ids['on']['native_extensions'][name][k]
+                   for k in ('sha256', 'source_sha256')), 'unrelated native extension changed'
+
+
 def preflight(allow_lease=False):
-    assert sum((PREFILL_CARRY, PROFILE_RETENTION, GPU_SOURCE_STAGING, HOT_HOST_RECLAIM)) <= 1, 'conflicting experiments'
+    assert sum((PREFILL_CARRY, PROFILE_RETENTION, GPU_SOURCE_STAGING, HOT_HOST_RECLAIM, ORIGINAL_BASELINE)) <= 1, 'conflicting experiments'
     commands = {mode: server_command(mode) for mode in MODES}
     env = {mode: server_env(mode) for mode in MODES}
     if GPU_SOURCE_STAGING:
         qualify_source_commands(commands)
     elif HOT_HOST_RECLAIM:
         qualify_hot_host_commands(commands)
+    elif ORIGINAL_BASELINE:
+        qualify_original_commands(commands)
     else:
         assert commands['off'] == commands['on']
     differences = {key for key in env['off'].keys() | env['on'].keys()
                    if env['off'].get(key) != env['on'].get(key)}
-    expected = set() if same_runtime_policy() else ({'PYTHONPATH'} if runtime_pair() else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'})
+    expected = set() if same_runtime_policy() else ({'PYTHONPATH'} if different_runtimes() else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'})
     assert differences == expected, differences
-    if runtime_pair() or same_runtime_policy():
+    if different_runtimes() or same_runtime_policy():
         assert all(e['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0' for e in env.values())
-    if HOT_HOST_RECLAIM:
+    if HOT_HOST_RECLAIM or ORIGINAL_BASELINE:
         assert all(e['FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR'] == '' for e in env.values()), 'HOT census enabled'
     if PROFILE_RETENTION:
         for flag, value in [('--session-expert-prefetch', 'on'), ('--session-protect-experts', '64')]:
@@ -293,6 +346,8 @@ def preflight(allow_lease=False):
     workers = gpu_pids()
     assert len(workers) == 1 and original['ControlGroup'] in Path(f'/proc/{workers[0]}/cgroup').read_text()
     runtime_ids = identities()
+    if ORIGINAL_BASELINE:
+        qualify_original_identities(runtime_ids)
     if same_runtime_policy():
         assert runtime_ids['off'] == runtime_ids['on'], 'policy runtime identities differ'
     if runtime_pair():
@@ -500,12 +555,15 @@ def remote_main(args):
         assert 'moe_collect_stats=False' in text and 'moe_step_timing=False' in text
         assert "cache_type='radix'" in text and "kv_ladder='off'" in text
         assert 'kv_disk_cache_gib=0.0' in text and "moe_hot_plan_persist='off'" in text
-        assert any('DISK staged prefill:' in line and 'file_io=buffered' in line for line in text.splitlines())
-        assert any('MoE HOT staging:' in line and 'file_io=mmap' in line for line in text.splitlines())
+        if ORIGINAL_BASELINE and mode == 'off':
+            assert "moe_disk_prefill='cpu'" in text
+        else:
+            assert any('DISK staged prefill:' in line and 'file_io=buffered' in line for line in text.splitlines())
+            assert any('MoE HOT staging:' in line and 'file_io=mmap' in line for line in text.splitlines())
         assert "speculative_mtp='off'" in text and 'special_token_ckpt=False' in text
         if PROFILE_RETENTION:
             assert "session_expert_prefetch='on'" in text and 'session_protect_experts=64' in text
-        snapshot_enabled = mode == 'on' and not runtime_pair() and not same_runtime_policy()
+        snapshot_enabled = mode == 'on' and not different_runtimes() and not same_runtime_policy()
         assert ('Aligned decode prefix snapshots enabled' in text) == snapshot_enabled
         shape = geometry(text, source_staging=GPU_SOURCE_STAGING)
         layout = source_layout(text, mode) if GPU_SOURCE_STAGING else None
@@ -527,7 +585,7 @@ def remote_main(args):
             assert f"moe_hot_host_cache='{policy}'" in text
             assert f'MoE HOT host cache: {policy}' in text
             result['hot_host_cache'] = policy
-        if same_runtime_policy():
+        if same_runtime_policy() or ORIGINAL_BASELINE:
             result['memory_before'] = memory_snapshot(worker)
         save(start_path, result)
         (out / (args.arm + '-startup.log')).write_text(text)
@@ -538,7 +596,7 @@ def remote_main(args):
         assert current['InvocationID'] == before['unit']['InvocationID'] and current['ActiveState'] == 'active'
         result = dict(unit=current, io_after=io_snapshot(before['worker']),
                       gpu_pids=gpu_pids(), original_unit=state('freetoken-serve'))
-        if same_runtime_policy():
+        if same_runtime_policy() or ORIGINAL_BASELINE:
             result['memory_after'] = memory_snapshot(before['worker'])
         assert result['gpu_pids'] == [before['worker']]
         text = journal(current['InvocationID'])
@@ -573,6 +631,8 @@ def remote_command(script, action, run_id, arm=None):
         command += ['--gpu-source-staging']
     if HOT_HOST_RECLAIM:
         command += ['--hot-host-cache-reclaim']
+    if ORIGINAL_BASELINE:
+        command += ['--original-baseline']
     if arm:
         command += ['--arm', arm]
     if action in ('start', 'end'):
@@ -634,6 +694,17 @@ def local_main(args):
                           'compute placement, HOT and cache geometry. OS memory counters outside '
                           'the client include warmup; they do not measure peak usage. Host page '
                           'cache retained. Keep failures and both execution orders.')
+    if ORIGINAL_BASELINE:
+        plan['design'] = ('Original/selected/selected/original: one warmup and two measured '
+                          'three-turn conversations per fresh server. Original CPU DISK prefill '
+                          'and native CPU executor versus the selected runtime with buffered '
+                          'staged prefill, HOT reuse, telemetry gates and prefill-marker carry. '
+                          'Same routing, precision, CPU/GPU placement and cache geometry. '
+                          'Decode snapshots and invasive diagnostics requested off in both arms; '
+                          'removal of legacy unconditional telemetry is part of the change. '
+                          'OS memory snapshots outside client timing include warmup. Retain '
+                          'host page cache, failures, both orders and all output differences. '
+                          'This measures the combined stack, not isolated component gains.')
     if not args.fixed_continuation:
         plan.update(pi_version=run(str(args.pi), '--version').stdout.strip(),
                     pi_executable_sha256=sha(args.pi.resolve()))
@@ -769,7 +840,7 @@ def local_main(args):
 
 
 def main():
-    global PREFILL_CARRY, PROFILE_RETENTION, GPU_SOURCE_STAGING, HOT_HOST_RECLAIM
+    global PREFILL_CARRY, PROFILE_RETENTION, GPU_SOURCE_STAGING, HOT_HOST_RECLAIM, ORIGINAL_BASELINE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--remote', dest='action', choices=['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
     parser.add_argument('--run-id', required=True)
@@ -787,18 +858,21 @@ def main():
                              help='compare pinned and staged GPU sources on the same runtime; decode snapshots stay off')
     experiments.add_argument('--hot-host-cache-reclaim', action='store_true',
                              help='compare retaining and reclaiming HOT source pages on one runtime')
+    experiments.add_argument('--original-baseline', action='store_true',
+                             help='compare original serving with the selected runtime on fixed continuations')
     parser.add_argument('--preflight', action='store_true')
     args = parser.parse_args()
     PREFILL_CARRY = args.prefill_snapshot_carry
     PROFILE_RETENTION = args.hybrid_profile_retention
     GPU_SOURCE_STAGING = args.gpu_source_staging
     HOT_HOST_RECLAIM = args.hot_host_cache_reclaim
+    ORIGINAL_BASELINE = args.original_baseline
     if not re.fullmatch(r'astra-pi-agentic-[a-z0-9-]+', args.run_id):
         parser.error('run-id must start astra-pi-agentic- and contain only lowercase letters, digits and hyphens')
     if args.action:
         print(json.dumps(remote_main(args), indent=2), flush=True)
         return 0
-    if (runtime_pair() or same_runtime_policy()) and not args.fixed_continuation:
+    if (different_runtimes() or same_runtime_policy()) and not args.fixed_continuation:
         parser.error('source experiments require --fixed-continuation')
     if not args.output_dir or (not args.pi and not args.fixed_continuation):
         parser.error('local controller requires --output-dir and either --pi or --fixed-continuation')
