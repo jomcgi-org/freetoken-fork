@@ -80,6 +80,31 @@ def test_graph_break_even_uses_graph_acceptance_and_replay_costs():
     assert "graph_break_even_acceptance_excluding_proposer" not in failed
 
 
+def test_checkpoint_break_even_requires_both_outcomes_and_uses_its_restore_cost():
+    rows = records()
+    rows += [dict(rows[0], mode="accept_graph", wall_s=1.2),
+             dict(rows[0], mode="reject_graph", wall_s=2.8)]
+    assert not probe.summarize(rows, graph_enabled=True, checkpoint_enabled=True)["2"]["complete"]
+    rows += [dict(rows[0], mode="accept_checkpoint", wall_s=1.3),
+             dict(rows[0], mode="reject_checkpoint", wall_s=1.4)]
+    result = probe.summarize(rows, graph_enabled=True, checkpoint_enabled=True)["2"]
+    assert result["checkpoint_break_even_acceptance_excluding_proposer"] == pytest.approx(0.4 / 1.1)
+    rows[-1]["checks_passed"] = False
+    failed = probe.summarize(rows, graph_enabled=True, checkpoint_enabled=True)["2"]
+    assert "checkpoint_break_even_acceptance_excluding_proposer" not in failed
+
+
+def test_checkpoint_saved_seed_state_is_part_of_numerical_qualification():
+    checks = {prefix + suffix: value for prefix in
+              ("eager_vs_sequential", "graph_vs_eager", "checkpoint_vs_eager")
+              for suffix, value in (("_logits", {"exact": True}),
+                                    ("_state", {"recurrent": {"exact": True}}))}
+    checks.update(graph_vs_eager_tokens_equal=True, checkpoint_vs_eager_tokens_equal=True,
+                  checkpoint_seed_state={"recurrent": {"exact": False}})
+    assert probe.numerical_mismatches(checks, graph_enabled=True, checkpoint_enabled=True) == [
+        "checkpoint_seed/recurrent"]
+
+
 @pytest.mark.parametrize("failure", [None, "eager_vs_sequential/logits",
                                     "eager_vs_sequential/recurrent", "graph_vs_eager/logits",
                                     "graph_vs_eager/recurrent", "graph_vs_eager/tokens"])
