@@ -78,9 +78,12 @@ def make_cache(sources, *, staged, threads):
         executor = CpuMoeExecutor(
             cache, top_k=10, activation='silu', apply_router_weight_on_input=False,
             num_threads=threads, max_tokens=4, device=torch.device('cuda'),
-            disk_lookahead=False, step_timing=False, moe_cpu_willneed='off',
+            disk_lookahead=False, step_timing=False, moe_cpu_willneed='always',
             prefill_coalesce=False, prefill_batch='off',
         )
+        # Plain resident tensors register no HostBank prefetch callback. This
+        # probe only submits GPU-fetch tasks, never CPU expert compute tasks.
+        assert not executor._disk_banks
         cache.set_cpu_executor(executor)
         cache.init_disk_gpufetch(executor, max_tokens=4, top_k=10)
         assert cache._gpufetch_capacity == CAPACITY and cache._gpufetch_fused_ok
