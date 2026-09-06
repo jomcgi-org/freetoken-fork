@@ -1,6 +1,7 @@
 """Explicit wider target-verification diagnostic with retained prefix state."""
 
 import copy
+from contextlib import nullcontext
 from dataclasses import replace
 import math
 from pathlib import Path
@@ -82,6 +83,23 @@ def numerical_failures(value, path=""):
     return errors
 
 
+def graph_reuse_qualified(records, captures, compact_enabled):
+    cases = {}
+    for row in records:
+        cases.setdefault(row["case"], set()).add(row.get("graph_reused"))
+    expected = {"full": 1, "compact": 1 if compact_enabled else 0}
+    return captures == expected and list(cases.values()) == [{False}, {True}, {True}, {True}]
+
+
+def close_graphs(graphs, stream):
+    for name in ("graph", "compact_graph"):
+        if graphs.get(name) is not None:
+            graphs[name].close()
+    if graphs.get("compact_checkpoint") is not None:
+        graphs["compact_checkpoint"].close(stream)
+    graphs.clear()
+
+
 def configure_fused(batch, ids, positions, locations, width):
     if ids.numel() != width or positions.numel() != width or locations.numel() != width:
         raise ValueError("fused inputs must match the configured verification width")
@@ -160,7 +178,8 @@ def install(width):
 
 
 def run_window(engine, source, position, seed, host_prefix, *, width, base, seed_api,
-               report, directory, repeats, warmup, compact_type=None, pair_compare=False):
+               report, directory, repeats, warmup, compact_type=None, pair_compare=False,
+               relocatable_state=False, graphs=None, relocation=None, control_logits=None):
     import torch
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.core import Batch
@@ -178,14 +197,27 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
     batch.active_table_idx = request_rows
     batch.mtp_original_cached_len, batch.mtp_original_device_len = position, position + 1
     positions = torch.arange(position, position + width, device=engine.device, dtype=torch.int32)
-    window = base["StateWindow"](engine, req, position, width=width)
+    window = base["StateWindow"](engine, req, position, width=width,
+                                 allow_reserved_page=relocation is not None)
     initial = window.capture()
+    neighbours = relocation.neighbours() if relocation is not None else {}
+    # Inactive-slot checks are diagnostic work outside the forward timer.
+    # Host snapshots also keep their comparison temporaries out of VRAM.
+    neighbour_state = {name: value.detach().to("cpu", copy=True) for name, value in neighbours.items()}
+
+    def neighbour_errors():
+        return ["neighbour/" + name for name, value in neighbours.items()
+                if not equal(value.cpu(), neighbour_state[name])]
     ids = seed.reshape(1).repeat(width).to(torch.int32)
     host_seed = seed.cpu().reshape(1).to(host_prefix.dtype)
     req.input_ids = torch.cat((host_prefix, host_seed.repeat(width)))
-    graph = None
-    compact_graph = None
-    compact_checkpoint = None
+    if graphs is not None and not relocatable_state:
+        raise ValueError("graph reuse requires explicit relocatable state bindings")
+    graph = graphs.get("graph") if graphs is not None else None
+    checkpoint = graphs.get("checkpoint") if graphs is not None else None
+    compact_graph = graphs.get("compact_graph") if graphs is not None else None
+    compact_checkpoint = graphs.get("compact_checkpoint") if graphs is not None else None
+    graph_reused = graph is not None
 
     def forward(step=None, *, captured=False, with_logits=False, compact=False):
         if step is None:
@@ -232,15 +264,22 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
     checks = dict(eager_logits=metrics(eager_logits, reference_logits),
                   eager_tokens_equal=equal(eager_tokens, reference_tokens),
                   eager_state=window.metrics(states[-1], committed_end=position + width))
+    if control_logits is not None:
+        checks["original_mapping_seed_logits"] = metrics(reference_logits[:1], control_logits)
     report.setdefault("numerical_checks", {})[case] = checks
     report["stage"] = "capturing wider checkpoint graph at " + case
     base["save"](directory, report)
     window.reset(initial)
     engine.stream.synchronize()
-    checkpoint = seed_api["SeedCheckpoint"].from_engine(
-        engine, req, base["state_views"](engine, req), width=width)
-    with seed_api["capture_context"](checkpoint):
-        graph = base["FusedGraph"](engine, batch)
+    if graph is None:
+        checkpoint = seed_api["SeedCheckpoint"].from_engine(
+            engine, req, base["state_views"](engine, req), width=width)
+        with seed_api["capture_context"](checkpoint):
+            graph = base["FusedGraph"](engine, batch,
+                                       state_checkpoint=checkpoint if relocatable_state else None)
+        report.setdefault("graph_captures", {"full": 0, "compact": 0})["full"] += 1
+        if graphs is not None:
+            graphs.update(graph=graph, checkpoint=checkpoint)
     window.reset(initial)
     graph_tokens, graph_logits = forward(captured=True, with_logits=True)
     checks.update(graph_logits=metrics(graph_logits, reference_logits),
@@ -261,12 +300,19 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
                         reserved_bytes=torch.cuda.memory_reserved(engine.device))
 
         allocator = dict(before_compact=allocator_state())
-        compact_checkpoint = compact_type.from_engine(
-            engine, req, base["state_views"](engine, req), width=width)
-        with seed_api["capture_context"](compact_checkpoint):
-            compact_graph = base["FusedGraph"](engine, batch)
+        capture_compact = compact_graph is None
+        if capture_compact:
+            compact_checkpoint = compact_type.from_engine(
+                engine, req, base["state_views"](engine, req), width=width)
+            with seed_api["capture_context"](compact_checkpoint):
+                compact_graph = base["FusedGraph"](
+                    engine, batch, state_checkpoint=compact_checkpoint if relocatable_state else None)
+            report.setdefault("graph_captures", {"full": 0, "compact": 0})["compact"] += 1
+            if graphs is not None:
+                graphs.update(compact_graph=compact_graph, compact_checkpoint=compact_checkpoint)
         allocator["after_compact_target"] = allocator_state()
-        compact_checkpoint.capture_restore_graphs(engine.stream)
+        if capture_compact:
+            compact_checkpoint.capture_restore_graphs(engine.stream)
         allocator["after_rollback_graphs"] = allocator_state()
         window.reset(initial)
         compact_tokens, compact_logits = forward(captured=True, compact=True, with_logits=True)
@@ -310,6 +356,9 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
             pair_checks[name] = checked
         checks["cpu_pair"] = pair_checks
         set_cpu_pair(engine, False)
+    if relocation is not None:
+        checks["neighbour_state"] = {name: metrics(value.cpu(), neighbour_state[name])
+                                     for name, value in neighbours.items()}
     errors = numerical_failures(checks)
     report["stage"] = "measuring wider checkpoint graph at " + case
     base["save"](directory, report)
@@ -375,24 +424,54 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
                         mismatches.append("post_reject_token")
                     mismatches += ["post_reject/" + name for name in
                                    window.compare(states[count], committed_end=position + count + 1)]
+            neighbour_mismatches = neighbour_errors()
+            mismatches += neighbour_mismatches
             report["records"].append(dict(case=case, mode=mode, repeat=repeat, warmup=repeat < 0,
                                            wall_s=elapsed, matched=matched, output_tokens=count,
                                            cpu_pair_enabled=paired,
+                                           graph_reused=graph_reused,
+                                           request_table=req.table_idx,
+                                           linear_slot=req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx,
+                                           physical_pages=list(window.physical_pages),
+                                           neighbours_unchanged=not neighbour_mismatches,
                                            checks_passed=not mismatches, mismatches=mismatches))
             base["save"](directory, report)
     window.reset(states[0])
     engine.stream.synchronize()
     if pair_compare:
         set_cpu_pair(engine, False)
-    graph.close()
-    if compact_graph is not None:
-        compact_graph.close()
-        compact_checkpoint.close(engine.stream)
+    if graphs is None:
+        close_graphs(dict(graph=graph, compact_graph=compact_graph,
+                          compact_checkpoint=compact_checkpoint), engine.stream)
     return tokens[0], torch.cat((host_prefix, host_seed))
 
 
+def original_seed_logits(engine, source, base):
+    """Check the next ordinary token before the diagnostic relocates any pages."""
+    from freetoken.attention.linear import build_fla_metadata
+
+    batch = copy.copy(source)
+    batch.reqs = [copy.copy(source.reqs[0])]
+    batch.padded_reqs = batch.reqs
+    window = base["StateWindow"](engine, batch.reqs[0], batch.reqs[0].cached_len, width=1)
+    initial = window.capture()
+    batch.fla_metadata = build_fla_metadata(batch, engine.device)
+    engine.attn_backend.prepare_metadata(batch)
+    engine.cpu_moe_executor.begin_decode_step()
+    try:
+        with engine.ctx.forward_batch(batch):
+            if not engine.graph_runner.can_use_cuda_graph(batch):
+                raise RuntimeError("ordinary control graph is unavailable")
+            result = engine.graph_runner.replay(batch).float().clone()
+        engine.cpu_moe_executor.raise_if_unhealthy()
+        return result
+    finally:
+        window.reset(initial)
+        engine.stream.synchronize()
+
+
 def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=1,
-          pair_compare=False):
+          pair_compare=False, relocatable_state=False, boundary_relocation=False):
     import hashlib
     import subprocess
     import sys
@@ -400,11 +479,14 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
 
     root = Path(__file__).resolve().parents[1]
     compact_type = base["_COMPACT_API"]["Checkpoint"] if base["_COMPACT_API"] else None
+    graphs = {} if relocatable_state else None
     report = dict(completed=False, diagnostic_only=True, model_wall_qualified=False,
                   width=width, draft_tokens=width - 1, graph_enabled=True, trace_only=False,
                   checkpoint_enabled=True, serial_linear=True, records=[],
                   compact_enabled=compact_type is not None,
                   cpu_pair_compare=pair_compare,
+                  relocatable_state=relocatable_state,
+                  boundary_relocation=boundary_relocation,
                   cpu_max_tokens=engine.cpu_moe_executor.max_tokens,
                   ring_capacity=engine.kv_cache.ring_capacity,
                   native_sha256=hashlib.sha256(Path(_cpu_moe.__file__).read_bytes()).hexdigest(),
@@ -422,19 +504,44 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
         req = batch.reqs[0]
         position = req.cached_len
         seed, prefix = batch.input_ids[:1].clone(), req.input_ids[:position].clone()
-        if len(prefix) != position or not eligible_window(position, engine.config.page_size, width, req.remain_len):
+        relocation_api = base.get("_RELOCATION_API") if boundary_relocation else None
+        if boundary_relocation and (relocation_api is None or not relocatable_state):
+            raise RuntimeError("boundary relocation requires its explicit helper and state bindings")
+        eligible = (relocation_api["eligible_boundary"] if boundary_relocation else eligible_window)
+        if len(prefix) != position or not eligible(position, engine.config.page_size, width, req.remain_len):
             raise RuntimeError("wider probe needs complete history and a fully allocated window")
-        for offset in range(4):
-            seed, prefix = run_window(engine, batch, position + offset, seed, prefix,
-                                      width=width, base=base, seed_api=seed_api, report=report,
-                                      directory=directory, repeats=repeats, warmup=warmup,
-                                      compact_type=compact_type, pair_compare=pair_compare)
+        control = original_seed_logits(engine, batch, base) if boundary_relocation else None
+        lease = (relocation_api["RelocationLease"](engine, batch, position, width, base["state_views"])
+                 if boundary_relocation else nullcontext())
+        with lease as relocation:
+            if relocation is not None:
+                report["relocation_layout"] = dict(relocation.layout)
+            for offset in range(4):
+                selected = relocation.select(offset) if relocation is not None else batch
+                seed, prefix = run_window(engine, selected, position + offset, seed, prefix,
+                                          width=width, base=base, seed_api=seed_api, report=report,
+                                          directory=directory, repeats=repeats, warmup=warmup,
+                                          compact_type=compact_type, pair_compare=pair_compare,
+                                          relocatable_state=relocatable_state, graphs=graphs,
+                                          relocation=relocation, control_logits=control if offset == 0 else None)
         report["summary"] = summarize(report["records"], width, compact_type is not None, pair_compare)
         report["checks_passed"] = (len(report["summary"]) == 4
                                    and all(case["checks_passed"] for case in report["summary"].values()))
+        if relocatable_state:
+            report["graph_reuse_qualified"] = graph_reuse_qualified(
+                report["records"], report.get("graph_captures"), compact_type is not None)
+            report["checks_passed"] &= report["graph_reuse_qualified"]
+        if boundary_relocation:
+            report["boundary_relocation_qualified"] = relocation_api["qualify"](
+                report["records"], report.get("relocation_layout"), width)
+            report["checks_passed"] &= report["boundary_relocation_qualified"]
         report["completed"] = True
     except BaseException as exc:
         report["error"] = type(exc).__name__ + ": " + str(exc)
         raise
     finally:
-        base["save"](directory, report)
+        try:
+            if graphs is not None:
+                close_graphs(graphs, engine.stream)
+        finally:
+            base["save"](directory, report)
