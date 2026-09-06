@@ -10,6 +10,12 @@ writing its private report. Never install it in normal serving, a user session,
 or a wall-time benchmark. Run only under an exclusive supervisor that restores
 the original service on success, failure, timeout, or controller disconnect.
 
+Set `FREETOKEN_TARGET_VERIFY_GRAPH=1` to add a dedicated verification graph. This
+adapts the host PLE staging and capture-safe constant indptr approach from the
+existing `feat/mtp-graphs` work at `1c42624`. It preserves the selected runtime's
+serial width-one GDN updates. PLE gets two staging/hash rows in every arm of this
+diagnostic; normal serving imports none of these hooks.
+
 Before starting the isolated server, set `FREETOKEN_TARGET_VERIFY_COST_DIR` to a
 new private directory. Put this explicit hook in that run's `sitecustomize.py`,
 using the absolute path to this clean worktree:
@@ -47,6 +53,20 @@ and ordinary seed replay). Timing includes stream completion and metadata work.
 Reset and correctness copies are outside each component window. Execution order
 alternates and warmups are retained but excluded from timing summaries.
 
+Graph mode adds acceptance and rejection through a separately captured two-token
+graph. Each diagnostic window owns its graph and addressing tensors. Replay
+restages token inputs, QSA addresses/lengths and PLE host lookups before launching
+it. Capture failures are fatal to the probe and cannot silently fall back to
+eager execution. This does not implement a proposer or serving scheduler.
+
+Untimed numerical checks report finite status, changed-element counts, maximum
+absolute error and RMS error for floating state and logits. Integer history is
+compared without float conversion. Graph verification is also compared directly
+with an independent eager two-token reference, separating capture discrepancies
+from differences already present between batched and sequential target forwards.
+These measurements do not introduce a tolerance or relax the existing exact
+qualification gate. Keep their values private with the rest of the records.
+
 Rejection restores recurrence, convolution, integer PLE history and QSA pending
 state. It deliberately leaves speculative KV/index writes beyond the committed
 length in place. The check compares all reachable state byte for byte, then
@@ -67,6 +87,7 @@ Validation: the focused checks pass on Linux, including the tensor comparisons;
 macOS runs the hermetic subset and skips the Torch checks. They exercise boundary
 selection, private reporting, lazy installation, break-even qualification, and
 committed versus unreachable cache-state comparisons. Full target-model execution
-also completed. Acceptance-state equivalence remains unresolved, so the change
-stays draft while that discrepancy is investigated. All measured records remain
-private; successful execution does not qualify a serving throughput improvement.
+also completed for eager verification. Graph-mode validation and acceptance-state
+equivalence remain unresolved, so the change stays draft while those checks run.
+All measured records remain private; successful execution does not qualify a
+serving throughput improvement.

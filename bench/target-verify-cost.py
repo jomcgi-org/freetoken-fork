@@ -16,7 +16,9 @@ import time
 
 
 OUTPUT_ENV = "FREETOKEN_TARGET_VERIFY_COST_DIR"
+GRAPH_ENV = "FREETOKEN_TARGET_VERIFY_GRAPH"
 MODES = ("graph_one", "graph_two", "snapshot", "accept", "reject")
+GRAPH_MODES = ("accept_graph", "reject_graph")
 
 
 def eligible_position(position, *, page_size, ratio, remaining):
@@ -28,7 +30,7 @@ def eligible_position(position, *, page_size, ratio, remaining):
     )
 
 
-def summarize(records):
+def summarize(records, *, graph_enabled=False):
     """Keep correctness independent of component costs and never claim a speedup."""
     groups = {}
     for record in records:
@@ -36,7 +38,7 @@ def summarize(records):
             groups.setdefault(record["case"], {}).setdefault(record["mode"], []).append(record)
     result = {}
     for case, modes in groups.items():
-        complete = set(modes) == set(MODES)
+        complete = set(modes) == set(MODES + (GRAPH_MODES if graph_enabled else ()))
         valid = complete and all(r["checks_passed"] for r in records if r["case"] == case)
         medians = {name: statistics.median(r["wall_s"] for r in rows)
                    for name, rows in modes.items()}
@@ -79,6 +81,183 @@ def bytes_equal(left, right):
                             right.contiguous().view(torch.uint8)))
 
 
+def difference_metrics(actual, expected):
+    """Describe discrepancies without choosing a tolerance or relaxing qualification."""
+    import torch
+
+    result = dict(dtype=str(actual.dtype), elements=actual.numel(),
+                  exact=bytes_equal(actual, expected))
+    if not actual.is_floating_point():
+        # Integer PLE history must never pass through a lossy float conversion.
+        result["different_elements"] = int(torch.count_nonzero(actual != expected).item())
+        return result
+    left, right = actual.float(), expected.float()
+    finite = bool(torch.isfinite(left).all().item() and torch.isfinite(right).all().item())
+    result["finite"] = finite
+    if not finite or not actual.numel():
+        return result
+    delta = left - right
+    rms = float(delta.square().mean().sqrt().item())
+    reference_rms = float(right.square().mean().sqrt().item())
+    result.update(different_elements=int(torch.count_nonzero(left != right).item()),
+                  max_abs=float(delta.abs().max().item()), rms=rms,
+                  relative_rms=rms / reference_rms if reference_rms else None)
+    return result
+
+
+def host_contexts(history, position, ids, contexts, boundary):
+    """Fill the two token-ordered PLE contexts, including left padding."""
+    if ids.numel() != 2 or contexts.shape[0] != 2 or history.numel() < position:
+        raise ValueError("two-token PLE staging requires complete host history")
+    width = contexts.shape[1]
+    contexts.fill_(boundary)
+    count = min(width, position)
+    if count:
+        contexts[0, width - count:].copy_(history[position - count:position])
+    if width:
+        contexts[1, :-1].copy_(contexts[0, 1:])
+        contexts[1, -1].copy_(ids[0])
+
+
+def install_graph_support():
+    """Diagnostic-only adaptations of the existing feat/mtp-graphs PLE work.
+
+    Retain serial width-one GDN updates. Only provision PLE's second row and make
+    the two constant PLE indptrs capture-safe. Ordinary decode delegates unchanged.
+    """
+    import torch
+    from freetoken.models.qwen4_exp import ple
+    from freetoken.models.qwen4_exp.ple_uring import UringTable
+
+    original_uring = UringTable.__init__
+    original_hash = ple.NGramEmbedding.snapshot_host_hash_constants
+    original_metadata = ple.build_ple_metadata
+    original_conv = ple.PLELayer._short_conv
+    indptrs = {}
+
+    def indptr(device, width):
+        key = (device, width)
+        if key not in indptrs:
+            indptrs[key] = torch.arange(0, width + 1, width, device=device, dtype=torch.int32)
+        return indptrs[key]
+
+    def uring(table, *args, **kwargs):
+        kwargs["max_decode_batch_size"] = max(2, kwargs["max_decode_batch_size"])
+        original_uring(table, *args, **kwargs)
+
+    def hash_constants(embedding, max_batch_size=None):
+        original_hash(embedding, max(2, max_batch_size or 0))
+
+    def metadata(batch, args, device, context_pool=None):
+        if not getattr(batch, "mtp_fused", False):
+            return original_metadata(batch, args, device, context_pool)
+        if context_pool is None:
+            context_pool = ple._ngram_context_pool()
+        slots = batch.linear_table_idx.long()
+        if slots.numel() != 1 or batch.input_ids.numel() != 2:
+            raise ValueError("fused probe requires one request and two tokens")
+        return ple.PLEMetadata(input_ids=batch.input_ids, cu_seqlens=indptr(device, 2),
+                               seq_lens=(2,), ngram_context=context_pool.index_select(0, slots).long(),
+                               state_slots=slots, fresh_slots=None, is_decode=False, mtp_fused=True)
+
+    def short_conv(layer, x, meta, states):
+        if not meta.mtp_fused:
+            return original_conv(layer, x, meta, states)
+        pieces = []
+        for step in range(2):
+            one = ple.PLEMetadata(input_ids=meta.input_ids[step:step + 1],
+                                   cu_seqlens=indptr(meta.cu_seqlens.device, 1), seq_lens=(1,),
+                                   ngram_context=meta.ngram_context, state_slots=meta.state_slots,
+                                   fresh_slots=None, is_decode=True)
+            pieces.append(layer._decode_conv(x[step:step + 1], one, states))
+        return torch.cat(pieces, dim=0)
+
+    UringTable.__init__ = uring
+    ple.NGramEmbedding.snapshot_host_hash_constants = hash_constants
+    ple.build_ple_metadata = metadata
+    ple.PLELayer._short_conv = short_conv
+
+
+class FusedGraph:
+    """A dedicated graph for one diagnostic window, with dynamic token inputs.
+
+    Positions, request slots and page mapping remain fixed for this window. This
+    does not implement a scheduler or generalize the graph to other requests.
+    """
+
+    def __init__(self, engine, source):
+        import torch
+        from freetoken.attention.linear import build_fla_metadata
+
+        self.engine = engine
+        self.batch = batch = copy.copy(source)
+        batch.input_ids = source.input_ids.clone()
+        batch.positions = source.positions.clone()
+        batch.out_loc = source.out_loc.clone()
+        batch.linear_table_idx = source.linear_table_idx.clone()
+        batch.active_table_idx = source.active_table_idx.clone()
+        batch.fla_metadata = build_fla_metadata(batch, engine.device)
+        # The existing eager QSA builder gives each token independent addressing
+        # tensors. Keep those tensors alive and fixed throughout this graph's use.
+        engine.attn_backend.prepare_metadata(batch)
+        args = engine.model._config.qwen4_args
+        self.ids = torch.empty(2, dtype=torch.int64, pin_memory=True)
+        self.contexts = torch.empty((2, args.ngram_size - 1), dtype=torch.int64, pin_memory=True)
+        self.boundary = args.ngram_boundary_token_id
+        self.copy_done = torch.cuda.Event()
+        self.backends = getattr(engine.model, "_ple_disk_decode", ())
+        if not self.backends:
+            raise RuntimeError("verification graph probe requires staged PLE backends")
+        self.logits = torch.empty((2, engine.config.model_config.vocab_size),
+                                  device=engine.device, dtype=torch.float32)
+        self.graph = torch.cuda.CUDAGraph()
+        self._prepare()
+        with engine.ctx.forward_batch(batch):
+            self.logits.copy_(engine.model.forward(select_last=False))
+        engine.model.finish_cuda_graph_replay(record_event=True)
+        engine.stream.synchronize()
+        self._prepare()
+        with engine.ctx.forward_batch(batch):
+            with torch.cuda.graph(self.graph, stream=engine.stream):
+                self.logits.copy_(engine.model.forward(select_last=False))
+        engine.model.finish_cuda_graph_replay(record_event=False)
+        engine.graph_runner._reset_moe_offload_cache()
+        engine.stream.synchronize()
+
+    def _prepare(self):
+        import torch
+
+        self.ids.copy_(self.batch.input_ids, non_blocking=True)
+        self.copy_done.record(self.engine.stream)
+        self.copy_done.synchronize()
+        req = self.batch.reqs[0]
+        host_contexts(req.input_ids, req.cached_len, self.ids, self.contexts, self.boundary)
+        for ple, backend in self.backends:
+            rows = ple.ple_embedding.host_decode_row_ids(self.contexts, self.ids)
+            backend.prepare_decode(rows)
+            if getattr(backend, "_decode_shape", None) != torch.Size(rows.shape):
+                raise RuntimeError("verification PLE staging did not complete")
+
+    def replay(self, batch):
+        for name in ("input_ids", "positions", "out_loc", "linear_table_idx", "active_table_idx"):
+            if getattr(batch, name).shape != getattr(self.batch, name).shape:
+                raise RuntimeError("verification graph shape changed")
+            getattr(self.batch, name).copy_(getattr(batch, name))
+        # Restage the address/length inputs as a serving graph would. The scatter
+        # plans are captured operations derived from these persistent inputs.
+        for destination, source in zip(self.batch.mtp_qsa_metadata, batch.mtp_qsa_metadata):
+            for name in ("block_table", "seq_lens", "ring_slots", "token_to_req", "cu_seqlens"):
+                getattr(destination, name).copy_(getattr(source, name))
+        self._prepare()
+        self.graph.replay()
+        self.engine.model.finish_cuda_graph_replay(record_event=True)
+        return self.logits
+
+    def close(self):
+        self.engine.stream.synchronize()
+        self.graph.reset()
+
+
 class StateWindow:
     """Reset trials fully; compare only state reachable at the committed length.
 
@@ -117,8 +296,7 @@ class StateWindow:
         for name, tensor in self.views.items():
             tensor.copy_(snapshot[name])
 
-    def compare(self, expected, *, committed_end):
-        mismatches = []
+    def committed_pairs(self, expected, committed_end):
         for name, actual in self.views.items():
             wanted = expected[name]
             if name == "cmp_scratch":
@@ -129,12 +307,19 @@ class StateWindow:
             elif name == "cmp_page":
                 count = (committed_end - self.base) // self.ratio
                 actual, wanted = actual[:, :count], wanted[:, :count]
-            if not bytes_equal(actual, wanted):
-                mismatches.append(name)
-        return mismatches
+            yield name, actual, wanted
+
+    def compare(self, expected, *, committed_end):
+        return [name for name, actual, wanted in self.committed_pairs(expected, committed_end)
+                if not bytes_equal(actual, wanted)]
+
+    def metrics(self, expected, *, committed_end):
+        return {name: difference_metrics(actual, wanted)
+                for name, actual, wanted in self.committed_pairs(expected, committed_end)}
 
 
-def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, warmup, report, directory):
+def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, warmup, report,
+               directory, graph_enabled=False):
     import torch
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.core import Batch
@@ -147,7 +332,9 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
     batch = Batch(reqs=[req], phase="decode")
     batch.padded_reqs = [req]
     batch.linear_table_idx = source_batch.linear_table_idx.clone()
-    batch.active_table_idx = source_batch.active_table_idx.clone()
+    request_rows = source_batch.active_table_idx.clone()
+    fused_rows = request_rows.repeat(2)
+    batch.active_table_idx = request_rows
     batch.mtp_original_cached_len = position
     batch.mtp_original_device_len = position + 1
     positions = torch.arange(position, position + 2, device=engine.device, dtype=torch.int32)
@@ -157,30 +344,39 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
     host_seed = seed.cpu().reshape(1).to(host_prefix.dtype)
     req.input_ids = torch.cat((host_prefix, host_seed, host_seed))
 
-    def forward(step=None):
+    captured_graph = None
+
+    def forward(step=None, *, captured=False, with_logits=False):
         if step is None:
             configure_mtp_fused_step(batch, verify_ids, positions, window.locations)
+            batch.active_table_idx = fused_rows
         else:
             configure_mtp_decode_step(batch, verify_ids, positions, window.locations, step)
+            batch.active_table_idx = request_rows
         batch.fla_metadata = build_fla_metadata(batch, engine.device)
         engine.attn_backend.prepare_metadata(batch)
         engine.cpu_moe_executor.begin_decode_step()
         with engine.ctx.forward_batch(batch):
-            if step is None:
+            if captured:
+                if step is not None or captured_graph is None:
+                    raise RuntimeError("dedicated verification graph is unavailable")
+                logits = captured_graph.replay(batch)
+            elif step is None:
                 logits = engine.model.forward(select_last=False)
             else:
                 if not engine.graph_runner.can_use_cuda_graph(batch):
                     raise RuntimeError("ordinary CUDA graph baseline is unavailable")
                 logits = engine.graph_runner.replay(batch)
         engine.cpu_moe_executor.raise_if_unhealthy()
-        return torch.argmax(logits, dim=-1).to(torch.int32)
+        tokens = torch.argmax(logits, dim=-1).to(torch.int32)
+        return (tokens, logits.float().clone()) if with_logits else tokens
 
     # Derive an actual accepted candidate, and independent one/two-step state references.
-    first = forward(0)
+    first, first_logits = forward(0, with_logits=True)
     expected_one = window.capture()
     verify_ids[1].copy_(first[0])
     req.input_ids[-1:].copy_(first.cpu().to(req.input_ids.dtype))
-    second = forward(1)
+    second, second_logits = forward(1, with_logits=True)
     expected_two = window.capture()
     good_ids = verify_ids.clone()
     good_history = req.input_ids.clone()
@@ -188,6 +384,26 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
     wrong_id = (int(first.item()) + 1) % engine.config.model_config.vocab_size
     pool, kv = engine.linear_state_pool, engine.kv_cache
     case = str(position)
+    window.reset(initial)
+    eager_tokens, eager_logits = forward(with_logits=True)
+    expected_eager = window.capture()
+    diagnostic = dict(position=position, eager_vs_sequential_logits=difference_metrics(
+        eager_logits, torch.cat((first_logits, second_logits))),
+        eager_vs_sequential_state=window.metrics(expected_two, committed_end=position + 2))
+    report.setdefault("numerical_checks", {})[case] = diagnostic
+    if graph_enabled:
+        report["stage"] = "capturing verification graph at " + case
+        save(directory, report)
+        window.reset(initial)
+        engine.stream.synchronize()
+        captured_graph = FusedGraph(engine, batch)
+        window.reset(initial)
+        graph_tokens, graph_logits = forward(captured=True, with_logits=True)
+        diagnostic["graph_vs_eager_logits"] = difference_metrics(graph_logits, eager_logits)
+        diagnostic["graph_vs_eager_state"] = window.metrics(expected_eager, committed_end=position + 2)
+        diagnostic["graph_vs_eager_tokens_equal"] = bytes_equal(graph_tokens, eager_tokens)
+        report["stage"] = "measuring verification graph at " + case
+        save(directory, report)
 
     def execute(mode):
         if mode == "graph_one":
@@ -197,21 +413,22 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
         saved = snapshot_verify_state(pool, kv, req)
         if mode == "snapshot":
             return saved, None
-        targets = forward()
+        targets = forward(captured=mode in GRAPH_MODES)
         accepted, matched = greedy_accept_prefix(verify_ids[1:], targets)
-        if mode == "reject":
+        if mode.startswith("reject"):
             # Deliberately leave future KV/index writes in place, as production does.
             restore_verify_state(pool, kv, req, saved)
             return forward(0), matched
         return accepted, matched
 
     for repeat in range(-warmup, repeats):
-        order = MODES if repeat % 2 == 0 else tuple(reversed(MODES))
+        modes = MODES + (GRAPH_MODES if graph_enabled else ())
+        order = modes if repeat % 2 == 0 else tuple(reversed(modes))
         for mode in order:
             window.reset(initial)
             verify_ids.copy_(good_ids)
             req.input_ids.copy_(good_history)
-            if mode == "reject":
+            if mode.startswith("reject"):
                 verify_ids[1] = wrong_id
                 req.input_ids[-1] = wrong_id
             # Reset and diagnostic copies are outside the timed component window.
@@ -229,14 +446,17 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
                 mismatches += ["snapshot/" + k for k in snapshot_views
                                if not bytes_equal(snapshot_views[k], flat[k])]
             else:
-                count = 2 if mode in ("graph_two", "accept") else 1
+                count = 2 if mode == "graph_two" or mode.startswith("accept") else 1
                 if not bytes_equal(output, expected_tokens[:count]):
                     mismatches.append("greedy_tokens")
                 mismatches += window.compare(expected_two if count == 2 else expected_one,
                                              committed_end=position + count)
-                if mode in ("accept", "reject") and matched != (mode == "accept"):
+                if mode.startswith(("accept", "reject")) and matched != mode.startswith("accept"):
                     mismatches.append("proposal_match")
-                if mode == "reject":
+                if mode == "accept_graph":
+                    mismatches += ["graph_vs_eager/" + k for k in
+                                   window.compare(expected_eager, committed_end=position + 2)]
+                if mode.startswith("reject"):
                     verify_ids.copy_(good_ids)
                     req.input_ids.copy_(good_history)
                     continued = forward(1)
@@ -253,6 +473,8 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
     # Advance only through the independent ordinary-graph reference for the next case.
     window.reset(expected_one)
     engine.stream.synchronize()
+    if captured_graph is not None:
+        captured_graph.close()
     return first, torch.cat((host_prefix, host_seed))
 
 
@@ -262,7 +484,9 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
     import hashlib
     import subprocess
 
+    graph_enabled = os.environ.get(GRAPH_ENV) == "1"
     report = dict(diagnostic_only=True, model_wall_qualified=False, completed=False,
+                  graph_enabled=graph_enabled,
                   records=[], pid=os.getpid(), speculative_mtp=engine.config.speculative_mtp,
                   graph_sizes=sorted(engine.graph_runner.graph_map),
                   cpu_max_tokens=engine.cpu_moe_executor.max_tokens,
@@ -272,6 +496,7 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
                   limitations=["Component costs exclude proposer and scheduler work",
                                "Repeated windows warm expert and file caches",
                                "All arms reserve CPU rows for two tokens and a speculative QSA ring",
+                               "Graph mode also reserves two PLE staging/hash rows in every arm",
                                "Exact local state checks are not broad quality evaluation",
                                "No service continuation is permitted after the probe"])
     try:
@@ -294,8 +519,8 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
         for offset in range(3):
             seed, prefix = run_window(engine, batch, position + offset, seed, prefix,
                                       repeats=repeats, warmup=warmup,
-                                      report=report, directory=directory)
-        report["summary"] = summarize(report["records"])
+                                      report=report, directory=directory, graph_enabled=graph_enabled)
+        report["summary"] = summarize(report["records"], graph_enabled=graph_enabled)
         report["checks_passed"] = all(r["checks_passed"] for r in report["records"])
         report["completed"] = True
     except BaseException as exc:
@@ -315,6 +540,8 @@ def install(engine_class):
         raise RuntimeError("explicit private probe output directory is required")
     if torch.cuda.is_initialized():
         raise RuntimeError("install the probe before Engine initializes CUDA")
+    if os.environ.get(GRAPH_ENV) == "1":
+        install_graph_support()
     directory = Path(os.environ[OUTPUT_ENV])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     original_cpu_init = CpuMoeExecutor.__init__

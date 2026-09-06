@@ -58,6 +58,15 @@ def test_incomplete_or_failed_work_suppresses_break_even(failure):
     assert "break_even_acceptance_excluding_proposer" not in result
 
 
+def test_graph_mode_requires_both_graph_outcomes():
+    rows = records()
+    assert not probe.summarize(rows, graph_enabled=True)["2"]["complete"]
+    rows += [dict(rows[0], mode=mode) for mode in probe.GRAPH_MODES]
+    assert probe.summarize(rows, graph_enabled=True)["2"]["complete"]
+    rows[-1]["checks_passed"] = False
+    assert not probe.summarize(rows, graph_enabled=True)["2"]["checks_passed"]
+
+
 def test_report_is_private_and_replaced_atomically(tmp_path):
     probe.save(tmp_path, {"completed": False})
     probe.save(tmp_path, {"completed": True})
@@ -136,3 +145,60 @@ def test_window_rejects_dummy_page(monkeypatch):
     window.engine.num_pages = 1
     with pytest.raises(RuntimeError, match="dummy KV page"):
         probe.StateWindow(window.engine, window.req, 6)
+
+
+def test_float_error_metrics_do_not_relax_exact_comparison():
+    torch = pytest.importorskip("torch")
+    expected = torch.tensor([1.0, 2.0])
+    actual = torch.tensor([1.0, 2.5])
+    result = probe.difference_metrics(actual, expected)
+    assert not result["exact"] and result["finite"]
+    assert result["different_elements"] == 1
+    assert result["max_abs"] == 0.5
+    assert result["rms"] == pytest.approx((0.25 / 2) ** 0.5)
+    assert result["relative_rms"] == pytest.approx((0.25 / 5) ** 0.5)
+
+
+def test_integer_metrics_preserve_low_bits_above_float_precision():
+    torch = pytest.importorskip("torch")
+    expected = torch.tensor([2**62], dtype=torch.int64)
+    result = probe.difference_metrics(expected + 1, expected)
+    assert not result["exact"] and result["different_elements"] == 1
+    assert "relative_rms" not in result
+
+
+def test_nonfinite_metrics_remain_json_serializable():
+    torch = pytest.importorskip("torch")
+    result = probe.difference_metrics(torch.tensor([float("nan")]), torch.tensor([1.0]))
+    assert not result["finite"] and not result["exact"]
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("position,width,expected", [
+    (0, 3, [[-1, -1, -1], [-1, -1, 99]]),
+    (1, 3, [[-1, -1, 10], [-1, 10, 99]]),
+    (4, 3, [[20, 30, 40], [30, 40, 99]]),
+    (4, 0, [[], []]),
+])
+def test_ple_candidate_context_is_ordered_and_left_padded(position, width, expected):
+    torch = pytest.importorskip("torch")
+    contexts = torch.empty((2, width), dtype=torch.int64)
+    probe.host_contexts(torch.tensor([10, 20, 30, 40]), position,
+                        torch.tensor([99, 100]), contexts, -1)
+    assert contexts.tolist() == expected
+
+
+def test_ple_staging_rejects_incomplete_history():
+    torch = pytest.importorskip("torch")
+    with pytest.raises(ValueError, match="complete host history"):
+        probe.host_contexts(torch.tensor([10]), 2, torch.tensor([20, 30]),
+                            torch.empty((2, 3), dtype=torch.int64), -1)
+
+
+def test_committed_metrics_exclude_unreachable_tail(monkeypatch):
+    window = state_window(monkeypatch)
+    saved = window.capture()
+    window.views["kv_page"][:, :, 7].fill_(1)
+    window.views["cmp_page"][:, 1].fill_(1)
+    assert all(row["exact"] for row in window.metrics(saved, committed_end=7).values())
+    assert not window.metrics(saved, committed_end=8)["kv_page"]["exact"]
