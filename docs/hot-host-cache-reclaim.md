@@ -38,5 +38,6 @@ and after reclamation. This synchronizes and copies GPU data. Remove the hook
 and its environment variable for non-debug wall-time comparisons.
 
 Targeted Linux CPU checks and CUDA staging/publication checks pass, including
-actual file-page reclamation and exact cached weight bytes. Complete-model
-resident-memory and wall-time qualification remain pending.
+actual file-page reclamation and exact cached weight bytes. Use the separate
+wall comparison in #54 to qualify a serving configuration before enabling
+reclamation. Keep full-model census records and wall measurements private.
