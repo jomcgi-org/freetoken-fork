@@ -46,3 +46,26 @@ the resident-skip flag off/on on the same prepared sources, mapping geometry and
 binary. Use complete requests in both start orders, retain all failures, and
 include both cache warmth and worker storage traffic. Keep this option disabled
 until the complete wall-time and output checks justify using it.
+
+The [component benchmark](../bench/resident-populate.py) is prepared for the first
+Linux check after the Pi run. It creates a private 256 MiB file, selects alternating
+2 MiB rows, and compares both flag orders under warm, cold, and mixed preparation.
+Cache advice targets only that file. It verifies the count of fully resident
+selected rows before each sample, times population plus SHA-256 consumption from
+the original mapping, and checks the resulting bytes. The checksum is a memory
+consumer for this component test, not an MoE compute benchmark. Probe time and
+subsequent faults are included; file preparation is outside timing. Source hashes,
+raw samples, scratch bytes copied, and process I/O deltas are retained.
+
+Run from a clean committed worktree with its Python package selected, after other
+timed work has finished. Write output outside the worktree:
+
+```sh
+PYTHONPATH=python python bench/resident-populate.py \
+  --directory /var/lib/longhorn/nvme-02/freetoken/tmp \
+  > /var/lib/longhorn/nvme-02/freetoken/results/resident-populate-component.json
+```
+
+Only syntax and CLI checks have run locally for this benchmark. Linux execution
+remains pending; neither this preparation nor checksum parity establishes a model
+throughput improvement.
