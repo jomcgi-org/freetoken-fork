@@ -28,6 +28,10 @@ the call body. Multimodal requests do not publish reusable token-only prefixes.
 Failed requests still use the existing discard path. Cache snapshots remain
 evictable under the existing memory budget.
 
+Publication also requires CPU token IDs through the full snapshot boundary.
+An overlapped abort can leave those IDs behind consumed device state. Such a
+state is released instead of being attached to an earlier, truncated cache key.
+
 This is a state-retention change, with no routing or precision changes. Snapshot
 copies consume GPU bandwidth and can affect scheduling. Qualification requires
 exact state and continuation checks, then complete multi-turn task wall time

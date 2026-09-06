@@ -171,7 +171,11 @@ def test_identical_concurrent_finishes_deduplicate_without_double_free(monkeypat
     for req in (first, second):
         while req.cached_len < 10:
             step(manager, pool, req)
-        finish(manager, req)
+        manager.cache_req(req, finished=True)
+        req.table_idx = -1
+    # The integrity check is idle-only; the second request owns uncached pages
+    # while the first one finishes.
+    manager.check_integrity()
     assert len(pool._free_slots) == len(set(pool._free_slots))
     assert pool.num_free_slots == pool.num_slots - 3  # sink plus two cached boundaries
     manager.ensure_mamba_slots(pool.num_slots - 1)
