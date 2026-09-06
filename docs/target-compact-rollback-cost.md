@@ -48,7 +48,14 @@ Run that check before model loading under the owned experiment supervisor, with
 automatic original-serving recovery. Keep the import hook disabled for the
 kernel check. Neither tests nor source changes may overlap measured model runs.
 
-Validation is pending for the compact path on the model. This is a diagnostic,
-with no proposer or serving scheduler. Repeated windows warm expert and file
-caches. Component timing and local exact checks do not establish end-to-end
-throughput or broad quality equivalence. Full records remain private.
+Validation completed for width five on the target model with layer tracing off.
+Both checkpoint methods passed full acceptance, every rejection prefix and the
+next ordinary decode, with exact logits and committed state in the tested
+windows. The focused Linux checks and the exclusive real-kernel CUDA check also
+passed. CPU tests cover stale input storage and changed update bindings.
+
+This is a diagnostic with no proposer or serving scheduler. Repeated windows
+warm expert and file caches. Compact ownership does not by itself establish a
+serving memory reduction or speedup. Component timing and local exact checks do
+not establish end-to-end throughput or broad quality equivalence. Full records
+remain private.
