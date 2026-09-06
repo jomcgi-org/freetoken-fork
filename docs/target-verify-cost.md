@@ -65,7 +65,9 @@ compared without float conversion. Graph verification is also compared directly
 with an independent eager two-token reference, separating capture discrepancies
 from differences already present between batched and sequential target forwards.
 These measurements do not introduce a tolerance or relax the existing exact
-qualification gate. Keep their values private with the rest of the records.
+qualification gate. A reference-logit, state or token discrepancy also fails
+component qualification and suppresses both break-even estimates. Keep their
+values private with the rest of the records.
 
 For localization, use `FREETOKEN_TARGET_VERIFY_LAYER_TRACE=1` in a separate run
 with graph-cost mode off. This deliberately records activation copies inside the
@@ -91,9 +93,12 @@ Acceptance also compares both target tokens and committed state with sequential
 ordinary graphs. Any discrepancy, including a warmup failure, suppresses the
 component break-even estimate and requires investigation.
 
-Reports contain component times, correctness failures and a theoretical
-acceptance threshold. They exclude proposer/scheduler overhead and repeatedly
-warm the same expert/file working set. They are not model throughput results or
+Reports contain component times, correctness failures and theoretical
+acceptance thresholds for eager and, when enabled, graph verification. Each
+threshold uses its own acceptance and rejection costs against ordinary graph
+decode; values above one cannot break even at any acceptance rate. The estimates
+exclude proposer/scheduler overhead. The probe repeatedly warms the same
+expert/file working set. These are not model throughput results or
 quality evaluation. Keep all measured artifacts private. A worker exit or an
 aborted HTTP response alone is not success: inspect `completed`, every record,
 and the external supervisor's serving-restoration audit.
@@ -101,8 +106,12 @@ and the external supervisor's serving-restoration audit.
 Validation: the focused checks pass on Linux, including the tensor comparisons;
 macOS runs the hermetic subset and skips the Torch checks. They exercise boundary
 selection, private reporting, lazy installation, break-even qualification, and
-committed versus unreachable cache-state comparisons. Full target-model execution
-also completed for eager verification. Graph-mode validation and acceptance-state
-equivalence remain unresolved, so the change stays draft while those checks run.
-All measured records remain private; successful execution does not qualify a
-serving throughput improvement.
+committed versus unreachable cache-state comparisons. Full target-model eager
+and graph execution completed. With the serial dense-row policy enabled,
+predictions, logits and committed state matched sequential ordinary decode in
+the tested windows, including rejection and subsequent continuation. A separate
+activation trace also matched the observed decoder stages. Performance records
+come from a run with activation tracing disabled. These local comparisons do not
+establish equivalence across all inputs or sampling settings, and no proposer or
+serving scheduler is implemented here. All measured records remain private;
+successful execution does not qualify a serving throughput improvement.

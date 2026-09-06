@@ -70,14 +70,36 @@ def summarize(records, *, graph_enabled=False):
         row = dict(complete=complete, checks_passed=valid, median_component_s=medians,
                    model_wall_qualified=False)
         if valid:
-            one, accepted, rejected = (medians[k] for k in ("graph_one", "accept", "reject"))
-            denominator = rejected - accepted + one
-            # p*A + (1-p)*R < (1+p)*D. Proposer and scheduler work is additional.
-            row["break_even_acceptance_excluding_proposer"] = (
-                (rejected - one) / denominator if denominator > 0 else None
-            )
+            paths = [("", "accept", "reject")]
+            if graph_enabled:
+                paths.append(("graph_", "accept_graph", "reject_graph"))
+            for prefix, accept_mode, reject_mode in paths:
+                one, accepted, rejected = (
+                    medians[k] for k in ("graph_one", accept_mode, reject_mode))
+                denominator = rejected - accepted + one
+                # p*A + (1-p)*R < (1+p)*D. Proposer and scheduler work is additional.
+                row[prefix + "break_even_acceptance_excluding_proposer"] = (
+                    (rejected - one) / denominator if denominator > 0 else None
+                )
         result[case] = row
     return result
+
+
+def numerical_mismatches(checks, *, graph_enabled=False):
+    """Include untimed reference comparisons in component qualification."""
+    prefixes = ["eager_vs_sequential"]
+    if graph_enabled:
+        prefixes.append("graph_vs_eager")
+    mismatches = []
+    for prefix in prefixes:
+        if not checks[prefix + "_logits"]["exact"]:
+            mismatches.append(prefix + "/logits")
+        mismatches.extend(prefix + "/" + name
+                          for name, metric in checks[prefix + "_state"].items()
+                          if not metric["exact"])
+    if graph_enabled and not checks["graph_vs_eager_tokens_equal"]:
+        mismatches.append("graph_vs_eager/tokens")
+    return mismatches
 
 
 def save(directory, report):
@@ -507,6 +529,8 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
         report["stage"] = "measuring verification graph at " + case
         save(directory, report)
 
+    reference_mismatches = numerical_mismatches(diagnostic, graph_enabled=graph_enabled)
+
     def execute(mode):
         if mode == "graph_one":
             return forward(0), None
@@ -539,9 +563,9 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
             output, matched = execute(mode)
             engine.stream.synchronize()
             elapsed = time.perf_counter() - started
-            mismatches = []
+            mismatches = list(reference_mismatches)
             if mode == "snapshot":
-                mismatches = window.compare(initial, committed_end=position)
+                mismatches += window.compare(initial, committed_end=position)
                 snapshot_views = state_views(engine, req)
                 flat = {k: v for k, v in output.items() if k not in ("slot", "slot_states")}
                 flat.update({"slot/" + k: v for k, v in output.get("slot_states", {}).items()})

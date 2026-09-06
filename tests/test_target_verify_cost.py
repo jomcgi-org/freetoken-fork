@@ -67,6 +67,40 @@ def test_graph_mode_requires_both_graph_outcomes():
     assert not probe.summarize(rows, graph_enabled=True)["2"]["checks_passed"]
 
 
+def test_graph_break_even_uses_graph_acceptance_and_replay_costs():
+    rows = records()
+    rows += [dict(rows[0], mode="accept_graph", wall_s=1.2),
+             dict(rows[0], mode="reject_graph", wall_s=2.8)]
+    result = probe.summarize(rows, graph_enabled=True)["2"]
+    assert result["break_even_acceptance_excluding_proposer"] == pytest.approx(1.5 / 2.1)
+    assert result["graph_break_even_acceptance_excluding_proposer"] == pytest.approx(1.8 / 2.6)
+    rows.append(dict(rows[-1], warmup=True, checks_passed=False))
+    failed = probe.summarize(rows, graph_enabled=True)["2"]
+    assert "break_even_acceptance_excluding_proposer" not in failed
+    assert "graph_break_even_acceptance_excluding_proposer" not in failed
+
+
+@pytest.mark.parametrize("failure", [None, "eager_vs_sequential/logits",
+                                    "eager_vs_sequential/recurrent", "graph_vs_eager/logits",
+                                    "graph_vs_eager/recurrent", "graph_vs_eager/tokens"])
+def test_numerical_reference_failures_are_included_in_qualification(failure):
+    checks = {prefix + suffix: value for prefix in ("eager_vs_sequential", "graph_vs_eager")
+              for suffix, value in (("_logits", {"exact": True}),
+                                    ("_state", {"recurrent": {"exact": True}}))}
+    checks["graph_vs_eager_tokens_equal"] = True
+    if failure:
+        prefix, field = failure.split("/")
+        if field == "tokens":
+            checks[prefix + "_tokens_equal"] = False
+        elif field == "logits":
+            checks[prefix + "_logits"]["exact"] = False
+        else:
+            checks[prefix + "_state"][field]["exact"] = False
+    assert probe.numerical_mismatches(checks, graph_enabled=True) == ([failure] if failure else [])
+    eager_failure = failure and failure.startswith("eager_vs_sequential/")
+    assert probe.numerical_mismatches(checks) == ([failure] if eager_failure else [])
+
+
 def test_report_is_private_and_replaced_atomically(tmp_path):
     probe.save(tmp_path, {"completed": False})
     probe.save(tmp_path, {"completed": True})
