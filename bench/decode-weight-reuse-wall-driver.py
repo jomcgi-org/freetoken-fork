@@ -6,6 +6,11 @@ WT = R / 'wt-astra-decode-weight-reuse'
 SRC = R / 'wt-plegather'
 OUT = R / 'results'
 UNIT = 'astra-decode-weight-reuse-wall-server'
+_lifecycle_spec = importlib.util.spec_from_file_location(
+    'decode_reuse_lifecycle', pathlib.Path(__file__).with_name('decode-weight-reuse-wall-lifecycle.py'))
+lifecycle = importlib.util.module_from_spec(_lifecycle_spec)
+_lifecycle_spec.loader.exec_module(lifecycle)
+lifecycle.preflight()
 
 def run(*args, **kwargs):
     return subprocess.run(args, check=True, text=True, **kwargs)
@@ -49,6 +54,8 @@ assert not run('git','-C',str(WT),'status','--porcelain',capture_output=True).st
 base_report = dict(
     revisions=revisions,
     driver_sha256=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest(),
+    lifecycle_sha256=hashlib.sha256(pathlib.Path(lifecycle.__file__).read_bytes()).hexdigest(),
+    restore_script_sha256=hashlib.sha256(pathlib.Path(__file__).with_name('decode-weight-reuse-wall-restore.sh').read_bytes()).hexdigest(),
     adaptation='automatic interval, split histories, unchanged phase aim and swap bounds, persistence off',
     design='Four isolated starts run native decode weight reuse off/on/on/off on the same b8ac3f7 runtime and qualified native binary. All starts offer four client requests with server capacity four, buffered staged GPU DISK prefill, mmap HOT staging, a 65536-token KV reserve, and the single-request-only ladder off. Only FREETOKEN_CPU_MOE_DECODE_WEIGHT_REUSE changes. Four warmups, twelve measured complete responses, and eight fidelity cases run per start. Host page cache is retained between starts; HOT assignments and histories persist within each process. Diagnostics, GPU timing, KV reuse, and HOT persistence are off.',
     policies={
@@ -240,10 +247,10 @@ try:
             with (OUT/f'astra-decode-weight-reuse-wall-{label}-journal.log').open('w') as log:
                 subprocess.run(['sudo', '-n', 'journalctl', '-u', UNIT, '--since', since, '--no-pager', '-o', 'cat'], stdout=log, check=False)
 finally:
-    stop()
-    run('sudo', '-n', 'systemctl', 'start', 'freetoken-serve')
-    print('PRODUCTION STARTED', flush=True)
-    ready(8090)
-    report['original_serving_restoration'] = completion(8090)
+    recovery = lifecycle.restore()
+    report['restoration'] = recovery
+    save()
+    assert recovery['verified'], recovery
+    report['original_serving_restoration'] = recovery['completion']
     save()
     print('PRODUCTION VERIFIED '+json.dumps(report['original_serving_restoration']), flush=True)
