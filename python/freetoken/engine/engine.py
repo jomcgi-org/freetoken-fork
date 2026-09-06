@@ -804,7 +804,12 @@ class Engine:
                     f"--moe-backend cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the "
                     f"pin budget; OS-locking all layers instead of pinning"
                 )
-        split_residency = bool(locked_layer_ids or disk_layer_ids)
+        gpu_staging_layer_ids = _gpu_source_staging_layers(
+            config, num_moe_layers, cpu_layer_ids,
+            bank_source=resolved_bank_source, custom_cache=cache_factory is not None,
+        )
+        file_layer_ids = disk_layer_ids | gpu_staging_layer_ids
+        split_residency = bool(locked_layer_ids or file_layer_ids)
         if cache_factory is None:
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
@@ -817,7 +822,7 @@ class Engine:
                 from freetoken.moe.host_banks import HostResidency
 
                 requested_residency = [
-                    HostResidency.DISK.value if i in disk_layer_ids else (
+                    HostResidency.DISK.value if i in file_layer_ids else (
                         HostResidency.LOCKED.value if i in locked_layer_ids
                         else HostResidency.PINNED.value
                     )
@@ -855,6 +860,8 @@ class Engine:
                     config, "moe_bank_hugepages_tmpfs_margin_gib", 1.0,
                 ),
             )
+            if gpu_staging_layer_ids and banks.quant_format != "nvfp4":
+                raise ValueError("staged GPU sources require native NVFP4 expert banks")
             moe_activation_dtype = "bf16"
             if getattr(config.model_config, "expert_quant", None) == "nvfp4":
                 from freetoken.moe.nvfp4_backends import (
@@ -1000,6 +1007,7 @@ class Engine:
                     config, "moe_prefill_split_kernel", "grouped"
                 ),
                 moe_disk_decode=config.moe_disk_decode,
+                gpu_staging_layer_ids=gpu_staging_layer_ids,
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -2825,6 +2833,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_split_kernel": "grouped",
     "moe_cpu_prefill_batch": "on",
     "moe_disk_decode": "cpu",
+    "moe_gpu_source": "pinned",
     "moe_disk_pager": "madvise",
     "moe_disk_lookahead": "on",
     "moe_step_timing": False,
@@ -2895,6 +2904,27 @@ def _gate_ple_settings(config, model_config, override) -> bool:
             f"ignoring PLE settings: {', '.join(ignored)}"
         )
     return False
+
+
+def _gpu_source_staging_layers(
+    config, num_layers: int, cpu_layer_ids: frozenset[int], *,
+    bank_source: str, custom_cache: bool,
+) -> frozenset[int]:
+    """Choose file backing only after the ordinary compute placement is fixed."""
+    if getattr(config, "moe_gpu_source", "pinned") == "pinned":
+        return frozenset()
+    if custom_cache or bank_source not in ("ftw", "index"):
+        raise ValueError("staged GPU sources require the standard file-backed expert cache")
+    if getattr(config.model_config, "expert_quant", None) != "nvfp4":
+        raise ValueError("staged GPU sources require native NVFP4 expert banks")
+    selected = frozenset(range(num_layers)) - cpu_layer_ids
+    if not selected:
+        raise ValueError("staged GPU sources need at least one selected GPU layer")
+    logger.info_rank0(
+        f"MoE GPU source staging: layers={sorted(selected)}; "
+        "CPU and HOT compute placement retained"
+    )
+    return selected
 
 
 def _validate_disk_prefill_task_size(config, cache) -> None:

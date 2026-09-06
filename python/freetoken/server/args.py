@@ -1180,6 +1180,19 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-gpu-source",
+        choices=["pinned", "staged"],
+        default=ServerArgs.moe_gpu_source,
+        help=(
+            "Host backing for the selected GPU layers: 'pinned' keeps full banks "
+            "pinned (default); 'staged' keeps file-backed native NVFP4 banks and "
+            "copies exact routed rows through bounded pinned buffers. Preserves "
+            "CPU/HOT compute placement; requires offload, staged DISK prefill "
+            "and the madvise pager."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-disk-pager",
         choices=["madvise", "uffd"],
         default=ServerArgs.moe_disk_pager,

@@ -551,7 +551,11 @@ class OffloadMoELayer(MoELayer):
         residency = getattr(cache, "layer_residency", ())
         disk_mode = None
         if self.layer_id < len(residency) and residency[self.layer_id] == "disk":
-            disk_mode = getattr(cache, "effective_disk_prefill", cache.moe_disk_prefill)
+            layer_mode = getattr(cache, "disk_prefill_mode", None)
+            disk_mode = (
+                layer_mode(self.layer_id) if layer_mode is not None
+                else getattr(cache, "effective_disk_prefill", cache.moe_disk_prefill)
+            )
             if disk_mode == "cpu":
                 hot_split = getattr(cache, "is_hot_split_layer", None)
                 if (

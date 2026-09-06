@@ -228,6 +228,7 @@ class OffloadMoeCache:
     # DISK-only decode policy. gpufetch keeps the mmap as the authoritative host
     # bank but fills LRU misses through a bounded pinned staging ring.
     moe_disk_decode: str = "cpu"
+    gpu_staging_layer_ids: frozenset[int] = frozenset()
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
@@ -617,6 +618,16 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
+        if self.gpu_staging_layer_ids:
+            if self.quant_format != "nvfp4" or self.moe_disk_prefill != "staged":
+                raise ValueError("GPU source staging requires native NVFP4 with staged prefill")
+            if self.decode_target == "hybrid" or self.moe_disk_decode != "cpu":
+                raise ValueError("GPU source staging must retain the existing CPU/GPU split")
+            if self.gpu_staging_layer_ids & self.cpu_layer_ids:
+                raise ValueError("GPU source staging cannot include CPU compute layers")
+            if any(not 0 <= i < self.num_layers or residency[i] != "disk"
+                   for i in self.gpu_staging_layer_ids):
+                raise ValueError("GPU source staging requires file-backed GPU layers")
         for label in residency:
             HostResidency(label)
         unpinned = frozenset(
@@ -625,7 +636,9 @@ class OffloadMoeCache:
         if unpinned:
             gpufetch_disk = frozenset(
                 i for i, r in enumerate(residency)
-                if r == HostResidency.DISK.value and self.moe_disk_decode == "gpufetch"
+                if r == HostResidency.DISK.value and (
+                    self.moe_disk_decode == "gpufetch" or i in self.gpu_staging_layer_ids
+                )
             )
             unsupported = unpinned - self.cpu_layer_ids - gpufetch_disk
             if unsupported:
@@ -652,6 +665,8 @@ class OffloadMoeCache:
                 f"HOT banks {sorted(hot_sources)} do not match schema {self.bank_schema}"
             )
         for layer_id, capacity in hot_expert_capacity.items():
+            if layer_id in self.gpu_staging_layer_ids:
+                raise ValueError("GPU source staging cannot change a GPU layer into a HOT split")
             expert_ids = hot_expert_ids.get(layer_id, ())
             if not 0 <= layer_id < self.num_layers:
                 raise ValueError(f"HOT layer id {layer_id} is out of range")
@@ -770,7 +785,7 @@ class OffloadMoeCache:
             if layer_id not in self._unpinned_layers:
                 self._prefill_overlap_buffer_ids[layer_id] = next_buffer
                 next_buffer ^= 1
-            elif residency != "disk" or self.effective_disk_prefill != "cpu":
+            elif residency != "disk" or self.disk_prefill_mode(layer_id) != "cpu":
                 next_buffer = 1
 
     @property
@@ -778,6 +793,13 @@ class OffloadMoeCache:
         if self.moe_disk_prefill != "staged":
             return self.moe_disk_prefill
         return "staged" if self._staged_prefill_active else "cpu"
+
+    def disk_prefill_mode(self, layer_id: int) -> str:
+        # Host placement must never send a formerly GPU-computed short chunk
+        # through the CPU activation quantization or expert arithmetic.
+        if layer_id in self.gpu_staging_layer_ids:
+            return "staged"
+        return self.effective_disk_prefill
 
     def _validate_staging_slots(self, cache_size: int) -> None:
         if self.moe_disk_prefill != "staged":
@@ -889,8 +911,8 @@ class OffloadMoeCache:
         """Return boot-time counts for overlap, synchronous, and CPU prefill."""
         overlap = sum(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids)
         cpu = sum(
-            residency == "disk" and self.effective_disk_prefill == "cpu"
-            for residency in self.layer_residency
+            residency == "disk" and self.disk_prefill_mode(layer_id) == "cpu"
+            for layer_id, residency in enumerate(self.layer_residency)
         )
         return overlap, self.num_layers - overlap - cpu, cpu
 
@@ -898,9 +920,9 @@ class OffloadMoeCache:
         """Allocate/register the bounded pinned row ring used by DISK decode misses."""
         disk_layers = [
             i for i, residency in enumerate(self.layer_residency)
-            if residency == "disk"
+            if self.is_gpufetch_layer(i)
         ]
-        if self.moe_disk_decode != "gpufetch" or not disk_layers:
+        if not disk_layers:
             return
         if self.device.type != "cuda":
             raise RuntimeError("--moe-disk-decode gpufetch requires CUDA")
@@ -1274,8 +1296,9 @@ class OffloadMoeCache:
         IO buffers, and the ``cudaLaunchHostFunc`` submit/sync plumbing. It reads
         experts straight from this cache's host ``bank_sources`` (no extra copy).
         """
-        assert self.decode_target in ("cpu", "hybrid") or self.moe_disk_decode == "gpufetch", (
-            "set_cpu_executor requires CPU/hybrid decode or DISK gpufetch"
+        assert (self.decode_target in ("cpu", "hybrid")
+                or self.moe_disk_decode == "gpufetch" or self.gpu_staging_layer_ids), (
+            "set_cpu_executor requires CPU/hybrid decode or GPU source fetching"
         )
         self.cpu_executor = executor
 
@@ -1797,7 +1820,11 @@ class OffloadMoeCache:
 
         plan = plan_session_prefetch(
             profile,
-            self.layer_residency,
+            # These layers keep GPU warming and protection advice even though
+            # their host source now needs the bounded file-to-GPU transport.
+            ["pinned" if i in self.gpu_staging_layer_ids else residency
+             for i, residency in enumerate(self.layer_residency)]
+            if self.gpu_staging_layer_ids else self.layer_residency,
             hot_experts=self.hot_expert_ids,
             protect_limit=self._session_protect_limit,
         )
@@ -2996,8 +3023,8 @@ class OffloadMoeCache:
     def is_gpufetch_layer(self, layer_id: int) -> bool:
         """Whether this file-backed layer decodes through the GPU slot cache."""
         return (
-            self.moe_disk_decode == "gpufetch"
-            and layer_id < len(self.layer_residency)
+            (self.moe_disk_decode == "gpufetch" or layer_id in self.gpu_staging_layer_ids)
+            and 0 <= layer_id < len(self.layer_residency)
             and self.layer_residency[layer_id] == "disk"
         )
 

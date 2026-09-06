@@ -139,6 +139,9 @@ class EngineConfig:
     # faults only LRU-missing routed expert rows into a pinned staging ring, copies
     # them into the existing GPU slot cache, and runs the normal GPU expert GEMM.
     moe_disk_decode: str = "cpu"
+    # Keep the existing compute placement, but optionally make GPU-layer host
+    # banks file-backed and fetch their misses through bounded pinned staging.
+    moe_gpu_source: str = "pinned"
     # DISK bank residency backend. "madvise" preserves the file-mmap path; "uffd"
     # installs FTW expert rows into anonymous mappings under a userspace LRU.
     moe_disk_pager: str = "madvise"
@@ -343,6 +346,15 @@ class EngineConfig:
             raise ValueError("--moe-disk-prefill-io cached requires --moe-disk-prefill staged")
         if self.moe_disk_prefill == "staged" and self.moe_disk_decode != "cpu":
             raise ValueError("staged DISK prefill requires --moe-disk-decode cpu")
+        if self.moe_gpu_source not in ("pinned", "staged"):
+            raise ValueError("--moe-gpu-source must be 'pinned' or 'staged'")
+        if self.moe_gpu_source == "staged":
+            if self.moe_backend != "offload":
+                raise ValueError("staged GPU sources require --moe-backend offload")
+            if self.moe_disk_prefill != "staged" or self.moe_disk_decode != "cpu":
+                raise ValueError("staged GPU sources require staged DISK prefill and CPU DISK decode")
+            if self.moe_disk_pager != "madvise":
+                raise ValueError("staged GPU sources require ordinary file-backed banks (madvise)")
         if self.moe_prefill_coalesce not in ("populate", "on", "off"):
             raise ValueError(
                 "--moe-prefill-coalesce must be 'populate', 'on', or 'off', got "
