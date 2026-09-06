@@ -22,6 +22,7 @@ SERIAL_LINEAR_ENV = "FREETOKEN_TARGET_VERIFY_SERIAL_LINEAR"
 CHECKPOINT_ENV = "FREETOKEN_TARGET_VERIFY_SEED_CHECKPOINT"
 WIDTH_ENV = "FREETOKEN_TARGET_VERIFY_WIDTH"
 COMPACT_ENV = "FREETOKEN_TARGET_VERIFY_COMPACT_ROLLBACK"
+PAIR_ENV = "FREETOKEN_TARGET_VERIFY_CPU_PAIR_COMPARE"
 MODES = ("graph_one", "graph_two", "snapshot", "accept", "reject")
 GRAPH_MODES = ("accept_graph", "reject_graph")
 CHECKPOINT_MODES = ("accept_checkpoint", "reject_checkpoint")
@@ -675,7 +676,8 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
     width = verification_width()
     if width > 2:
         return _MULTI_API["probe"](engine, batch, directory, width=width, base=globals(),
-                                    seed_api=_CHECKPOINT_API, repeats=repeats, warmup=warmup)
+                                    seed_api=_CHECKPOINT_API, repeats=repeats, warmup=warmup,
+                                    pair_compare=os.environ.get(PAIR_ENV) == "1")
     import torch
     from freetoken.kernel import _cpu_moe
     import hashlib
@@ -747,6 +749,8 @@ def install(engine_class):
     if torch.cuda.is_initialized():
         raise RuntimeError("install the probe before Engine initializes CUDA")
     width = verification_width()
+    if os.environ.get(PAIR_ENV) == "1" and width == 2:
+        raise RuntimeError("CPU pair comparison requires the wider target graph diagnostic")
     if os.environ.get(COMPACT_ENV) == "1" and width == 2:
         raise RuntimeError("compact rollback comparison requires a wider target graph")
     if width > 2 and (os.environ.get(GRAPH_ENV) != "1" or os.environ.get(SERIAL_LINEAR_ENV) != "1"
@@ -787,6 +791,10 @@ def install(engine_class):
             raise RuntimeError("probe requires the capacity-one CPU decode configuration")
         kwargs["max_tokens"] = width
         original_cpu_init(executor, *args, **kwargs)
+        if os.environ.get(PAIR_ENV) == "1":
+            setter = getattr(executor._ext, "set_nvfp4_pair_dot", None)
+            if setter is None or not setter(True) or not setter(False):
+                raise RuntimeError("CPU pair comparison requires the qualified AVX-512 NVFP4 native kernel")
 
     def ring_capacity(cls, index_ratio, num_speculative_tokens=0):
         return original_ring_capacity(index_ratio, max(width - 1, num_speculative_tokens))

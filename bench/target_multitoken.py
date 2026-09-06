@@ -2,6 +2,7 @@
 
 import copy
 from dataclasses import replace
+import math
 from pathlib import Path
 import statistics
 from types import SimpleNamespace
@@ -12,13 +13,33 @@ def eligible_window(position, page_size, width, remaining):
     return remaining >= width + 3 and position // page_size == (position + width + 2) // page_size
 
 
-def modes(width, compact_enabled=False):
+def modes(width, compact_enabled=False, pair_compare=False):
     outcomes = ("accept",) + tuple(f"reject_{i}" for i in range(width - 1))
-    return (("graph_one", "graph_all") + outcomes
-            + (tuple("compact_" + name for name in outcomes) if compact_enabled else ()))
+    ordinary = (("graph_one", "graph_all") + outcomes
+                + (tuple("compact_" + name for name in outcomes) if compact_enabled else ()))
+    return ordinary + (tuple("pair_" + name for name in ordinary) if pair_compare else ())
 
 
-def summarize(records, width, compact_enabled=False):
+def trial_order(width, compact_enabled, pair_compare, repeat):
+    ordinary = modes(width, compact_enabled)
+    ordered = ordinary if repeat % 2 == 0 else tuple(reversed(ordinary))
+    if not pair_compare:
+        return ordered
+    prefixes = ("", "pair_") if repeat % 2 == 0 else ("pair_", "")
+    return tuple(prefix + mode for mode in ordered for prefix in prefixes)
+
+
+def set_cpu_pair(engine, enabled):
+    setter = getattr(engine.cpu_moe_executor._ext, "set_nvfp4_pair_dot", None)
+    if setter is None:
+        raise RuntimeError("CPU pair comparison requires its native setter")
+    # Graph-replayed CPU tasks must have finished before changing their dispatch.
+    engine.stream.synchronize()
+    if not setter(enabled):
+        raise RuntimeError("CPU pair comparison requires AVX-512 NVFP4")
+
+
+def summarize(records, width, compact_enabled=False, pair_compare=False):
     cases = {}
     for row in records:
         cases.setdefault(row["case"], []).append(row)
@@ -29,12 +50,20 @@ def summarize(records, width, compact_enabled=False):
             if not row["warmup"]:
                 values.setdefault(row["mode"], []).append(row["wall_s"])
         medians = {name: statistics.median(costs) for name, costs in values.items()}
-        valid = set(values) == set(modes(width, compact_enabled)) and all(row["checks_passed"] for row in rows)
+        valid = (set(values) == set(modes(width, compact_enabled, pair_compare))
+                 and all(row["checks_passed"] and math.isfinite(row["wall_s"])
+                         and row["wall_s"] > 0 for row in rows)
+                 and (not pair_compare or all(
+                     row.get("cpu_pair_enabled") is row["mode"].startswith("pair_") for row in rows)))
         result[case] = dict(checks_passed=valid, median_component_s=medians,
                             model_wall_qualified=False)
         if valid:
             result[case]["component_cost_over_one"] = {
                 name: cost / medians["graph_one"] for name, cost in medians.items()}
+            if pair_compare:
+                result[case]["cpu_pair_reduction_percent"] = {
+                    name: 100 * (1 - medians["pair_" + name] / medians[name])
+                    for name in modes(width, compact_enabled)}
     return result
 
 
@@ -131,13 +160,15 @@ def install(width):
 
 
 def run_window(engine, source, position, seed, host_prefix, *, width, base, seed_api,
-               report, directory, repeats, warmup, compact_type=None):
+               report, directory, repeats, warmup, compact_type=None, pair_compare=False):
     import torch
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.core import Batch
     from freetoken.spec_decode import configure_mtp_decode_step, greedy_accept_prefix
 
     equal, metrics = base["bytes_equal"], base["difference_metrics"]
+    if pair_compare:
+        set_cpu_pair(engine, False)
     req = copy.copy(source.reqs[0])
     batch = Batch(reqs=[req], phase="decode")
     batch.padded_reqs = [req]
@@ -256,16 +287,42 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
             rollback_graphs=len(compact_checkpoint.restore_graphs),
             excludes_graph_pool_allocations=True,
             process_allocator_snapshots=allocator)
+    if pair_compare:
+        set_cpu_pair(engine, True)
+        pair_checks = {}
+        variants = [("eager", False, False), ("graph", True, False)]
+        if compact_type is not None:
+            variants.append(("compact", True, True))
+        for name, captured, is_compact in variants:
+            window.reset(initial)
+            actual_tokens, actual_logits = forward(
+                captured=captured, compact=is_compact, with_logits=True)
+            checked = dict(tokens_equal=equal(actual_tokens, reference_tokens),
+                           logits=metrics(actual_logits, reference_logits),
+                           state=window.metrics(states[-1], committed_end=position + width))
+            if captured:
+                selected = compact_checkpoint if is_compact else checkpoint
+                checked["restored_prefix_state"] = {}
+                for length in range(1, width):
+                    selected.restore(length)
+                    checked["restored_prefix_state"][str(length)] = window.metrics(
+                        states[length - 1], committed_end=position + length)
+            pair_checks[name] = checked
+        checks["cpu_pair"] = pair_checks
+        set_cpu_pair(engine, False)
     errors = numerical_failures(checks)
     report["stage"] = "measuring wider checkpoint graph at " + case
     base["save"](directory, report)
 
     for repeat in range(-warmup, repeats):
-        candidates = modes(width, compact_type is not None)
-        order = candidates if repeat % 2 == 0 else tuple(reversed(candidates))
+        order = trial_order(width, compact_type is not None, pair_compare, repeat)
         for mode in order:
-            is_compact = mode.startswith("compact_")
-            outcome = mode.removeprefix("compact_")
+            paired = mode.startswith("pair_")
+            if pair_compare:
+                set_cpu_pair(engine, paired)
+            plain_mode = mode.removeprefix("pair_")
+            is_compact = plain_mode.startswith("compact_")
+            outcome = plain_mode.removeprefix("compact_")
             selected_checkpoint = compact_checkpoint if is_compact else checkpoint
             window.reset(initial)
             ids.copy_(good_ids)
@@ -320,10 +377,13 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
                                    window.compare(states[count], committed_end=position + count + 1)]
             report["records"].append(dict(case=case, mode=mode, repeat=repeat, warmup=repeat < 0,
                                            wall_s=elapsed, matched=matched, output_tokens=count,
+                                           cpu_pair_enabled=paired,
                                            checks_passed=not mismatches, mismatches=mismatches))
             base["save"](directory, report)
     window.reset(states[0])
     engine.stream.synchronize()
+    if pair_compare:
+        set_cpu_pair(engine, False)
     graph.close()
     if compact_graph is not None:
         compact_graph.close()
@@ -331,7 +391,8 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
     return tokens[0], torch.cat((host_prefix, host_seed))
 
 
-def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=1):
+def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=1,
+          pair_compare=False):
     import hashlib
     import subprocess
     import sys
@@ -343,6 +404,7 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
                   width=width, draft_tokens=width - 1, graph_enabled=True, trace_only=False,
                   checkpoint_enabled=True, serial_linear=True, records=[],
                   compact_enabled=compact_type is not None,
+                  cpu_pair_compare=pair_compare,
                   cpu_max_tokens=engine.cpu_moe_executor.max_tokens,
                   ring_capacity=engine.kv_cache.ring_capacity,
                   native_sha256=hashlib.sha256(Path(_cpu_moe.__file__).read_bytes()).hexdigest(),
@@ -366,9 +428,10 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
             seed, prefix = run_window(engine, batch, position + offset, seed, prefix,
                                       width=width, base=base, seed_api=seed_api, report=report,
                                       directory=directory, repeats=repeats, warmup=warmup,
-                                      compact_type=compact_type)
-        report["summary"] = summarize(report["records"], width, compact_type is not None)
-        report["checks_passed"] = all(row["checks_passed"] for row in report["records"])
+                                      compact_type=compact_type, pair_compare=pair_compare)
+        report["summary"] = summarize(report["records"], width, compact_type is not None, pair_compare)
+        report["checks_passed"] = (len(report["summary"]) == 4
+                                   and all(case["checks_passed"] for case in report["summary"].values()))
         report["completed"] = True
     except BaseException as exc:
         report["error"] = type(exc).__name__ + ": " + str(exc)
