@@ -1,0 +1,23 @@
+{
+  "command": [
+    "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python",
+    "-m",
+    "pytest",
+    "-q",
+    "-o",
+    "addopts=",
+    "tests/test_pi_agentic_wall.py",
+    "--junitxml=checks.xml"
+  ],
+  "exit_code": 0,
+  "stdout": "..................                                                       [100%]\n18 passed in 0.28s\n",
+  "stderr": "",
+  "source_sha256": "986875b712ff05862c03417e56e45c18559d82e05af913e134055a84268715d5",
+  "tests_sha256": "9604253003220d86936ed51bbf9a699a732d69b48df3924d169b722a4363081d",
+  "mac_validation": {
+    "command": "/private/tmp/astra-pi-checks/bin/python -m pytest -q -o addopts= tests/test_pi_agentic_wall.py",
+    "passed": 18,
+    "elapsed_s": 0.58,
+    "advisory_only": true
+  }
+}

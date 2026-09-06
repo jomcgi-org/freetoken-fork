@@ -1,0 +1,8 @@
+{
+  "id": "expiry-cache-v1",
+  "stages": [
+    "Read cache.py and test_cache.py. Fix Cache expiry semantics: an entry is expired when now >= its expiry. put with ttl <= 0 must remove an existing value for that key and must not store the new value. Preserve get's caller-provided default, including falsey values. Stored None is a valid value. Add regression tests and run python3 -m unittest -v. Work only in this workspace; do not install packages. Finish with a brief result.",
+    "Extend this same Cache with optional capacity: Cache(capacity=None) stays unbounded; positive integer capacity enforces LRU; zero or negative capacity raises ValueError. Successful get and put promote a key to most recently used. Missing get must not change order. Before capacity eviction, discard all entries expired at put's now. Updating an existing key must not evict another key. Preserve all earlier expiry behavior. Add tests and run python3 -m unittest -v.",
+    "Add get_or_load(key, loader, ttl, now). Return and promote an unexpired cached value, including None, without calling loader. On miss/expiry, call the zero-argument loader once and put its result using the existing TTL and LRU rules. If the loader raises, propagate the same exception and do not evict an unrelated live entry or cache a result. Preserve every earlier requirement, add tests, and run python3 -m unittest -v."
+  ]
+}
