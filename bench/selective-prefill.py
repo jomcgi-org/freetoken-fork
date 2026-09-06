@@ -15,7 +15,12 @@ import urllib.request
 from pathlib import Path
 
 
-def request(base_url, payload):
+def request(base_url, payload, *, observe_first_text=None):
+    """Time a complete stream, with an optional diagnostic first-text observer.
+
+    Record TTFT before calling the observer. Its cost remains in total wall
+    time, so callers must keep observations off in performance comparisons.
+    """
     payload = dict(payload, stream=True, stream_options={"include_usage": True})
     req = urllib.request.Request(
         base_url + "/v1/chat/completions", data=json.dumps(payload).encode(),
@@ -25,6 +30,7 @@ def request(base_url, payload):
     first = None
     chunks, usage = [], {}
     finish_reason = None
+    first_text_observation = None
     with urllib.request.urlopen(req, timeout=300) as response:
         for raw in response:
             if not raw.startswith(b"data: "):
@@ -42,16 +48,22 @@ def request(base_url, payload):
                 delta = choice.get("delta", {})
                 text = delta.get("content") or delta.get("reasoning_content") or ""
                 if text:
-                    first = first or time.perf_counter()
+                    if first is None:
+                        first = time.perf_counter()
+                        if observe_first_text is not None:
+                            first_text_observation = observe_first_text()
                     chunks.append(text)
     end = time.perf_counter()
     if first is None or not usage:
         raise RuntimeError("stream returned no generated text or usage")
-    return {
+    result = {
         "ttft_s": first - start, "wall_s": end - start,
         "decode_s": end - first, "text": "".join(chunks), "usage": usage,
         "finish_reason": finish_reason,
     }
+    if observe_first_text is not None:
+        result["first_text_observation"] = first_text_observation
+    return result
 
 
 def main():

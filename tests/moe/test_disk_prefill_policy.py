@@ -12,27 +12,45 @@ from freetoken.server.args import parse_args
 
 
 @pytest.mark.parametrize("threshold", [None, 1536])
-def test_staged_cli_crossover_default_and_override(threshold):
+@pytest.mark.parametrize("file_io", [None, "cached"])
+def test_staged_cli_crossover_default_and_override(threshold, file_io):
     args, _ = parse_args([
         "--model", "/tmp/nonexistent-model", "--dtype", "bfloat16",
         "--moe-disk-prefill", "staged",
-    ] + ([] if threshold is None else ["--moe-disk-prefill-min-tokens", str(threshold)]))
+    ] + ([] if threshold is None else ["--moe-disk-prefill-min-tokens", str(threshold)])
+      + ([] if file_io is None else ["--moe-disk-prefill-io", file_io]))
     assert args.moe_disk_prefill == "staged"
     assert args.moe_disk_prefill_min_tokens == (1024 if threshold is None else threshold)
     assert EngineConfig.__dataclass_fields__["moe_disk_prefill_min_tokens"].default == 1024
     assert OffloadMoeCache.__dataclass_fields__["moe_disk_prefill_min_tokens"].default == 1024
+    assert args.moe_disk_prefill_io == (file_io or "buffered")
 
 
 @pytest.mark.parametrize("kwargs,message", [
     ({"moe_disk_prefill_min_tokens": 0}, "must be positive"),
     ({"moe_disk_prefill_min_tokens": -1}, "must be positive"),
     ({"moe_disk_decode": "gpufetch"}, "requires --moe-disk-decode cpu"),
+    ({"moe_disk_prefill_io": "direct"}, "must be 'buffered' or 'cached'"),
 ])
 def test_staged_config_rejects_invalid_policy(kwargs, message):
     with pytest.raises(ValueError, match=message):
         EngineConfig(
             model_path="/tmp/model", tp_info=DistributedInfo(0, 1),
             dtype=torch.bfloat16, moe_disk_prefill="staged", **kwargs,
+        )
+
+
+@pytest.mark.parametrize("mode", ["cpu", "copy"])
+def test_cached_io_requires_staged_policy(mode):
+    with pytest.raises(ValueError, match="requires --moe-disk-prefill staged"):
+        EngineConfig(
+            model_path="/tmp/model", tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16, moe_disk_prefill=mode, moe_disk_prefill_io="cached",
+        )
+    with pytest.raises(ValueError, match="require staged DISK prefill"):
+        OffloadMoeCache(
+            num_layers=1, num_experts=8, cache_size=24, device=torch.device("cpu"),
+            moe_disk_prefill=mode, moe_disk_prefill_io="cached",
         )
 
 

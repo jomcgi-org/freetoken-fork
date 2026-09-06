@@ -988,6 +988,7 @@ class Engine:
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 moe_disk_prefill=config.moe_disk_prefill,
                 moe_disk_prefill_min_tokens=getattr(config, "moe_disk_prefill_min_tokens", 1024),
+                moe_disk_prefill_io=getattr(config, "moe_disk_prefill_io", "buffered"),
                 moe_prefill_coalesce=getattr(
                     config, "moe_prefill_coalesce", "populate"
                 ),
@@ -2816,6 +2817,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_idle_min_interval_ms": 2000,
     "moe_disk_prefill": "cpu",
     "moe_disk_prefill_min_tokens": 1024,
+    "moe_disk_prefill_io": "buffered",
     "moe_prefill_coalesce": "populate",
     "moe_prefill_hot_split": "on",
     "moe_prefill_split_kernel": "grouped",

@@ -1,0 +1,59 @@
+{
+  "linux_host": "node-4",
+  "tested_revision": "878d72376220537d158f8c1db5d553e0188e662c",
+  "client_revision": "031c377",
+  "client_files_unchanged": true,
+  "source_sha256": {
+    "bench/selective-prefill.py": "5c7da33677641d695b774308d900e48d860003e49a1961e6cb663f678167f9fc",
+    "bench/sustained-prefill-wall.py": "ce9f048bb46a7908ab32aded517d923b20d83725e71a56ae08dae30b6e7ae0ee",
+    "tests/test_sustained_prefill_client.py": "3683da20082f2b944b55f03781213121b3b188e9acbebe131bbc93a7bb54cfd7"
+  },
+  "command": {
+    "args": [
+      "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python",
+      "-m",
+      "pytest",
+      "-q",
+      "tests/test_sustained_prefill_client.py"
+    ],
+    "returncode": 0,
+    "wall_s": 0.2137684299959801
+  },
+  "output": "15 passed in 0.03s",
+  "original_serving_restoration": {
+    "id": "chatcmpl-0",
+    "object": "chat.completion",
+    "created": 1788653068,
+    "model": "qwen3.6-27b",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "OK"
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 17,
+      "completion_tokens": 2,
+      "total_tokens": 19
+    }
+  },
+  "final_state": {
+    "timestamp_utc": "2026-09-06T00:09:51.380947+00:00",
+    "validation": {
+      "MainPID": "0",
+      "Result": "success",
+      "ExecMainStatus": "0",
+      "ActiveState": "inactive"
+    },
+    "production": {
+      "MainPID": "725193",
+      "Result": "success",
+      "ExecMainStatus": "0",
+      "ActiveState": "active"
+    }
+  }
+}
