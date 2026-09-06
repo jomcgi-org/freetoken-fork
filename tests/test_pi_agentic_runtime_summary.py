@@ -319,3 +319,84 @@ def test_omitted_zero_hits_cannot_hide_disabled_cache_reporting(fixed_records):
            d['preflight']['commands']['on'].remove('--enable-cache-report'))
     with pytest.raises(ValueError, match='enabled cache reporting'):
         summary.summarize(fixed_records, fixed_continuation=True)
+
+
+@pytest.fixture
+def carry_records(fixed_records):
+    root = fixed_records
+    spec = importlib.util.spec_from_file_location(
+        'carry_gate_fixture', Path(__file__).parents[1] / 'bench/pi-decode-prefix-wall-driver.py')
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    driver = json.loads((root / 'driver.json').read_text())
+    plan = driver['preflight']
+    plan['experiment'] = 'prefill-snapshot-carry'
+    for mode in ('off', 'on'):
+        plan['identities'][mode] = dict(revision=gate.PREFILL_CARRY_REVISIONS[mode],
+                                       tree='/runtime/' + mode, native='/same/native.so',
+                                       native_sha256='native', cpp_sha256='cpp',
+                                       native_extensions={name: dict(path='/same/' + name,
+                                           sha256='binary', source_sha256='source')
+                                           for name in gate.EXTENSION_SOURCES})
+        plan['env'][mode].update(PYTHONPATH='/runtime/' + mode + '/python',
+                                 FREETOKEN_DECODE_PREFIX_SNAPSHOT='0')
+    for arm, mode in summary.SNAPSHOT_ARMS:
+        start = json.loads((root / (arm + '-server-start.json')).read_text())
+        start.update(identity=plan['identities'][mode], revision=gate.PREFILL_CARRY_REVISIONS[mode],
+                     env=plan['env'][mode], snapshot_enabled=False)
+        write(root, arm + '-server-start.json', start)
+        change(root, arm + '/metadata.json', lambda d: d.update(server_metadata=start))
+    write(root, 'driver.json', driver)
+    return root
+
+
+def test_prefill_carry_qualifies_fixed_work_with_both_orders(carry_records):
+    result = summary.summarize(carry_records, prefill_snapshot_carry=True)
+    assert result['experiment'] == 'prefill-snapshot-carry'
+    assert result['fixed_work_qualified'] and not result['broad_quality_equivalence']
+    assert result['comparison']['wall_reduction_percent'] == pytest.approx(20)
+    assert len(result['sessions']) == 12 and len(result['orders']) == 2
+
+
+@pytest.mark.parametrize(('section', 'key', 'value', 'message'), [
+    ('identities', 'revision', 'other', 'runtime revisions'),
+    ('identities', 'native_sha256', 'other', 'native binary'),
+    ('identities', 'cpp_sha256', 'other', 'native binary'),
+    ('env', 'FREETOKEN_DECODE_PREFIX_SNAPSHOT', '1', 'snapshot flags'),
+    ('env', 'PYTHONPATH', '/wrong/python', 'wrong tree'),
+    ('env', 'EXTRA', '1', 'environment difference'),
+])
+def test_prefill_carry_rejects_unrelated_changes(carry_records, section, key, value, message):
+    change(carry_records, 'driver.json', lambda d:
+           d['preflight'][section]['on'].update({key: value}))
+    with pytest.raises(ValueError, match=message):
+        summary.summarize(carry_records, prefill_snapshot_carry=True)
+
+
+def test_prefill_carry_cannot_be_reported_as_decode_snapshot_experiment(carry_records):
+    with pytest.raises(ValueError, match='wrong experiment'):
+        summary.summarize(carry_records, fixed_continuation=True)
+
+
+def test_prefill_carry_still_rejects_answer_drift(carry_records):
+    change(carry_records, 'r2/session-2/result.json', lambda d:
+           d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message'].update(
+               content=d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message']['content'] + '\n'))
+    result = summary.summarize(carry_records, prefill_snapshot_carry=True)
+    assert not result['fixed_work_qualified']
+    assert result['comparison']['wall_reduction_percent'] is None
+    assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+
+
+@pytest.mark.parametrize('change_kind', ['missing', 'changed'])
+def test_prefill_carry_requires_matching_ple_native_identity(carry_records, change_kind):
+    def mutate(driver):
+        ids = driver['preflight']['identities']
+        if change_kind == 'missing':
+            for row in ids.values():
+                row['native_extensions'].pop('_ple_uring')
+        else:
+            ids['on']['native_extensions']['_ple_uring']['sha256'] = 'other'
+    change(carry_records, 'driver.json', mutate)
+    with pytest.raises(ValueError, match='native extension identity missing or changed'):
+        summary.summarize(carry_records, prefill_snapshot_carry=True)

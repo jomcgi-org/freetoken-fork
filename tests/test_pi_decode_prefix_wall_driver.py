@@ -217,3 +217,55 @@ def test_orphan_action_prevents_starting_a_new_comparison(monkeypatch):
     monkeypatch.setattr(gate, 'live', lambda unit: unit == gate.ACTION)
     with pytest.raises(AssertionError, match='another benchmark is live'):
         gate.preflight()
+
+
+def test_prefill_carry_changes_only_runtime_path_with_decode_snapshots_off(monkeypatch):
+    monkeypatch.setattr(gate, 'PREFILL_CARRY', True)
+    off, on = (gate.server_env(mode) for mode in gate.MODES)
+    assert off.pop('PYTHONPATH') == str(gate.OPT / 'python')
+    assert on.pop('PYTHONPATH') == str(gate.CARRY / 'python')
+    assert off == on and off['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0'
+    assert gate.runtime_revision('off') == gate.REVISIONS['off']
+    assert gate.runtime_revision('on') != gate.runtime_revision('off')
+    assert gate.runtime_revision('original') == gate.REVISIONS['original']
+
+
+@pytest.mark.parametrize('action', ['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
+def test_prefill_carry_selection_reaches_every_remote_action(monkeypatch, action):
+    monkeypatch.setattr(gate, 'PREFILL_CARRY', True)
+    command = gate.remote_command('/tmp/driver.py', action, 'astra-pi-agentic-carry-test')
+    assert command.count('--prefill-snapshot-carry') == 1
+    if action in ('start', 'end'):
+        assert '--property=BindsTo=' + gate.LEASE + '.service' in command
+    else:
+        assert command[0] == '/usr/bin/python3'
+
+
+def test_prefill_carry_rejects_decode_snapshot_confounds_before_service_access(monkeypatch):
+    monkeypatch.setattr(gate, 'PREFILL_CARRY', True)
+    monkeypatch.setattr(gate, 'server_command', lambda _: ['same'])
+    monkeypatch.setattr(gate, 'server_env', lambda mode: {
+        'PYTHONPATH': mode, 'FREETOKEN_DECODE_PREFIX_SNAPSHOT': '1'})
+    monkeypatch.setattr(gate, 'state', lambda _: pytest.fail('must reject before accessing services'))
+    with pytest.raises(AssertionError):
+        gate.preflight()
+
+
+@pytest.mark.parametrize('missing', [None, *gate.EXTENSION_SOURCES])
+def test_native_identity_requires_every_serving_extension(tmp_path, missing):
+    kernel = tmp_path / 'python/freetoken/kernel'
+    for name, source in gate.EXTENSION_SOURCES.items():
+        code = kernel / 'csrc' / source
+        code.parent.mkdir(parents=True, exist_ok=True)
+        code.write_bytes(b'synthetic source')
+        if name != missing:
+            (kernel / (name + '.test.so')).write_bytes(b'synthetic extension')
+    if missing:
+        with pytest.raises(AssertionError, match='missing or ambiguous native extension'):
+            gate.native_extensions(tmp_path)
+    else:
+        result = gate.native_extensions(tmp_path)
+        assert set(result) == set(gate.EXTENSION_SOURCES)
+        for name, row in result.items():
+            assert row['sha256'] == gate.sha(kernel / (name + '.test.so'))
+            assert row['source_sha256'] == gate.sha(kernel / 'csrc' / gate.EXTENSION_SOURCES[name])

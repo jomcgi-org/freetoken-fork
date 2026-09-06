@@ -26,6 +26,14 @@ R = Path('/var/lib/longhorn/nvme-02/freetoken')
 SERVICE = Path('/etc/systemd/system/freetoken-serve.service')
 SRC = R / 'wt-plegather'
 OPT = R / 'wt-astra-decode-prefix-snapshot'
+CARRY = R / 'wt-astra-prefill-snapshot-carry'
+PREFILL_CARRY = False
+EXTENSION_SOURCES = {
+    '_cpu_moe': 'cpu_moe/cpu_moe_ext.cpp',
+    '_pinned_tensor': 'pinned_tensor.cpp',
+    '_ple_uring': 'ple_uring/ple_uring_ext.cpp',
+    '_uffd_pager': 'uffd_pager.cpp',
+}
 SERVER = 'astra-pi-agentic-server'
 LEASE = 'astra-pi-agentic-lease'
 ACTION = 'astra-pi-agentic-action'
@@ -34,6 +42,8 @@ SSH = ['ssh', '-oIdentityAgent=none', '-oIdentitiesOnly=yes', '-oBatchMode=yes',
 REVISIONS = {'original': '3a67403a293be20836604bc25729329997848e09',
              'off': '9c2eb77e9abe3f843b5e50ed55e90871d57ed8d9',
              'on': '9c2eb77e9abe3f843b5e50ed55e90871d57ed8d9'}
+PREFILL_CARRY_REVISIONS = {'off': REVISIONS['off'],
+                         'on': '58a5355fc671a5dc5892bbb76f006950e4b5ab54'}
 BINARIES = {'original': 'aad1f3169b9b39829a356877de7e5add9b8c8a0173837f54140871b24e0c0048',
             'off': 'c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f',
             'on': 'c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f'}
@@ -113,18 +123,38 @@ def completion(port):
     return result
 
 
+def runtime_tree(mode):
+    return CARRY if PREFILL_CARRY and mode == 'on' else OPT
+
+
+def runtime_revision(mode):
+    return PREFILL_CARRY_REVISIONS[mode] if PREFILL_CARRY and mode != 'original' else REVISIONS[mode]
+
+
+def native_extensions(tree):
+    kernel = tree / 'python/freetoken/kernel'
+    result = {}
+    for name, source in EXTENSION_SOURCES.items():
+        binaries = list(kernel.glob(name + '.*.so'))
+        assert len(binaries) == 1, ('missing or ambiguous native extension', name)
+        native = binaries[0].resolve(strict=True)
+        result[name] = dict(path=str(native), sha256=sha(native),
+                            source_sha256=sha(kernel / 'csrc' / source))
+    return result
+
+
 def identities():
     result = {}
-    for mode, tree in [('original', SRC), ('off', OPT), ('on', OPT)]:
+    for mode, tree in [('original', SRC), *[(m, runtime_tree(m)) for m in MODES]]:
         revision = run('git', '-C', str(tree), 'rev-parse', 'HEAD').stdout.strip()
-        assert revision == REVISIONS[mode], (mode, revision)
+        assert revision == runtime_revision(mode), (mode, revision)
         assert not run('git', '-C', str(tree), 'status', '--porcelain').stdout.strip(), tree
-        binaries = list((tree / 'python/freetoken/kernel').glob('_cpu_moe.*.so'))
-        assert len(binaries) == 1
-        native = binaries[0].resolve()
+        extensions = native_extensions(tree)
+        native = Path(extensions['_cpu_moe']['path'])
         assert sha(native) == BINARIES[mode], native
         result[mode] = dict(revision=revision, tree=str(tree), native=str(native), native_sha256=sha(native),
-                            cpp_sha256=sha(tree / 'python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp'))
+                            cpp_sha256=sha(tree / 'python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp'),
+                            native_extensions=extensions)
     return result
 
 
@@ -148,8 +178,8 @@ def server_env(mode):
     assert mode in MODES, mode
     return dict(CUDA_HOME='/usr/local/cuda-13.0',
                 PATH=f'{SRC}/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin', TMPDIR=str(R / 'tmp'),
-                PYTHONPATH=str(OPT / 'python'),
-                FREETOKEN_DECODE_PREFIX_SNAPSHOT='1' if mode == 'on' else '0',
+                PYTHONPATH=str(runtime_tree(mode) / 'python'),
+                FREETOKEN_DECODE_PREFIX_SNAPSHOT='1' if mode == 'on' and not PREFILL_CARRY else '0',
                 FREETOKEN_CONTINUATION_TRACE_DIR='',
                 FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS='128', FREETOKEN_PREFILL_HOT_OVERLAP='0')
 
@@ -160,7 +190,9 @@ def preflight(allow_lease=False):
     assert commands['off'] == commands['on']
     differences = {key for key in env['off'].keys() | env['on'].keys()
                    if env['off'].get(key) != env['on'].get(key)}
-    assert differences == {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}, differences
+    assert differences == ({'PYTHONPATH'} if PREFILL_CARRY else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}), differences
+    if PREFILL_CARRY:
+        assert all(e['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0' for e in env.values())
     for unit in ['astra-decode-weight-reuse-wall-driver', 'astra-concurrent-wall-driver',
                  'astra-decode-weight-reuse-validation-v2', 'astra-sustained-hot-staging-wall-driver',
                  'astra-sustained-reader-wall-driver', SERVER, ACTION, *([] if allow_lease else [LEASE])]:
@@ -169,7 +201,16 @@ def preflight(allow_lease=False):
     assert original['ActiveState'] == 'active', original
     workers = gpu_pids()
     assert len(workers) == 1 and original['ControlGroup'] in Path(f'/proc/{workers[0]}/cgroup').read_text()
-    return dict(identities=identities(), original_unit=original,
+    runtime_ids = identities()
+    if PREFILL_CARRY:
+        for key in ('native', 'native_sha256', 'cpp_sha256', 'native_extensions'):
+            assert runtime_ids['off'][key] == runtime_ids['on'][key], key
+        changed = run('git', '-C', str(CARRY), 'diff', '--name-only',
+                      PREFILL_CARRY_REVISIONS['off'], PREFILL_CARRY_REVISIONS['on'],
+                      '--', 'python/').stdout.splitlines()
+        assert changed == ['python/freetoken/scheduler/prefill.py'], changed
+    return dict(identities=runtime_ids, original_unit=original,
+                experiment='prefill-snapshot-carry' if PREFILL_CARRY else 'decode-prefix-snapshot',
                 service_sha256=sha(SERVICE),
                 model_config_sha256=sha(R / 'models/flash-e2m1.ftw/config.json'),
                 layer_profile_sha256=sha(R / 'layer-profile-v3.json'),
@@ -284,6 +325,12 @@ def remote_main(args):
         assert unit['ControlGroup'] in Path(f'/proc/{worker}/cgroup').read_text()
         maps = [line for line in Path(f'/proc/{worker}/maps').read_text().splitlines() if '_cpu_moe.' in line]
         assert maps and all(line.split()[-1] == plan['identities'][mode]['native'] for line in maps)
+        all_maps = Path(f'/proc/{worker}/maps').read_text().splitlines()
+        for name, identity in plan['identities'][mode]['native_extensions'].items():
+            loaded = [line.split()[-1] for line in all_maps if '/' + name + '.' in line]
+            if name in ('_cpu_moe', '_ple_uring'):
+                assert loaded, ('required extension not mapped', name)
+            assert all(path == identity['path'] for path in loaded), ('native mapping changed', name)
         actual_env = dict(item.split(b'=', 1) for item in Path(f'/proc/{worker}/environ').read_bytes().split(b'\0') if b'=' in item)
         assert all(actual_env[k.encode()].decode() == v for k, v in server_env(mode).items())
         text = journal(unit['InvocationID'])
@@ -293,16 +340,17 @@ def remote_main(args):
         assert any('DISK staged prefill:' in line and 'file_io=buffered' in line for line in text.splitlines())
         assert any('MoE HOT staging:' in line and 'file_io=mmap' in line for line in text.splitlines())
         assert "speculative_mtp='off'" in text and 'special_token_ckpt=False' in text
-        assert ('Aligned decode prefix snapshots enabled' in text) == (mode == 'on')
+        snapshot_enabled = mode == 'on' and not PREFILL_CARRY
+        assert ('Aligned decode prefix snapshots enabled' in text) == snapshot_enabled
         shape = geometry(text)
         if args.arm != 'r1':
             first = json.loads((out / 'r1-start.json').read_text())
             assert shape == first['geometry'], dict(first=first['geometry'], current=shape)
-        result = dict(arm=args.arm, mode=mode, revision=REVISIONS[mode], unit=unit, worker=worker,
+        result = dict(arm=args.arm, mode=mode, revision=runtime_revision(mode), unit=unit, worker=worker,
                       health=health, startup_completion=check, geometry=shape, native_maps=maps,
                       command=server_command(mode), env=server_env(mode), io_before=io_snapshot(worker),
                       worker_stat=Path(f'/proc/{worker}/stat').read_text(),
-                      diagnostics_disabled=True, snapshot_enabled=(mode == 'on'), original_unit=state('freetoken-serve'),
+                      diagnostics_disabled=True, snapshot_enabled=snapshot_enabled, original_unit=state('freetoken-serve'),
                       identity=plan['identities'][mode], driver_sha256=plan['driver_sha256'],
                       cache_policy='RAM radix reuse on; disk prefix cache and HOT persistence off')
         save(start_path, result)
@@ -339,6 +387,8 @@ def all_tasks_passed(arms):
 
 def remote_command(script, action, run_id, arm=None):
     command = ['/usr/bin/python3', str(script), '--remote', action, '--run-id', run_id]
+    if PREFILL_CARRY:
+        command += ['--prefill-snapshot-carry']
     if arm:
         command += ['--arm', arm]
     if action in ('start', 'end'):
@@ -377,6 +427,12 @@ def local_main(args):
                 client_kind='fixed-continuation' if args.fixed_continuation else 'pi',
                 local_revision=run('git', '-C', str(here.parent), 'rev-parse', 'HEAD').stdout.strip(),
                 design='Snapshot off/on/on/off: one warmup and two measured three-turn conversations per start. Same runtime and native binary; only FREETOKEN_DECODE_PREFIX_SNAPSHOT differs. All failures retained. Capacity one, graph one, 65536 FP8 KV tokens, 3753 expert slots, radix prefixes enabled, token trace and invasive diagnostics off. Host page cache retained. No model routing or quantization change.')
+    if PREFILL_CARRY:
+        plan['design'] = ('Prefill marker carry parent/fix/fix/parent: one warmup and two measured '
+                          'three-turn conversations per start. Pinned runtime revisions; identical '
+                          'native binary, command and environment except PYTHONPATH. Decode snapshots '
+                          'and invasive diagnostics off in both arms. Same capacity-one geometry, '
+                          'quantization and routing. Retain all failures and both orders.')
     if not args.fixed_continuation:
         plan.update(pi_version=run(str(args.pi), '--version').stdout.strip(),
                     pi_executable_sha256=sha(args.pi.resolve()))
@@ -405,11 +461,10 @@ def local_main(args):
     spec.loader.exec_module(client_module)
 
     try:
-        restore = shlex.join(['/usr/bin/python3', str(remote_script), '--remote', 'restore', '--run-id', args.run_id])
+        restore = shlex.join(remote_command(remote_script, 'restore', args.run_id))
         command = ['sudo', '-n', 'systemd-run', '--unit=' + LEASE, '--pipe', '--wait', '--collect', '--uid=jomcgi',
                    '--property=RuntimeMaxSec=14400', '--property=TimeoutStopSec=600',
-                   '--property=ExecStopPost=' + restore,
-                   '/usr/bin/python3', str(remote_script), '--remote', 'hold', '--run-id', args.run_id]
+                   '--property=ExecStopPost=' + restore] + remote_command(remote_script, 'hold', args.run_id)
         with (root / 'lease-stderr.log').open('wb') as err:
             lease = subprocess.Popen(SSH + ['node-4', shlex.join(command)], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=err, start_new_session=True)
@@ -513,6 +568,7 @@ def local_main(args):
 
 
 def main():
+    global PREFILL_CARRY
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--remote', dest='action', choices=['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
     parser.add_argument('--run-id', required=True)
@@ -521,13 +577,18 @@ def main():
     parser.add_argument('--pi', type=Path)
     parser.add_argument('--fixed-continuation', action='store_true',
                         help='use ordinary greedy scripted copying instead of Pi tasks')
+    parser.add_argument('--prefill-snapshot-carry', action='store_true',
+                        help='compare the pinned prefill-marker fix with its parent; decode snapshots stay off')
     parser.add_argument('--preflight', action='store_true')
     args = parser.parse_args()
+    PREFILL_CARRY = args.prefill_snapshot_carry
     if not re.fullmatch(r'astra-pi-agentic-[a-z0-9-]+', args.run_id):
         parser.error('run-id must start astra-pi-agentic- and contain only lowercase letters, digits and hyphens')
     if args.action:
         print(json.dumps(remote_main(args), indent=2), flush=True)
         return 0
+    if PREFILL_CARRY and not args.fixed_continuation:
+        parser.error('--prefill-snapshot-carry requires --fixed-continuation')
     if not args.output_dir or (not args.pi and not args.fixed_continuation):
         parser.error('local controller requires --output-dir and either --pi or --fixed-continuation')
     return local_main(args)
