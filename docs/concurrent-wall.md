@@ -30,12 +30,15 @@ service after the comparison. Report aggregate wall time and individual
 latency together. A throughput gain with slower individual responses is a
 tradeoff, not a single-request speedup. This client introduces no serving
 policy or model changes, and has not yet qualified concurrent serving on
-the 4090. The running HOT staging reader gate is separate and unchanged.
+the 4090. The HOT staging reader gate is separate and unchanged.
 
-All eighteen targeted pure Python checks pass locally without a model or
-network service. They cover actual overlapping workers, the concurrency
+All eighteen targeted pure Python checks pass locally and on Linux without
+a model or network service. They cover actual overlapping workers, the concurrency
 bound, refilling while an earlier response remains pending, error retention,
 warmup separation, exact JSON checks, prose format versus semantics, and
 workload timing that includes recording but excludes outer I/O snapshots.
-This local pass is advisory. Linux validation and model wall-time comparison
-remain pending.
+The [Linux validation record](../bench/results/4090-concurrent-client-validation-20260906.json)
+retains the exact source hashes and command at `c0775ea`. It verifies that the
+HOT reader wall-time driver finished successfully before testing and that
+the original service remained active with the same PID. Model wall-time
+comparison remains pending; these checks qualify the client protocol only.
