@@ -955,6 +955,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-host-cache",
+        choices=("retain", "reclaim"),
+        default=ServerArgs.moe_hot_host_cache,
+        help=(
+            "Host file cache for GPU HOT experts: retain (default), or experimentally "
+            "reclaim complete file pages after promotion. Requires native NVFP4, "
+            "staged prefill with HOT splitting and madvise paging."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-boundary-cap-frac",
         type=float,
         default=ServerArgs.moe_hot_adapt_boundary_cap_frac,
