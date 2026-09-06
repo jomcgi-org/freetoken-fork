@@ -18,9 +18,32 @@ import time
 OUTPUT_ENV = "FREETOKEN_TARGET_VERIFY_COST_DIR"
 GRAPH_ENV = "FREETOKEN_TARGET_VERIFY_GRAPH"
 TRACE_ENV = "FREETOKEN_TARGET_VERIFY_LAYER_TRACE"
+SERIAL_LINEAR_ENV = "FREETOKEN_TARGET_VERIFY_SERIAL_LINEAR"
 MODES = ("graph_one", "graph_two", "snapshot", "accept", "reject")
 GRAPH_MODES = ("accept_graph", "reject_graph")
 _ACTIVATIONS = {}
+
+
+def install_serial_linear():
+    """Keep ordinary dense row reduction order inside the two-token diagnostic."""
+    import torch
+    import torch.nn.functional as functional
+    from freetoken.core import get_global_ctx
+
+    original = functional.linear
+
+    def linear(input, weight, bias=None):
+        if input.ndim == 2 and input.shape[0] == 2:
+            try:
+                batch = get_global_ctx().batch
+            except AssertionError:
+                batch = None
+            if getattr(batch, "mtp_fused", False):
+                return torch.cat((original(input[:1], weight, bias),
+                                  original(input[1:], weight, bias)), dim=0)
+        return original(input, weight, bias)
+
+    functional.linear = linear
 
 
 def eligible_position(position, *, page_size, ratio, remaining):
@@ -567,6 +590,7 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
     trace_only = os.environ.get(TRACE_ENV) == "1"
     report = dict(diagnostic_only=True, model_wall_qualified=False, completed=False,
                   graph_enabled=graph_enabled, trace_only=trace_only,
+                  serial_linear=os.environ.get(SERIAL_LINEAR_ENV) == "1",
                   component_timings_usable=not trace_only,
                   records=[], pid=os.getpid(), speculative_mtp=engine.config.speculative_mtp,
                   graph_sizes=sorted(engine.graph_runner.graph_map),
@@ -623,6 +647,8 @@ def install(engine_class):
         raise RuntimeError("explicit private probe output directory is required")
     if torch.cuda.is_initialized():
         raise RuntimeError("install the probe before Engine initializes CUDA")
+    if os.environ.get(SERIAL_LINEAR_ENV) == "1":
+        install_serial_linear()
     if os.environ.get(TRACE_ENV) == "1":
         if os.environ.get(GRAPH_ENV) == "1":
             raise RuntimeError("run activation tracing separately from graph cost measurement")

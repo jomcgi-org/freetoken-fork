@@ -218,3 +218,31 @@ def test_activation_snapshot_owns_storage(monkeypatch):
     assert saved["00/input"].tolist() == [[1.0, 2.0]]
     with pytest.raises(RuntimeError, match="missing its forward"):
         probe.activation_snapshot("eager", 2)
+
+
+@pytest.mark.parametrize("fused,rows,expected_calls", [
+    (True, 2, [1, 1]), (False, 2, [2]), (True, 1, [1]), (True, 3, [3]),
+])
+def test_serial_dense_policy_is_limited_to_two_token_verification(monkeypatch, fused, rows, expected_calls):
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as functional
+    import freetoken.core as core
+
+    original = functional.linear
+    calls = []
+
+    def observe(input, weight, bias=None):
+        calls.append(input.shape[0])
+        return original(input, weight, bias)
+
+    # Register the original attribute with monkeypatch so the diagnostic wrapper
+    # is removed after this test as well as the observer.
+    monkeypatch.setattr(functional, "linear", observe)
+    monkeypatch.setattr(core, "get_global_ctx", lambda: SimpleNamespace(batch=SimpleNamespace(mtp_fused=fused)))
+    probe.install_serial_linear()
+    inputs = torch.arange(rows * 3, dtype=torch.float32).reshape(rows, 3)
+    weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    bias = torch.tensor([2.0, 3.0])
+    actual = functional.linear(input=inputs, weight=weight, bias=bias)
+    assert torch.equal(actual, original(inputs, weight, bias))
+    assert calls == expected_calls

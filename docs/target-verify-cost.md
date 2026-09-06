@@ -74,6 +74,14 @@ eager width-one execution, then locates stage differences between fused and
 sequential target execution. It emits no component timings. These invasive
 copies must never be included in a performance comparison.
 
+`FREETOKEN_TARGET_VERIFY_SERIAL_LINEAR=1` is a separate diagnostic execution
+policy: dense `F.linear` calls within a fused two-token window execute each row
+with ordinary width-one geometry. Routed expert work remains batched. The gate
+does not affect ordinary decode, prefill, weights or quantization. It can be
+combined with tracing for numerical localization, then with graph mode in a
+separate run to measure its component cost. Do not assume this preserves all
+state until the full-model comparisons pass.
+
 Rejection restores recurrence, convolution, integer PLE history and QSA pending
 state. It deliberately leaves speculative KV/index writes beyond the committed
 length in place. The check compares all reachable state byte for byte, then
