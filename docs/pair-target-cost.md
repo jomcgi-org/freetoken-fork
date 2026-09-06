@@ -29,3 +29,17 @@ windows warm expert and file caches, and all trials reserve the wider workspace.
 A production proposer and scheduler, broad task validation and separate non-debug
 wall measurements remain required. No serving path enables paired execution by
 default.
+
+Validation completed with 57 focused Mac checks passing and 35 Torch/CUDA checks
+skipped. Linux passed 202 focused checks, followed by the exclusive CUDA rollback
+check. The full-model experiments passed every required logit, token, state,
+rejection-prefix and next-decode comparison. The repeat included an explicit
+native bypass that keeps single-token tasks on the ordinary route loop.
+Original serving recovered after each run, with a real completion and verified
+GPU ownership.
+
+Rejection components showed the more consistent timing improvement. Acceptance
+timings remained sensitive to execution order, and ordinary decode controls
+varied. This diagnostic is complete, but it does not establish a stable model or
+serving speedup. Keep paired dispatch opt-in until separate serving qualification.
+Detailed model records and timing payloads remain private.
