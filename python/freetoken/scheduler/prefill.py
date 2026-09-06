@@ -139,6 +139,7 @@ class PrefillAdder:
         linear_slot_idx: int | None = None,
         ping_pong: tuple | None = None,
         next_track_idx: int = 0,
+        last_track_seqlen: int | None = None,
         restore_src: int | None = None,
         qsa_restore_pending: torch.Tensor | None = None,
         lazy_kv_restore=None,
@@ -214,6 +215,10 @@ class PrefillAdder:
         req.linear_slot_idx = linear_slot_idx
         req.mamba_ping_pong = ping_pong
         req.mamba_next_track_idx = next_track_idx
+        # Intermediate chunks do not donate into radix under overlap. A short
+        # final extend may produce no new track, so keep the earlier frozen
+        # boundary paired with its inherited ping-pong slots and write index.
+        req.mamba_last_track_seqlen = last_track_seqlen
         req.mamba_restore_src = restore_src
         req.qsa_restore_pending = qsa_restore_pending
         req.lazy_kv_restore = lazy_kv_restore
@@ -256,6 +261,7 @@ class PrefillAdder:
                 linear_slot_idx=chunked_req.linear_slot_idx,
                 ping_pong=chunked_req.mamba_ping_pong,
                 next_track_idx=chunked_req.mamba_next_track_idx,
+                last_track_seqlen=chunked_req.mamba_last_track_seqlen,
                 restore_src=None,  # continuation chunk already has live state
                 lazy_kv_restore=chunked_req.lazy_kv_restore,
                 restore_started_at=chunked_req.restore_started_at,
