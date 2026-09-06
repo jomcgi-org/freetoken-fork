@@ -28,6 +28,8 @@ SRC = R / 'wt-plegather'
 OPT = R / 'wt-astra-decode-prefix-snapshot'
 CARRY = R / 'wt-astra-prefill-snapshot-carry'
 PREFILL_CARRY = False
+PROFILE = R / 'wt-astra-hybrid-profile-retention'
+PROFILE_RETENTION = False
 EXTENSION_SOURCES = {
     '_cpu_moe': 'cpu_moe/cpu_moe_ext.cpp',
     '_pinned_tensor': 'pinned_tensor.cpp',
@@ -44,6 +46,8 @@ REVISIONS = {'original': '3a67403a293be20836604bc25729329997848e09',
              'on': '9c2eb77e9abe3f843b5e50ed55e90871d57ed8d9'}
 PREFILL_CARRY_REVISIONS = {'off': REVISIONS['off'],
                          'on': '58a5355fc671a5dc5892bbb76f006950e4b5ab54'}
+PROFILE_RETENTION_REVISIONS = {'off': PREFILL_CARRY_REVISIONS['on'],
+                              'on': '5b0ea43e03971759f7355f5a9c80e8065636f31b'}
 BINARIES = {'original': 'aad1f3169b9b39829a356877de7e5add9b8c8a0173837f54140871b24e0c0048',
             'off': 'c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f',
             'on': 'c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f'}
@@ -124,11 +128,25 @@ def completion(port):
 
 
 def runtime_tree(mode):
+    if PROFILE_RETENTION:
+        return PROFILE if mode == 'on' else CARRY
     return CARRY if PREFILL_CARRY and mode == 'on' else OPT
 
 
 def runtime_revision(mode):
+    if PROFILE_RETENTION and mode != 'original':
+        return PROFILE_RETENTION_REVISIONS[mode]
     return PREFILL_CARRY_REVISIONS[mode] if PREFILL_CARRY and mode != 'original' else REVISIONS[mode]
+
+
+def runtime_pair():
+    return PREFILL_CARRY or PROFILE_RETENTION
+
+
+def experiment_name():
+    if PROFILE_RETENTION:
+        return 'hybrid-profile-retention'
+    return 'prefill-snapshot-carry' if PREFILL_CARRY else 'decode-prefix-snapshot'
 
 
 def native_extensions(tree):
@@ -170,6 +188,12 @@ def server_command(mode):
     args.extend(['--moe-hot-plan-persist', 'off', '--cache-type', 'radix', '--kv-ladder', 'off',
                  '--kv-reserve-tokens', '65536', '--cuda-graph-max-bs', '1'])
     args.extend(['--moe-disk-prefill-io', 'buffered', '--moe-hot-staging-io', 'mmap'])
+    if PROFILE_RETENTION:
+        for flag, value in [('--session-expert-prefetch', 'on'), ('--session-protect-experts', '64')]:
+            if flag in args:
+                args[args.index(flag) + 1] = value
+            else:
+                args.extend([flag, value])
     assert '--moe-collect-stats' not in args and '--moe-step-timing' not in args
     return args
 
@@ -179,20 +203,25 @@ def server_env(mode):
     return dict(CUDA_HOME='/usr/local/cuda-13.0',
                 PATH=f'{SRC}/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin', TMPDIR=str(R / 'tmp'),
                 PYTHONPATH=str(runtime_tree(mode) / 'python'),
-                FREETOKEN_DECODE_PREFIX_SNAPSHOT='1' if mode == 'on' and not PREFILL_CARRY else '0',
+                FREETOKEN_DECODE_PREFIX_SNAPSHOT='1' if mode == 'on' and not runtime_pair() else '0',
                 FREETOKEN_CONTINUATION_TRACE_DIR='',
                 FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS='128', FREETOKEN_PREFILL_HOT_OVERLAP='0')
 
 
 def preflight(allow_lease=False):
+    assert not (PREFILL_CARRY and PROFILE_RETENTION), 'conflicting experiments'
     commands = {mode: server_command(mode) for mode in MODES}
     env = {mode: server_env(mode) for mode in MODES}
     assert commands['off'] == commands['on']
     differences = {key for key in env['off'].keys() | env['on'].keys()
                    if env['off'].get(key) != env['on'].get(key)}
-    assert differences == ({'PYTHONPATH'} if PREFILL_CARRY else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}), differences
-    if PREFILL_CARRY:
+    assert differences == ({'PYTHONPATH'} if runtime_pair() else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}), differences
+    if runtime_pair():
         assert all(e['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0' for e in env.values())
+    if PROFILE_RETENTION:
+        for flag, value in [('--session-expert-prefetch', 'on'), ('--session-protect-experts', '64')]:
+            assert commands['off'].count(flag) == 1
+            assert commands['off'][commands['off'].index(flag) + 1] == value
     for unit in ['astra-decode-weight-reuse-wall-driver', 'astra-concurrent-wall-driver',
                  'astra-decode-weight-reuse-validation-v2', 'astra-sustained-hot-staging-wall-driver',
                  'astra-sustained-reader-wall-driver', SERVER, ACTION, *([] if allow_lease else [LEASE])]:
@@ -202,15 +231,16 @@ def preflight(allow_lease=False):
     workers = gpu_pids()
     assert len(workers) == 1 and original['ControlGroup'] in Path(f'/proc/{workers[0]}/cgroup').read_text()
     runtime_ids = identities()
-    if PREFILL_CARRY:
+    if runtime_pair():
         for key in ('native', 'native_sha256', 'cpp_sha256', 'native_extensions'):
             assert runtime_ids['off'][key] == runtime_ids['on'][key], key
-        changed = run('git', '-C', str(CARRY), 'diff', '--name-only',
-                      PREFILL_CARRY_REVISIONS['off'], PREFILL_CARRY_REVISIONS['on'],
+        changed = run('git', '-C', str(runtime_tree('on')), 'diff', '--name-only',
+                      runtime_revision('off'), runtime_revision('on'),
                       '--', 'python/').stdout.splitlines()
-        assert changed == ['python/freetoken/scheduler/prefill.py'], changed
+        expected_file = 'cache.py' if PROFILE_RETENTION else 'prefill.py'
+        assert changed == ['python/freetoken/scheduler/' + expected_file], changed
     return dict(identities=runtime_ids, original_unit=original,
-                experiment='prefill-snapshot-carry' if PREFILL_CARRY else 'decode-prefix-snapshot',
+                experiment=experiment_name(),
                 service_sha256=sha(SERVICE),
                 model_config_sha256=sha(R / 'models/flash-e2m1.ftw/config.json'),
                 layer_profile_sha256=sha(R / 'layer-profile-v3.json'),
@@ -340,7 +370,9 @@ def remote_main(args):
         assert any('DISK staged prefill:' in line and 'file_io=buffered' in line for line in text.splitlines())
         assert any('MoE HOT staging:' in line and 'file_io=mmap' in line for line in text.splitlines())
         assert "speculative_mtp='off'" in text and 'special_token_ckpt=False' in text
-        snapshot_enabled = mode == 'on' and not PREFILL_CARRY
+        if PROFILE_RETENTION:
+            assert "session_expert_prefetch='on'" in text and 'session_protect_experts=64' in text
+        snapshot_enabled = mode == 'on' and not runtime_pair()
         assert ('Aligned decode prefix snapshots enabled' in text) == snapshot_enabled
         shape = geometry(text)
         if args.arm != 'r1':
@@ -389,6 +421,8 @@ def remote_command(script, action, run_id, arm=None):
     command = ['/usr/bin/python3', str(script), '--remote', action, '--run-id', run_id]
     if PREFILL_CARRY:
         command += ['--prefill-snapshot-carry']
+    if PROFILE_RETENTION:
+        command += ['--hybrid-profile-retention']
     if arm:
         command += ['--arm', arm]
     if action in ('start', 'end'):
@@ -427,8 +461,9 @@ def local_main(args):
                 client_kind='fixed-continuation' if args.fixed_continuation else 'pi',
                 local_revision=run('git', '-C', str(here.parent), 'rev-parse', 'HEAD').stdout.strip(),
                 design='Snapshot off/on/on/off: one warmup and two measured three-turn conversations per start. Same runtime and native binary; only FREETOKEN_DECODE_PREFIX_SNAPSHOT differs. All failures retained. Capacity one, graph one, 65536 FP8 KV tokens, 3753 expert slots, radix prefixes enabled, token trace and invasive diagnostics off. Host page cache retained. No model routing or quantization change.')
-    if PREFILL_CARRY:
-        plan['design'] = ('Prefill marker carry parent/fix/fix/parent: one warmup and two measured '
+    if runtime_pair():
+        label = 'Hybrid expert profile retention' if PROFILE_RETENTION else 'Prefill marker carry'
+        plan['design'] = (label + ' parent/fix/fix/parent: one warmup and two measured '
                           'three-turn conversations per start. Pinned runtime revisions; identical '
                           'native binary, command and environment except PYTHONPATH. Decode snapshots '
                           'and invasive diagnostics off in both arms. Same capacity-one geometry, '
@@ -568,7 +603,7 @@ def local_main(args):
 
 
 def main():
-    global PREFILL_CARRY
+    global PREFILL_CARRY, PROFILE_RETENTION
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--remote', dest='action', choices=['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
     parser.add_argument('--run-id', required=True)
@@ -577,18 +612,22 @@ def main():
     parser.add_argument('--pi', type=Path)
     parser.add_argument('--fixed-continuation', action='store_true',
                         help='use ordinary greedy scripted copying instead of Pi tasks')
-    parser.add_argument('--prefill-snapshot-carry', action='store_true',
-                        help='compare the pinned prefill-marker fix with its parent; decode snapshots stay off')
+    experiments = parser.add_mutually_exclusive_group()
+    experiments.add_argument('--prefill-snapshot-carry', action='store_true',
+                             help='compare the pinned prefill-marker fix with its parent; decode snapshots stay off')
+    experiments.add_argument('--hybrid-profile-retention', action='store_true',
+                             help='compare the pinned expert-profile fix with its parent; decode snapshots stay off')
     parser.add_argument('--preflight', action='store_true')
     args = parser.parse_args()
     PREFILL_CARRY = args.prefill_snapshot_carry
+    PROFILE_RETENTION = args.hybrid_profile_retention
     if not re.fullmatch(r'astra-pi-agentic-[a-z0-9-]+', args.run_id):
         parser.error('run-id must start astra-pi-agentic- and contain only lowercase letters, digits and hyphens')
     if args.action:
         print(json.dumps(remote_main(args), indent=2), flush=True)
         return 0
-    if PREFILL_CARRY and not args.fixed_continuation:
-        parser.error('--prefill-snapshot-carry requires --fixed-continuation')
+    if runtime_pair() and not args.fixed_continuation:
+        parser.error('runtime-pair experiments require --fixed-continuation')
     if not args.output_dir or (not args.pi and not args.fixed_continuation):
         parser.error('local controller requires --output-dir and either --pi or --fixed-continuation')
     return local_main(args)

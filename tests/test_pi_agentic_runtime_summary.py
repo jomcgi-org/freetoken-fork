@@ -359,7 +359,7 @@ def test_prefill_carry_qualifies_fixed_work_with_both_orders(carry_records):
 
 
 @pytest.mark.parametrize(('section', 'key', 'value', 'message'), [
-    ('identities', 'revision', 'other', 'runtime revisions'),
+    ('identities', 'revision', 'other', 'runtime pair revisions'),
     ('identities', 'native_sha256', 'other', 'native binary'),
     ('identities', 'cpp_sha256', 'other', 'native binary'),
     ('env', 'FREETOKEN_DECODE_PREFIX_SNAPSHOT', '1', 'snapshot flags'),
@@ -400,3 +400,80 @@ def test_prefill_carry_requires_matching_ple_native_identity(carry_records, chan
     change(carry_records, 'driver.json', mutate)
     with pytest.raises(ValueError, match='native extension identity missing or changed'):
         summary.summarize(carry_records, prefill_snapshot_carry=True)
+
+
+@pytest.fixture
+def profile_records(carry_records):
+    root = carry_records
+    spec = importlib.util.spec_from_file_location(
+        'profile_gate_fixture', Path(__file__).parents[1] / 'bench/pi-decode-prefix-wall-driver.py')
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    driver = json.loads((root / 'driver.json').read_text())
+    plan = driver['preflight']
+    plan['experiment'] = 'hybrid-profile-retention'
+    for mode, tree in [('off', gate.CARRY), ('on', gate.PROFILE)]:
+        plan['identities'][mode].update(revision=gate.PROFILE_RETENTION_REVISIONS[mode], tree=str(tree))
+        plan['env'][mode]['PYTHONPATH'] = str(tree / 'python')
+        plan['commands'][mode] += ['--session-expert-prefetch', 'on', '--session-protect-experts', '64']
+    for arm, mode in summary.SNAPSHOT_ARMS:
+        start = json.loads((root / (arm + '-server-start.json')).read_text())
+        start.update(identity=plan['identities'][mode], revision=plan['identities'][mode]['revision'],
+                     env=plan['env'][mode], command=plan['commands'][mode])
+        write(root, arm + '-server-start.json', start)
+        change(root, arm + '/metadata.json', lambda d: d.update(server_metadata=start))
+    write(root, 'driver.json', driver)
+    return root
+
+
+def test_profile_retention_qualifies_same_work_and_reports_both_orders(profile_records):
+    result = summary.summarize(profile_records, hybrid_profile_retention=True)
+    assert result['experiment'] == 'hybrid-profile-retention'
+    assert result['fixed_work_qualified'] and not result['broad_quality_equivalence']
+    assert result['comparison']['wall_reduction_percent'] == pytest.approx(20)
+    assert len(result['sessions']) == 12 and len(result['orders']) == 2
+
+
+@pytest.mark.parametrize(('section', 'key', 'value', 'message'), [
+    ('identities', 'revision', 'other', 'runtime pair revisions'),
+    ('identities', 'native_extensions', {}, 'native extension identity'),
+    ('env', 'FREETOKEN_DECODE_PREFIX_SNAPSHOT', '1', 'snapshot flags'),
+    ('env', 'PYTHONPATH', '/wrong/python', 'wrong tree'),
+    ('env', 'EXTRA', '1', 'environment difference'),
+])
+def test_profile_retention_rejects_unrelated_changes(profile_records, section, key, value, message):
+    change(profile_records, 'driver.json', lambda d:
+           d['preflight'][section]['on'].update({key: value}))
+    with pytest.raises(ValueError, match=message):
+        summary.summarize(profile_records, hybrid_profile_retention=True)
+
+
+@pytest.mark.parametrize(('flag', 'value'), [('--session-expert-prefetch', 'off'),
+                                           ('--session-protect-experts', '0')])
+def test_profile_retention_requires_the_same_enabled_advice_policy(profile_records, flag, value):
+    def mutate(driver):
+        for command in driver['preflight']['commands'].values():
+            command[command.index(flag) + 1] = value
+    change(profile_records, 'driver.json', mutate)
+    with pytest.raises(ValueError, match='wrong session prefetch policy'):
+        summary.summarize(profile_records, hybrid_profile_retention=True)
+
+
+def test_profile_retention_cannot_be_reported_as_prefill_carry(profile_records):
+    with pytest.raises(ValueError, match='wrong experiment'):
+        summary.summarize(profile_records, prefill_snapshot_carry=True)
+
+
+def test_profile_retention_still_rejects_answer_drift(profile_records):
+    change(profile_records, 'r2/session-2/result.json', lambda d:
+           d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message'].update(
+               content=d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message']['content'] + '\n'))
+    result = summary.summarize(profile_records, hybrid_profile_retention=True)
+    assert not result['fixed_work_qualified']
+    assert result['comparison']['wall_reduction_percent'] is None
+    assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+
+
+def test_summary_rejects_conflicting_source_pairs_before_reading_files(tmp_path):
+    with pytest.raises(ValueError, match='conflicting experiments'):
+        summary.summarize(tmp_path, prefill_snapshot_carry=True, hybrid_profile_retention=True)
