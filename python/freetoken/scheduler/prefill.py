@@ -57,6 +57,9 @@ class PrefillAdder:
         mr = self.cache_manager.match_req(req)
         handle = mr.cuda_handle
         cached_len = handle.cached_len
+        trace = getattr(self.cache_manager, "continuation_trace", None)
+        if trace is not None:
+            trace.match(req, cached_len, self.cache_manager)
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_len = extend_len + req.output_len
