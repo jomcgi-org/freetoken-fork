@@ -85,11 +85,13 @@ def compare(rows, mode_names=('baseline', 'optimized')):
 
 
 def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
-              prefill_snapshot_carry=False, hybrid_profile_retention=False, gpu_source_staging=False):
-    require(sum((prefill_snapshot_carry, hybrid_profile_retention, decode_prefix_snapshot, gpu_source_staging)) <= 1,
+              prefill_snapshot_carry=False, hybrid_profile_retention=False, gpu_source_staging=False,
+              hot_host_cache_reclaim=False):
+    require(sum((prefill_snapshot_carry, hybrid_profile_retention, decode_prefix_snapshot, gpu_source_staging, hot_host_cache_reclaim)) <= 1,
             'conflicting experiments')
     runtime_pair = prefill_snapshot_carry or hybrid_profile_retention
-    fixed_continuation = fixed_continuation or runtime_pair or gpu_source_staging
+    same_runtime_policy = gpu_source_staging or hot_host_cache_reclaim
+    fixed_continuation = fixed_continuation or runtime_pair or same_runtime_policy
     decode_prefix_snapshot = decode_prefix_snapshot or fixed_continuation
     hashes = {}
     expected_arms = SNAPSHOT_ARMS if decode_prefix_snapshot else ARMS
@@ -120,8 +122,10 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
             experiment = 'hybrid-profile-retention'
         if gpu_source_staging:
             experiment = 'gpu-source-staging'
+        if hot_host_cache_reclaim:
+            experiment = 'hot-host-cache-reclaim'
         require(plan.get('experiment', 'decode-prefix-snapshot') == experiment, 'wrong experiment')
-        if runtime_pair or gpu_source_staging:
+        if runtime_pair or same_runtime_policy:
             spec = importlib.util.spec_from_file_location(
                 'carry_gate', Path(__file__).with_name('pi-decode-prefix-wall-driver.py'))
             gate = importlib.util.module_from_spec(spec)
@@ -145,28 +149,31 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
         else:
             require(plan['identities']['off'] == plan['identities']['on'],
                     'snapshot arms used different runtime identities')
-        if gpu_source_staging:
-            require(ids['off']['revision'] == gate.GPU_SOURCE_REVISION
-                    and ids['off']['tree'] == str(gate.GPU_SOURCE), 'wrong GPU source runtime')
+        if same_runtime_policy:
+            revision = gate.HOT_HOST_REVISION if hot_host_cache_reclaim else gate.GPU_SOURCE_REVISION
+            tree = gate.HOT_HOST if hot_host_cache_reclaim else gate.GPU_SOURCE
+            require(ids['off']['revision'] == revision
+                    and ids['off']['tree'] == str(tree), 'wrong policy runtime')
             extensions = ids['off'].get('native_extensions', {})
             require(set(extensions) == set(gate.EXTENSION_SOURCES)
                     and all(all(row.get(k) for k in ('path', 'sha256', 'source_sha256'))
-                            for row in extensions.values()), 'GPU source native identity missing')
+                            for row in extensions.values()), 'policy native identity missing')
             try:
-                gate.qualify_source_commands(plan['commands'])
+                qualify = gate.qualify_hot_host_commands if hot_host_cache_reclaim else gate.qualify_source_commands
+                qualify(plan['commands'])
             except AssertionError as exc:
-                raise ValueError('GPU source command mismatch: ' + str(exc)) from exc
+                raise ValueError('policy command mismatch: ' + str(exc)) from exc
         else:
             require(plan['commands']['off'] == plan['commands']['on'],
                     'snapshot arms used different command lines')
         off, on = plan['env']['off'], plan['env']['on']
         require(off['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0'
-                and on['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == ('0' if runtime_pair or gpu_source_staging else '1'),
+                and on['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == ('0' if runtime_pair or same_runtime_policy else '1'),
                 'wrong snapshot flags')
         require({key for key in off.keys() | on.keys() if off.get(key) != on.get(key)}
-                == (set() if gpu_source_staging else ({'PYTHONPATH'} if runtime_pair else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'})),
+                == (set() if same_runtime_policy else ({'PYTHONPATH'} if runtime_pair else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'})),
                 'unrelated environment difference')
-        if runtime_pair or gpu_source_staging:
+        if runtime_pair or same_runtime_policy:
             require(all(plan['env'][m]['PYTHONPATH'] == str(Path(ids[m]['tree']) / 'python')
                         for m in ('off', 'on')), 'runtime pair environment points at wrong tree')
         if hybrid_profile_retention:
@@ -179,6 +186,9 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
                         and command[command.index(flag) + 1] == value,
                         'wrong session prefetch policy')
         require(off['FREETOKEN_CONTINUATION_TRACE_DIR'] == '', 'engine token trace enabled')
+        if hot_host_cache_reclaim:
+            require(all(e.get('FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR') == '' for e in (off, on)),
+                    'HOT census enabled or unset')
         require(driver.get('lease_returncode') == 0 and not driver.get('error')
                 and not driver.get('restoration_error'), 'snapshot controller or lease failed')
     rows, arms = [], []
@@ -190,7 +200,7 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
         client_summary = read(Path(arm) / 'summary.json')
         require(start['arm'] == arm and start['mode'] == mode, f'{arm}: wrong server arm')
         if decode_prefix_snapshot:
-            require(start.get('snapshot_enabled') is (mode == 'on' and not runtime_pair and not gpu_source_staging),
+            require(start.get('snapshot_enabled') is (mode == 'on' and not runtime_pair and not same_runtime_policy),
                     f'{arm}: wrong snapshot marker')
         require(start['identity'] == plan['identities'][mode]
                 and start['revision'] == plan['identities'][mode]['revision']
@@ -231,6 +241,10 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
                         f'{arm}: source compute placement mismatch')
             except AssertionError as exc:
                 raise ValueError(f'{arm}: source layout mismatch: {exc}') from exc
+        if hot_host_cache_reclaim:
+            require(start.get('hot_host_cache') == ('retain' if mode == 'off' else 'reclaim'),
+                    f'{arm}: wrong HOT host cache policy marker')
+        if same_runtime_policy:
             for snapshot in (start['memory_before'], end['memory_after']):
                 for section, keys in [('worker_bytes', gate.WORKER_MEMORY_FIELDS),
                                       ('system_bytes', gate.SYSTEM_MEMORY_FIELDS)]:
@@ -246,9 +260,12 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
         arms.append(dict(arm=arm, mode=mode, warmup=arm_rows[0],
                          measured=totals(arm_rows[1:]),
                          worker_read_bytes_including_warmup=delta))
+        if same_runtime_policy:
+            arms[-1].update(memory_before=start['memory_before'], memory_after=end['memory_after'])
         if gpu_source_staging:
-            arms[-1].update(memory_before=start['memory_before'], memory_after=end['memory_after'],
-                            source_layout=layout)
+            arms[-1]['source_layout'] = layout
+        if hot_host_cache_reclaim:
+            arms[-1]['hot_host_cache'] = start['hot_host_cache']
         rows.extend(arm_rows)
     measured = [row for row in rows if not row['warmup']]
     result = dict(completed_protocol=True, broad_quality_equivalence=False,
@@ -320,17 +337,20 @@ def main():
                         help='verify the pinned expert-profile parent/fix scripted comparison')
     parser.add_argument('--gpu-source-staging', action='store_true',
                         help='verify the same-runtime pinned/staged GPU source comparison')
+    parser.add_argument('--hot-host-cache-reclaim', action='store_true',
+                        help='verify the same-runtime HOT source page retain/reclaim comparison')
     args = parser.parse_args()
     try:
         result = summarize(args.results, decode_prefix_snapshot=args.decode_prefix_snapshot,
                            fixed_continuation=args.fixed_continuation,
                            prefill_snapshot_carry=args.prefill_snapshot_carry,
                            hybrid_profile_retention=args.hybrid_profile_retention,
-                           gpu_source_staging=args.gpu_source_staging)
+                           gpu_source_staging=args.gpu_source_staging,
+                           hot_host_cache_reclaim=args.hot_host_cache_reclaim)
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(1, f'Cannot summarize comparison: {exc}\n')
     print(json.dumps(result, indent=2, allow_nan=False))
-    fixed = args.fixed_continuation or args.prefill_snapshot_carry or args.hybrid_profile_retention or args.gpu_source_staging
+    fixed = args.fixed_continuation or args.prefill_snapshot_carry or args.hybrid_profile_retention or args.gpu_source_staging or args.hot_host_cache_reclaim
     if fixed and not result['fixed_work_qualified']:
         raise SystemExit(1)
 

@@ -87,7 +87,8 @@ def test_gpu_source_mode_reaches_remote_recovery_and_serving(monkeypatch, action
     assert command.count('--gpu-source-staging') == 1
 
 
-@pytest.mark.parametrize('unit', ['astra-gpu-source-staging-cost', 'astra-gpu-source-staging-validation'])
+@pytest.mark.parametrize('unit', ['astra-gpu-source-staging-cost', 'astra-gpu-source-staging-validation',
+                                 'astra-hot-host-cache-reclaim-validation', 'astra-hot-host-cache-reclaim-census'])
 def test_staging_component_job_prevents_model_benchmark(monkeypatch, unit):
     monkeypatch.setattr(gate, 'server_command', lambda _: ['same'])
     monkeypatch.setattr(gate, 'server_env', lambda mode: {
@@ -432,3 +433,40 @@ def test_conflicting_source_pairs_are_rejected_before_services(monkeypatch):
     monkeypatch.setattr(gate, 'server_command', lambda _: pytest.fail('must reject first'))
     with pytest.raises(AssertionError, match='conflicting experiments'):
         gate.preflight()
+
+
+@pytest.mark.parametrize('action', ['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
+def test_hot_host_mode_preserves_runtime_and_reaches_recovery(monkeypatch, tmp_path, action):
+    monkeypatch.setattr(gate, 'HOT_HOST_RECLAIM', True)
+    service = tmp_path / 'original.service'
+    service.write_text('ExecStart=/bin/ft --port 8090 --moe-disk-prefill cpu '
+                       '--max-running-requests 1 --kv-disk-cache-gib 1 --moe-collect-stats')
+    monkeypatch.setattr(gate, 'SERVICE', service)
+    commands = {mode: gate.server_command(mode) for mode in gate.MODES}
+    gate.qualify_hot_host_commands(commands)
+    assert gate.server_env('off') == gate.server_env('on')
+    env = gate.server_env('on')
+    assert env['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0'
+    assert env['FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR'] == ''
+    assert env['PYTHONPATH'] == str(gate.HOT_HOST / 'python')
+    assert gate.runtime_tree('off') == gate.runtime_tree('on') == gate.HOT_HOST
+    assert gate.runtime_revision('off') == gate.runtime_revision('on') == gate.HOT_HOST_REVISION
+    assert gate.runtime_revision('original') == gate.REVISIONS['original']
+    command = gate.remote_command('/tmp/driver.py', action, 'astra-pi-agentic-hot-host-test')
+    assert command.count('--hot-host-cache-reclaim') == 1
+
+
+@pytest.mark.parametrize('change', ['duplicate', 'unrelated', 'wrong', 'missing_value'])
+def test_hot_host_commands_reject_confounds(change):
+    commands = {'off': ['ft', '--moe-hot-host-cache', 'retain'],
+                'on': ['ft', '--moe-hot-host-cache', 'reclaim']}
+    if change == 'duplicate':
+        commands['on'] += ['--moe-hot-host-cache', 'reclaim']
+    elif change == 'unrelated':
+        commands['on'] += ['--extra']
+    elif change == 'wrong':
+        commands['on'][-1] = 'retain'
+    else:
+        commands['on'].pop()
+    with pytest.raises(AssertionError):
+        gate.qualify_hot_host_commands(commands)
