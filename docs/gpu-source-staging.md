@@ -13,7 +13,8 @@ Session advice continues warming GPU slots for the selected GPU layers.
 
 The initial implementation requires the standard FTW or supported bank-index
 loader, `--moe-backend offload`, native NVFP4 banks, `--moe-disk-prefill staged`,
-`--moe-disk-decode cpu`, and `--moe-disk-pager madvise`.
+`--moe-disk-decode cpu`, and `--moe-disk-pager madvise`. Tmpfs mirrors are
+incompatible because these sources must remain backed by checkpoint storage.
 
 ```sh
 ft serve --model /path/to/model \

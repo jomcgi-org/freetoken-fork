@@ -64,6 +64,7 @@ def test_cli_defaults_to_full_pinned_gpu_sources_and_accepts_opt_in():
     {"moe_gpu_source": "pageable"}, {"moe_backend": "hybrid"},
     {"moe_backend": "cpu"}, {"moe_disk_prefill": "cpu"},
     {"moe_disk_decode": "gpufetch"}, {"moe_disk_pager": "uffd"},
+    {"moe_bank_hugepages_tmpfs": "/tmp/mirror"},
 ])
 def test_config_rejects_changes_to_the_required_execution_contract(override):
     fields = dict(model_path="/tmp/model", tp_info=DistributedInfo(0, 1),
@@ -147,6 +148,7 @@ def test_short_chunks_keep_gpu_math_and_protect_the_following_overlap_buffer():
     cache = OffloadMoeCache(
         num_layers=4, num_experts=8, cache_size=24, device=torch.device("cpu"),
         quant_format="nvfp4", moe_disk_prefill="staged", moe_disk_prefill_min_tokens=8,
+        prefill_overlap=True,
         gpu_staging_layer_ids=frozenset({0}),
     )
     cache.layer_residency = ["disk", "pinned", "disk", "pinned"]

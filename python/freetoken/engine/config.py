@@ -355,6 +355,8 @@ class EngineConfig:
                 raise ValueError("staged GPU sources require staged DISK prefill and CPU DISK decode")
             if self.moe_disk_pager != "madvise":
                 raise ValueError("staged GPU sources require ordinary file-backed banks (madvise)")
+            if self.moe_bank_hugepages_tmpfs is not None:
+                raise ValueError("staged GPU sources require checkpoint backing without a tmpfs mirror")
         if self.moe_prefill_coalesce not in ("populate", "on", "off"):
             raise ValueError(
                 "--moe-prefill-coalesce must be 'populate', 'on', or 'off', got "
