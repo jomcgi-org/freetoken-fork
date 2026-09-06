@@ -85,6 +85,7 @@ def preflight(h, *, allow_driver=False):
 def run_gate(h, plan):
     probe = json.loads((OUT / 'recovery-probe.json').read_text())
     assert probe['verified'] and probe['unit']['InvocationID'] == plan['original']['original_unit']['InvocationID']
+    assert probe['restore_command'] == plan['restore_command'] and probe['helper_sha256'] == HELPER_SHA
     report = dict(preflight=plan, recovery_probe=probe, completed=False, arms=[],
                   driver_source=Path(__file__).read_text(), helper_source=HELPER.read_text(),
                   started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
