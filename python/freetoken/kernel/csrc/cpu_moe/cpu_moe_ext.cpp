@@ -722,6 +722,8 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
   return s * (0.5f * global);
 }
 
+#include "nvfp4_pair_dot.h"
+
 // AVX-512 counterpart of the expert-prefill kernel. Keep the decoded weight group
 // outside the M-row loop, as in the AVX-VNNI implementation, but use EVEX VPDPBUSD
 // so AVX-512 VNNI CPUs do not depend on the distinct AVX-VNNI feature bit.
@@ -3572,6 +3574,81 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("acts_ptr"), py::arg("act_scales_ptr"), py::arg("rows"),
         py::arg("activation_rows"), py::arg("hidden_size"));
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
+  // Explicit diagnostic entry point. Serving does not dispatch to the pair kernel.
+  m.def("nvfp4_pair_dot_probe",
+        [](torch::Tensor packed, torch::Tensor scales, torch::Tensor globals,
+           torch::Tensor acts, torch::Tensor act_scales, int iterations, bool pair_first) {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+          if (select_nvi8_dispatch(detect_nvi8_tier()).dot != dot_nvfp4_i8_avx512vnni)
+            throw std::runtime_error("pair dot probe requires AVX-512 VNNI");
+          for (const auto& t : {packed, scales, globals, acts, act_scales})
+            TORCH_CHECK(t.device().is_cpu() && t.is_contiguous(),
+                        "pair dot inputs must be contiguous CPU tensors");
+          TORCH_CHECK(packed.scalar_type() == torch::kUInt8 &&
+                      scales.scalar_type() == torch::kUInt8 &&
+                      globals.scalar_type() == torch::kFloat32 &&
+                      acts.scalar_type() == torch::kInt8 &&
+                      act_scales.scalar_type() == torch::kFloat32,
+                      "pair dot input dtype mismatch");
+          TORCH_CHECK(packed.dim() == 2 && scales.dim() == 2 && globals.dim() == 1 &&
+                      acts.dim() == 2 && act_scales.dim() == 2,
+                      "pair dot input rank mismatch");
+          const int64_t K = acts.size(1), rows = packed.size(0);
+          TORCH_CHECK(K > 0 && K <= INT32_MAX && K % 16 == 0 && rows > 0 &&
+                      acts.size(0) == 2 && packed.size(1) == K / 2 &&
+                      scales.size(0) == rows && scales.size(1) == K / 16 &&
+                      globals.size(0) == rows && act_scales.size(0) == 2 &&
+                      act_scales.size(1) == K / 16 && iterations > 0,
+                      "pair dot input geometry mismatch");
+          auto paired = torch::empty({rows, 2}, globals.options());
+          auto singles = torch::empty({rows, 2}, globals.options());
+          const auto* p = packed.data_ptr<uint8_t>();
+          const auto* s = scales.data_ptr<uint8_t>();
+          const auto* g = globals.data_ptr<float>();
+          const auto* a = acts.data_ptr<int8_t>();
+          const auto* as = act_scales.data_ptr<float>();
+          float* paired_out = paired.data_ptr<float>();
+          float* singles_out = singles.data_ptr<float>();
+          float lut[256];
+          for (int i = 0; i < 256; ++i) lut[i] = e4m3_decode(static_cast<uint8_t>(i));
+          auto run = [&](bool pair) {
+            for (int64_t row = 0; row < rows; ++row) {
+              if (pair) {
+                dot_nvfp4_i8_avx512vnni_pair(paired_out + row * 2, p + row * (K / 2),
+                    s + row * (K / 16), g[row], a, a + K, K, lut, as, as + K / 16);
+              } else {
+                for (int input = 0; input < 2; ++input)
+                  singles_out[row * 2 + input] = dot_nvfp4_i8_avx512vnni(
+                      p + row * (K / 2), s + row * (K / 16), g[row], a + input * K,
+                      K, lut, as + input * (K / 16));
+              }
+            }
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+          };
+          auto measure = [&](bool pair) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < iterations; ++i) run(pair);
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+          };
+          run(false);
+          run(true);
+          double paired_s, singles_s;
+          if (pair_first) { paired_s = measure(true); singles_s = measure(false); }
+          else { singles_s = measure(false); paired_s = measure(true); }
+          py::dict result;
+          result["paired"] = paired;
+          result["singles"] = singles;
+          result["paired_s"] = paired_s;
+          result["singles_s"] = singles_s;
+          return result;
+#else
+          throw std::runtime_error("pair dot probe requires AVX-512 VNNI");
+          return py::dict();
+#endif
+        }, py::arg("packed"), py::arg("scales"), py::arg("globals"),
+        py::arg("acts"), py::arg("act_scales"), py::arg("iterations") = 1,
+        py::arg("pair_first") = false);
   m.def("memop_submit", &cumemop_submit, py::arg("stream"), py::arg("done_addr"),
         py::arg("ready_addr"), py::arg("slot"));
   m.def("memop_sync", &cumemop_sync, py::arg("stream"), py::arg("done_addr"),
