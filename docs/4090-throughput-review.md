@@ -8,8 +8,8 @@ experts per layer, top-10 routing, H=2560 and I=640. `qwen3.6-27b` is its API
 alias. Measurements use node-4's RTX 4090 and Ryzen 7 7800X3D with 61.91 GiB
 RAM and local NVMe. GLM is outside this performance qualification.
 
-Performance evidence updated on 2026-09-06 after the concurrency gate and native
-decode weight-reuse validation.
+Performance evidence updated on 2026-09-06 after the completed Pi agentic gate,
+concurrency gate, and native decode and resident-populate correctness checks.
 
 ## Sustained wall time and the reader regression
 
@@ -56,6 +56,33 @@ GPU staging for this sustained workload. The
 evidence. These two experiments have different baselines; their percentages
 cannot be added or treated as a direct original-versus-buffered comparison.
 Both completed gates restored and verified the original system service.
+
+## Complete agentic task wall time
+
+The [controlled Pi comparison (#39)](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-agentic-runtime-gate/docs/pi-agentic-runtime-gate.md)
+measures the original `3a67403` runtime against the optimized `c0775ea` stack
+with buffered GPU DISK prefill and mmap HOT staging. Four measured continuing
+coding tasks per runtime take 1506.667 seconds (25m07s) baseline versus
+1158.016 seconds (19m18s) optimized, **23.1% less task wall time**. Both matched
+start orders improve, by 4.8% and 37.6%. All eight measured tasks and four
+warmups pass all three independent cumulative checks; full outputs and repair
+sequences were reviewed. The original service is restored and verified.
+
+This is observed agentic throughput with model-behavior variation. Optimized
+tasks use 67 calls and 22752 output tokens, versus 85 calls and 26999 tokens
+baseline. The final baseline task uses 29 calls and five failed test commands
+before removing an incorrect test expectation. All repair time is retained.
+The unequal work and large spread between orders prevent attributing 23.1%
+solely to faster inference. This result is separate from the fixed-request
+17.8% sustained comparison above, and one Cache task does not establish broad
+quality equivalence.
+
+Both modes request diagnostic flags off. The baseline still calls legacy
+disk/PLE status-statistics helpers; their removal is included in the optimized
+stack. This gate does not isolate telemetry savings. Radix prefixes are enabled,
+capacity and graph size are one, and the fixed 64K FP8 K/V pool is 0.80 GiB.
+All four starts match 3753 expert slots and 2296 protected HOT rows. These
+allocations differ from the earlier naive-cache experiments.
 
 ## Earlier combined short-sequence wall time
 
@@ -277,7 +304,9 @@ model wall time have separate meanings.
 | Buffered reads into HOT staging rows | Sustained wall time is 19.6% longer than mmap, with both orders slower; 164 focused Linux/CUDA checks and 25 zero-error memcheck checks pass | [#35](https://github.com/jomcgi-org/freetoken-fork/pull/35), draft; keep mmap HOT staging |
 | Concurrent complete-response client and gate | Fixed-capacity 1/4/4/1 starts: 498.127 to 512.904 seconds, 3.0% longer overall with conflicting orders; mean individual latency 20.755 to 82.122 seconds; 18 client checks pass | [#36](https://github.com/jomcgi-org/freetoken-fork/pull/36), ready as benchmark tooling; no dependable batching gain |
 | Reuse weight unpacking across shared decode routes | At batch four and ten active routes, resident-weight native task time falls 21.2% with five shared experts and 43.8% with ten; 69 Linux/CUDA checks and 352 bitwise-equal timing pairs pass; model wall time pending | [#37](https://github.com/jomcgi-org/freetoken-fork/pull/37), draft; defaults off |
-| Multi-turn Pi task benchmark | All three independent task stages pass in a live integration, 18 model calls and two recovered test failures; 18 focused client checks pass; no agentic A/B speedup measured | [#38](https://github.com/jomcgi-org/freetoken-fork/pull/38), ready as benchmark tooling |
+| Multi-turn Pi task benchmark | All three independent task stages pass in a live integration, 18 model calls and two recovered test failures; 18 focused client checks pass; completed runtime comparison is reported separately in #39 | [#38](https://github.com/jomcgi-org/freetoken-fork/pull/38), ready as benchmark tooling |
+| Complete Pi runtime comparison | Four measured tasks per mode: 1506.667 to 1158.016 seconds, 23.1% less wall time; both orders improve, all checks pass, but generated work differs; 9 controller and 15 summary checks pass | [#39](https://github.com/jomcgi-org/freetoken-fork/pull/39), ready as benchmark and evidence |
+| Skip resident CPU populate reads | Default-off hint avoids scratch copies that are discarded before mapped compute; 11 Linux correctness checks pass without skips; component and model timing pending | [#40](https://github.com/jomcgi-org/freetoken-fork/pull/40), draft |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
@@ -362,7 +391,7 @@ All four starts have equal geometry, including 3,920 expert slots and 1,024 KV
 pages; the fixed four-request allocation differs from earlier single-capacity
 comparisons. Do not combine their percentages.
 
-The next gate is complete model wall time for
+A separate pending gate is complete model wall time for
 [#37's native decode weight reuse](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-decode-weight-reuse/docs/decode-weight-reuse.md).
 The existing CPU schedule groups routes by expert but repeats weight unpacking
 inside each group. The opt-in AVX-512 VNNI path shares that work across up to four
@@ -380,31 +409,27 @@ JSON by 26.8% but slowed prose by 8.6%. That experiment changed only placement
 planning, yet still failed the general throughput gate. It provides no reason
 to bias the model toward HOT experts.
 
-A separate [multi-turn Pi benchmark (#38)](https://github.com/jomcgi-org/freetoken-fork/pull/38)
-is being qualified for the interactive workload. It keeps one agent session
-through code changes, local tests, follow-up requirements, and independent
-cumulative checks. Its timer includes tool execution and check-driven repairs.
-The existing prompt gates disable prefix reuse and cannot represent this path.
-The client has 18 passing focused checks on Linux and macOS. Its frozen live
-integration passed all three stages in 464.073 seconds, with 18 model calls,
-16 tool executions, two failed local test commands recovered by Pi, and a
-14406-token final context. Cached prefixes were reported on 17 model calls.
-The earlier failed development attempt under a small output cap is retained.
-The integration used the original diagnostic-enabled service and did not exclude
-other requests, so it establishes no speedup. The benchmark tooling is ready
-for review; paired server timing with diagnostics disabled remains pending.
-Neither this client nor its integration changes the established 17.8% sustained
-combined wall-time result.
+The multi-turn Pi tooling in #38 is now qualified by the completed #39
+comparison above. It retains conversation history, local tests, follow-up
+requirements, and independent cumulative checks within each task clock.
+The 18 client checks, nine controller checks, and fifteen summary checks pass
+on Linux and macOS. Systemd EOF and heartbeat-timeout recovery probes passed,
+and the completed run accounts for all 229 expected HTTP completions without
+inference errors. The full record preserves warmups, failed local commands,
+final files and verified restoration.
 
-The [controlled agentic runtime gate (#39)](https://github.com/jomcgi-org/freetoken-fork/pull/39)
-now compares original `3a67403` with optimized `c0775ea` in A/B/B/A order, with
-one warmup and two measured Pi sessions per server start. Both arms preserve
-FP8 K/V, radix prefix reuse, capacity one and a fixed 65536-token reservation;
-diagnostics, disk prefix cache, KV ladder and HOT persistence are off. The
-first baseline start has 3753 expert slots and 1024 KV pages. This geometry
-differs from the earlier naive-cache gates, and later arms must match it.
-Nine focused controller tests and live EOF/heartbeat-expiry recovery probes
-pass. The first arm is running; no agentic optimization result is available yet.
+The next single-agent experiment is
+[#40's optional resident CPU population check](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-populate-resident/docs/resident-populate.md).
+CPU prefill currently copies selected file bytes into reusable scratch, discards
+them, and computes from original bank mappings. Owned-file residency hints can
+skip those copies when all covering pages are in RAM, while uncertain hints
+retain buffered reads. This preserves routing and packed weight bytes. All
+11 focused Linux checks pass without skips, including real warm-file skipping
+and unchanged mapped bytes. Component timing must include later mapped-byte
+consumption, then a full-model gate must establish whether fewer copies shorten
+wall time. No gain is claimed; the option remains disabled. The pending native
+decode reuse experiment targets shared experts across multiple routes and does
+not accelerate the single-route case by itself.
 
 A [source review of the existing MTP graph branch](mtp-4090-review.md) identifies
 prerequisites for a separate sequential-decode experiment. The deployed FTW index
@@ -412,4 +437,4 @@ contains no MTP tensors. The branch also records six CUDA timing events per
 verification step without a diagnostic guard, while host PLE staging, state
 snapshots, rejected-seed replay, and draft-head VRAM compete with any verification
 gain. Gate the timing instrumentation and retain target-equivalence checks before
-qualifying MTP. The current Pi comparison keeps MTP off and remains unchanged.
+qualifying MTP. The completed Pi comparison kept MTP off.
