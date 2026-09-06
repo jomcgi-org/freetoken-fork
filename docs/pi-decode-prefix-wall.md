@@ -52,3 +52,20 @@ recovery with an active or stopped original server, retained restoration
 failures, heartbeat EOF and timeout, geometry drift, accidental differences
 between arms, and missing or failed tasks. These validate the controller;
 they do not qualify model performance.
+
+After the controller finishes and verifies restoration, summarize its complete
+records with:
+
+```sh
+python3 bench/pi-agentic-runtime-summary.py \
+  --decode-prefix-snapshot \
+  /private/tmp/astra-pi-agentic-decode-prefix-wall-20260906
+```
+
+The snapshot protocol additionally requires matching runtime identities,
+identical command lines, and only the snapshot flag to differ in the explicit
+environment. It rejects engine token tracing and inconsistent controller or
+worker markers. A failed warmup or measured task retains its wall time and
+suppresses speedup percentages. The output keeps all twelve tasks, measured
+totals, both orders, work counts, and input-file hashes. Journals, final files,
+and complete responses still need review before interpreting the result.

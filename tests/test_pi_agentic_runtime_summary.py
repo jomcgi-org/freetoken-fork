@@ -122,3 +122,96 @@ def test_changed_geometry_is_rejected_even_when_client_agrees(records):
     change(records, 'r2/metadata.json', lambda d: d.update(server_metadata=start))
     with pytest.raises(ValueError, match='geometry mismatch'):
         summary.summarize(records)
+
+
+@pytest.fixture
+def snapshot_records(records):
+    driver = json.loads((records / 'driver.json').read_text())
+    plan = driver['preflight']
+    plan['identities'] = {mode: {'revision': 'same', 'native_sha256': 'same'}
+                          for mode in ('off', 'on')}
+    plan['commands'] = {mode: ['ft', 'same'] for mode in ('off', 'on')}
+    plan['env'] = {mode: {'FREETOKEN_DECODE_PREFIX_SNAPSHOT': '1' if mode == 'on' else '0',
+                          'FREETOKEN_CONTINUATION_TRACE_DIR': ''}
+                   for mode in ('off', 'on')}
+    driver.update(all_tasks_passed=True, lease_returncode=0)
+    for control, (arm, mode) in zip(driver['arms'], summary.SNAPSHOT_ARMS):
+        control['mode'] = mode
+        start = json.loads((records / (arm + '-server-start.json')).read_text())
+        start.update(mode=mode, revision='same', identity=plan['identities'][mode],
+                     command=plan['commands'][mode], env=plan['env'][mode],
+                     snapshot_enabled=(mode == 'on'))
+        write(records, arm + '-server-start.json', start)
+        change(records, arm + '/metadata.json', lambda d: d.update(server_metadata=start))
+    write(records, 'driver.json', driver)
+    return records
+
+
+def test_snapshot_comparison_preserves_both_orders_and_warmup_accounting(snapshot_records):
+    result = summary.summarize(snapshot_records, decode_prefix_snapshot=True)
+    comparison = result['comparison']
+    assert comparison['modes']['off']['attempted_task_wall_s'] == 400
+    assert comparison['modes']['on']['attempted_task_wall_s'] == 320
+    assert comparison['wall_reduction_percent'] == pytest.approx(20)
+    assert all(order['wall_reduction_percent'] == pytest.approx(20) for order in result['orders'])
+    assert result['all_tasks_passed_including_warmups']
+    assert len(result['sessions']) == 12
+    assert not result['broad_quality_equivalence']
+
+
+@pytest.mark.parametrize(('field', 'message'), [
+    ('identities', 'different runtime identities'),
+    ('commands', 'different command lines'),
+    ('env', 'unrelated environment difference'),
+])
+def test_snapshot_comparison_rejects_additional_changes(snapshot_records, field, message):
+    def mutate(driver):
+        value = driver['preflight'][field]['on']
+        if field == 'identities':
+            value['native_sha256'] = 'different'
+        elif field == 'commands':
+            value.append('--different')
+        else:
+            value['EXTRA'] = '1'
+    change(snapshot_records, 'driver.json', mutate)
+    with pytest.raises(ValueError, match=message):
+        summary.summarize(snapshot_records, decode_prefix_snapshot=True)
+
+
+def test_snapshot_engine_trace_is_rejected_even_if_both_arms_use_it(snapshot_records):
+    def mutate(driver):
+        for env in driver['preflight']['env'].values():
+            env['FREETOKEN_CONTINUATION_TRACE_DIR'] = '/trace'
+    change(snapshot_records, 'driver.json', mutate)
+    with pytest.raises(ValueError, match='engine token trace'):
+        summary.summarize(snapshot_records, decode_prefix_snapshot=True)
+
+
+@pytest.mark.parametrize('ordinal', [1, 2])
+def test_snapshot_failed_warmup_or_measurement_prevents_speedup_claim(snapshot_records, ordinal):
+    change(snapshot_records, f'r2/session-{ordinal}/result.json', lambda d: d.update(
+        passed=False, stages=[], task_wall_s=1, verified_task_wall_s=None, error='timeout'))
+    change(snapshot_records, 'driver.json', lambda d: (
+        d['arms'][1].update(client_returncode=1), d.update(all_tasks_passed=False)))
+    result = summary.summarize(snapshot_records, decode_prefix_snapshot=True)
+    assert not result['all_tasks_passed_including_warmups']
+    assert result['comparison']['wall_reduction_percent'] is None
+    assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+    assert result['comparison']['modes']['on']['attempted_task_wall_s'] == (320 if ordinal == 1 else 241)
+
+
+@pytest.mark.parametrize(('fields', 'message'), [
+    ({'all_tasks_passed': False}, 'success summary disagrees'),
+    ({'lease_returncode': 1}, 'controller or lease failed'),
+    ({'error': 'transport closed'}, 'controller or lease failed'),
+])
+def test_snapshot_controller_claims_must_match_evidence(snapshot_records, fields, message):
+    change(snapshot_records, 'driver.json', lambda d: d.update(fields))
+    with pytest.raises(ValueError, match=message):
+        summary.summarize(snapshot_records, decode_prefix_snapshot=True)
+
+
+def test_snapshot_start_marker_must_match_the_arm(snapshot_records):
+    change(snapshot_records, 'r2-server-start.json', lambda d: d.update(snapshot_enabled=False))
+    with pytest.raises(ValueError, match='wrong snapshot marker'):
+        summary.summarize(snapshot_records, decode_prefix_snapshot=True)
