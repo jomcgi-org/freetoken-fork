@@ -67,17 +67,30 @@ def prose_checks(text, finish_reason):
     )
 
 
-def build_cases(tokenizer, root, warmup_pairs=2, blocks=6):
-    backgrounds = {
-        name: tokenizer.decode(tokenizer.encode((root / name).read_text(), add_special_tokens=False)[:1400])
+def prefill_band_matches(tokens, band):
+    if band == "short":
+        return 2 <= tokens < 1024
+    if band == "long":
+        return tokens >= 1024
+    raise ValueError(f"unknown prefill band: {band}")
+
+
+def build_cases(tokenizer, root, warmup_pairs=2, blocks=6, *, mixed_prefill=False):
+    documents = {
+        name: tokenizer.encode((root / name).read_text(), add_special_tokens=False)
         for name in SOURCE_FILES
     }
+    backgrounds = {name: tokenizer.decode(tokens[:1400]) for name, tokens in documents.items()}
+    short_backgrounds = ({name: tokenizer.decode(tokens[:128]) for name, tokens in documents.items()}
+                         if mixed_prefill else {})
     cases = []
     for row in schedule(warmup_pairs, blocks):
         block, kind = row["block"], row["kind"]
         source = SOURCE_FILES[block % len(SOURCE_FILES)]
         nonce = hashlib.sha256(f"sustained/{block}/{kind}".encode()).hexdigest()[:20]
-        background = f"{nonce}. Background code excerpt:\n<background>\n{backgrounds[source]}\n</background>\n"
+        short = mixed_prefill and ((block % 2 == 0) == (kind == "json"))
+        excerpt = (short_backgrounds if short else backgrounds)[source]
+        background = f"{nonce}. Background code excerpt:\n<background>\n{excerpt}\n</background>\n"
         if kind == "json":
             expected = {f"r{i:02}": (24531 + 7919 * i + 104729 * block) % 99999 for i in range(32)}
             records = "\n".join(f"{key} = {value}" for key, value in expected.items())
@@ -98,7 +111,10 @@ def build_cases(tokenizer, root, warmup_pairs=2, blocks=6):
                 "Use no headings or lists."
             )
             cap = 1024
-        cases.append(dict(row, source_file=source, prompt=prompt, expected=expected, max_tokens=cap))
+        case = dict(row, source_file=source, prompt=prompt, expected=expected, max_tokens=cap)
+        if mixed_prefill:
+            case["prefill_band"] = "short" if short else "long"
+        cases.append(case)
     return cases
 
 
@@ -132,6 +148,10 @@ def main():
     parser.add_argument("--model", default="qwen3.6-27b")
     parser.add_argument("--warmup-pairs", type=int, default=2)
     parser.add_argument("--blocks", type=int, default=6)
+    parser.add_argument(
+        "--mixed-prefill", action="store_true",
+        help="balance CPU-size and staged-GPU-size prompts; validate actual token bands",
+    )
     parser.add_argument("--io-pid", required=True, type=int)
     parser.add_argument(
         "--phase-io", action="store_true",
@@ -144,7 +164,8 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     root = Path(__file__).parents[1]
-    cases = build_cases(tokenizer, root, args.warmup_pairs, args.blocks)
+    cases = build_cases(tokenizer, root, args.warmup_pairs, args.blocks,
+                        mixed_prefill=args.mixed_prefill)
     # The manifest is prepared before the first warmup and is identical in both
     # policies. No tokenization, source reads, or control toggles occur per request.
     args.output.with_suffix(".prompts.json").write_text(json.dumps(cases, indent=2) + "\n")
@@ -158,7 +179,7 @@ def main():
                 max_tokens=case["max_tokens"], temperature=0,
                 chat_template_kwargs=dict(enable_thinking=False),
             ), args.io_pid, phase_io=args.phase_io)
-            if result["usage"]["prompt_tokens"] < 1024:
+            if not args.mixed_prefill and result["usage"]["prompt_tokens"] < 1024:
                 raise RuntimeError("sustained prompt must exercise long prefill")
             for key in ("prompt_tokens", "completion_tokens"):
                 cumulative[key] += result["usage"][key]
@@ -170,6 +191,13 @@ def main():
                 row["completed"] = result["finish_reason"] == "stop" and row["passed"]
             else:
                 row.update(prose_checks(result["text"], result["finish_reason"]))
+            if args.mixed_prefill:
+                row["prefill_band_valid"] = prefill_band_matches(
+                    result["usage"]["prompt_tokens"], case["prefill_band"]
+                )
+                # Preserve the complete response if its measured prompt band is
+                # wrong. It cannot qualify timing for the intended execution path.
+                row["completed"] = row["completed"] and row["prefill_band_valid"]
             out.write(json.dumps(row) + "\n")
             out.flush()
             print(json.dumps({k: v for k, v in row.items() if k not in ("prompt", "text", "process_io", "expected")}), flush=True)
