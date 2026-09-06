@@ -42,3 +42,43 @@ retains the exact source hashes and command at `c0775ea`. It verifies that the
 HOT reader wall-time driver finished successfully before testing and that
 the original service remained active with the same PID. Model wall-time
 comparison remains pending; these checks qualify the client protocol only.
+
+The checked-in [model driver](../bench/concurrent-wall-driver.py) freezes
+`c0775ea` and runs four starts with offered concurrency 1/4/4/1. Every start
+uses the same four-request admission limit, CUDA graph capacity four, mmap
+HOT staging, buffered GPU DISK prefill, and automatic HOT adaptation settings.
+The existing KV ladder only supports admission capacity one, so this gate
+explicitly disables it and reserves 65,536 KV tokens in both modes. This
+matches the earlier pool floor, but the four-request state allocation may
+change other startup budgets. Verify identical geometry within this gate;
+do not combine its percentages with the earlier single-capacity results.
+
+Each start has four complete warmups, twelve measured complete responses,
+and eight fidelity cases run at that start's offered concurrency. Fidelity
+backgrounds come from manifest order, independent of response completion
+order. Whole-worker snapshots bracket each client group. Failed responses
+remain in the record; a client output-check failure does not skip the
+opposite mode when all scheduled records and group summaries are present.
+Report every failure and semantic-review limitation before qualifying a gain.
+
+Concurrent response windows overlap. Source-balanced early/late and per-kind
+latencies may describe behavior, but their sums are not separate elapsed
+workload times. Pair JSON and prose by prompt identity, compare both start
+orders, and retain per-request latency alongside the full measured-group
+duration. This does not qualify production prefix reuse, idle convergence,
+very long contexts, or a single-request speedup from batching.
+
+The driver checks actual CPU executor and graph capacity at startup, native
+worker mappings, transport settings, and clean frozen sources. `--preflight`
+is read-only. Launch its detached unit with a two-hour runtime limit and
+the [recovery script](../bench/concurrent-wall-restore.sh) as `ExecStopPost`.
+Each server start has a 45-minute limit. The normal finalizer restores the
+original service and verifies a real completion. Observe the live driver
+after a session interruption; never restart it merely because observation
+timed out.
+
+The driver and recovery script pass syntax checks. The
+[Linux preflight](../bench/results/4090-concurrent-wall-preflight-20260906.json)
+confirms identical frozen revisions and native identities, the fixed
+four-request settings, and a driver hash matching the committed script.
+It does not measure concurrent model performance.
