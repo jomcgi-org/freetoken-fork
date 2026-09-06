@@ -63,6 +63,10 @@ quality evaluation. Keep all measured artifacts private. A worker exit or an
 aborted HTTP response alone is not success: inspect `completed`, every record,
 and the external supervisor's serving-restoration audit.
 
-Validation is pending on Linux and the full target model. The focused tests
-exercise boundary selection, private reporting, lazy installation, break-even
-qualification, and committed versus unreachable cache-state comparisons.
+Validation: the focused checks pass on Linux, including the tensor comparisons;
+macOS runs the hermetic subset and skips the Torch checks. They exercise boundary
+selection, private reporting, lazy installation, break-even qualification, and
+committed versus unreachable cache-state comparisons. Full target-model execution
+also completed. Acceptance-state equivalence remains unresolved, so the change
+stays draft while that discrepancy is investigated. All measured records remain
+private; successful execution does not qualify a serving throughput improvement.
