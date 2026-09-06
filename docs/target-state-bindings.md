@@ -38,23 +38,26 @@ existing exact numerical and prefix-state checks. Other cost modes keep their
 existing per-window capture protocol.
 
 CPU address-copy tests alone do not qualify full-model graph reuse across requests
-or page boundaries. Those model checks, a serving proposer and scheduler, task
-completion checks and separate non-debug wall measurements remain required.
+or page boundaries. The model qualification below covers controlled diagnostic
+relocation. A serving proposer and scheduler, task completion checks and separate
+non-debug wall measurements remain required.
 Gather/scatter operations may add component cost and graph-pool allocations.
 This experiment claims no serving speedup and leaves serving startup unchanged.
 Detailed model records and measured payloads stay private.
 
-Validation completed with 118 focused Mac checks and 229 focused Linux checks
+Validation completed with 146 focused Mac checks and 257 focused Linux checks
 passing. The three exclusive CUDA checks passed, including the real GDN kernel
-with changing slots and overwritten activation inputs. Full-model verification
-then passed every required logit, token, committed-state and rejection-prefix
-comparison while reusing each graph across adjacent windows in one allocated
-page. Both experiments ended with verified original-serving recovery and a real
-completion. Full-model relocation to other request slots and across page
-boundaries remains unqualified, so serving integration is still pending.
+with changing slots and overwritten activation inputs. Width-five full-model
+verification passed every required logit, token, committed-state, rejection-prefix
+and subsequent ordinary-decode comparison while reusing each graph. Qualification
+passed both within one allocated page and in the boundary protocol below, with
+request-table and linear-state slots varied independently and inactive state
+unchanged. The model experiments ended with verified original-serving recovery
+and a real completion. The boundary result qualifies the isolated diagnostic;
+ordinary scheduler allocation and multi-request serving remain unqualified.
 
-The additional opt-in `FREETOKEN_TARGET_VERIFY_RELOCATE_BOUNDARY=1` targets that
-remaining model check. It requires the relocation setting above. The probe saves
+The additional opt-in `FREETOKEN_TARGET_VERIFY_RELOCATE_BOUNDARY=1` enables the
+boundary model check. It requires the relocation setting above. The probe saves
 ordinary seed logits before changing any page mapping, then moves the current KV
 and compressed page into allocated padding storage and uses the old physical page
 for the next logical page. This forces a noncontiguous transition. The diagnostic
@@ -74,6 +77,6 @@ request is aborted after the probe. This is not an allocation policy for serving
 
 Borrowed-storage backups and inactive-state snapshots use host RAM. Their copies
 and comparisons run outside the forward timer, preserving the model's existing
-VRAM geometry for the graph and checkpoint experiment. The first boundary run
-exhausted VRAM with device-resident diagnostic backups before any timing trials;
-the host-backup revision requires a fresh full-model qualification.
+VRAM geometry for the graph and checkpoint experiment. Device-resident diagnostic
+backups exhausted VRAM before any timing trials. The host-backed run completed
+the full boundary qualification with the same model precision and cache geometry.
