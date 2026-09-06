@@ -1,6 +1,7 @@
 """Keep warmup costs, failures and mismatched runs out of speedup claims."""
 
 import importlib.util
+import copy
 import json
 from pathlib import Path
 
@@ -477,3 +478,89 @@ def test_profile_retention_still_rejects_answer_drift(profile_records):
 def test_summary_rejects_conflicting_source_pairs_before_reading_files(tmp_path):
     with pytest.raises(ValueError, match='conflicting experiments'):
         summary.summarize(tmp_path, prefill_snapshot_carry=True, hybrid_profile_retention=True)
+
+
+@pytest.fixture
+def source_records(carry_records):
+    root = carry_records
+    spec = importlib.util.spec_from_file_location(
+        'source_gate_fixture', Path(__file__).with_name('test_pi_decode_prefix_wall_driver.py'))
+    fixture = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixture)
+    gate = fixture.gate
+    driver = json.loads((root / 'driver.json').read_text())
+    plan = driver['preflight']
+    plan['experiment'] = 'gpu-source-staging'
+    identity = copy.deepcopy(plan['identities']['off'])
+    identity.update(revision=gate.GPU_SOURCE_REVISION, tree=str(gate.GPU_SOURCE))
+    memory = dict(worker_bytes={k: 1024 for k in gate.WORKER_MEMORY_FIELDS},
+                  system_bytes={k: 1024 for k in gate.SYSTEM_MEMORY_FIELDS})
+    for mode in ('off', 'on'):
+        plan['identities'][mode] = copy.deepcopy(identity)
+        plan['env'][mode]['PYTHONPATH'] = str(gate.GPU_SOURCE / 'python')
+        plan['commands'][mode] += ['--moe-gpu-source', 'pinned' if mode == 'off' else 'staged']
+    for control, (arm, mode) in zip(driver['arms'], summary.SNAPSHOT_ARMS):
+        start = json.loads((root / (arm + '-server-start.json')).read_text())
+        layout = gate.source_layout(fixture.source_log(mode), mode)
+        placement = 'GPU candidates=' + layout['prefill_paths'].split('GPU candidates=', 1)[1]
+        start.update(identity=plan['identities'][mode], revision=gate.GPU_SOURCE_REVISION,
+                     env=plan['env'][mode], command=plan['commands'][mode],
+                     source_layout=layout, memory_before=memory,
+                     geometry={'expert_slots': 3753, 'GPU compute placement': placement})
+        write(root, arm + '-server-start.json', start)
+        change(root, arm + '/metadata.json', lambda d: d.update(server_metadata=start))
+        control['end']['memory_after'] = memory
+        write(root, arm + '-server-end.json', control['end'])
+    write(root, 'driver.json', driver)
+    return root
+
+
+def test_gpu_source_reports_matched_work_and_os_memory(source_records):
+    result = summary.summarize(source_records, gpu_source_staging=True)
+    assert result['fixed_work_qualified'] and not result['broad_quality_equivalence']
+    assert result['comparison']['wall_reduction_percent'] == pytest.approx(20)
+    assert result['arms'][0]['memory_before']['worker_bytes']['RssShmem'] == 1024
+    assert len(result['arms'][1]['source_layout']['file_layer_ids']) == 48
+
+
+@pytest.mark.parametrize('change_kind', ['command', 'environment', 'revision', 'native'])
+def test_gpu_source_rejects_other_experiment_changes(source_records, change_kind):
+    def mutate(driver):
+        plan = driver['preflight']
+        if change_kind == 'command':
+            plan['commands']['on'].append('--extra')
+        elif change_kind == 'environment':
+            plan['env']['on']['EXTRA'] = '1'
+        elif change_kind == 'native':
+            plan['identities']['on']['native_sha256'] = 'other'
+        else:
+            for row in plan['identities'].values():
+                row['revision'] = 'other'
+    change(source_records, 'driver.json', mutate)
+    with pytest.raises(ValueError):
+        summary.summarize(source_records, gpu_source_staging=True)
+
+
+@pytest.mark.parametrize('change_kind', ['layout', 'geometry', 'memory'])
+def test_gpu_source_rejects_false_placement_or_memory_evidence(source_records, change_kind):
+    start = json.loads((source_records / 'r2-server-start.json').read_text())
+    if change_kind == 'layout':
+        start['source_layout']['file_layer_ids'].pop()
+    elif change_kind == 'geometry':
+        start['geometry']['GPU compute placement'] = 'changed'
+    else:
+        start['memory_before']['worker_bytes']['RssShmem'] = -1
+    write(source_records, 'r2-server-start.json', start)
+    change(source_records, 'r2/metadata.json', lambda d: d.update(server_metadata=start))
+    with pytest.raises(ValueError):
+        summary.summarize(source_records, gpu_source_staging=True)
+
+
+def test_gpu_source_answer_drift_suppresses_gain(source_records):
+    change(source_records, 'r2/session-1/result.json', lambda d:
+           d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message'].update(
+               content=d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message']['content'] + '\n'))
+    result = summary.summarize(source_records, gpu_source_staging=True)
+    assert not result['fixed_work_qualified']
+    assert result['comparison']['wall_reduction_percent'] is None
+    assert all(order['wall_reduction_percent'] is None for order in result['orders'])
