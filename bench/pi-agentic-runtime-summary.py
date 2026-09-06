@@ -254,7 +254,7 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
                         f'{arm}: source compute placement mismatch')
             except AssertionError as exc:
                 raise ValueError(f'{arm}: source layout mismatch: {exc}') from exc
-        if hot_host_cache_reclaim:
+        if hot_host_cache_reclaim or (original_baseline and mode == 'on'):
             require(start.get('hot_host_cache') == ('retain' if mode == 'off' else 'reclaim'),
                     f'{arm}: wrong HOT host cache policy marker')
         if same_runtime_policy or original_baseline:

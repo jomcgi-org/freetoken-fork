@@ -486,9 +486,9 @@ def test_original_baseline_selects_qualified_runtime_and_recovery(monkeypatch, t
     assert all(e['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0' for e in env.values())
     assert all(e['FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR'] == '' for e in env.values())
     assert gate.runtime_tree('off') == gate.SRC
-    assert gate.runtime_tree('on') == gate.CARRY
+    assert gate.runtime_tree('on') == gate.HOT_HOST
     assert gate.runtime_revision('off') == gate.REVISIONS['original']
-    assert gate.runtime_revision('on') == gate.PREFILL_CARRY_REVISIONS['on']
+    assert gate.runtime_revision('on') == gate.HOT_HOST_REVISION
     command = gate.remote_command('/tmp/driver.py', action, 'astra-pi-agentic-original-test')
     assert command.count('--original-baseline') == 1
 
@@ -497,7 +497,7 @@ def test_original_baseline_selects_qualified_runtime_and_recovery(monkeypatch, t
 def test_original_baseline_commands_reject_confounds(change):
     commands = {'off': ['ft', '--moe-disk-prefill', 'cpu'],
                 'on': ['ft', '--moe-disk-prefill', 'staged', '--moe-disk-prefill-io', 'buffered',
-                       '--moe-hot-staging-io', 'mmap']}
+                       '--moe-hot-staging-io', 'mmap', '--moe-hot-host-cache', 'reclaim']}
     if change == 'baseline_reader':
         commands['off'] += ['--moe-disk-prefill-io', 'buffered']
     elif change == 'duplicate':

@@ -667,7 +667,7 @@ def original_records(carry_records):
                   system_bytes={k: 1024 for k in gate.SYSTEM_MEMORY_FIELDS})
     for mode, tree, revision, binary in [
         ('off', gate.SRC, gate.REVISIONS['original'], gate.BINARIES['original']),
-        ('on', gate.CARRY, gate.PREFILL_CARRY_REVISIONS['on'], gate.BINARIES['on']),
+        ('on', gate.HOT_HOST, gate.HOT_HOST_REVISION, gate.BINARIES['on']),
     ]:
         row = plan['identities'][mode]
         row.update(revision=revision, tree=str(tree), native=f'/{mode}/cpu.so', native_sha256=binary,
@@ -677,12 +677,15 @@ def original_records(carry_records):
         plan['env'][mode].update(PYTHONPATH=str(tree / 'python'), FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR='')
         plan['commands'][mode] += ['--moe-disk-prefill', 'cpu' if mode == 'off' else 'staged']
         if mode == 'on':
-            plan['commands'][mode] += ['--moe-disk-prefill-io', 'buffered', '--moe-hot-staging-io', 'mmap']
+            plan['commands'][mode] += ['--moe-disk-prefill-io', 'buffered', '--moe-hot-staging-io', 'mmap',
+                                       '--moe-hot-host-cache', 'reclaim']
     plan['identities']['original'] = copy.deepcopy(plan['identities']['off'])
     for control, (arm, mode) in zip(driver['arms'], summary.SNAPSHOT_ARMS):
         start = json.loads((root / (arm + '-server-start.json')).read_text())
         start.update(identity=plan['identities'][mode], revision=plan['identities'][mode]['revision'],
                      env=plan['env'][mode], command=plan['commands'][mode], memory_before=memory)
+        if mode == 'on':
+            start['hot_host_cache'] = 'reclaim'
         write(root, arm + '-server-start.json', start)
         change(root, arm + '/metadata.json', lambda d: d.update(server_metadata=start))
         control['end']['memory_after'] = memory
@@ -739,3 +742,13 @@ def test_original_baseline_answer_drift_suppresses_gain(original_records, sessio
     assert not result['fixed_work_qualified']
     assert result['comparison']['wall_reduction_percent'] is None
     assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+
+
+
+def test_original_baseline_requires_reclaim_runtime_marker(original_records):
+    start = json.loads((original_records / 'r2-server-start.json').read_text())
+    start['hot_host_cache'] = 'retain'
+    write(original_records, 'r2-server-start.json', start)
+    change(original_records, 'r2/metadata.json', lambda d: d.update(server_metadata=start))
+    with pytest.raises(ValueError, match='HOT host cache policy marker'):
+        summary.summarize(original_records, original_baseline=True)

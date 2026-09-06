@@ -6,19 +6,20 @@ Run `bench/pi-decode-prefix-wall-driver.py --original-baseline
 Add `--preflight` to inspect the configuration without stopping serving.
 
 The baseline is the original serving checkout, with CPU DISK prefill and its
-original CPU executor binary. The selected runtime is the pinned prefill-marker
-carry revision from #45. It includes buffered staged prefill, published HOT
-reuse, CPU executor improvements and gates for unnecessary telemetry. The
+original CPU executor binary. The selected runtime is the pinned HOT host-cache
+reclaim revision from #53, which includes prefill-marker carry from #45. It uses
+buffered staged prefill, published HOT reuse, CPU executor improvements, gates
+for unnecessary telemetry and `--moe-hot-host-cache reclaim`. The
 comparison measures their combined effect and cannot attribute an isolated
-speedup to one component. Experimental GPU source staging, host-page reclaim,
-profile retention and decode prefix snapshots are excluded.
+speedup to one component. Experimental GPU source staging, profile retention
+and decode prefix snapshots are excluded.
 
 Both arms request diagnostic flags off. The original still performs legacy
 unconditional diagnostic work; removing that work is part of the selected
 runtime. The controller uses the same model and actual expert routes, fixed
 CPU/GPU placement, HOT capacity, FP8 KV capacity and CUDA graph geometry.
-Only the qualified CPU native binary/source and prefill configuration may
-differ. The other three native extension hashes and sources must agree.
+Only the qualified CPU native binary/source, prefill configuration and HOT
+host-cache policy may differ. The other three native extension hashes and sources must agree.
 The original arm must match the identity used by normal serving and recovery.
 
 Run original, selected, selected, original with a fresh server, one warmup and

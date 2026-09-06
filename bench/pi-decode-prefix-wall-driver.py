@@ -136,7 +136,7 @@ def completion(port):
 
 def runtime_tree(mode):
     if ORIGINAL_BASELINE:
-        return SRC if mode == 'off' else CARRY
+        return SRC if mode == 'off' else HOT_HOST
     if HOT_HOST_RECLAIM:
         return HOT_HOST
     if GPU_SOURCE_STAGING:
@@ -148,7 +148,7 @@ def runtime_tree(mode):
 
 def runtime_revision(mode):
     if ORIGINAL_BASELINE and mode != 'original':
-        return REVISIONS['original'] if mode == 'off' else PREFILL_CARRY_REVISIONS['on']
+        return REVISIONS['original'] if mode == 'off' else HOT_HOST_REVISION
     if HOT_HOST_RECLAIM and mode != 'original':
         return HOT_HOST_REVISION
     if GPU_SOURCE_STAGING and mode != 'original':
@@ -231,7 +231,7 @@ def server_command(mode):
     if GPU_SOURCE_STAGING:
         assert '--moe-gpu-source' not in args, 'original service already overrides GPU sources'
         args.extend(['--moe-gpu-source', 'staged' if mode == 'on' else 'pinned'])
-    if HOT_HOST_RECLAIM:
+    if HOT_HOST_RECLAIM or (ORIGINAL_BASELINE and mode == 'on'):
         assert '--moe-hot-host-cache' not in args, 'original service already overrides HOT host cache'
         args.extend(['--moe-hot-host-cache', 'reclaim' if mode == 'on' else 'retain'])
     assert '--moe-collect-stats' not in args and '--moe-step-timing' not in args
@@ -278,9 +278,11 @@ def qualify_original_commands(commands):
         command = commands[mode].copy()
         flags = [('--moe-disk-prefill', prefill)]
         if mode == 'on':
-            flags += [('--moe-disk-prefill-io', 'buffered'), ('--moe-hot-staging-io', 'mmap')]
+            flags += [('--moe-disk-prefill-io', 'buffered'), ('--moe-hot-staging-io', 'mmap'),
+                      ('--moe-hot-host-cache', 'reclaim')]
         else:
-            assert '--moe-disk-prefill-io' not in command and '--moe-hot-staging-io' not in command
+            assert all(flag not in command for flag in
+                       ('--moe-disk-prefill-io', '--moe-hot-staging-io', '--moe-hot-host-cache'))
         for flag, value in flags:
             assert command.count(flag) == 1, 'missing or duplicate combined-runtime flag'
             index = command.index(flag)
@@ -294,7 +296,7 @@ def qualify_original_identities(ids):
     assert ids['off'] == ids['original'], 'baseline is not the original serving identity'
     for mode, tree, revision, binary in [
         ('off', SRC, REVISIONS['original'], BINARIES['original']),
-        ('on', CARRY, PREFILL_CARRY_REVISIONS['on'], BINARIES['on']),
+        ('on', HOT_HOST, HOT_HOST_REVISION, BINARIES['on']),
     ]:
         row = ids[mode]
         assert row['tree'] == str(tree) and row['revision'] == revision, 'wrong combined-runtime revision or tree'
@@ -580,7 +582,7 @@ def remote_main(args):
         if GPU_SOURCE_STAGING:
             assert ("moe_gpu_source='staged'" if mode == 'on' else "moe_gpu_source='pinned'") in text
             result['source_layout'] = layout
-        if HOT_HOST_RECLAIM:
+        if HOT_HOST_RECLAIM or (ORIGINAL_BASELINE and mode == 'on'):
             policy = 'reclaim' if mode == 'on' else 'retain'
             assert f"moe_hot_host_cache='{policy}'" in text
             assert f'MoE HOT host cache: {policy}' in text
@@ -698,7 +700,8 @@ def local_main(args):
         plan['design'] = ('Original/selected/selected/original: one warmup and two measured '
                           'three-turn conversations per fresh server. Original CPU DISK prefill '
                           'and native CPU executor versus the selected runtime with buffered '
-                          'staged prefill, HOT reuse, telemetry gates and prefill-marker carry. '
+                          'staged prefill, HOT reuse, telemetry gates, prefill-marker carry and '
+                          'published HOT host-page reclamation. '
                           'Same routing, precision, CPU/GPU placement and cache geometry. '
                           'Decode snapshots and invasive diagnostics requested off in both arms; '
                           'removal of legacy unconditional telemetry is part of the change. '
