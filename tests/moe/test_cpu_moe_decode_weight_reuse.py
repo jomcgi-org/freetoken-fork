@@ -128,3 +128,60 @@ def test_disabling_vnni_keeps_the_existing_fallback(monkeypatch):
         executor._ext.set_decode_weight_reuse(enabled)
         outputs.append(run_task(executor, x, weights, ids))
     assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
+
+
+@pytest.mark.parametrize("flag_sync", [False, True])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph transport requires a GPU")
+def test_nvfp4_graph_replay_preserves_bits_with_both_transports(monkeypatch, flag_sync):
+    extension()
+    from freetoken.moe import cpu_executor
+
+    monkeypatch.setattr(cpu_executor, "_FLAG_SYNC", flag_sync)
+    fixtures = fixture_module("test_cpu_moe_prefill_batch.py")
+    cache = fixtures._make_nvfp4_cache(12, 256, 128, seed=981)
+    executor = cpu_executor.CpuMoeExecutor(
+        cache, top_k=4, activation="silu", apply_router_weight_on_input=False,
+        num_threads=3, max_tokens=4, device=torch.device("cuda"), prefill_batch="off",
+    )
+    if not executor._ext.decode_weight_reuse_available():
+        pytest.skip("AVX-512 VNNI is unavailable")
+    if flag_sync and not executor._flag_sync:
+        pytest.skip("CUDA stream memory operations are unavailable")
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        hidden = torch.randn(4, 256, dtype=torch.bfloat16, device="cuda")
+        weights = torch.rand(4, 4, device="cuda")
+        ids = torch.tensor([[0, 1, 2, 3]] * 4, dtype=torch.int32, device="cuda")
+        executor.decode(0, hidden, weights, ids)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = executor.decode(0, hidden, weights, ids)
+    torch.cuda.synchronize()
+    for turn in range(3):
+        host_hidden = torch.randn(4, 256, dtype=torch.bfloat16)
+        host_weights = torch.rand(4, 4)
+        host_ids = torch.tensor([[0, 1, 2, 3]] * 4, dtype=torch.int32)
+        if turn == 1:
+            host_ids.fill_(-1)
+        elif turn == 2:
+            host_ids[:, 2] = 1  # Repeated expert routes keep independent weights.
+        outputs = {}
+        for enabled in ((False, True) if turn % 2 == 0 else (True, False)):
+            executor._ext.set_decode_weight_reuse(enabled)
+            with torch.cuda.stream(stream):
+                hidden.copy_(host_hidden)
+                weights.copy_(host_weights)
+                ids.copy_(host_ids)
+                graph.replay()
+            torch.cuda.synchronize()
+            outputs[enabled] = captured.cpu().clone()
+        assert torch.isfinite(outputs[True]).all()
+        assert torch.equal(outputs[False].view(torch.int16), outputs[True].view(torch.int16))
+        if turn == 1:
+            assert torch.count_nonzero(outputs[True]) == 0
+    if flag_sync:
+        slot = executor._flag_slots[(0, 4)]
+        assert executor._ext.flag_served_count(slot) >= 7
+        assert int(executor._err.sum()) == 0
+        executor.raise_if_unhealthy()

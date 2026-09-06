@@ -30,6 +30,9 @@ pointers, zero scales, full persistent-task output parity, changing batch sizes,
 duplicate routes, absent experts, empty tasks, router weights on input/output,
 activation variants, and the disabled-VNNI fallback. They also check that model
 weights, input activations, route IDs, and route weights remain unchanged.
+Two CUDA graph cases replay fresh, empty, and duplicate routes through both
+the host-function and stream-memory-operation transports. Reuse is toggled
+between replays of the same captured graph, with exact output-bit comparisons.
 
 The [paired CPU benchmark](../bench/cpu-decode-weight-reuse.py) uses the real
 Qwen Flash H=2560/I=640 geometry and fourteen threads by default. It varies batch
