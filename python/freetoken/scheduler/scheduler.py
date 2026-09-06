@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -159,7 +160,13 @@ class Scheduler(SchedulerIOMixin):
                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
+            decode_prefix_snapshot=(
+                os.environ.get("FREETOKEN_DECODE_PREFIX_SNAPSHOT", "0") == "1"
+                and config.speculative_mtp != "on"
+            ),
         )
+        if self.cache_manager.decode_prefix_snapshot:
+            logger.info_rank0("Aligned decode prefix snapshots enabled")
         self.continuation_trace = continuation_trace_from_env()
         self.cache_manager.continuation_trace = self.continuation_trace
         self.decode_manager = DecodeManager(config.page_size)
@@ -1962,6 +1969,12 @@ class Scheduler(SchedulerIOMixin):
                 self.decode_manager.filter_reqs(batch.reqs)
         else:
             self.decode_manager.filter_reqs(batch.reqs)
+        if (
+            batch.is_decode
+            and getattr(self.cache_manager, "decode_prefix_snapshot", False)
+            and not getattr(batch, "mtp_verify", False)
+        ):
+            self.cache_manager.snapshot_decode_prefix(batch.reqs)
         return forward_output
 
 

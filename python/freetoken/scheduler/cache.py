@@ -34,7 +34,7 @@ class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None,
                  kv_cache=None, disk_prefix_store=None, moe_offload_cache=None,
-                 expert_prefetch_stream=None):
+                 expert_prefetch_stream=None, decode_prefix_snapshot=False):
         # The `_free_slots` follows a page-aligned manner. For example, if page_size = 2,
         # the `_free_slots` may look like [0, 2, 4, 6, ...], and each slot represents a page.
         device = page_table.device
@@ -51,6 +51,10 @@ class CacheManager:
         self.moe_offload_cache = moe_offload_cache
         self.expert_prefetch_stream = expert_prefetch_stream
         self.is_hybrid = type == "hybrid_radix"
+        # Page-size-one caches can donate the live final state at every finish.
+        self.decode_prefix_snapshot = bool(
+            decode_prefix_snapshot and self.is_hybrid and page_size > 1
+        )
         self.is_swa = type == "swa_radix"
         # swa_paged: this SWA model drives the global-paged swa pool -- true for BOTH the naive
         # (NaivePrefixCache, no reuse) and radix (SWARadixCache) paths. Gates the swa slot
@@ -506,6 +510,39 @@ class CacheManager:
             r.mamba_last_track_seqlen = a
             r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
 
+    def snapshot_decode_prefix(self, reqs: List[Req]) -> None:
+        """Keep the latest aligned decode state in request-owned ping-pong storage.
+
+        Call AFTER a successful single-token forward on the engine stream:
+        cached_len names the state that forward just produced. Copies precede
+        the next forward's writes in stream order. Finish-time publication uses
+        the existing frozen-slot donation and KV ownership path.
+        """
+        if not self.decode_prefix_snapshot:
+            return
+        for req in reqs:
+            boundary = req.cached_len
+            if (
+                req.aborted
+                or req.table_idx < 0
+                or req.mm_embeds is not None
+                or req.linear_slot_idx is None
+                or req.mamba_ping_pong is None
+                or boundary <= req.cache_handle.cached_len
+                or boundary % self.page_size
+                or boundary == req.mamba_last_track_seqlen
+                # When special-token checkpoints are enabled, keep the last
+                # aligned state through the opener for reserialized tool calls.
+                or (req.toolcall_anchor_len is not None and boundary > req.toolcall_anchor_len)
+            ):
+                continue
+            dst = req.mamba_ping_pong[req.mamba_next_track_idx]
+            # Includes every declared slot state, notably Qwen's PLE convolution.
+            # QSA groups close at page boundaries; their index rows ride KV pages.
+            self.linear_state_pool.copy_from(req.linear_slot_idx, dst)
+            req.mamba_last_track_seqlen = boundary
+            req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
+
     def maybe_free_swa_out_of_window(self, reqs: List[Req], *, forward_iter: int) -> None:
         """Proactively free each decoding request's now-out-of-window SWA slots, bounding its swa
         footprint to ~one window so a smaller-than-full swa pool (swa_full_tokens_ratio<1) stays
@@ -771,7 +808,7 @@ class CacheManager:
             L = req.mamba_last_track_seqlen
             if (
                 L is not None
-                and 0 < L <= req.cached_len
+                and 0 < L <= min(req.cached_len, req.input_ids.numel())
                 and align_down(L, self.page_size) == L
                 and req.mamba_ping_pong is not None
             ):
@@ -795,7 +832,9 @@ class CacheManager:
             # remain as reuse points).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
-            if insert_len == req.cached_len and insert_len > 0:
+            # An overlapped abort can leave consumed state ahead of the host
+            # token sequence. Never attach that state to a truncated key.
+            if 0 < insert_len == req.cached_len <= req.input_ids.numel():
                 self._queue_disk_prefix(
                     req, insert_len, page_indices, req.linear_slot_idx,
                     expert_profile=parked_profile,
