@@ -165,8 +165,15 @@ wait and later GPU installation. It includes host copies from file-mapped
 tensors under concurrent serving; it does not isolate faults, CPU scheduling,
 or memory copying. The experimental buffered HOT reader in
 [#35](https://github.com/jomcgi-org/freetoken-fork/pull/35) targets this work
-without changing the selected experts or adding a weight buffer. Its model
-wall-time qualification remains pending.
+without changing the selected experts or adding a weight buffer. Its completed
+sustained comparison loses: 465.939 seconds with mmap versus 557.449 seconds
+with buffered HOT reads, a 19.6% increase. Both matched orders regress and
+21 of 24 responses are slower. All twelve measured JSON pairs have identical
+text and usage, with a 23.6% penalty. Keep mmap HOT staging. Different
+readahead controls and actual adaptation transitions are possible contributors,
+not established causes; the
+[HOT reader record](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-hot-staging-io/docs/hot-staging-io.md)
+retains those limits and the complete output review.
 
 A separate diagnostic replay found approximately 11% fixed-HOT decode
 coverage versus approximately 97% retrospective coverage with the same
@@ -266,12 +273,14 @@ model wall time have separate meanings.
 | Correct temporary materialization ownership | Prevents sparse scratch from advertising uncopied experts as hits; protected HOT bytes retained | [#32](https://github.com/jomcgi-org/freetoken-fork/pull/32), ready |
 | Selected DISK staging and exact HOT VRAM reuse | Earlier direct CPU comparison: 31.6% lower prose wall time, mixed JSON gains; included in the sustained combined 17.8% result | [#33](https://github.com/jomcgi-org/freetoken-fork/pull/33), draft |
 | Cache-aware staged reads | Short reader gate: 18.3% less wall time; sustained isolation: 6.8% slower overall and 15.7% slower in second halves; 99 CUDA checks pass normally and under memcheck | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; keep buffered staging for the sustained workload |
-| Buffered reads into HOT staging rows | 164 focused Linux/CUDA checks pass; 25 new checks pass under memcheck with zero errors; model wall-time qualification pending | [#35](https://github.com/jomcgi-org/freetoken-fork/pull/35), draft; default remains mmap |
+| Buffered reads into HOT staging rows | Sustained wall time is 19.6% longer than mmap, with both orders slower; 164 focused Linux/CUDA checks and 25 zero-error memcheck checks pass | [#35](https://github.com/jomcgi-org/freetoken-fork/pull/35), draft; keep mmap HOT staging |
+| Concurrent complete-response client | 18 hermetic checks pass locally and on Linux; reports workload elapsed time separately from request latency; no model speedup measured yet | [#36](https://github.com/jomcgi-org/freetoken-fork/pull/36), draft |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
 #34 evaluates a DISK prefill reader on top of #33; #35 evaluates HOT staging
-on top of #34. The original serving checkout is restored and verified after
+on top of #34, and #36 adds a concurrency client on top of #35. The original
+serving checkout is restored and verified after
 every completed model gate; these changes are delivered in PRs.
 
 ## Quality and measurement contract
@@ -291,7 +300,7 @@ scored tasks and complete responses. In the CPU-versus-staged gate, all JSON
 records were correct and both modes retained the same 7/8 long-fidelity score,
 including the same wrong code-trace answer. The earlier combined CPU comparison
 also retained 7/8 but changed that incorrect answer. Prose from the earlier
-192-token-cap probes remains unscored. Both sustained comparisons generate
+192-token-cap probes remains unscored. The three sustained comparisons generate
 complete prose with a 1,024-token ceiling. Their artifacts include an
 assistant review of all responses against the seven-constraint reference
 specification. Both modes have omissions or unsupported explanatory
@@ -323,17 +332,18 @@ was also slower overall and increased worker storage reads to about 27 GiB
 per response. These results favor preserving useful RAM residency over
 unconditional cache bypass on this machine.
 
-The next comparison isolates buffered file reads into existing HOT staging
-rows, using the frozen, validated `878d723` runtime for both modes. It keeps
-buffered GPU DISK prefill, cache geometry, native binaries, automatic HOT
-adaptation settings, and every routed contribution unchanged. Four starts
-use mmap/buffered/buffered/mmap HOT staging order, each with four warmups,
-twelve measured complete responses, and eight fidelity cases. Diagnostics
-and GPU timing are off. The
-[#35 protocol](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-hot-staging-io/docs/hot-staging-io.md)
-requires both matched orders, source-balanced halves, output checks, and
-reference-based prose review before claiming a response wall-time gain.
-Faster host staging alone is insufficient.
+The HOT staging comparison at `878d723` also favors the existing mmap path.
+Do not infer a serving gain from a cheaper host-copy operation. Matching
+descriptor advice remains a possible follow-up, with no qualified gain yet.
+
+The next larger question is concurrent request throughput using the preferred
+buffered GPU DISK prefill and mmap HOT staging. The
+[#36 client](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-concurrent-wall-client/docs/concurrent-wall.md)
+preserves the same scored prompts and complete outputs, measures the entire
+workload's elapsed time, and reports individual response latency separately.
+Keep server admission capacity, runtime, cache geometry, and other policies
+fixed while varying offered client concurrency. Use both start orders with
+diagnostics off. No concurrent-serving speedup is claimed before that gate.
 
 The tested automatic decode-history preference was reverted: it improved
 JSON by 26.8% but slowed prose by 8.6%. That experiment changed only placement
