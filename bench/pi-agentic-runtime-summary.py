@@ -13,6 +13,7 @@ from pathlib import Path
 
 ARMS = [('r1', 'baseline'), ('r2', 'optimized'),
         ('r3', 'optimized'), ('r4', 'baseline')]
+SNAPSHOT_ARMS = [('r1', 'off'), ('r2', 'on'), ('r3', 'on'), ('r4', 'off')]
 CLIENT_FIELDS = ('pi_version', 'pi_executable_sha256', 'command', 'client_host',
                  'python', 'task', 'model_config', 'settings', 'requested_sessions',
                  'budgets', 'sources')
@@ -69,19 +70,21 @@ def totals(rows):
                         for key in ('input', 'output', 'cacheRead', 'cacheWrite')})
 
 
-def compare(rows):
+def compare(rows, mode_names=('baseline', 'optimized')):
     modes = {mode: totals([r for r in rows if r['mode'] == mode])
-             for mode in ('baseline', 'optimized')}
+             for mode in mode_names}
     complete = all(m['sessions'] and not m['failed'] for m in modes.values())
     baseline, optimized = (modes[m]['attempted_task_wall_s']
-                           for m in ('baseline', 'optimized'))
+                           for m in mode_names)
     return dict(modes=modes,
                 wall_reduction_percent=100 * (1 - optimized / baseline) if complete else None,
                 throughput_ratio=baseline / optimized if complete else None)
 
 
-def summarize(root):
+def summarize(root, *, decode_prefix_snapshot=False):
     hashes = {}
+    expected_arms = SNAPSHOT_ARMS if decode_prefix_snapshot else ARMS
+    mode_names = ('off', 'on') if decode_prefix_snapshot else ('baseline', 'optimized')
 
     def read(relative):
         data = (root / relative).read_bytes()
@@ -93,17 +96,32 @@ def summarize(root):
     require(driver.get('restored') is True
             and driver.get('restoration', {}).get('verified') is True,
             'original service restoration is not verified')
-    require([(a['arm'], a['mode']) for a in driver['arms']] == ARMS,
+    require([(a['arm'], a['mode']) for a in driver['arms']] == expected_arms,
             'controller does not contain exactly A/B/B/A')
     plan = driver['preflight']
+    if decode_prefix_snapshot:
+        require(plan['identities']['off'] == plan['identities']['on'],
+                'snapshot arms used different runtime identities')
+        require(plan['commands']['off'] == plan['commands']['on'],
+                'snapshot arms used different command lines')
+        off, on = plan['env']['off'], plan['env']['on']
+        require(off['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0'
+                and on['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '1', 'wrong snapshot flags')
+        require({key for key in off.keys() | on.keys() if off.get(key) != on.get(key)}
+                == {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}, 'unrelated environment difference')
+        require(off['FREETOKEN_CONTINUATION_TRACE_DIR'] == '', 'engine token trace enabled')
+        require(driver.get('lease_returncode') == 0 and not driver.get('error')
+                and not driver.get('restoration_error'), 'snapshot controller or lease failed')
     rows, arms = [], []
     first_geometry = first_client = None
-    for control, (arm, mode) in zip(driver['arms'], ARMS):
+    for control, (arm, mode) in zip(driver['arms'], expected_arms):
         start = read(Path(arm + '-server-start.json'))
         end = read(Path(arm + '-server-end.json'))
         metadata = read(Path(arm) / 'metadata.json')
         client_summary = read(Path(arm) / 'summary.json')
         require(start['arm'] == arm and start['mode'] == mode, f'{arm}: wrong server arm')
+        if decode_prefix_snapshot:
+            require(start.get('snapshot_enabled') is (mode == 'on'), f'{arm}: wrong snapshot marker')
         require(start['identity'] == plan['identities'][mode]
                 and start['revision'] == plan['identities'][mode]['revision']
                 and start['driver_sha256'] == plan['driver_sha256'],
@@ -142,21 +160,33 @@ def summarize(root):
                          worker_read_bytes_including_warmup=delta))
         rows.extend(arm_rows)
     measured = [row for row in rows if not row['warmup']]
-    return dict(completed_protocol=True, broad_quality_equivalence=False,
+    result = dict(completed_protocol=True, broad_quality_equivalence=False,
                 review_required='Review journals, complete model outputs and final workspaces. '
                                 'Recorded checks do not establish broad quality equivalence.',
-                comparison=compare(measured),
-                orders=[dict(order=order, **compare([r for r in measured if r['arm'] in pair]))
+                comparison=compare(measured, mode_names),
+                orders=[dict(order=order, **compare([r for r in measured if r['arm'] in pair], mode_names))
                         for order, pair in [('A/B', ('r1', 'r2')), ('B/A', ('r3', 'r4'))]],
                 arms=arms, sessions=rows, geometry=first_geometry, input_sha256=hashes)
+    if decode_prefix_snapshot:
+        all_passed = all(row['passed'] for row in rows)
+        require(driver.get('all_tasks_passed') is all_passed,
+                'controller success summary disagrees with task records')
+        result['all_tasks_passed_including_warmups'] = all_passed
+        if not all_passed:
+            for comparison in [result['comparison'], *result['orders']]:
+                comparison['wall_reduction_percent'] = None
+                comparison['throughput_ratio'] = None
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('results', type=Path)
+    parser.add_argument('--decode-prefix-snapshot', action='store_true',
+                        help='verify the same-runtime snapshot off/on/on/off protocol')
     args = parser.parse_args()
     try:
-        result = summarize(args.results)
+        result = summarize(args.results, decode_prefix_snapshot=args.decode_prefix_snapshot)
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(1, f'Cannot summarize comparison: {exc}\n')
     print(json.dumps(result, indent=2, allow_nan=False))
