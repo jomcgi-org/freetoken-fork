@@ -28,6 +28,7 @@ SRC = R / 'wt-plegather'
 OPT = R / 'wt-astra-decode-prefix-snapshot'
 SERVER = 'astra-pi-agentic-server'
 LEASE = 'astra-pi-agentic-lease'
+ACTION = 'astra-pi-agentic-action'
 SSH = ['ssh', '-oIdentityAgent=none', '-oIdentitiesOnly=yes', '-oBatchMode=yes',
        '-oServerAliveInterval=15', '-oServerAliveCountMax=3']
 REVISIONS = {'original': '3a67403a293be20836604bc25729329997848e09',
@@ -162,7 +163,7 @@ def preflight(allow_lease=False):
     assert differences == {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}, differences
     for unit in ['astra-decode-weight-reuse-wall-driver', 'astra-concurrent-wall-driver',
                  'astra-decode-weight-reuse-validation-v2', 'astra-sustained-hot-staging-wall-driver',
-                 'astra-sustained-reader-wall-driver', SERVER, *([] if allow_lease else [LEASE])]:
+                 'astra-sustained-reader-wall-driver', SERVER, ACTION, *([] if allow_lease else [LEASE])]:
         assert not live(unit), ('another benchmark is live', unit)
     original = state('freetoken-serve')
     assert original['ActiveState'] == 'active', original
@@ -226,6 +227,9 @@ def remote_main(args):
     if args.action == 'restore':
         result = dict(started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
         try:
+            # SSH termination alone can leave a remote start helper waiting for
+            # readiness. Stop its whole unit before restoring the original port.
+            stop(ACTION)
             stop(SERVER)
             if state('freetoken-serve')['ActiveState'] not in ('active', 'activating'):
                 wait_gpu_release()
@@ -333,6 +337,21 @@ def all_tasks_passed(arms):
     )
 
 
+def remote_command(script, action, run_id, arm=None):
+    command = ['/usr/bin/python3', str(script), '--remote', action, '--run-id', run_id]
+    if arm:
+        command += ['--arm', arm]
+    if action in ('start', 'end'):
+        # After + BindsTo makes lease shutdown stop the helper before the lease's
+        # restoration hook. This also covers a killed local SSH process.
+        command = ['sudo', '-n', 'systemd-run', '--unit=' + ACTION, '--pipe', '--wait',
+                   '--collect', '--uid=jomcgi', '--property=KillMode=control-group',
+                   '--property=TimeoutStopSec=15', '--property=RuntimeMaxSec=660',
+                   '--property=BindsTo=' + LEASE + '.service',
+                   '--property=After=' + LEASE + '.service'] + command
+    return command
+
+
 def local_main(args):
     here = Path(__file__).resolve().parent
     pi_client = here / 'pi-agentic-wall.py'
@@ -350,9 +369,7 @@ def local_main(args):
         str(Path(__file__).resolve()), 'node-4:' + str(remote_script))
 
     def remote(action, arm=None):
-        command = ['python3', str(remote_script), '--remote', action, '--run-id', args.run_id]
-        if arm:
-            command += ['--arm', arm]
+        command = remote_command(remote_script, action, args.run_id, arm)
         return json.loads(run(*(SSH + ['node-4', shlex.join(command)]), timeout=600).stdout)
 
     plan = remote('preflight')

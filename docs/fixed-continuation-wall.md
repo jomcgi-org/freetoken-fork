@@ -20,7 +20,12 @@ python3 bench/pi-decode-prefix-wall-driver.py \
 Add `--preflight` to inspect the pinned runtime and serving configuration without
 stopping serving. The remote server setup, identity and geometry checks,
 heartbeat lease, timeout recovery and restoration verification are shared with
-the Pi snapshot comparison. The controller still requires a clean linked
+the Pi snapshot comparison. Remote start/end helpers run in a dedicated systemd
+action unit bound to the lease. Lease shutdown stops that unit before recovery,
+and recovery explicitly stops it before the benchmark server. An interrupted
+SSH connection therefore cannot leave a startup helper issuing requests after
+restoration. Preflight rejects an existing live action unit.
+The controller still requires a clean linked
 worktree. Its client source hash is recorded and checked before each arm.
 
 The schedule is off/on/on/off, with one warmup and two measured conversations
