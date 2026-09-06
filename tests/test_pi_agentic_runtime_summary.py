@@ -651,3 +651,104 @@ def test_hot_host_answer_drift_suppresses_gain_including_warmup(hot_host_records
     assert not result['fixed_work_qualified']
     assert result['comparison']['wall_reduction_percent'] is None
     assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+
+
+@pytest.fixture
+def original_records(carry_records):
+    root = carry_records
+    spec = importlib.util.spec_from_file_location(
+        'original_gate_fixture', Path(__file__).parents[1] / 'bench/pi-decode-prefix-wall-driver.py')
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    driver = json.loads((root / 'driver.json').read_text())
+    plan = driver['preflight']
+    plan['experiment'] = 'original-continuation'
+    memory = dict(worker_bytes={k: 1024 for k in gate.WORKER_MEMORY_FIELDS},
+                  system_bytes={k: 1024 for k in gate.SYSTEM_MEMORY_FIELDS})
+    for mode, tree, revision, binary in [
+        ('off', gate.SRC, gate.REVISIONS['original'], gate.BINARIES['original']),
+        ('on', gate.HOT_HOST, gate.HOT_HOST_REVISION, gate.BINARIES['on']),
+    ]:
+        row = plan['identities'][mode]
+        row.update(revision=revision, tree=str(tree), native=f'/{mode}/cpu.so', native_sha256=binary,
+                   cpp_sha256=mode + '-cpp')
+        row['native_extensions']['_cpu_moe'].update(path=row['native'], sha256=binary,
+                                                  source_sha256=row['cpp_sha256'])
+        plan['env'][mode].update(PYTHONPATH=str(tree / 'python'), FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR='')
+        plan['commands'][mode] += ['--moe-disk-prefill', 'cpu' if mode == 'off' else 'staged']
+        if mode == 'on':
+            plan['commands'][mode] += ['--moe-disk-prefill-io', 'buffered', '--moe-hot-staging-io', 'mmap',
+                                       '--moe-hot-host-cache', 'reclaim']
+    plan['identities']['original'] = copy.deepcopy(plan['identities']['off'])
+    for control, (arm, mode) in zip(driver['arms'], summary.SNAPSHOT_ARMS):
+        start = json.loads((root / (arm + '-server-start.json')).read_text())
+        start.update(identity=plan['identities'][mode], revision=plan['identities'][mode]['revision'],
+                     env=plan['env'][mode], command=plan['commands'][mode], memory_before=memory)
+        if mode == 'on':
+            start['hot_host_cache'] = 'reclaim'
+        write(root, arm + '-server-start.json', start)
+        change(root, arm + '/metadata.json', lambda d: d.update(server_metadata=start))
+        control['end']['memory_after'] = memory
+        write(root, arm + '-server-end.json', control['end'])
+    write(root, 'driver.json', driver)
+    return root
+
+
+def test_original_baseline_allows_known_cpu_change_with_matched_work(original_records):
+    result = summary.summarize(original_records, original_baseline=True)
+    assert result['experiment'] == 'original-continuation'
+    assert result['fixed_work_qualified'] and not result['broad_quality_equivalence']
+    assert result['comparison']['wall_reduction_percent'] == pytest.approx(20)
+    assert result['arms'][0]['memory_before']['worker_bytes']['RssShmem'] == 1024
+    assert len(result['sessions']) == 12
+
+
+@pytest.mark.parametrize('change_kind', ['original_identity', 'runtime', 'cpu_binary', 'cpu_manifest',
+                                        'ple_binary', 'ple_source', 'command', 'census', 'snapshot', 'pythonpath'])
+def test_original_baseline_rejects_unqualified_configuration(original_records, change_kind):
+    def mutate(driver):
+        plan = driver['preflight']
+        if change_kind == 'original_identity':
+            plan['identities']['original']['revision'] = 'other'
+        elif change_kind == 'runtime':
+            plan['identities']['on']['revision'] = 'other'
+        elif change_kind == 'cpu_binary':
+            plan['identities']['on']['native_sha256'] = 'other'
+        elif change_kind == 'cpu_manifest':
+            plan['identities']['on']['native_extensions']['_cpu_moe']['source_sha256'] = 'other'
+        elif change_kind in ('ple_binary', 'ple_source'):
+            key = 'sha256' if change_kind == 'ple_binary' else 'source_sha256'
+            plan['identities']['on']['native_extensions']['_ple_uring'][key] = 'other'
+        elif change_kind == 'command':
+            plan['commands']['on'] += ['--extra']
+        elif change_kind == 'snapshot':
+            plan['env']['on']['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] = '1'
+        elif change_kind == 'pythonpath':
+            plan['env']['on']['PYTHONPATH'] = '/wrong/python'
+        else:
+            for env in plan['env'].values():
+                env['FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR'] = '/tmp/census'
+    change(original_records, 'driver.json', mutate)
+    with pytest.raises(ValueError):
+        summary.summarize(original_records, original_baseline=True)
+
+
+@pytest.mark.parametrize('session_number', [1, 2])
+def test_original_baseline_answer_drift_suppresses_gain(original_records, session_number):
+    change(original_records, f'r2/session-{session_number}/result.json', lambda d:
+           d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message'].update(
+               content=d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message']['content'] + '\n'))
+    result = summary.summarize(original_records, original_baseline=True)
+    assert not result['fixed_work_qualified']
+    assert result['comparison']['wall_reduction_percent'] is None
+    assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+
+
+
+def test_original_baseline_requires_reclaim_runtime_marker(original_records):
+    start = json.loads((original_records / 'r2-server-start.json').read_text())
+    start['hot_host_cache'] = 'retain'
+    write(original_records, 'r2-server-start.json', start)
+    change(original_records, 'r2/metadata.json', lambda d: d.update(server_metadata=start))
+    with pytest.raises(ValueError, match='HOT host cache policy marker'):
+        summary.summarize(original_records, original_baseline=True)
