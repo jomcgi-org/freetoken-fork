@@ -147,3 +147,13 @@ Startup records retain the server invocation before readiness, and the worker
 must map the expected native PLE reader before timing. Failure journals are
 retained even when readiness fails. These checks address the missing-dependency
 failure; the model wall-time comparison remains pending.
+
+The revised comparison launched at 05:15:45 UTC on 2026-09-06 and reached
+inference. Its [partial startup record](../bench/results/4090-populate-resident-wall-startup-v2-20260906.json)
+confirms a successful recovery probe, expected native reader mappings, and
+valid short/long prompt bands in the completed responses at capture. The first
+start has 4045 expert slots, 1024 KV pages and 2296 protected HOT rows; every
+later start must match. This naive-cache geometry differs from the Pi gate's
+3753 slots. The systemd driver runs independently of the local CLI. All four
+arms, output review and final recovery remain necessary before claiming a
+model throughput result.
