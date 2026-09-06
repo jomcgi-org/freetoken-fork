@@ -131,3 +131,19 @@ The driver refuses a prior model run and requires the probe's serving invocation
 to match current serving. The enclosing driver unit must use that same recovery
 command, a four-hour runtime bound and a 600-second stop timeout. This preparation
 is not yet a model performance result.
+
+The [first model attempt](../bench/results/4090-populate-resident-wall-startup-failure-20260906.json)
+failed before readiness or any timed response because the dedicated worktree
+lacked `_ple_uring`. Its pretested recovery command restored original serving
+and verified a real completion. This infrastructure failure provides no model
+performance result. The attempt and its journals are retained.
+
+The retry uses a new `-v2` run directory. Preflight now verifies and imports the
+unchanged PLE, pinned-tensor and UFFD support binaries as well as CPU MoE,
+without initializing CUDA. The [revised preflight record](../bench/results/4090-populate-resident-runtime-preflight-v2-20260906.json)
+confirms those imports and hashes pass on Linux. The support sources match the
+working runtime.
+Startup records retain the server invocation before readiness, and the worker
+must map the expected native PLE reader before timing. Failure journals are
+retained even when readiness fails. These checks address the missing-dependency
+failure; the model wall-time comparison remains pending.

@@ -22,10 +22,15 @@ REVISION = 'e865d198bff1fec5dde6c6acd7639d3bba65fe57'
 NATIVE_SHA = 'c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f'
 HELPER = R / 'tmp/astra-pi-agentic-runtime-20260906-driver.py'
 HELPER_SHA = '6829b8f07b6e3d223338018fea730c88d0cf50383d44c082d81d39dcbf543ddb'
-RUN_ID = 'astra-pi-agentic-resident-populate-wall-20260906'
+RUN_ID = 'astra-pi-agentic-resident-populate-wall-20260906-v2'
 OUT = R / 'results' / RUN_ID
-DRIVER_UNIT = 'astra-resident-populate-wall-driver'
+DRIVER_UNIT = 'astra-resident-populate-wall-driver-v2'
 FLAG = 'FREETOKEN_PREFILL_POPULATE_SKIP_RESIDENT'
+SUPPORT_SHA = {
+    '_ple_uring': 'dd58afde7b49fd8b6ef3f819181a906d8f2689dbe055985f3c27e6682d04c9cf',
+    '_pinned_tensor': '9e1ee95c87e8590ef87c824f6f2626427e32814888cc1043e42c9037c4224df1',
+    '_uffd_pager': '071e22fdc54f31bd7f137856ed52f0522570a5cd116daf1ecbaa5f24866e51b4',
+}
 
 
 def sha(path):
@@ -54,20 +59,41 @@ def identity(h):
     assert not h.run('git', '-C', str(WT), 'status', '--porcelain').stdout.strip()
     binaries = list((WT / 'python/freetoken/kernel').glob('_cpu_moe.*.so'))
     assert len(binaries) == 1 and sha(binaries[0]) == NATIVE_SHA
+    support = {}
+    for name, digest in SUPPORT_SHA.items():
+        paths = list((WT / 'python/freetoken/kernel').glob(name + '.*.so'))
+        assert len(paths) == 1 and sha(paths[0]) == digest, ('missing or changed native support', name)
+        support[name] = dict(path=str(paths[0].resolve()), sha256=digest)
     sources = ['python/freetoken/moe/host_banks.py', 'python/freetoken/moe/resident_range.py',
                'python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp',
+               'python/freetoken/kernel/csrc/ple_uring/ple_uring_ext.cpp',
+               'python/freetoken/kernel/csrc/pinned_tensor.cpp', 'python/freetoken/kernel/csrc/uffd_pager.cpp',
                'bench/sustained-prefill-wall.py', 'bench/selective-prefill.py',
                'bench/staged-prefill-long-output.py', 'bench/moe-fidelity.py']
     return dict(revision=REVISION, native=str(binaries[0].resolve()), native_sha256=NATIVE_SHA,
-                sources={name: sha(WT / name) for name in sources})
+                support_extensions=support, sources={name: sha(WT / name) for name in sources})
 
 
 def preflight(h, *, allow_driver=False):
     for unit in ['astra-populate-component-20260906', 'astra-populate-component-recovery-20260906',
+                 'astra-resident-populate-wall-driver',
                  *([] if allow_driver else [DRIVER_UNIT])]:
         assert not h.live(unit), ('another experiment is live', unit)
     plan = h.preflight()
     current = identity(h)
+    import_code = (
+        "import importlib,json,pathlib,torch; "
+        "names=['_cpu_moe','_ple_uring','_pinned_tensor','_uffd_pager']; "
+        "modules={n:str(pathlib.Path(importlib.import_module('freetoken.kernel.'+n).__file__).resolve()) for n in names}; "
+        "print(json.dumps(dict(modules=modules,cuda_initialized=torch.cuda.is_initialized())))"
+    )
+    imported = h.run(str(h.SRC / '.venv/bin/python'), '-c', import_code,
+                     env=dict(os.environ, PYTHONPATH=str(WT / 'python'), CUDA_VISIBLE_DEVICES='',
+                              OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1'), timeout=120)
+    import_probe = json.loads(imported.stdout)
+    assert import_probe['cuda_initialized'] is False
+    assert import_probe['modules']['_cpu_moe'] == current['native']
+    assert all(import_probe['modules'][n] == data['path'] for n, data in current['support_extensions'].items())
     if OUT.exists():
         assert {p.name for p in OUT.iterdir()} == {'recovery-probe.json'}, OUT
     args = h.server_command('optimized')
@@ -79,7 +105,7 @@ def preflight(h, *, allow_driver=False):
     assert manifest['client_sha256'] == current['sources']['bench/sustained-prefill-wall.py']
     assert len(manifest['cases']) == 16 and all(c['predicted_prefill_band_valid'] for c in manifest['cases'])
     return dict(original=plan, identity=current, args=args, env=env, manifest=manifest,
-                driver_sha256=sha(Path(__file__)), restore_command=restore_command())
+                native_import_probe=import_probe, driver_sha256=sha(Path(__file__)), restore_command=restore_command())
 
 
 def run_gate(h, plan):
@@ -114,6 +140,8 @@ def run_gate(h, plan):
             report['arms'].append(record)
             h.save(OUT / 'driver.json', report)
             h.run(*(command + plan['args']))
+            record['unit'] = h.state(h.SERVER)
+            h.save(OUT / 'driver.json', report)
             record['health'] = h.ready(18090)
             record['readiness'] = h.completion(18090)
             unit = h.state(h.SERVER)
@@ -121,8 +149,13 @@ def run_gate(h, plan):
             assert len(pids) == 1
             worker = pids[0]
             assert unit['ControlGroup'] in Path(f'/proc/{worker}/cgroup').read_text()
-            mapped = [line for line in Path(f'/proc/{worker}/maps').read_text().splitlines() if '_cpu_moe.' in line]
+            all_maps = Path(f'/proc/{worker}/maps').read_text().splitlines()
+            mapped = [line for line in all_maps if '_cpu_moe.' in line]
             assert mapped and all(line.split()[-1] == plan['identity']['native'] for line in mapped)
+            support_maps = {name: [line for line in all_maps if name + '.' in line] for name in SUPPORT_SHA}
+            assert support_maps['_ple_uring'], 'native PLE reader absent from worker mappings'
+            assert all(line.split()[-1] == plan['identity']['support_extensions'][name]['path']
+                       for name, lines in support_maps.items() for line in lines)
             assert (FLAG + '=' + flag).encode() in Path(f'/proc/{worker}/environ').read_bytes().split(b'\0')
             assert h.state('freetoken-serve')['ActiveState'] == 'inactive'
             startup = h.journal(unit['InvocationID'])
@@ -133,7 +166,7 @@ def run_gate(h, plan):
             assert 'CPU MoE prefill coalesce: populate' in startup
             assert 'minimum_chunk=1024 tokens, file_io=buffered' in startup
             assert 'MoE HOT staging: file_io=mmap' in startup
-            record.update(unit=unit, worker=worker, native_maps=mapped, geometry=resolved,
+            record.update(unit=unit, worker=worker, native_maps=mapped, native_support_maps=support_maps, geometry=resolved,
                           io_before=h.io_snapshot(worker), phase='timing')
             h.save(OUT / 'driver.json', report)
             print('ARM_READY ' + arm + ' flag=' + flag, flush=True)
@@ -196,6 +229,17 @@ def run_gate(h, plan):
         report['ended_utc'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
         h.save(OUT / 'driver.json', report)
         h.stop(h.SERVER)
+        if report['arms'] and report['arms'][-1]['phase'] != 'completed':
+            record = report['arms'][-1]
+            invocation = record.get('unit', {}).get('InvocationID')
+            if invocation:
+                try:
+                    journal = h.journal(invocation)
+                    (OUT / (record['arm'] + '-journal.log')).write_text(journal)
+                    record['journal_sha256'] = hashlib.sha256(journal.encode()).hexdigest()
+                except Exception as error:
+                    record['journal_error'] = f'{type(error).__name__}: {error}'
+                h.save(OUT / 'driver.json', report)
         # The enclosing systemd unit executes the pretested recovery command.
 
 
