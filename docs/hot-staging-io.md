@@ -36,12 +36,17 @@ No per-row diagnostic timers or GPU readbacks are added. The existing
 functional staging timer still feeds automatic backoff, and one startup log
 identifies the configured reader. A throughput claim requires complete client
 wall time with diagnostics off and both matched orders, including warmup and
-later requests. The current live reader-isolation run stays frozen and does
-not contain this change.
+later requests. The reader-isolation run completed on frozen `132b629` and
+did not contain this change.
 
 The new tests cover exact byte transport for weight and scale dtypes, scalar
 rows, source views, short reads, EOF, bounds, non-file fallback, cancellation
 after a weight read but before its scales, and CUDA consumption before a
-staging buffer is reused. Syntax checks pass. Linux and CUDA validation,
-memcheck, and model wall-time qualification are pending. No performance gain
-is claimed yet.
+staging buffer is reused. At `878d723`, all 164 focused Linux/CUDA HOT staging,
+adaptation, materialization, and DISK policy checks pass. All 25 new transport
+checks also pass under CUDA memcheck with zero errors. The fifteen client
+diagnostic protocol checks pass on Linux. The
+[validation record](../bench/results/4090-hot-staging-io-validation-20260906.json)
+includes exact commands, driver, output, successful unit completion, and a
+real `OK` response from the restored original service. Model wall-time
+qualification remains pending. No performance gain is claimed yet.
