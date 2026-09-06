@@ -50,3 +50,37 @@ diagnostic protocol checks pass on Linux. The
 includes exact commands, driver, output, successful unit completion, and a
 real `OK` response from the restored original service. Model wall-time
 qualification remains pending. No performance gain is claimed yet.
+
+The next model comparison uses the checked-in
+[`sustained-hot-staging-wall-driver.py`](../bench/sustained-hot-staging-wall-driver.py)
+on the frozen, validated `878d723` runtime for both policies. Only
+`--moe-hot-staging-io` changes, in mmap/buffered/buffered/mmap start order.
+Both modes use buffered staged GPU DISK prefill, which won the sustained
+DISK reader isolation. Each start retains automatic HOT adaptation through
+four warmups, twelve measured complete JSON/prose responses, and eight
+fidelity cases. Cache geometry, native binaries, prompts, and other settings
+must match. Actual adaptation transitions remain observations under the
+same controller settings.
+
+Diagnostic stats, GPU timing, the client's `--phase-io` diagnostic, HOT plan
+persistence, and KV reuse are off. Report all responses, both matched start
+orders, equal-output subsets, and source-balanced early and late halves.
+Review complete prose against the reference separately from formatting.
+Retain storage counters and functional staging logs without interpreting
+either as isolated disk bandwidth. A staging-time improvement alone does
+not qualify a response wall-time gain.
+
+The driver supports a read-only `--preflight` before service interruption.
+Its two-hour systemd limit must be paired with
+[`sustained-hot-staging-restore.sh`](../bench/sustained-hot-staging-restore.sh)
+as `ExecStopPost`. The normal finalizer stops the benchmark service, restores
+the original system service, and verifies a real completion. Each model
+start has a 45-minute limit. Never restart a live driver after a session
+interruption. This experiment does not qualify very long contexts,
+concurrency, production prefix reuse, or broad model-quality equivalence.
+
+The driver and recovery script pass syntax checks. The
+[Linux preflight](../bench/results/4090-hot-staging-wall-preflight-20260906.json)
+passes with identical frozen revisions and native binaries, buffered GPU
+DISK prefill, and diagnostic stats disabled. Its driver SHA-256 matches the
+committed script. Preflight does not measure model performance.
