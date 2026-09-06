@@ -19,9 +19,12 @@ OUTPUT_ENV = "FREETOKEN_TARGET_VERIFY_COST_DIR"
 GRAPH_ENV = "FREETOKEN_TARGET_VERIFY_GRAPH"
 TRACE_ENV = "FREETOKEN_TARGET_VERIFY_LAYER_TRACE"
 SERIAL_LINEAR_ENV = "FREETOKEN_TARGET_VERIFY_SERIAL_LINEAR"
+CHECKPOINT_ENV = "FREETOKEN_TARGET_VERIFY_SEED_CHECKPOINT"
 MODES = ("graph_one", "graph_two", "snapshot", "accept", "reject")
 GRAPH_MODES = ("accept_graph", "reject_graph")
+CHECKPOINT_MODES = ("accept_checkpoint", "reject_checkpoint")
 _ACTIVATIONS = {}
+_CHECKPOINT_API = None
 
 
 def install_serial_linear():
@@ -55,7 +58,7 @@ def eligible_position(position, *, page_size, ratio, remaining):
     )
 
 
-def summarize(records, *, graph_enabled=False):
+def summarize(records, *, graph_enabled=False, checkpoint_enabled=False):
     """Keep correctness independent of component costs and never claim a speedup."""
     groups = {}
     for record in records:
@@ -63,7 +66,8 @@ def summarize(records, *, graph_enabled=False):
             groups.setdefault(record["case"], {}).setdefault(record["mode"], []).append(record)
     result = {}
     for case, modes in groups.items():
-        complete = set(modes) == set(MODES + (GRAPH_MODES if graph_enabled else ()))
+        complete = set(modes) == set(MODES + (GRAPH_MODES if graph_enabled else ())
+                                    + (CHECKPOINT_MODES if checkpoint_enabled else ()))
         valid = complete and all(r["checks_passed"] for r in records if r["case"] == case)
         medians = {name: statistics.median(r["wall_s"] for r in rows)
                    for name, rows in modes.items()}
@@ -73,6 +77,8 @@ def summarize(records, *, graph_enabled=False):
             paths = [("", "accept", "reject")]
             if graph_enabled:
                 paths.append(("graph_", "accept_graph", "reject_graph"))
+            if checkpoint_enabled:
+                paths.append(("checkpoint_", "accept_checkpoint", "reject_checkpoint"))
             for prefix, accept_mode, reject_mode in paths:
                 one, accepted, rejected = (
                     medians[k] for k in ("graph_one", accept_mode, reject_mode))
@@ -85,11 +91,13 @@ def summarize(records, *, graph_enabled=False):
     return result
 
 
-def numerical_mismatches(checks, *, graph_enabled=False):
+def numerical_mismatches(checks, *, graph_enabled=False, checkpoint_enabled=False):
     """Include untimed reference comparisons in component qualification."""
     prefixes = ["eager_vs_sequential"]
     if graph_enabled:
         prefixes.append("graph_vs_eager")
+    if checkpoint_enabled:
+        prefixes.append("checkpoint_vs_eager")
     mismatches = []
     for prefix in prefixes:
         if not checks[prefix + "_logits"]["exact"]:
@@ -99,6 +107,12 @@ def numerical_mismatches(checks, *, graph_enabled=False):
                           if not metric["exact"])
     if graph_enabled and not checks["graph_vs_eager_tokens_equal"]:
         mismatches.append("graph_vs_eager/tokens")
+    if checkpoint_enabled:
+        if not checks["checkpoint_vs_eager_tokens_equal"]:
+            mismatches.append("checkpoint_vs_eager/tokens")
+        mismatches.extend("checkpoint_seed/" + name
+                          for name, metric in checks["checkpoint_seed_state"].items()
+                          if not metric["exact"])
     return mismatches
 
 
@@ -421,7 +435,7 @@ class StateWindow:
 
 
 def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, warmup, report,
-               directory, graph_enabled=False, trace_only=False):
+               directory, graph_enabled=False, trace_only=False, checkpoint_enabled=False):
     import torch
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.core import Batch
@@ -447,8 +461,11 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
     req.input_ids = torch.cat((host_prefix, host_seed, host_seed))
 
     captured_graph = None
+    checkpoint_graph = None
+    checkpoint = None
 
-    def forward(step=None, *, captured=False, with_logits=False, ordinary_eager=False):
+    def forward(step=None, *, captured=False, with_logits=False, ordinary_eager=False,
+                seed_checkpoint=False):
         if step is None:
             configure_mtp_fused_step(batch, verify_ids, positions, window.locations)
             batch.active_table_idx = fused_rows
@@ -460,9 +477,10 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
         engine.cpu_moe_executor.begin_decode_step()
         with engine.ctx.forward_batch(batch):
             if captured:
-                if step is not None or captured_graph is None:
+                graph = checkpoint_graph if seed_checkpoint else captured_graph
+                if step is not None or graph is None:
                     raise RuntimeError("dedicated verification graph is unavailable")
-                logits = captured_graph.replay(batch)
+                logits = graph.replay(batch)
             elif step is None or ordinary_eager:
                 logits = engine.model.forward(select_last=False)
             else:
@@ -529,13 +547,40 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
         report["stage"] = "measuring verification graph at " + case
         save(directory, report)
 
-    reference_mismatches = numerical_mismatches(diagnostic, graph_enabled=graph_enabled)
+    if checkpoint_enabled:
+        report["stage"] = "capturing first-token checkpoint graph at " + case
+        save(directory, report)
+        window.reset(initial)
+        engine.stream.synchronize()
+        checkpoint = _CHECKPOINT_API["SeedCheckpoint"].from_engine(
+            engine, req, state_views(engine, req))
+        with _CHECKPOINT_API["capture_context"](checkpoint):
+            checkpoint_graph = FusedGraph(engine, batch)
+        window.reset(initial)
+        checkpoint_tokens, checkpoint_logits = forward(
+            captured=True, seed_checkpoint=True, with_logits=True)
+        diagnostic["checkpoint_vs_eager_logits"] = difference_metrics(checkpoint_logits, eager_logits)
+        diagnostic["checkpoint_vs_eager_state"] = window.metrics(expected_eager, committed_end=position + 2)
+        diagnostic["checkpoint_vs_eager_tokens_equal"] = bytes_equal(checkpoint_tokens, eager_tokens)
+        diagnostic["checkpoint_seed_state"] = {
+            name: difference_metrics(value, expected_one[name]) for name, value in checkpoint.saved.items()}
+        report["stage"] = "measuring first-token checkpoint graph at " + case
+        save(directory, report)
+
+    reference_mismatches = numerical_mismatches(
+        diagnostic, graph_enabled=graph_enabled, checkpoint_enabled=checkpoint_enabled)
 
     def execute(mode):
         if mode == "graph_one":
             return forward(0), None
         if mode == "graph_two":
             return torch.cat((forward(0), forward(1))), None
+        if mode in CHECKPOINT_MODES:
+            targets = forward(captured=True, seed_checkpoint=True)
+            accepted, matched = greedy_accept_prefix(verify_ids[1:], targets)
+            if mode == "reject_checkpoint":
+                checkpoint.restore()
+            return accepted, matched
         saved = snapshot_verify_state(pool, kv, req)
         if mode == "snapshot":
             return saved, None
@@ -548,7 +593,8 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
         return accepted, matched
 
     for repeat in range(-warmup, repeats):
-        modes = MODES + (GRAPH_MODES if graph_enabled else ())
+        modes = (MODES + (GRAPH_MODES if graph_enabled else ())
+                 + (CHECKPOINT_MODES if checkpoint_enabled else ()))
         order = modes if repeat % 2 == 0 else tuple(reversed(modes))
         for mode in order:
             window.reset(initial)
@@ -582,6 +628,9 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
                 if mode == "accept_graph":
                     mismatches += ["graph_vs_eager/" + k for k in
                                    window.compare(expected_eager, committed_end=position + 2)]
+                if mode in CHECKPOINT_MODES:
+                    mismatches += ["checkpoint_seed/" + name for name, value in checkpoint.saved.items()
+                                   if not bytes_equal(value, expected_one[name])]
                 if mode.startswith("reject"):
                     verify_ids.copy_(good_ids)
                     req.input_ids.copy_(good_history)
@@ -601,6 +650,8 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
     engine.stream.synchronize()
     if captured_graph is not None:
         captured_graph.close()
+    if checkpoint_graph is not None:
+        checkpoint_graph.close()
     return first, torch.cat((host_prefix, host_seed))
 
 
@@ -612,8 +663,10 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
 
     graph_enabled = os.environ.get(GRAPH_ENV) == "1"
     trace_only = os.environ.get(TRACE_ENV) == "1"
+    checkpoint_enabled = os.environ.get(CHECKPOINT_ENV) == "1"
     report = dict(diagnostic_only=True, model_wall_qualified=False, completed=False,
                   graph_enabled=graph_enabled, trace_only=trace_only,
+                  checkpoint_enabled=checkpoint_enabled,
                   serial_linear=os.environ.get(SERIAL_LINEAR_ENV) == "1",
                   component_timings_usable=not trace_only,
                   records=[], pid=os.getpid(), speculative_mtp=engine.config.speculative_mtp,
@@ -649,9 +702,10 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
             seed, prefix = run_window(engine, batch, position + offset, seed, prefix,
                                       repeats=repeats, warmup=warmup,
                                       report=report, directory=directory, graph_enabled=graph_enabled,
-                                      trace_only=trace_only)
+                                      trace_only=trace_only, checkpoint_enabled=checkpoint_enabled)
         if not trace_only:
-            report["summary"] = summarize(report["records"], graph_enabled=graph_enabled)
+            report["summary"] = summarize(report["records"], graph_enabled=graph_enabled,
+                                          checkpoint_enabled=checkpoint_enabled)
             report["checks_passed"] = all(r["checks_passed"] for r in report["records"])
         report["completed"] = True
     except BaseException as exc:
@@ -663,6 +717,7 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
 
 def install(engine_class):
     """Provision the diagnostic before Engine initializes CUDA; no draft head."""
+    global _CHECKPOINT_API
     import torch
     from freetoken.kvcache.qsa_pool import QSAKVCache
     from freetoken.moe.cpu_executor import CpuMoeExecutor
@@ -679,6 +734,13 @@ def install(engine_class):
         install_layer_trace()
     if os.environ.get(GRAPH_ENV) == "1":
         install_graph_support()
+    if os.environ.get(CHECKPOINT_ENV) == "1":
+        if (os.environ.get(GRAPH_ENV) != "1" or os.environ.get(SERIAL_LINEAR_ENV) != "1"
+                or os.environ.get(TRACE_ENV) == "1"):
+            raise RuntimeError("seed checkpoint requires graph and serial linear modes, with tracing off")
+        import runpy
+        _CHECKPOINT_API = runpy.run_path(str(Path(__file__).with_name("target_seed_checkpoint.py")))
+        _CHECKPOINT_API["install"]()
     directory = Path(os.environ[OUTPUT_ENV])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     original_cpu_init = CpuMoeExecutor.__init__
