@@ -85,9 +85,11 @@ def compare(rows, mode_names=('baseline', 'optimized')):
 
 
 def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
-              prefill_snapshot_carry=False):
-    require(not (prefill_snapshot_carry and decode_prefix_snapshot), 'conflicting experiments')
-    fixed_continuation = fixed_continuation or prefill_snapshot_carry
+              prefill_snapshot_carry=False, hybrid_profile_retention=False):
+    require(sum((prefill_snapshot_carry, hybrid_profile_retention, decode_prefix_snapshot)) <= 1,
+            'conflicting experiments')
+    runtime_pair = prefill_snapshot_carry or hybrid_profile_retention
+    fixed_continuation = fixed_continuation or runtime_pair
     decode_prefix_snapshot = decode_prefix_snapshot or fixed_continuation
     hashes = {}
     expected_arms = SNAPSHOT_ARMS if decode_prefix_snapshot else ARMS
@@ -114,25 +116,29 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
         require(plan.get('client_kind', 'pi') == 'pi', 'use --fixed-continuation for scripted requests')
     if decode_prefix_snapshot:
         experiment = 'prefill-snapshot-carry' if prefill_snapshot_carry else 'decode-prefix-snapshot'
+        if hybrid_profile_retention:
+            experiment = 'hybrid-profile-retention'
         require(plan.get('experiment', 'decode-prefix-snapshot') == experiment, 'wrong experiment')
-        if prefill_snapshot_carry:
+        if runtime_pair:
             spec = importlib.util.spec_from_file_location(
                 'carry_gate', Path(__file__).with_name('pi-decode-prefix-wall-driver.py'))
             gate = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(gate)
             ids = plan['identities']
-            require({m: ids[m]['revision'] for m in ('off', 'on')} == gate.PREFILL_CARRY_REVISIONS,
-                    'wrong prefill carry runtime revisions')
-            require(ids['off']['tree'] != ids['on']['tree'], 'same prefill carry runtime tree')
+            revisions = (gate.PROFILE_RETENTION_REVISIONS if hybrid_profile_retention
+                         else gate.PREFILL_CARRY_REVISIONS)
+            require({m: ids[m]['revision'] for m in ('off', 'on')} == revisions,
+                    'wrong runtime pair revisions')
+            require(ids['off']['tree'] != ids['on']['tree'], 'same runtime pair tree')
             require(all(ids['off'].get(k) and ids['off'][k] == ids['on'].get(k)
                         for k in ('native', 'native_sha256', 'cpp_sha256')),
-                    'prefill carry native binary or source changed')
+                    'runtime pair native binary or source changed')
             extensions = ids['off'].get('native_extensions', {})
             require(set(extensions) == set(gate.EXTENSION_SOURCES)
                     and extensions == ids['on'].get('native_extensions')
                     and all(all(row.get(k) for k in ('path', 'sha256', 'source_sha256'))
                             for row in extensions.values()),
-                    'prefill carry native extension identity missing or changed')
+                    'runtime pair native extension identity missing or changed')
         else:
             require(plan['identities']['off'] == plan['identities']['on'],
                     'snapshot arms used different runtime identities')
@@ -140,14 +146,23 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
                 'snapshot arms used different command lines')
         off, on = plan['env']['off'], plan['env']['on']
         require(off['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0'
-                and on['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == ('0' if prefill_snapshot_carry else '1'),
+                and on['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == ('0' if runtime_pair else '1'),
                 'wrong snapshot flags')
         require({key for key in off.keys() | on.keys() if off.get(key) != on.get(key)}
-                == ({'PYTHONPATH'} if prefill_snapshot_carry else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}),
+                == ({'PYTHONPATH'} if runtime_pair else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}),
                 'unrelated environment difference')
-        if prefill_snapshot_carry:
+        if runtime_pair:
             require(all(plan['env'][m]['PYTHONPATH'] == str(Path(ids[m]['tree']) / 'python')
-                        for m in ('off', 'on')), 'prefill carry environment points at wrong tree')
+                        for m in ('off', 'on')), 'runtime pair environment points at wrong tree')
+        if hybrid_profile_retention:
+            require({m: ids[m]['tree'] for m in ('off', 'on')}
+                    == {'off': str(gate.CARRY), 'on': str(gate.PROFILE)},
+                    'wrong profile retention runtime tree')
+            for flag, value in [('--session-expert-prefetch', 'on'), ('--session-protect-experts', '64')]:
+                command = plan['commands']['off']
+                require(command.count(flag) == 1 and command.index(flag) + 1 < len(command)
+                        and command[command.index(flag) + 1] == value,
+                        'wrong session prefetch policy')
         require(off['FREETOKEN_CONTINUATION_TRACE_DIR'] == '', 'engine token trace enabled')
         require(driver.get('lease_returncode') == 0 and not driver.get('error')
                 and not driver.get('restoration_error'), 'snapshot controller or lease failed')
@@ -160,7 +175,7 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
         client_summary = read(Path(arm) / 'summary.json')
         require(start['arm'] == arm and start['mode'] == mode, f'{arm}: wrong server arm')
         if decode_prefix_snapshot:
-            require(start.get('snapshot_enabled') is (mode == 'on' and not prefill_snapshot_carry),
+            require(start.get('snapshot_enabled') is (mode == 'on' and not runtime_pair),
                     f'{arm}: wrong snapshot marker')
         require(start['identity'] == plan['identities'][mode]
                 and start['revision'] == plan['identities'][mode]['revision']
@@ -266,15 +281,19 @@ def main():
                         help='also require matched scripted requests, answers and token counts')
     parser.add_argument('--prefill-snapshot-carry', action='store_true',
                         help='verify the pinned parent/fix scripted comparison with decode snapshots off')
+    parser.add_argument('--hybrid-profile-retention', action='store_true',
+                        help='verify the pinned expert-profile parent/fix scripted comparison')
     args = parser.parse_args()
     try:
         result = summarize(args.results, decode_prefix_snapshot=args.decode_prefix_snapshot,
                            fixed_continuation=args.fixed_continuation,
-                           prefill_snapshot_carry=args.prefill_snapshot_carry)
+                           prefill_snapshot_carry=args.prefill_snapshot_carry,
+                           hybrid_profile_retention=args.hybrid_profile_retention)
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(1, f'Cannot summarize comparison: {exc}\n')
     print(json.dumps(result, indent=2, allow_nan=False))
-    if (args.fixed_continuation or args.prefill_snapshot_carry) and not result['fixed_work_qualified']:
+    fixed = args.fixed_continuation or args.prefill_snapshot_carry or args.hybrid_profile_retention
+    if fixed and not result['fixed_work_qualified']:
         raise SystemExit(1)
 
 

@@ -269,3 +269,74 @@ def test_native_identity_requires_every_serving_extension(tmp_path, missing):
         for name, row in result.items():
             assert row['sha256'] == gate.sha(kernel / (name + '.test.so'))
             assert row['source_sha256'] == gate.sha(kernel / 'csrc' / gate.EXTENSION_SOURCES[name])
+
+
+def test_profile_retention_compares_with_carried_prefill_parent(monkeypatch):
+    monkeypatch.setattr(gate, 'PROFILE_RETENTION', True)
+    off, on = (gate.server_env(mode) for mode in gate.MODES)
+    assert off.pop('PYTHONPATH') == str(gate.CARRY / 'python')
+    assert on.pop('PYTHONPATH') == str(gate.PROFILE / 'python')
+    assert off == on and off['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0'
+    assert gate.runtime_revision('off') == gate.PREFILL_CARRY_REVISIONS['on']
+    assert gate.runtime_revision('on') == '5b0ea43e03971759f7355f5a9c80e8065636f31b'
+    assert gate.runtime_revision('original') == gate.REVISIONS['original']
+
+
+def test_profile_retention_pins_advice_policy_in_both_commands(monkeypatch):
+    monkeypatch.setattr(gate, 'PROFILE_RETENTION', True)
+    service = ('ExecStart=/bin/ft --port 8090 --moe-disk-prefill staged '
+               '--max-running-requests 4 --kv-disk-cache-gib 2 --moe-collect-stats '
+               '--session-expert-prefetch off --session-protect-experts 32')
+    monkeypatch.setattr(gate, 'SERVICE', SimpleNamespace(read_text=lambda: service))
+    off, on = (gate.server_command(mode) for mode in gate.MODES)
+    assert off == on
+    for flag, value in [('--session-expert-prefetch', 'on'), ('--session-protect-experts', '64'),
+                        ('--max-running-requests', '1')]:
+        assert off.count(flag) == 1 and off[off.index(flag) + 1] == value
+    assert '--moe-collect-stats' not in off and '--moe-step-timing' not in off
+
+
+@pytest.mark.parametrize('action', ['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
+def test_profile_retention_selection_reaches_every_remote_action(monkeypatch, action):
+    monkeypatch.setattr(gate, 'PROFILE_RETENTION', True)
+    command = gate.remote_command('/tmp/driver.py', action, 'astra-pi-agentic-profile-test')
+    assert command.count('--hybrid-profile-retention') == 1
+    assert '--prefill-snapshot-carry' not in command
+    if action in ('start', 'end'):
+        assert '--property=BindsTo=' + gate.LEASE + '.service' in command
+
+
+@pytest.mark.parametrize('files', ['cache.py', 'prefill.py', 'cache.py\nprefill.py'])
+def test_profile_retention_preflight_allows_only_the_cache_finish_change(monkeypatch, files):
+    monkeypatch.setattr(gate, 'PROFILE_RETENTION', True)
+    command = ['ft', '--session-expert-prefetch', 'on', '--session-protect-experts', '64']
+    monkeypatch.setattr(gate, 'server_command', lambda _: command)
+    monkeypatch.setattr(gate, 'live', lambda _: False)
+    monkeypatch.setattr(gate, 'state', lambda _: {'ActiveState': 'active', 'ControlGroup': 'group'})
+    monkeypatch.setattr(gate, 'gpu_pids', lambda: [123])
+    monkeypatch.setattr(Path, 'read_text', lambda _: 'group')
+    monkeypatch.setattr(gate, 'sha', lambda _: 'sha')
+    identity = dict(native='same', native_sha256='same', cpp_sha256='same', native_extensions='same')
+    monkeypatch.setattr(gate, 'identities', lambda: {m: identity for m in gate.MODES})
+
+    def diff(*args, **kwargs):
+        assert args == ('git', '-C', str(gate.PROFILE), 'diff', '--name-only',
+                        gate.PROFILE_RETENTION_REVISIONS['off'], gate.PROFILE_RETENTION_REVISIONS['on'],
+                        '--', 'python/')
+        return SimpleNamespace(stdout='\n'.join('python/freetoken/scheduler/' + f
+                                                for f in files.splitlines()))
+
+    monkeypatch.setattr(gate, 'run', diff)
+    if files == 'cache.py':
+        assert gate.preflight()['experiment'] == 'hybrid-profile-retention'
+    else:
+        with pytest.raises(AssertionError):
+            gate.preflight()
+
+
+def test_conflicting_source_pairs_are_rejected_before_services(monkeypatch):
+    monkeypatch.setattr(gate, 'PREFILL_CARRY', True)
+    monkeypatch.setattr(gate, 'PROFILE_RETENTION', True)
+    monkeypatch.setattr(gate, 'server_command', lambda _: pytest.fail('must reject first'))
+    with pytest.raises(AssertionError, match='conflicting experiments'):
+        gate.preflight()
