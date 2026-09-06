@@ -797,6 +797,11 @@ class CacheManager:
             return
 
         if finished:
+            # Final prefill may already have donated the last reusable snapshot.
+            # Keep the collected profile there even when an unaligned finish
+            # cannot insert another snapshot. Never attach a session to root.
+            if parked_profile is not None and old_handle.cached_len > 0:
+                old_handle.node.expert_profile = parked_profile
             # A pending freeze (the tool-call anchor, or a prefill ×64 track the request
             # finished too early to chunk-commit) is a strictly shorter prefix than the live
             # donate below: insert it first and advance the dedup-free floor to its boundary

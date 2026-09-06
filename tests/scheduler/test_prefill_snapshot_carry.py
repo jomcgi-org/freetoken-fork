@@ -170,3 +170,79 @@ def test_failed_final_forward_discards_pending_state(monkeypatch, tail):
     cm.check_integrity()
     assert cm.prefix_cache.size_info.evictable_size == 0
     assert pool.num_free_slots == pool.num_slots - 1  # padding only
+
+
+def profile_source(cm, profile):
+    calls = []
+    cm.moe_offload_cache = SimpleNamespace(
+        session_profile_enabled=profile is not None,
+        export_session_profile=lambda table_idx: calls.append(('export', table_idx)) or profile,
+        release_session_profile=lambda uid: calls.append(('release', uid)),
+        admit_session_profile=lambda uid, value: calls.append(('admit', uid, value)))
+    return calls
+
+
+@pytest.mark.parametrize('tail', [7, 64, 65])
+def test_finish_keeps_profile_on_committed_prefix_without_changing_state(monkeypatch, tail):
+    from freetoken.moe.session_profile import SessionExpertProfile
+
+    cm, tm, _pm, pool, req, boundary, _snapshots = prefill(monkeypatch, 128 + tail, [128, 128])
+    profile = SessionExpertProfile(ids=((1, 2),), counts=((3.0, 1.0),))
+    calls = profile_source(cm, profile)
+    cm.cache_req(req, finished=False)
+    node = req.cache_handle.node
+    frozen = node.mamba_value
+    expected = [t.clone() for t in tensors(pool, frozen)]
+    expected_pages = cm.page_table[req.table_idx, :boundary].clone()
+    assert calls == [] and node.expert_profile is None
+
+    cm.cache_req(req, finished=True)
+    tm.free(req.table_idx)
+    cm.check_integrity()
+    assert calls == [('export', req.table_idx), ('release', req.uid)]
+    assert node.expert_profile is profile
+    assert all(torch.equal(a, b) for a, b in zip(tensors(pool, frozen), expected))
+
+    # The earlier boundary remains useful even when an aligned finish can also
+    # donate a longer prefix. Admission uses its advice with the same KV/state.
+    ids = torch.arange(boundary + 1, dtype=torch.int32)
+    match = cm.prefix_cache.match_prefix(ids)
+    assert match.cached_len == boundary and match.mamba_value == frozen
+    assert torch.equal(match.kv_indices, expected_pages)
+    assert cm.admit_expert_profile(2, ids) is profile
+    assert calls[-1] == ('admit', 2, profile)
+    assert cm.lookup_expert_profile(torch.arange(133 + tail, dtype=torch.int32)) is profile
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_finish_without_export_preserves_existing_prefix_profile(monkeypatch, failed):
+    from freetoken.moe.session_profile import SessionExpertProfile
+
+    cm, tm, _pm, _pool, req, _boundary, _snapshots = prefill(monkeypatch, 135, [128, 128])
+    cm.cache_req(req, finished=False)
+    node = req.cache_handle.node
+    old_profile = SessionExpertProfile(ids=((1,),), counts=((2.0,),))
+    node.expert_profile = old_profile
+    calls = profile_source(cm, old_profile if failed else None)
+
+    cm.cache_req(req, finished=True, failed=failed)
+    tm.free(req.table_idx)
+    cm.check_integrity()
+    assert node.expert_profile is old_profile
+    assert calls == ([('release', req.uid)] if failed else
+                     [('export', req.table_idx), ('release', req.uid)])
+
+
+def test_finish_without_reusable_prefix_does_not_attach_profile_to_root(monkeypatch):
+    from freetoken.moe.session_profile import SessionExpertProfile
+
+    cm, tm, _pm, pool, req, boundary, _snapshots = prefill(monkeypatch, 7, [8])
+    assert boundary is None and req.cache_handle.cached_len == 0
+    root = req.cache_handle.node
+    profile_source(cm, SessionExpertProfile(ids=((1,),), counts=((2.0,),)))
+    cm.cache_req(req, finished=True)
+    tm.free(req.table_idx)
+    cm.check_integrity()
+    assert root.expert_profile is None
+    assert cm.lookup_expert_profile(torch.arange(12, dtype=torch.int32)) is None
+    assert pool.num_free_slots == pool.num_slots - 1
