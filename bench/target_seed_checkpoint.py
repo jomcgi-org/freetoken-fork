@@ -11,18 +11,23 @@ _ACTIVE = None
 
 
 class SeedCheckpoint:
-    def __init__(self, views, *, gdn_sources, ple_layers, qsa_layers):
+    def __init__(self, views, *, gdn_sources, ple_layers, qsa_layers, width=2):
         import torch
 
         required = {"conv", "recurrent", "slot/ple_conv", "slot/ple_ngram_ctx", "qsa_pending"}
         if set(views) != required:
             raise ValueError("checkpoint requires exactly the supported Qwen request state")
+        if width not in (2, 3, 5):
+            raise ValueError("checkpoint width must be two, three or five")
+        self.width = width
         self.views = views
-        self.saved = {name: torch.empty_like(value) for name, value in views.items()}
+        self.prefixes = [{name: torch.empty_like(value) for name, value in views.items()}
+                         for _ in range(width - 1)]
+        self.saved = self.prefixes[0]
         self.gdn_sources, self.ple_layers, self.qsa_layers = gdn_sources, ple_layers, qsa_layers
-        self.expected = {("gdn", i): 2 for i in range(views["recurrent"].shape[0])}
-        self.expected.update({("ple", i): 2 for i in range(views["slot/ple_conv"].shape[0])})
-        self.expected.update({("qsa", i): 2 for i in range(views["qsa_pending"].shape[0])})
+        self.expected = {("gdn", i): width for i in range(views["recurrent"].shape[0])}
+        self.expected.update({("ple", i): width for i in range(views["slot/ple_conv"].shape[0])})
+        self.expected.update({("qsa", i): width for i in range(views["qsa_pending"].shape[0])})
         self.expected[("ngram", 0)] = 1
         for mapping, name in ((gdn_sources, "recurrent"), (ple_layers, "slot/ple_conv"),
                               (qsa_layers, "qsa_pending")):
@@ -32,9 +37,9 @@ class SeedCheckpoint:
         self.ready = False
 
     @classmethod
-    def from_engine(cls, engine, req, views):
+    def from_engine(cls, engine, req, views, *, width=2):
         pool = engine.linear_state_pool
-        return cls(views,
+        return cls(views, width=width,
                    gdn_sources={pool.recurrent_states[i].data_ptr(): i
                                 for i in range(pool.recurrent_states.shape[0])},
                    ple_layers=dict(pool._state_layer_index["ple_conv"]),
@@ -50,48 +55,54 @@ class SeedCheckpoint:
         if key not in self.expected or count >= self.expected[key]:
             raise RuntimeError("unexpected checkpoint state update")
         self.counts[key] = count + 1
-        return count == 0
+        return count
 
     def capture_gdn(self, state_source):
         index = self.gdn_sources[state_source.data_ptr()]
-        if self._visit("gdn", index):
+        step = self._visit("gdn", index)
+        if step < self.width - 1:
             for name in ("conv", "recurrent"):
-                self.saved[name][index].copy_(self.views[name][index])
+                self.prefixes[step][name][index].copy_(self.views[name][index])
 
     def capture_ple(self, layer_id):
         index = self.ple_layers[layer_id]
-        if self._visit("ple", index):
-            self.saved["slot/ple_conv"][index].copy_(self.views["slot/ple_conv"][index])
+        step = self._visit("ple", index)
+        if step < self.width - 1:
+            self.prefixes[step]["slot/ple_conv"][index].copy_(self.views["slot/ple_conv"][index])
 
     def capture_qsa(self, layer_id):
         index = self.qsa_layers[layer_id]
-        if self._visit("qsa", index):
-            self.saved["qsa_pending"][index].copy_(self.views["qsa_pending"][index])
+        step = self._visit("qsa", index)
+        if step < self.width - 1:
+            self.prefixes[step]["qsa_pending"][index].copy_(self.views["qsa_pending"][index])
 
     def capture_ngram(self, meta):
         import torch
 
         destination = self.saved["slot/ple_ngram_ctx"]
-        if (meta.input_ids.numel() != 2 or destination.ndim != 2
+        if (meta.input_ids.numel() != self.width or destination.ndim != 2
                 or destination.shape[0] != 1 or destination.shape[1] < 1
                 or meta.ngram_context.shape != destination.shape):
-            raise ValueError("checkpoint requires one two-token ngram history")
+            raise ValueError("checkpoint requires one matching-width ngram history")
         self._visit("ngram", 0)
         # Same integer shift as ordinary width-one commit; the live context still
         # receives the original two-token commit after this copy.
-        destination.copy_(torch.cat((meta.ngram_context[:, 1:],
-                                     meta.input_ids[:1].reshape(1, 1)), dim=1))
+        for length, prefix in enumerate(self.prefixes, 1):
+            history = torch.cat((meta.ngram_context, meta.input_ids[:length].reshape(1, -1)), dim=1)
+            prefix["slot/ple_ngram_ctx"].copy_(history[:, -destination.shape[1]:])
 
     def finish(self):
         if self.counts != self.expected:
-            raise RuntimeError("checkpoint did not observe both updates of every state")
+            raise RuntimeError("checkpoint did not observe every expected state update")
         self.ready = True
 
-    def restore(self):
+    def restore(self, prefix_len=1):
         if not self.ready:
             raise RuntimeError("checkpoint is not ready")
+        if not 1 <= prefix_len < self.width:
+            raise ValueError("checkpoint prefix is outside the retained range")
         for name, value in self.views.items():
-            value.copy_(self.saved[name])
+            value.copy_(self.prefixes[prefix_len - 1][name])
 
 
 @contextmanager
@@ -121,8 +132,8 @@ def install():
         checkpoint = _ACTIVE
         if checkpoint is None:
             return original_model(network, input_ids, batch)
-        if not getattr(batch, "mtp_fused", False) or input_ids.numel() != 2:
-            raise RuntimeError("checkpoint capture requires a fused two-token forward")
+        if not getattr(batch, "mtp_fused", False) or input_ids.numel() != checkpoint.width:
+            raise RuntimeError("checkpoint capture requires a matching-width fused forward")
         checkpoint.begin()
         result = original_model(network, input_ids, batch)
         checkpoint.finish()

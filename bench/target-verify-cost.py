@@ -20,14 +20,23 @@ GRAPH_ENV = "FREETOKEN_TARGET_VERIFY_GRAPH"
 TRACE_ENV = "FREETOKEN_TARGET_VERIFY_LAYER_TRACE"
 SERIAL_LINEAR_ENV = "FREETOKEN_TARGET_VERIFY_SERIAL_LINEAR"
 CHECKPOINT_ENV = "FREETOKEN_TARGET_VERIFY_SEED_CHECKPOINT"
+WIDTH_ENV = "FREETOKEN_TARGET_VERIFY_WIDTH"
 MODES = ("graph_one", "graph_two", "snapshot", "accept", "reject")
 GRAPH_MODES = ("accept_graph", "reject_graph")
 CHECKPOINT_MODES = ("accept_checkpoint", "reject_checkpoint")
 _ACTIVATIONS = {}
 _CHECKPOINT_API = None
+_MULTI_API = None
 
 
-def install_serial_linear():
+def verification_width():
+    width = int(os.environ.get(WIDTH_ENV, "2"))
+    if width not in (2, 3, 5):
+        raise ValueError("target verification width must be two, three or five")
+    return width
+
+
+def install_serial_linear(width=2):
     """Keep ordinary dense row reduction order inside the two-token diagnostic."""
     import torch
     import torch.nn.functional as functional
@@ -36,14 +45,14 @@ def install_serial_linear():
     original = functional.linear
 
     def linear(input, weight, bias=None):
-        if input.ndim == 2 and input.shape[0] == 2:
+        if input.ndim == 2 and input.shape[0] == width:
             try:
                 batch = get_global_ctx().batch
             except AssertionError:
                 batch = None
             if getattr(batch, "mtp_fused", False):
-                return torch.cat((original(input[:1], weight, bias),
-                                  original(input[1:], weight, bias)), dim=0)
+                return torch.cat([original(input[i:i + 1], weight, bias)
+                                  for i in range(width)], dim=0)
         return original(input, weight, bias)
 
     functional.linear = linear
@@ -167,17 +176,19 @@ def difference_metrics(actual, expected):
 
 
 def host_contexts(history, position, ids, contexts, boundary):
-    """Fill the two token-ordered PLE contexts, including left padding."""
-    if ids.numel() != 2 or contexts.shape[0] != 2 or history.numel() < position:
-        raise ValueError("two-token PLE staging requires complete host history")
+    """Fill token-ordered PLE contexts from known inputs, including left padding."""
+    if (ids.numel() not in (2, 3, 5) or contexts.shape[0] != ids.numel()
+            or history.numel() < position):
+        raise ValueError("PLE staging requires matching width and complete host history")
     width = contexts.shape[1]
     contexts.fill_(boundary)
     count = min(width, position)
     if count:
         contexts[0, width - count:].copy_(history[position - count:position])
     if width:
-        contexts[1, :-1].copy_(contexts[0, 1:])
-        contexts[1, -1].copy_(ids[0])
+        for step in range(1, ids.numel()):
+            contexts[step, :-1].copy_(contexts[step - 1, 1:])
+            contexts[step, -1].copy_(ids[step - 1])
 
 
 def install_layer_trace():
@@ -235,7 +246,7 @@ def activation_comparison(actual, expected):
     return {name: difference_metrics(value, expected[name]) for name, value in actual.items()}
 
 
-def install_graph_support():
+def install_graph_support(width=2):
     """Diagnostic-only adaptations of the existing feat/mtp-graphs PLE work.
 
     Retain serial width-one GDN updates. Only provision PLE's second row and make
@@ -258,11 +269,11 @@ def install_graph_support():
         return indptrs[key]
 
     def uring(table, *args, **kwargs):
-        kwargs["max_decode_batch_size"] = max(2, kwargs["max_decode_batch_size"])
+        kwargs["max_decode_batch_size"] = max(width, kwargs["max_decode_batch_size"])
         original_uring(table, *args, **kwargs)
 
     def hash_constants(embedding, max_batch_size=None):
-        original_hash(embedding, max(2, max_batch_size or 0))
+        original_hash(embedding, max(width, max_batch_size or 0))
 
     def metadata(batch, args, device, context_pool=None):
         if not getattr(batch, "mtp_fused", False):
@@ -270,17 +281,17 @@ def install_graph_support():
         if context_pool is None:
             context_pool = ple._ngram_context_pool()
         slots = batch.linear_table_idx.long()
-        if slots.numel() != 1 or batch.input_ids.numel() != 2:
-            raise ValueError("fused probe requires one request and two tokens")
-        return ple.PLEMetadata(input_ids=batch.input_ids, cu_seqlens=indptr(device, 2),
-                               seq_lens=(2,), ngram_context=context_pool.index_select(0, slots).long(),
+        if slots.numel() != 1 or batch.input_ids.numel() != width:
+            raise ValueError("fused probe requires one request and matching token width")
+        return ple.PLEMetadata(input_ids=batch.input_ids, cu_seqlens=indptr(device, width),
+                               seq_lens=(width,), ngram_context=context_pool.index_select(0, slots).long(),
                                state_slots=slots, fresh_slots=None, is_decode=False, mtp_fused=True)
 
     def short_conv(layer, x, meta, states):
         if not meta.mtp_fused:
             return original_conv(layer, x, meta, states)
         pieces = []
-        for step in range(2):
+        for step in range(width):
             one = ple.PLEMetadata(input_ids=meta.input_ids[step:step + 1],
                                    cu_seqlens=indptr(meta.cu_seqlens.device, 1), seq_lens=(1,),
                                    ngram_context=meta.ngram_context, state_slots=meta.state_slots,
@@ -306,6 +317,7 @@ class FusedGraph:
         from freetoken.attention.linear import build_fla_metadata
 
         self.engine = engine
+        self.width = width = source.input_ids.numel()
         self.batch = batch = copy.copy(source)
         batch.input_ids = source.input_ids.clone()
         batch.positions = source.positions.clone()
@@ -317,14 +329,14 @@ class FusedGraph:
         # tensors. Keep those tensors alive and fixed throughout this graph's use.
         engine.attn_backend.prepare_metadata(batch)
         args = engine.model._config.qwen4_args
-        self.ids = torch.empty(2, dtype=torch.int64, pin_memory=True)
-        self.contexts = torch.empty((2, args.ngram_size - 1), dtype=torch.int64, pin_memory=True)
+        self.ids = torch.empty(width, dtype=torch.int64, pin_memory=True)
+        self.contexts = torch.empty((width, args.ngram_size - 1), dtype=torch.int64, pin_memory=True)
         self.boundary = args.ngram_boundary_token_id
         self.copy_done = torch.cuda.Event()
         self.backends = getattr(engine.model, "_ple_disk_decode", ())
         if not self.backends:
             raise RuntimeError("verification graph probe requires staged PLE backends")
-        self.logits = torch.empty((2, engine.config.model_config.vocab_size),
+        self.logits = torch.empty((width, engine.config.model_config.vocab_size),
                                   device=engine.device, dtype=torch.float32)
         self.graph = torch.cuda.CUDAGraph()
         self._prepare()
@@ -382,7 +394,7 @@ class StateWindow:
     rejection with another ordinary decode checks that those rows are overwritten.
     """
 
-    def __init__(self, engine, req, position):
+    def __init__(self, engine, req, position, *, width=2):
         self.engine, self.req = engine, req
         self.page_size = engine.config.page_size
         self.ratio = engine.kv_cache.index_ratio
@@ -396,7 +408,9 @@ class StateWindow:
         page = physical[0] // self.page_size
         if page >= engine.num_pages:
             raise RuntimeError("probe must not use the dummy KV page")
-        self.locations = page_row[position - self.base:position - self.base + 2].clone()
+        self.locations = page_row[position - self.base:position - self.base + width].clone()
+        if self.locations.numel() != width:
+            raise RuntimeError("verification window extends beyond its allocated page")
         self.views = state_views(engine, req)
         self.views["kv_page"] = engine.kv_cache._kv_buffer.select(2, page)
         begin = physical[0] // self.ratio
@@ -656,6 +670,10 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
 
 
 def probe(engine, batch, directory, *, repeats=4, warmup=1):
+    width = verification_width()
+    if width > 2:
+        return _MULTI_API["probe"](engine, batch, directory, width=width, base=globals(),
+                                    seed_api=_CHECKPOINT_API, repeats=repeats, warmup=warmup)
     import torch
     from freetoken.kernel import _cpu_moe
     import hashlib
@@ -717,7 +735,7 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
 
 def install(engine_class):
     """Provision the diagnostic before Engine initializes CUDA; no draft head."""
-    global _CHECKPOINT_API
+    global _CHECKPOINT_API, _MULTI_API
     import torch
     from freetoken.kvcache.qsa_pool import QSAKVCache
     from freetoken.moe.cpu_executor import CpuMoeExecutor
@@ -726,14 +744,18 @@ def install(engine_class):
         raise RuntimeError("explicit private probe output directory is required")
     if torch.cuda.is_initialized():
         raise RuntimeError("install the probe before Engine initializes CUDA")
+    width = verification_width()
+    if width > 2 and (os.environ.get(GRAPH_ENV) != "1" or os.environ.get(SERIAL_LINEAR_ENV) != "1"
+                      or os.environ.get(CHECKPOINT_ENV) != "1" or os.environ.get(TRACE_ENV) == "1"):
+        raise RuntimeError("wider verification requires graphs, serial linears and checkpoints, with tracing off")
     if os.environ.get(SERIAL_LINEAR_ENV) == "1":
-        install_serial_linear()
+        install_serial_linear(width)
     if os.environ.get(TRACE_ENV) == "1":
         if os.environ.get(GRAPH_ENV) == "1":
             raise RuntimeError("run activation tracing separately from graph cost measurement")
         install_layer_trace()
     if os.environ.get(GRAPH_ENV) == "1":
-        install_graph_support()
+        install_graph_support(width)
     if os.environ.get(CHECKPOINT_ENV) == "1":
         if (os.environ.get(GRAPH_ENV) != "1" or os.environ.get(SERIAL_LINEAR_ENV) != "1"
                 or os.environ.get(TRACE_ENV) == "1"):
@@ -741,6 +763,10 @@ def install(engine_class):
         import runpy
         _CHECKPOINT_API = runpy.run_path(str(Path(__file__).with_name("target_seed_checkpoint.py")))
         _CHECKPOINT_API["install"]()
+    if width > 2:
+        import runpy
+        _MULTI_API = runpy.run_path(str(Path(__file__).with_name("target_multitoken.py")))
+        _MULTI_API["install"](width)
     directory = Path(os.environ[OUTPUT_ENV])
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     original_cpu_init = CpuMoeExecutor.__init__
@@ -751,11 +777,11 @@ def install(engine_class):
     def cpu_init(executor, *args, **kwargs):
         if kwargs.get("max_tokens") != 1:
             raise RuntimeError("probe requires the capacity-one CPU decode configuration")
-        kwargs["max_tokens"] = 2
+        kwargs["max_tokens"] = width
         original_cpu_init(executor, *args, **kwargs)
 
     def ring_capacity(cls, index_ratio, num_speculative_tokens=0):
-        return original_ring_capacity(index_ratio, max(1, num_speculative_tokens))
+        return original_ring_capacity(index_ratio, max(width - 1, num_speculative_tokens))
 
     def initialize(engine, config):
         if (config.speculative_mtp != "off" or config.max_running_req != 1
@@ -775,7 +801,9 @@ def install(engine_class):
             if (req.decode_batch_idx >= 16 and req.sampling_params.is_greedy
                     and req.sampling_params.guided_decoding is None
                     and eligible_position(req.cached_len, page_size=engine.config.page_size,
-                                          ratio=engine.kv_cache.index_ratio, remaining=req.remain_len)):
+                                          ratio=engine.kv_cache.index_ratio, remaining=req.remain_len)
+                    and (width == 2 or _MULTI_API["eligible_window"](
+                        req.cached_len, engine.config.page_size, width, req.remain_len))):
                 with torch.inference_mode():
                     probe(engine, batch, directory)
                 # This request is intentionally aborted. Its repeated expert/cache
