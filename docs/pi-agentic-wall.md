@@ -97,7 +97,7 @@ settled completion, response truncation, call/time limits, and overlapping tool
 spans. Real Pi/FreeToken integration and controlled runtime comparisons are
 recorded separately; no agentic speedup is claimed by adding this client.
 
-The [17 focused client checks](../bench/results/4090-pi-agentic-client-validation-20260906.json)
+The [18 focused client checks](../bench/results/4090-pi-agentic-client-validation-20260906.json)
 pass on Linux and macOS. The [first development smoke](../bench/results/4090-pi-agentic-development-smoke-20260906.json)
 passed the TTL stage, exercised real read/write/edit/bash tools and reported
 prefix reuse on subsequent model calls. It failed during stage two when the
@@ -106,4 +106,26 @@ model calls remain a failed integration attempt, with no speedup claim. The
 original server had diagnostics enabled and other requests were not excluded.
 The client and grader were still being developed during that attempt. The
 final client snapshots its grader and defaults to an 8192-token allowance.
-A complete frozen-client integration run remains pending.
+The [frozen-client integration at 460c6ff](../bench/results/4090-pi-agentic-integration-20260906.json)
+then passed all three independent stages in 464.073 seconds (7m 44s), using
+18 model calls, 16 tool executions, and 5493 output tokens. Stage wall times,
+including each verifier, were 125.393, 219.687, and 118.994 seconds. Two failed
+local test commands were recovered within Pi's own loop; the independent
+verifier needed no additional repair prompts. Reported conversation context
+grew to 14406 tokens, with cached prefixes reported on 17 of 18 model calls.
+All final stage responses completed normally. The record retains both failed
+test outputs, later passing runs, complete messages, and the final source/tests.
+
+The Mac spent about 0.424 seconds executing tools and 0.205 seconds in the
+independent verifier across the whole run. The remaining wall time includes
+model requests, server queueing, transport, and client orchestration; this
+integration does not isolate those components. The original server retained
+diagnostics and was not isolated from other clients, so 464 seconds is an
+integration observation, not a qualified optimization result. No runtime A/B
+comparison has been made with this client yet.
+
+The final client also catches interruption, terminates Pi and its remaining
+process group, retains the failed attempt, and does not start another session.
+An incomplete or cancelled session schedule exits unsuccessfully. The extra
+hermetic cancellation case passes on Linux and macOS; it does not change the
+completed integration's prompt, sampling, tool, or grading protocol.

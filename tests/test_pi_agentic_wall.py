@@ -4,6 +4,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import time
 
@@ -243,3 +245,47 @@ def test_overlapping_tools_use_union_and_assistant_usage_is_not_duplicated():
     assert metrics["tool_wall_s"] == 4
     assert metrics["tool_calls"] == 2 and metrics["tool_errors"] == 1
     assert metrics["model_usage"] == [dict(input=100, output=20)]
+
+
+def test_interrupted_cli_records_failure_and_stops_pi_before_next_session(tmp_path):
+    fake = tmp_path / "pi"
+    fake.write_text(f"#!{sys.executable}\n" + '''import json,os,sys,time
+from pathlib import Path
+if "--version" in sys.argv:
+    print("0.85.1")
+    raise SystemExit(0)
+for line in sys.stdin:
+    command = json.loads(line)
+    if command["type"] == "get_state":
+        print(json.dumps(dict(type="response",id=command["id"],success=True,data=dict(model=dict(provider="freetoken",id="qwen3.6-27b")))),flush=True)
+    if command["type"] == "prompt":
+        Path("ready.pid").write_text(str(os.getpid()))
+        print(json.dumps(dict(type="response",id=command["id"],success=True)),flush=True)
+        time.sleep(30)
+''')
+    fake.chmod(0o755)
+    output = tmp_path / "output"
+    process = subprocess.Popen([sys.executable, str(ROOT / "bench/pi-agentic-wall.py"),
+                                "--pi", str(fake), "--output-dir", str(output),
+                                "--label", "hermetic-interruption", "--sessions", "2"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    ready = output / "workspace/ready.pid"
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists():
+            if process.poll() is not None or time.monotonic() > deadline:
+                raise AssertionError("fake Pi did not accept prompt")
+            time.sleep(0.01)
+        pi_pid = int(ready.read_text())
+        process.send_signal(signal.SIGTERM)
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 1, (stdout, stderr)
+        row = json.loads((output / "session-1/result.json").read_text())
+        assert not row["passed"] and "interrupted by signal" in row["error"]
+        assert not (output / "session-2").exists()
+        summary = json.loads((output / "summary.json").read_text())
+        assert summary["cancelled"] and not summary["completed_schedule"]
+        with pytest.raises(ProcessLookupError):
+            os.kill(pi_pid, 0)
+    finally:
+        client.kill_group(process)

@@ -289,6 +289,7 @@ def main():
                     trace=args.trace, started_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     task=task, model_config=model_config(args),
                     settings=json.loads((config / "settings.json").read_text()),
+                    requested_sessions=args.sessions,
                     budgets=dict(timeout=args.timeout, repairs=args.repairs, max_model_calls=args.max_model_calls),
                     sources={str(p.relative_to(HERE)): sha(p) for p in
                              [Path(__file__), HERE / "agentic-verify.py", HERE / "pi/package-lock.json",
@@ -299,6 +300,17 @@ def main():
     write_json(root / "metadata.json", metadata)
     rows = []
     workspace = root / "workspace"
+    cancelled = False
+
+    def interrupted(signum, _frame):
+        nonlocal cancelled
+        cancelled = True
+        # selectors treats InterruptedError as an interrupted system call and
+        # can swallow it. Use a regular exception to retain the cancellation.
+        raise RuntimeError(f"benchmark interrupted by signal {signum}")
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     for ordinal in range(1, args.sessions + 1):
         if workspace.exists():
             shutil.rmtree(workspace)
@@ -344,12 +356,16 @@ def main():
         write_json(session_dir / "result.json", row)
         rows.append(row)
         summary = summarize(rows)
+        summary["cancelled"] = cancelled
+        summary["completed_schedule"] = not cancelled and len(rows) == args.sessions
         summary["wall_gate_eligible"] = False
         summary["qualification_note"] = "Requires paired server-controlled runs and review of server identity, diagnostics, cache state and competing work."
         write_json(root / "summary.json", summary)
         print(json.dumps(dict(ordinal=ordinal, passed=row["passed"], wall_s=row["task_wall_s"],
                               model_calls=row.get("model_calls"), error=row.get("error"))), flush=True)
-    return 0 if all(row["passed"] for row in rows) else 1
+        if cancelled:
+            break
+    return 0 if not cancelled and len(rows) == args.sessions and all(row["passed"] for row in rows) else 1
 
 
 if __name__ == "__main__":
