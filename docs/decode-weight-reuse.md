@@ -69,3 +69,19 @@ Its recovery verified the original service. The second attempt retained that
 failure, waited for GPU release, passed compilation/tests/timings, and again
 verified a real completion from the restored original service. All native work
 started after the concurrent model wall-time driver had exited successfully.
+
+The [model wall-time driver](../bench/decode-weight-reuse-wall-driver.py) freezes
+the qualified `b8ac3f7` runtime and native binary. It offers four requests in all
+four starts, with reuse off/on/on/off and identical server capacity, KV reserve,
+reader policies, and automatic HOT adaptation settings. Each start runs four
+warmups, twelve measured complete responses, and eight fidelity cases. It checks
+the worker's actual reuse environment value and native mapping before timing.
+Only group elapsed time determines aggregate throughput; individual response
+latency and all outputs remain in the record.
+
+Launch the detached driver with a two-hour runtime limit and the
+[recovery script](../bench/decode-weight-reuse-wall-restore.sh) as `ExecStopPost`.
+It waits for GPU release before each benchmark start and restores the original
+service with a real completion afterward. `--preflight` checks frozen sources,
+the completed native validation record, and binary identity without stopping
+the current service. This model comparison remains pending.
