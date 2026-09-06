@@ -48,10 +48,10 @@ checks also pass under CUDA memcheck with zero errors. The fifteen client
 diagnostic protocol checks pass on Linux. The
 [validation record](../bench/results/4090-hot-staging-io-validation-20260906.json)
 includes exact commands, driver, output, successful unit completion, and a
-real `OK` response from the restored original service. Model wall-time
-qualification remains pending. No performance gain is claimed yet.
+real `OK` response from the restored original service. The completed model
+comparison below finds a wall-time regression. No performance gain qualifies.
 
-The next model comparison uses the checked-in
+The model comparison uses the checked-in
 [`sustained-hot-staging-wall-driver.py`](../bench/sustained-hot-staging-wall-driver.py)
 on the frozen, validated `878d723` runtime for both policies. Only
 `--moe-hot-staging-io` changes, in mmap/buffered/buffered/mmap start order.
@@ -98,8 +98,60 @@ sets state on the open file. Its
 [synchronous read path](https://github.com/torvalds/linux/blob/v6.8/mm/readahead.c#L633)
 uses forced reads for the requested range instead of normal readahead
 prediction. This is not a cache-insertion ban or proof of zero extra I/O.
-The distinction is a candidate explanation to investigate if the buffered
-HOT reader loses. Whole-worker counters cannot establish readahead as the
+The distinction is a candidate explanation of the buffered HOT reader's
+regression. Whole-worker counters cannot establish readahead as the
 cause, and the frozen wall-time experiment does not contain an advice change.
 Any follow-up must preserve the same bytes and validate complete response
 wall time with diagnostics off.
+
+## Completed whole-response comparison
+
+The four-start comparison finished successfully. The benchmark driver and
+server are inactive; the original system service is active and returned a
+real `OK` completion. The [complete record](../bench/results/4090-sustained-hot-staging-wall-20260906.json)
+retains all outputs, source revisions, exact drivers and clients, journals,
+native identities, matching startup geometry, and reproducible analysis.
+
+The buffered HOT reader loses against mmap on this sustained workload:
+
+| Client response | mmap HOT staging | Buffered HOT staging | Buffered wall-time increase |
+| --- | ---: | ---: | ---: |
+| Complete JSON, mean | 22.303 s | 27.567 s | 23.6% |
+| Complete prose, mean | 16.525 s | 18.887 s | 14.3% |
+| Fixed 24-request mix, total | 465.939 s | 557.449 s | 19.6% |
+
+Both matched start orders regress, by 10.7% and 28.8%; 21 of 24 paired
+responses are slower. The source-balanced first halves take 25.3% longer,
+the second halves 12.5% longer. All twelve JSON pairs have identical text
+and token usage, so their 23.6% penalty is not an output-length effect.
+Mean prose output is 247.667 versus 249.583 tokens; every prose pair differs
+in text and usage. All responses and length differences remain in the record.
+
+JSON first-token time rises from 5.735 to 6.655 seconds, and subsequent
+generation rises from 16.568 to 20.912 seconds. Prose first-token time rises
+from 5.767 to 6.587 seconds, with subsequent generation rising from 10.758
+to 12.300 seconds. Mean whole-worker storage reads are 2.989 versus 4.945
+GiB per request in the first halves, and 0.548 versus 1.433 GiB in the second
+halves. These counters do not isolate HOT staging or establish readahead
+as the cause. The final mmap start also backs adaptation off to 2,000 routed
+tokens after an 829 ms staging batch, whereas the other starts retain the
+1,000-token interval. Actual transitions and dispatches are retained as
+downstream observations under identical controller settings.
+
+All 32 JSON responses, including warmups, finish normally and pass strict
+value, type, order, and multiplicity checks. All 32 prose responses finish
+normally in three paragraphs. All four starts retain the same 7/8 fidelity
+score and identical answers, including the code-trace error `108` (expected
+`68`). The assistant review covers all 32 prose responses, checking both
+ownership conditions and both ordering conditions. Measured mmap responses
+explicitly cover 79 of 84 reference-constraint instances, versus 81 with
+buffered reads. Both modes have omissions and unsupported connections, with
+no identified direct core contradiction. This is a small reference-based
+audit, not statistical evidence of model-quality equivalence.
+
+Keep mmap HOT staging with buffered staged GPU DISK prefill for this measured
+workload. These results are a separate comparison from the earlier combined
+17.8% gain against original CPU serving and cannot be added to it. The
+buffered HOT option remains experimental and default-off. Matching descriptor
+advice is a possible follow-up; a cheaper host-copy operation by itself is
+not enough to qualify a serving improvement.
