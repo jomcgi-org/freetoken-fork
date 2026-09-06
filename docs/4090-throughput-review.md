@@ -378,3 +378,15 @@ The tested automatic decode-history preference was reverted: it improved
 JSON by 26.8% but slowed prose by 8.6%. That experiment changed only placement
 planning, yet still failed the general throughput gate. It provides no reason
 to bias the model toward HOT experts.
+
+A separate [multi-turn Pi benchmark (#38)](https://github.com/jomcgi-org/freetoken-fork/pull/38)
+is being qualified for the interactive workload. It keeps one agent session
+through code changes, local tests, follow-up requirements, and independent
+cumulative checks. Its timer includes tool execution and check-driven repairs.
+The existing prompt gates disable prefix reuse and cannot represent this path.
+The client has 17 passing focused checks on Linux and macOS; complete live
+integration and paired server timing are still pending. The first development
+attempt passed the initial task stage and reported cached prefixes, then failed
+a truncated tool call under its small output cap. That failure is retained.
+Neither the client addition nor its development run changes the established
+17.8% sustained combined wall-time result.
