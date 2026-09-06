@@ -69,8 +69,8 @@ def make_cache(sources, *, staged, threads):
         num_layers=1, num_experts=EXPERTS, cache_size=EXPERTS,
         device=torch.device('cuda'), quant_format='nvfp4', decode_target='gpu',
         prefill_overlap=False, moe_disk_decode='gpufetch' if staged else 'cpu',
-        collect_stats=False,
     )
+    assert not cache.collect_stats
     cache.set_bank_sources({name: [source] for name, source in sources.items()},
                            layer_residency=['disk' if staged else 'pinned'])
     executor = None
