@@ -1,0 +1,132 @@
+[
+  {
+    "kind": "eof",
+    "command": [
+      "sudo",
+      "-n",
+      "systemd-run",
+      "--unit=astra-pi-agentic-lease",
+      "--pipe",
+      "--wait",
+      "--collect",
+      "--uid=jomcgi",
+      "--property=RuntimeMaxSec=180",
+      "--property=TimeoutStopSec=600",
+      "--property=ExecStopPost=/usr/bin/python3 /var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-runtime-driver-checks/bench/pi-agentic-runtime-driver.py --remote restore --run-id astra-pi-agentic-lease-eof-20260906",
+      "/usr/bin/python3",
+      "/var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-runtime-driver-checks/bench/pi-agentic-runtime-driver.py",
+      "--remote",
+      "hold",
+      "--run-id",
+      "astra-pi-agentic-lease-eof-20260906"
+    ],
+    "returncode": 0,
+    "wall_s": 2.0464704199985135,
+    "output": "Running as unit: astra-pi-agentic-lease.service\nLEASE_READY\n{\n  \"lease\": \"closed\"\n}\n{\n  \"started_utc\": \"2026-09-06T03:07:13Z\",\n  \"health\": {\n    \"status\": \"ok\",\n    \"model\": \"qwen3.6-27b\",\n    \"instance_id\": \"cca59183-6241-4488-b2ee-ede0775f8b8c\",\n    \"uptime_s\": 3341,\n    \"maintenance\": \"serving\",\n    \"version\": \"0.1.2\"\n  },\n  \"completion\": {\n    \"id\": \"chatcmpl-76\",\n    \"object\": \"chat.completion\",\n    \"created\": 1788664035,\n    \"model\": \"qwen3.6-27b\",\n    \"choices\": [\n      {\n        \"index\": 0,\n        \"message\": {\n          \"role\": \"assistant\",\n          \"content\": \"OK\"\n        },\n        \"finish_reason\": \"stop\"\n      }\n    ],\n    \"usage\": {\n      \"prompt_tokens\": 17,\n      \"completion_tokens\": 2,\n      \"total_tokens\": 19\n    }\n  },\n  \"unit\": {\n    \"MainPID\": \"749860\",\n    \"Result\": \"success\",\n    \"ControlGroup\": \"/system.slice/freetoken-serve.service\",\n    \"ActiveState\": \"active\",\n    \"InvocationID\": \"cb8bbc936c634b5b8e88e1718825d5d8\"\n  },\n  \"verified\": true\n}\nFinished with result: success\nMain processes terminated with: code=exited/status=0\nService runtime: 2.021s\nCPU time consumed: 175ms\nMemory peak: 44.5M\nMemory swap peak: 0B\n",
+    "restoration": {
+      "started_utc": "2026-09-06T03:07:13Z",
+      "health": {
+        "status": "ok",
+        "model": "qwen3.6-27b",
+        "instance_id": "cca59183-6241-4488-b2ee-ede0775f8b8c",
+        "uptime_s": 3341,
+        "maintenance": "serving",
+        "version": "0.1.2"
+      },
+      "completion": {
+        "id": "chatcmpl-76",
+        "object": "chat.completion",
+        "created": 1788664035,
+        "model": "qwen3.6-27b",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "OK"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 17,
+          "completion_tokens": 2,
+          "total_tokens": 19
+        }
+      },
+      "unit": {
+        "MainPID": "749860",
+        "Result": "success",
+        "ControlGroup": "/system.slice/freetoken-serve.service",
+        "ActiveState": "active",
+        "InvocationID": "cb8bbc936c634b5b8e88e1718825d5d8"
+      },
+      "verified": true
+    }
+  },
+  {
+    "kind": "timeout",
+    "command": [
+      "sudo",
+      "-n",
+      "systemd-run",
+      "--unit=astra-pi-agentic-lease",
+      "--pipe",
+      "--wait",
+      "--collect",
+      "--uid=jomcgi",
+      "--property=RuntimeMaxSec=180",
+      "--property=TimeoutStopSec=600",
+      "--property=ExecStopPost=/usr/bin/python3 /var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-runtime-driver-checks/bench/pi-agentic-runtime-driver.py --remote restore --run-id astra-pi-agentic-lease-timeout-20260906",
+      "/usr/bin/python3",
+      "/var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-runtime-driver-checks/bench/pi-agentic-runtime-driver.py",
+      "--remote",
+      "hold",
+      "--run-id",
+      "astra-pi-agentic-lease-timeout-20260906"
+    ],
+    "returncode": 1,
+    "wall_s": 91.942669526994,
+    "output": "Running as unit: astra-pi-agentic-lease.service\nLEASE_READY\nTraceback (most recent call last):\n  File \"/var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-runtime-driver-checks/bench/pi-agentic-runtime-driver.py\", line 483, in <module>\n    raise SystemExit(main())\n                     ^^^^^^\n  File \"/var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-runtime-driver-checks/bench/pi-agentic-runtime-driver.py\", line 475, in main\n    print(json.dumps(remote_main(args), indent=2), flush=True)\n                     ^^^^^^^^^^^^^^^^^\n  File \"/var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-runtime-driver-checks/bench/pi-agentic-runtime-driver.py\", line 236, in remote_main\n    return hold_connection(sys.stdin)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-runtime-driver-checks/bench/pi-agentic-runtime-driver.py\", line 204, in hold_connection\n    raise TimeoutError('client stopped renewing the benchmark lease')\nTimeoutError: client stopped renewing the benchmark lease\n{\n  \"started_utc\": \"2026-09-06T03:08:45Z\",\n  \"health\": {\n    \"status\": \"ok\",\n    \"model\": \"qwen3.6-27b\",\n    \"instance_id\": \"cca59183-6241-4488-b2ee-ede0775f8b8c\",\n    \"uptime_s\": 3433,\n    \"maintenance\": \"serving\",\n    \"version\": \"0.1.2\"\n  },\n  \"completion\": {\n    \"id\": \"chatcmpl-78\",\n    \"object\": \"chat.completion\",\n    \"created\": 1788664127,\n    \"model\": \"qwen3.6-27b\",\n    \"choices\": [\n      {\n        \"index\": 0,\n        \"message\": {\n          \"role\": \"assistant\",\n          \"content\": \"OK\"\n        },\n        \"finish_reason\": \"stop\"\n      }\n    ],\n    \"usage\": {\n      \"prompt_tokens\": 17,\n      \"completion_tokens\": 2,\n      \"total_tokens\": 19\n    }\n  },\n  \"unit\": {\n    \"MainPID\": \"749860\",\n    \"Result\": \"success\",\n    \"ControlGroup\": \"/system.slice/freetoken-serve.service\",\n    \"ActiveState\": \"active\",\n    \"InvocationID\": \"cb8bbc936c634b5b8e88e1718825d5d8\"\n  },\n  \"verified\": true\n}\nFinished with result: exit-code\nMain processes terminated with: code=exited/status=1\nService runtime: 1min 31.888s\nCPU time consumed: 198ms\nMemory peak: 31.8M\nMemory swap peak: 0B\n",
+    "restoration": {
+      "started_utc": "2026-09-06T03:08:45Z",
+      "health": {
+        "status": "ok",
+        "model": "qwen3.6-27b",
+        "instance_id": "cca59183-6241-4488-b2ee-ede0775f8b8c",
+        "uptime_s": 3433,
+        "maintenance": "serving",
+        "version": "0.1.2"
+      },
+      "completion": {
+        "id": "chatcmpl-78",
+        "object": "chat.completion",
+        "created": 1788664127,
+        "model": "qwen3.6-27b",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "OK"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 17,
+          "completion_tokens": 2,
+          "total_tokens": 19
+        }
+      },
+      "unit": {
+        "MainPID": "749860",
+        "Result": "success",
+        "ControlGroup": "/system.slice/freetoken-serve.service",
+        "ActiveState": "active",
+        "InvocationID": "cb8bbc936c634b5b8e88e1718825d5d8"
+      },
+      "verified": true
+    }
+  }
+]

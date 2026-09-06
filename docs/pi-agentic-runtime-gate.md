@@ -73,3 +73,11 @@ found reasoning/coding degradation with aggressive variants and lower
 throughput than FP8 on its H100 workloads. Those are not this model's results.
 Any implementation needs its own quality and non-debug wall-time gate; this
 comparison retains FP8 unchanged.
+
+Nine focused driver checks pass on Linux and macOS. Live systemd probes also
+verify both normal EOF recovery and the 90-second missing-heartbeat timeout.
+Both probes confirm a real completion from the original service and preserve
+its invocation, since it was already serving. The timeout probe exits
+unsuccessfully as expected and still runs recovery. The
+[complete recovery record](../bench/results/4090-pi-runtime-recovery-20260906.json)
+retains both commands, exit status, output, and verified original completion.
