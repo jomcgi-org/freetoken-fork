@@ -85,7 +85,7 @@ def test_checkpoint_restores_seed_state_without_touching_other_request_slots(sta
 
 def test_missing_state_update_never_reuses_a_previous_checkpoint(state):
     advance(state)
-    with pytest.raises(RuntimeError, match="both updates"):
+    with pytest.raises(RuntimeError, match="every expected"):
         advance(state, omit_second_qsa=True)
     with pytest.raises(RuntimeError, match="not ready"):
         state.cp.restore()
@@ -151,6 +151,7 @@ def test_hooks_preserve_outputs_and_only_capture_inside_explicit_context(monkeyp
     cp = SimpleNamespace(**{name: (lambda *a, name=name: calls.append((name, a)))
                             for name in ("begin", "finish", "capture_gdn", "capture_ple",
                                          "capture_qsa", "capture_ngram")})
+    cp.width = 2
     with checkpoint.capture_context(cp):
         assert network.forward(token_ids, batch) is output
     assert calls == [("begin", ()), ("capture_gdn", ("state",)), ("capture_ple", (5,)),
