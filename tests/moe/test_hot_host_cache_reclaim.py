@@ -1,8 +1,11 @@
 """Immutable file reclamation, cold-page preservation and HOT publication."""
 
 import ctypes
+import importlib.util
+import json
 import mmap
 import os
+from pathlib import Path
 import sys
 
 import pytest
@@ -190,6 +193,31 @@ def test_reclamation_skips_retired_owners_and_warns_once(tmp_path, monkeypatch):
     assert cache._reclaim_hot_host_rows(swaps) == 0
     assert cache._reclaim_hot_host_rows(swaps) == 0
     assert rows == [2, 2] and len(warnings) == 1
+
+
+def test_explicit_census_records_actual_pages_and_exact_cached_bytes_once(tmp_path, monkeypatch):
+    path = Path(__file__).parents[2] / "bench/hot-host-cache-census.py"
+    spec = importlib.util.spec_from_file_location("hot_census_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.delenv("FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR", raising=False)
+    with pytest.raises(RuntimeError, match="explicit census"):
+        module.install()
+    root = tmp_path / "census"
+    monkeypatch.setenv("FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR", str(root))
+    monkeypatch.setattr(OffloadMoeCache, "_reclaim_hot_host_rows", OffloadMoeCache._reclaim_hot_host_rows)
+    module.install()
+    cache, _, _, _, _ = cache_with_file_rows(tmp_path, "reclaim", "cpu")
+    cache._hot_slot_owners = {0: [0, 1]}
+    cache._reload_hot_slots()
+    cache._reload_hot_slots()
+    records = [json.loads(line) for path in root.glob("*.jsonl") for line in path.read_text().splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record['rows'] == 2 and record['layers'] == 1
+    assert record['resident_hot_bytes_before'] == record['advised_bytes'] == 3 * mmap.PAGESIZE
+    assert record['resident_hot_bytes_after'] == 0 and record['gpu_bytes_equal']
+    assert record['diagnostic_only'] and not record['wall_time_qualified']
 
 
 @pytest.mark.parametrize("policy", [None, "reclaim"])

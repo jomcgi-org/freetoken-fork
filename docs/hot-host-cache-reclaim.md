@@ -29,3 +29,14 @@ pages separately with a diagnostic census; keep that census out of production
 and out of wall-time measurements. Reclamation can add syscall cost and future
 page faults, so keep this option disabled until a controlled complete-model
 comparison demonstrates a throughput benefit with matching work and outputs.
+
+The explicit diagnostic hook in `bench/hot-host-cache-census.py` records the
+first nonempty reclamation per cache. Set `FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR`
+to a private output directory and call its `install()` before engine creation.
+It queries actual file-page residency and hashes the GPU HOT weights before
+and after reclamation. This synchronizes and copies GPU data. Remove the hook
+and its environment variable for non-debug wall-time comparisons.
+
+Targeted Linux CPU checks and CUDA staging/publication checks pass, including
+actual file-page reclamation and exact cached weight bytes. Complete-model
+resident-memory and wall-time qualification remain pending.
