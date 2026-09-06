@@ -26,6 +26,8 @@ prediction, logit and committed-state comparison must match ordinary decoding
 exactly. Each partial acceptance gets its own forced-rejection trial and subsequent
 ordinary continuation check. Unknown state, missing updates or mismatches fail
 qualification, including failures during warmup.
+Retained state storage grows with proposal width; a serving integration must
+budget those buffers alongside expert and KV residency.
 
 Four adjacent windows cover the QSA compression offsets, with the full target
 width contained in one allocated KV page. Timings alternate ordinary decode,
@@ -37,5 +39,14 @@ distribution to estimate cost; a single acceptance percentage is insufficient.
 
 These repeated windows warm the expert/file working set. Component costs exclude
 proposer and serving scheduler work, and all measured artifacts remain private.
-They cannot qualify serving throughput or broad quality equivalence. Focused
-Linux checks and full target-model validation are pending.
+They cannot qualify serving throughput or broad quality equivalence.
+
+Validation: focused Linux checks pass, including prefix-specific restoration,
+state-slot isolation, independent QSA lengths/addresses and unchanged ordinary
+operation delegation. Full target-model execution completed at both wider
+settings, with tracing disabled. Predictions, logits, retained prefixes and
+committed state matched ordinary decode in the tested windows, including every
+forced rejection prefix and subsequent ordinary continuation. Original serving
+was restored after each experiment. These local comparisons do not cover every
+input, cache boundary or sampling setting; a serving integration needs separate
+wall-time and quality validation.

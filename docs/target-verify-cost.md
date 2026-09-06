@@ -115,3 +115,6 @@ come from a run with activation tracing disabled. These local comparisons do not
 establish equivalence across all inputs or sampling settings, and no proposer or
 serving scheduler is implemented here. All measured records remain private;
 successful execution does not qualify a serving throughput improvement.
+
+For wider proposals and retained state after each accepted prefix, see
+[the wider verification diagnostic](target-multitoken-cost.md).
