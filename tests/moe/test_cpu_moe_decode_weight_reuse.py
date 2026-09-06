@@ -148,6 +148,7 @@ def test_nvfp4_graph_replay_preserves_bits_with_both_transports(monkeypatch, fla
     if flag_sync and not executor._flag_sync:
         pytest.skip("CUDA stream memory operations are unavailable")
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         hidden = torch.randn(4, 256, dtype=torch.bfloat16, device="cuda")
         weights = torch.rand(4, 4, device="cuda")
