@@ -1041,6 +1041,8 @@ class HostBank:
         page cache so the executor's fixed mmap pointers encounter minor faults.
         UFFD banks stay on their pager-owned prefetch path. Tmpfs mirrors need no
         read and report their skipped logical bytes through the executor separately.
+        The optional resident-range experiment skips fully resident scratch-sized
+        reads; the return value counts only bytes actually read into scratch.
         """
         if not self._disk or self._uffd or self._tmpfs_backed:
             return 0
@@ -1061,10 +1063,22 @@ class HostBank:
         fd = os.open(self._file_path, os.O_RDONLY)
         total = 0
         try:
+            probe = None
+            if os.environ.get("FREETOKEN_PREFILL_POPULATE_SKIP_RESIDENT") == "1":
+                from freetoken.moe.resident_range import owned_file_probe
+
+                probe = owned_file_probe(fd, len(dst))
             for start, length in ranges:
                 done = 0
                 while done < length:
                     want = min(len(dst), length - done)
+                    if probe is not None and probe.resident(
+                        self._mapping_addr + start + done - self._map_offset, want
+                    ):
+                        # Populate data is discarded. Native compute retains its
+                        # original mmap pointers and can fault after a stale hint.
+                        done += want
+                        continue
                     if hasattr(os, "preadv"):
                         got = os.preadv(fd, [dst[:want]], start + done)
                     else:

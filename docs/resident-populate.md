@@ -1,0 +1,48 @@
+# Skip redundant CPU populate reads
+
+The CPU prefill path warms selected file-backed experts with buffered reads into
+a reusable scratch buffer. It discards the read data and computes from the original
+bank mappings. A warm request can therefore copy gigabytes of already resident
+weights solely to prepare those same mappings for computation.
+
+`FREETOKEN_PREFILL_POPULATE_SKIP_RESIDENT=1` enables an experimental shortcut in
+that preparation step. Before each scratch-sized read, it checks the pages covering
+the exact requested mapping range. It skips the read only when every page is
+reported resident. A partly resident range, an unavailable probe, or a file owned
+by another user retains the existing buffered read. The default remains disabled.
+Neither target routing nor packed weights, scales, native arithmetic, or expert
+placement changes. The existing scratch buffer and memory geometry remain intact.
+
+Linux [mincore](https://github.com/torvalds/linux/blob/v6.8/mm/mincore.c#L147)
+may conceal residency for mappings the caller does not own or cannot write. The
+experiment conservatively probes only owned files. A successful result can also
+be stale immediately. Native computation retains its original file-backed pointers
+and can demand-fault if a page leaves RAM after the check. Probe failure chooses
+the existing read path. The hint never selects different model data.
+
+Each populate call owns a bounded bitmap, including calls from the background
+prefill thread. A probe covers at most 32 MiB before reusing that bitmap; larger
+requests are checked in pieces. Address calculation includes the bank mapping
+offset and an unaligned tensor view. The returned populate-byte counter counts
+actual scratch reads, while no extra diagnostic counters or device readbacks are
+introduced. Probe time is part of any measured client wall time.
+
+This is separate from the negative cache-aware GPU staging experiment. GPU staging
+must still copy every selected weight into VRAM. CPU populate data is discarded,
+so this experiment can eliminate a read without providing replacement bytes or
+using direct I/O. Changed cache-access patterns and stale hints can still reduce
+performance; no improvement is assumed from fewer copied bytes.
+
+Seven focused hermetic probe tests pass on macOS. They check unaligned boundaries,
+the defined residency bit, bounded multi-piece queries, failed probes after a
+resident answer, foreign ownership, and unsupported platforms. Linux file-bank
+checks are prepared for the default read path, real warm-file skipping, mixed
+hints, fallback reads, and unchanged mapped bytes. Those checks have not yet run,
+and no native or model wall-time result is available.
+
+The running Pi runtime comparison uses its frozen sources and does not enable this
+experiment. Once it finishes, run the focused Linux checks and then compare
+population off/on on the same prepared sources, mapping geometry and native
+binary. Use complete requests in both start orders, retain all failures, and
+include both cache warmth and worker storage traffic. Keep this option disabled
+until the complete wall-time and output checks justify using it.
