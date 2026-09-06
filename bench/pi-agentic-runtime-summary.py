@@ -226,8 +226,8 @@ def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False,
                 layout_text = '\n'.join([layout['bank'], layout['prefill_paths'], *layout['staging']])
                 require(gate.source_layout(layout_text, mode) == layout,
                         f'{arm}: source layout metadata mismatch')
-                placement = layout['prefill_paths'].split('GPU candidates=', 1)[1]
-                require(start['geometry']['GPU compute placement'] == 'GPU candidates=' + placement,
+                placement = gate.gpu_compute_placement(layout['prefill_paths'])
+                require(start['geometry']['GPU compute placement'] == placement,
                         f'{arm}: source compute placement mismatch')
             except AssertionError as exc:
                 raise ValueError(f'{arm}: source layout mismatch: {exc}') from exc

@@ -502,7 +502,7 @@ def source_records(carry_records):
     for control, (arm, mode) in zip(driver['arms'], summary.SNAPSHOT_ARMS):
         start = json.loads((root / (arm + '-server-start.json')).read_text())
         layout = gate.source_layout(fixture.source_log(mode), mode)
-        placement = 'GPU candidates=' + layout['prefill_paths'].split('GPU candidates=', 1)[1]
+        placement = gate.gpu_compute_placement(layout['prefill_paths'])
         start.update(identity=plan['identities'][mode], revision=gate.GPU_SOURCE_REVISION,
                      env=plan['env'][mode], command=plan['commands'][mode],
                      source_layout=layout, memory_before=memory,

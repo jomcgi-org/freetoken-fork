@@ -16,6 +16,9 @@ configuration, expert slots, FP8 KV capacity and graph batch size. It separately
 checks the intended transition from 20 pinned and 28 file-backed layers to
 48 file-backed layers, with precisely the original 20 GPU layers staged. A
 different automatically selected GPU cache size aborts the run.
+Compare the planner's selected layers, candidate order, selected weight bytes
+and fixed reservation. Retain its host-memory budget estimate in the source
+layout evidence, but allow that estimate to vary between fresh server starts.
 
 Worker RSS categories, locked memory, swap and OS cache/available memory are
 sampled before and after the client. These snapshots include the warmup and are

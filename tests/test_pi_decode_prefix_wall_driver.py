@@ -22,7 +22,7 @@ def source_log(mode):
             f'{20 if mode == "off" else 0} GPU layers) + '
             f'0.00 GiB OS-locked (0 CPU layers: []) + 0.00 GiB file-backed '
             f'({len(disk)} DISK layers: {disk})')
-    paths = f'MoE prefill paths: overlap=0; GPU candidates={gpu}, chosen={gpu}, bytes=0 B'
+    paths = f'MoE prefill paths: overlap=0; GPU candidates={gpu}, chosen={gpu}, bytes=0 B; budget=100 B - reserved=0 B = available=100'
     staging = f'MoE GPU source staging: layers={gpu}; synthetic fixture' if mode == 'on' else ''
     return '\n'.join([bank, paths, staging])
 
@@ -69,6 +69,15 @@ def test_source_layout_allows_backing_changes_but_preserves_gpu_compute():
         gate.source_layout(source_log('on').replace('0 GPU layers)', '20 GPU layers)'), 'on')
     with pytest.raises(AssertionError, match='wrong GPU staging'):
         gate.source_layout(source_log('on').replace('staging: layers=[0,', 'staging: layers=[99,'), 'on')
+
+
+def test_gpu_placement_ignores_budget_estimate_but_rejects_changed_selection():
+    original = source_log('off')
+    changed_budget = original.replace('budget=100', 'budget=110').replace('available=100', 'available=110')
+    assert gate.gpu_compute_placement(original) == gate.gpu_compute_placement(changed_budget)
+    for before, after in [('chosen=[0,', 'chosen=[99,'), ('candidates=[0,', 'candidates=[99,'),
+                          ('bytes=0', 'bytes=1'), ('reserved=0', 'reserved=1')]:
+        assert gate.gpu_compute_placement(original) != gate.gpu_compute_placement(original.replace(before, after))
 
 
 @pytest.mark.parametrize('action', ['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])

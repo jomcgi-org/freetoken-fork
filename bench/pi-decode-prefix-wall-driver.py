@@ -306,7 +306,21 @@ def geometry(text, *, source_staging=False):
         found = [line[line.index('GPU candidates='):] for line in lines
                  if 'MoE prefill paths:' in line and 'GPU candidates=' in line]
         assert len(found) == 1, 'missing or ambiguous GPU compute placement'
-        result['GPU compute placement'] = found[0]
+        result['GPU compute placement'] = gpu_compute_placement(found[0])
+    return result
+
+
+def gpu_compute_placement(text):
+    """Compare placement, excluding the volatile available-host-memory estimate."""
+    result = {}
+    for name in ('candidates', 'chosen'):
+        match = re.search(name + r'=(\[[0-9, ]*\])', text)
+        assert match, ('missing GPU placement field', name)
+        result[name] = json.loads(match[1])
+    for name in ('bytes', 'reserved'):
+        match = re.search(name + r'=(\d+)', text)
+        assert match, ('missing GPU placement field', name)
+        result[name] = int(match[1])
     return result
 
 
