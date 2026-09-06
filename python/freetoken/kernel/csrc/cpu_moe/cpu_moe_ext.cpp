@@ -1657,6 +1657,7 @@ struct CpuMoeExecutor {
   nvi8batch_rows_fn nvi8batch_rows = nullptr;  // R_w weight rows x M activations
   const char* nvi8batch_name = "scalar";
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
+  bool nvfp4_pair_dot = false;   // explicit diagnostic opt-in, configured before tasks
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
@@ -2428,11 +2429,88 @@ struct CpuMoeExecutor {
   // writes independent fp32 route outputs, then pass 3 weights and sums them in the
   // token's original top-k order, preserving the old deterministic reduction.
 
+  bool set_nvfp4_pair_dot(bool enabled) {
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+    if (enabled && (fmt != WF_NVFP4 || nvi8dot != dot_nvfp4_i8_avx512vnni)) return false;
+    nvfp4_pair_dot = enabled;
+    return true;
+#else
+    return !enabled;
+#endif
+  }
+
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+  void do_pass1_nvfp4_pair(const MoeTask* t, int e, int route0, int route1, int ib) {
+    const auto* packed = reinterpret_cast<const uint8_t*>(tbl_at(gate_up_tbl, t->layer_id));
+    const auto* scale = reinterpret_cast<const uint8_t*>(tbl_at(gu_scale_tbl, t->layer_id));
+    const auto* global = reinterpret_cast<const uint16_t*>(tbl_at(gu_global_tbl, t->layer_id));
+    const int tok0 = route0 / top_k, tok1 = route1 / top_k;
+    const int8_t* x0 = xi8_scratch.data() + static_cast<size_t>(tok0) * H;
+    const int8_t* x1 = xi8_scratch.data() + static_cast<size_t>(tok1) * H;
+    const float* as0 = xas_scratch.data() + static_cast<size_t>(tok0) * (H / 16);
+    const float* as1 = xas_scratch.data() + static_cast<size_t>(tok1) * (H / 16);
+    bf16_t* dst[2] = {g_scratch.data() + static_cast<size_t>(route0) * I,
+                     g_scratch.data() + static_cast<size_t>(route1) * I};
+    const float weights[2] = {apply_on_input ? t->w[route0] : 1.0f,
+                              apply_on_input ? t->w[route1] : 1.0f};
+    const bool swigluoai = act == ACT_SWIGLUOAI;
+    const bool clamped_silu = act == ACT_CLAMPED_SILU;
+    const float lim = swiglu_limit, alpha = swiglu_alpha;
+    for (int i = ib * IBLK; i < std::min(I, (ib + 1) * IBLK); ++i) {
+      const size_t gr = static_cast<size_t>(e) * (2 * I) + i, ur = gr + I;
+      float gates[2], ups[2];
+      dot_nvfp4_i8_avx512vnni_pair(gates, packed + gr * (H / 2), scale + gr * (H / 16),
+          fp16_to_f32(global[gr]), x0, x1, H, e4m3_lut, as0, as1);
+      dot_nvfp4_i8_avx512vnni_pair(ups, packed + ur * (H / 2), scale + ur * (H / 16),
+          fp16_to_f32(global[ur]), x0, x1, H, e4m3_lut, as0, as1);
+      for (int input = 0; input < 2; ++input) {
+        float gate = gates[input] * weights[input], up = ups[input] * weights[input];
+        // Keep the ordinary route's activation, clamp and BF16 rounding order.
+        if (swigluoai || clamped_silu) {
+          if (gate > lim) gate = lim;
+          if (up > lim) up = lim;
+          else if (up < -lim) up = -lim;
+          const float glu = gate / (1.0f + std::exp(-gate * (swigluoai ? alpha : 1.0f)));
+          dst[input][i] = f32_to_bf16(glu * (swigluoai ? up + 1.0f : up));
+        } else {
+          dst[input][i] = f32_to_bf16(act_apply(act, gate) * up);
+        }
+      }
+    }
+  }
+
+  void do_pass2_nvfp4_pair(const MoeTask* t, int e, int route0, int route1, int hb) {
+    const auto* packed = reinterpret_cast<const uint8_t*>(tbl_at(down_tbl, t->layer_id));
+    const auto* scale = reinterpret_cast<const uint8_t*>(tbl_at(dn_scale_tbl, t->layer_id));
+    const auto* global = reinterpret_cast<const uint16_t*>(tbl_at(dn_global_tbl, t->layer_id));
+    const int8_t* a0 = gi8_scratch.data() + static_cast<size_t>(route0) * I;
+    const int8_t* a1 = gi8_scratch.data() + static_cast<size_t>(route1) * I;
+    const float* as0 = gas_scratch.data() + static_cast<size_t>(route0) * (I / 16);
+    const float* as1 = gas_scratch.data() + static_cast<size_t>(route1) * (I / 16);
+    float* dst0 = route_y_scratch.data() + static_cast<size_t>(route0) * H;
+    float* dst1 = route_y_scratch.data() + static_cast<size_t>(route1) * H;
+    for (int h = hb * HBLK; h < std::min(H, (hb + 1) * HBLK); ++h) {
+      const size_t row = static_cast<size_t>(e) * H + h;
+      float values[2];
+      dot_nvfp4_i8_avx512vnni_pair(values, packed + row * (I / 2), scale + row * (I / 16),
+          fp16_to_f32(global[row]), a0, a1, I, e4m3_lut, as0, as1);
+      dst0[h] = values[0];
+      dst1[h] = values[1];
+    }
+  }
+#endif
+
   void do_pass1_grouped(const MoeTask* t, int64_t p) {
     const int ib = static_cast<int>(p % n_iblk);
     const int di = static_cast<int>(p / n_iblk);
     const int e = distinct_experts[di];
-    for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; ++pos)
+    int pos = expert_offsets[e];
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+    if (nvfp4_pair_dot)
+      for (; pos + 1 < expert_offsets[e + 1]; pos += 2)
+        do_pass1_nvfp4_pair(t, e, grouped_routes[pos], grouped_routes[pos + 1], ib);
+#endif
+    for (; pos < expert_offsets[e + 1]; ++pos)
       do_pass1_route(t, grouped_routes[pos], ib);
   }
 
@@ -2503,7 +2581,13 @@ struct CpuMoeExecutor {
     const int hb = static_cast<int>(p % n_hblk);
     const int di = static_cast<int>(p / n_hblk);
     const int e = distinct_experts[di];
-    for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; ++pos)
+    int pos = expert_offsets[e];
+#if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
+    if (nvfp4_pair_dot)
+      for (; pos + 1 < expert_offsets[e + 1]; pos += 2)
+        do_pass2_nvfp4_pair(t, e, grouped_routes[pos], grouped_routes[pos + 1], hb);
+#endif
+    for (; pos < expert_offsets[e + 1]; ++pos)
       do_pass2_grouped_route(t, grouped_routes[pos], e, hb);
   }
 
@@ -3516,6 +3600,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_input_prequant",
            [](CpuMoeExecutor& e, bool v) { e.input_prequant = v; },
            py::arg("value"))
+      .def("set_nvfp4_pair_dot", &CpuMoeExecutor::set_nvfp4_pair_dot, py::arg("enabled"))
       .def("isa_name", &CpuMoeExecutor::isa_name)
       .def("prefill_batch_kernel_name",
            &CpuMoeExecutor::prefill_batch_kernel_name);

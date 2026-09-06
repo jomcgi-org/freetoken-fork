@@ -1,5 +1,8 @@
 """Exact CPU dot parity across vector loops, tails, signs and scale encodings."""
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -78,3 +81,67 @@ def test_probe_rejects_invalid_tensor_contracts(probe, change):
         values[3] = values[3][:, ::2]
     with pytest.raises(RuntimeError, match="pair dot"):
         probe(*values, **kwargs)
+
+
+def make_executor(hidden, intermediate, batch, activation="silu", apply_on_input=False, threads=3):
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    spec = importlib.util.spec_from_file_location(
+        "pair_dot_fixtures", Path(__file__).with_name("test_cpu_moe_prefill_batch.py"))
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    cache = fixtures._make_nvfp4_cache(16, hidden, intermediate, seed=4090)
+    return CpuMoeExecutor(cache, top_k=3, activation=activation,
+                          apply_router_weight_on_input=apply_on_input,
+                          num_threads=threads, max_tokens=batch, device=torch.device("cpu"),
+                          swiglu_limit=1.3, prefill_batch="off")
+
+
+def executor_inputs(hidden, batch, routes):
+    rng = torch.Generator().manual_seed(4091)
+    x = torch.randn(batch, hidden, dtype=torch.bfloat16, generator=rng)
+    weights = torch.rand(batch, 3, generator=rng)
+    if routes == "shared":
+        ids = torch.tensor([[0, 1, 2]] * batch, dtype=torch.int32)
+    elif routes == "disjoint":
+        ids = torch.arange(batch * 3, dtype=torch.int32).reshape(batch, 3)
+    else:
+        ids = torch.tensor([[0, 1, -1], [0, 4, 4], [1, 2, 16], [0, 2, 3], [-1, -1, -1]],
+                           dtype=torch.int32)[:batch].clone()
+    return x, weights, ids
+
+
+def check_executor(hidden, intermediate, batch, activation, apply_on_input, routes):
+    executor = make_executor(hidden, intermediate, batch, activation, apply_on_input)
+    if not hasattr(executor._ext, "set_nvfp4_pair_dot"):
+        pytest.skip("CPU extension needs rebuilding for pair executor")
+    if not executor._ext.set_nvfp4_pair_dot(True):
+        pytest.skip("pair executor requires NVFP4 and AVX-512 VNNI")
+    io = executor._io_for(batch)
+    x, weights, ids = executor_inputs(hidden, batch, routes)
+    io["x"].copy_(x)
+    io["ids"].copy_(ids)
+    io["w"].copy_(weights)
+    task = executor._task_for(0, batch)
+    executor._ext.run_task(task)
+    paired = io["y"].clone()
+    assert executor._ext.set_nvfp4_pair_dot(False)
+    executor._ext.run_task(task)
+    ordinary = io["y"].clone()
+    assert torch.isfinite(ordinary).all()
+    assert torch.equal(paired.view(torch.int16), ordinary.view(torch.int16))
+
+
+@pytest.mark.parametrize("batch", [1, 2, 5])
+@pytest.mark.parametrize("activation", ["silu", "swigluoai", "clamped_silu"])
+@pytest.mark.parametrize("apply_on_input", [False, True])
+@pytest.mark.parametrize("routes", ["shared", "disjoint", "mixed"])
+def test_complete_expert_pair_schedule_is_exact(probe, batch, activation, apply_on_input, routes):
+    # Partial output tiles and inner-loop tails exercise both pair and remainder paths.
+    check_executor(272, 80, batch, activation, apply_on_input, routes)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 5])
+@pytest.mark.parametrize("apply_on_input", [False, True])
+def test_model_expert_dimensions_are_exact(probe, batch, apply_on_input):
+    check_executor(2560, 640, batch, "silu", apply_on_input, "mixed")

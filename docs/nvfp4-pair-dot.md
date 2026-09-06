@@ -7,20 +7,35 @@ ordinary decode kernel's four FP32 accumulation chains, group scale order,
 horizontal reduction, scalar tail and final global scale multiplication.
 Activation quantization and expert selection are unchanged.
 
-The candidate is available only through the explicit `nvfp4_pair_dot_probe`
-diagnostic entry point. Serving dispatch is unchanged. The existing batched
+The candidate is available through the explicit `nvfp4_pair_dot_probe`
+diagnostic entry point and `CpuMoeExecutor.set_nvfp4_pair_dot`. Configure the
+executor before submitting tasks, with no task in flight. The setter rejects
+unsupported formats and ISAs. Pair dispatch defaults off and the serving startup
+path does not enable it. An enabled grouped decode task pairs routes within each
+expert, preserves the existing route quantization and activation, and leaves the
+final top-k reduction unchanged. Unpaired routes use the ordinary dot.
+The existing batched
 prefill dot uses a different reduction order and is not the exact reference.
 
 `tests/moe/test_nvfp4_pair_dot.py` compares FP32 bit patterns against two ordinary
 decode dots. Cases cover vector and scalar tails, both model inner dimensions,
 finite scale encodings, zero inputs, signs and extreme valid int8 activations.
-The native tests require Linux with AVX-512 VNNI.
+Complete expert-output comparisons additionally cover overlapping, disjoint,
+duplicate and invalid routes, input/output router weighting, activation clamps,
+odd route counts and the model's expert dimensions. Native checks require Linux
+with AVX-512 VNNI.
 
 `bench/nvfp4-pair-dot.py --output /private/pair-dot.json` pins one CPU and measures
 both kernels in both orders. Inputs include small row tiles, expert matrices and
 a weight pool larger than LLC. Run it with exclusive benchmark ownership and
 automatic original-serving recovery, after builds and validation finish. It
 writes detailed results only to the requested private path.
+
+`bench/nvfp4-pair-executor.py --output /private/pair-executor.json` measures the
+complete CPU expert layer with one and multiple workers, overlapping and disjoint
+routes, and odd batch sizes. Input copying is outside the timer; task submission,
+activation preparation, both projections and ordered route reduction are inside.
+The same exclusive ownership and recovery requirements apply.
 
 Kernel parity and component cost are preliminary gates. A serving change still
 requires full expert-output parity, model verification and separate non-debug
