@@ -395,3 +395,13 @@ other requests, so it establishes no speedup. The benchmark tooling is ready
 for review; paired server timing with diagnostics disabled remains pending.
 Neither this client nor its integration changes the established 17.8% sustained
 combined wall-time result.
+
+The [controlled agentic runtime gate (#39)](https://github.com/jomcgi-org/freetoken-fork/pull/39)
+now compares original `3a67403` with optimized `c0775ea` in A/B/B/A order, with
+one warmup and two measured Pi sessions per server start. Both arms preserve
+FP8 K/V, radix prefix reuse, capacity one and a fixed 65536-token reservation;
+diagnostics, disk prefix cache, KV ladder and HOT persistence are off. The
+first baseline start has 3753 expert slots and 1024 KV pages. This geometry
+differs from the earlier naive-cache gates, and later arms must match it.
+Nine focused controller tests and live EOF/heartbeat-expiry recovery probes
+pass. The first arm is running; no agentic optimization result is available yet.
