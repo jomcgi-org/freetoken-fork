@@ -1,0 +1,123 @@
+{
+  "revision": "5011e6b9a062120005f17ec00041b946f4aee1f7",
+  "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.39",
+  "before": {
+    "astra-pi-agentic-lease": {
+      "MainPID": "0",
+      "Result": "success",
+      "ActiveState": "inactive",
+      "InvocationID": ""
+    },
+    "astra-pi-agentic-server": {
+      "MainPID": "0",
+      "Result": "success",
+      "ActiveState": "inactive",
+      "InvocationID": ""
+    },
+    "astra-decode-weight-reuse-wall-driver": {
+      "MainPID": "0",
+      "Result": "success",
+      "ActiveState": "inactive",
+      "InvocationID": ""
+    },
+    "freetoken-serve": {
+      "MainPID": "763263",
+      "Result": "success",
+      "ActiveState": "active",
+      "InvocationID": "a332375ed64442fa8abf1a448dc76acb"
+    }
+  },
+  "args": [
+    "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python",
+    "-m",
+    "pytest",
+    "-q",
+    "tests/test_resident_range_probe.py",
+    "tests/moe/test_populate_residency_linux.py"
+  ],
+  "returncode": 0,
+  "wall_s": 2.709489576984197,
+  "stdout": "...........                                                              [100%]\n11 passed in 2.09s\n",
+  "stderr": "",
+  "environment": {
+    "PYTHONPATH": "/var/lib/longhorn/nvme-02/freetoken/wt-astra-populate-resident/python",
+    "CUDA_VISIBLE_DEVICES": "",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1"
+  },
+  "source_sha256": {
+    "tests/test_resident_range_probe.py": "ba50cef7cd95258c66013fb5f99091275040a24cafd501bfe75abb08fd07f986",
+    "tests/moe/test_populate_residency_linux.py": "18f108e26e81e76a21a172ae5e59db8eb29d3c357368b31000853761af137d21",
+    "python/freetoken/moe/host_banks.py": "88c36ea9ee4740bb60ccf9802011e0e1bcc166eac5172a3a3af5270f18d6b8b6",
+    "python/freetoken/moe/resident_range.py": "c40353045ecb455ea48eac46f500aa600af61a7357240ed600015a73573a942c",
+    "bench/resident-populate.py": "ef961dead9e375ef861ef0c373280ef4cb03bfb12e36c135ccfed123541f1324"
+  },
+  "after": {
+    "astra-pi-agentic-lease": {
+      "MainPID": "0",
+      "Result": "success",
+      "ActiveState": "inactive",
+      "InvocationID": ""
+    },
+    "astra-pi-agentic-server": {
+      "MainPID": "0",
+      "Result": "success",
+      "ActiveState": "inactive",
+      "InvocationID": ""
+    },
+    "astra-decode-weight-reuse-wall-driver": {
+      "MainPID": "0",
+      "Result": "success",
+      "ActiveState": "inactive",
+      "InvocationID": ""
+    },
+    "freetoken-serve": {
+      "MainPID": "763263",
+      "Result": "success",
+      "ActiveState": "active",
+      "InvocationID": "a332375ed64442fa8abf1a448dc76acb"
+    }
+  },
+  "prior_restoration": {
+    "started_utc": "2026-09-06T04:31:18Z",
+    "health": {
+      "status": "ok",
+      "model": "qwen3.6-27b",
+      "instance_id": "40aee1f6-e2b4-4be9-a42b-d8a1f684f422",
+      "uptime_s": 0,
+      "maintenance": "serving",
+      "version": "0.1.2"
+    },
+    "completion": {
+      "id": "chatcmpl-0",
+      "object": "chat.completion",
+      "created": 1788669171,
+      "model": "qwen3.6-27b",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "OK"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 2,
+        "total_tokens": 19
+      }
+    },
+    "unit": {
+      "MainPID": "763263",
+      "Result": "success",
+      "ControlGroup": "/system.slice/freetoken-serve.service",
+      "ActiveState": "active",
+      "InvocationID": "a332375ed64442fa8abf1a448dc76acb"
+    },
+    "verified": true
+  },
+  "driver_source": "import hashlib, json, os, pathlib, platform, subprocess, time\nR = pathlib.Path('/var/lib/longhorn/nvme-02/freetoken')\nSRC = R / 'wt-plegather'\ndef run(args, **kwargs):\n    return subprocess.run(args, text=True, capture_output=True, check=True, **kwargs)\ndef state(unit):\n    output = run(['systemctl', 'show', unit, '-p', 'ActiveState', '-p', 'MainPID', '-p', 'InvocationID', '-p', 'Result']).stdout\n    return dict(line.split('=', 1) for line in output.splitlines() if '=' in line)\nunits = ['astra-pi-agentic-lease', 'astra-pi-agentic-server', 'astra-decode-weight-reuse-wall-driver', 'freetoken-serve']\nbefore = {unit: state(unit) for unit in units}\nassert all(before[unit]['ActiveState'] == 'inactive' for unit in units[:-1]), before\nassert before['freetoken-serve']['ActiveState'] == 'active', before\nrestoration = json.loads((R / 'results/astra-pi-agentic-runtime-20260906/restoration.json').read_text())\nassert restoration['verified'] is True\nassert restoration['unit']['InvocationID'] == before['freetoken-serve']['InvocationID']\nassert restoration['completion']['choices'][0]['message']['content'].strip() == 'OK'\nsuites = [\n    ('pi-runtime-summary', '94556c3cd0ba0c9369d4f4c42f1a9a727c3752f4', 'astra-pi-gate-94556c3.bundle', 'perf/4090-agentic-runtime-gate',\n     ['tests/test_pi_agentic_runtime_summary.py'], ['bench/pi-agentic-runtime-summary.py']),\n    ('populate-resident', '5011e6b9a062120005f17ec00041b946f4aee1f7', 'astra-populate-resident-5011e6b.bundle', 'perf/4090-populate-resident',\n     ['tests/test_resident_range_probe.py', 'tests/moe/test_populate_residency_linux.py'],\n     ['python/freetoken/moe/host_banks.py', 'python/freetoken/moe/resident_range.py', 'bench/resident-populate.py']),\n]\nfor name, revision, bundle, branch, tests, sources in suites:\n    tree = R / ('wt-astra-' + name)\n    assert not tree.exists(), tree\n    target = 'bench/astra-' + name\n    run(['git', '-C', str(R / 'FreeToken'), 'fetch', str(R / 'tmp' / bundle), branch + ':refs/heads/' + target])\n    run(['git', '-C', str(R / 'FreeToken'), 'worktree', 'add', str(tree), target])\n    assert run(['git', '-C', str(tree), 'rev-parse', 'HEAD']).stdout.strip() == revision\n    assert not run(['git', '-C', str(tree), 'status', '--porcelain']).stdout.strip()\n    assert (tree / '.git').is_file()\n    env = dict(os.environ, PYTHONPATH=str(tree / 'python'), CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1')\n    command = [str(SRC / '.venv/bin/python'), '-m', 'pytest', '-q', *tests]\n    started = time.monotonic()\n    result = subprocess.run(command, text=True, capture_output=True, cwd=tree, env=env, timeout=120)\n    report = dict(revision=revision, platform=platform.platform(), before=before, args=command, returncode=result.returncode,\n                  wall_s=time.monotonic() - started, stdout=result.stdout, stderr=result.stderr,\n                  environment={k:env[k] for k in ['PYTHONPATH', 'CUDA_VISIBLE_DEVICES', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS', 'OPENBLAS_NUM_THREADS']},\n                  source_sha256={f:hashlib.sha256((tree / f).read_bytes()).hexdigest() for f in tests + sources},\n                  after={unit:state(unit) for unit in units}, prior_restoration=restoration,\n                  driver_source=pathlib.Path(__file__).read_text())\n    path = R / ('results/astra-' + name + '-linux-validation-20260906.json')\n    assert not path.exists(), path\n    path.write_text(json.dumps(report, indent=2) + '\\n')\n    print(json.dumps({k:v for k,v in report.items() if k not in ('driver_source','prior_restoration')}, indent=2), flush=True)\n    assert result.returncode == 0, result.stdout + result.stderr\n    assert 'skipped' not in result.stdout, result.stdout\n    assert report['after'] == before, report['after']\n"
+}

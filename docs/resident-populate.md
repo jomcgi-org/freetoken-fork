@@ -33,22 +33,25 @@ so this experiment can eliminate a read without providing replacement bytes or
 using direct I/O. Changed cache-access patterns and stale hints can still reduce
 performance; no improvement is assumed from fewer copied bytes.
 
-Seven focused hermetic probe tests pass on macOS. They check unaligned boundaries,
-the defined residency bit, bounded multi-piece queries, failed probes after a
-resident answer, foreign ownership, and unsupported platforms. Linux file-bank
-checks are prepared for the default read path, real warm-file skipping, mixed
-hints, fallback reads, and unchanged mapped bytes. Those checks have not yet run,
-and no native or model wall-time result is available.
+All eleven focused checks pass on Linux with no skips: seven probe checks and
+four real file-bank checks. They cover unaligned boundaries, the defined
+residency bit, bounded queries, failed probes after a resident answer, foreign
+ownership, unsupported platforms, the default read path, real warm-file skipping,
+mixed hints, fallback reads, and unchanged mapped bytes. The seven hermetic
+probe checks also pass on macOS. The [Linux validation record](../bench/results/4090-populate-resident-validation-20260906.json)
+retains exact sources, command, output and unchanged serving state. Validation
+ran after the Pi comparison finished and the original service was restored.
+No native or model wall-time result is available for this experiment.
 
-The running Pi runtime comparison uses its frozen sources and does not enable this
-experiment. Once it finishes, run the focused Linux checks and then compare
-the resident-skip flag off/on on the same prepared sources, mapping geometry and native
-binary. Use complete requests in both start orders, retain all failures, and
-include both cache warmth and worker storage traffic. Keep this option disabled
-until the complete wall-time and output checks justify using it.
+The completed Pi runtime comparison used frozen sources without this option.
+Next measure the component, then compare the resident-skip flag off/on on the
+same prepared sources, mapping geometry and native binary. Use complete requests
+in both start orders, retain all failures, and include both cache warmth and
+worker storage traffic. Keep this option disabled until complete wall-time and
+output checks justify using it.
 
-The [component benchmark](../bench/resident-populate.py) is prepared for the first
-Linux check after the Pi run. It creates a private 256 MiB file, selects alternating
+The [component benchmark](../bench/resident-populate.py) is prepared for Linux timing
+after the correctness checks. It creates a private 256 MiB file, selects alternating
 2 MiB rows, and compares both flag orders under warm, cold, and mixed preparation.
 Cache advice targets only that file. It verifies the count of fully resident
 selected rows before each sample, times population plus SHA-256 consumption from
