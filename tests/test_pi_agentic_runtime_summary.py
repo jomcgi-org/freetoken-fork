@@ -564,3 +564,90 @@ def test_gpu_source_answer_drift_suppresses_gain(source_records):
     assert not result['fixed_work_qualified']
     assert result['comparison']['wall_reduction_percent'] is None
     assert all(order['wall_reduction_percent'] is None for order in result['orders'])
+
+
+@pytest.fixture
+def hot_host_records(source_records):
+    root = source_records
+    spec = importlib.util.spec_from_file_location(
+        'hot_host_gate_fixture', Path(__file__).parents[1] / 'bench/pi-decode-prefix-wall-driver.py')
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    driver = json.loads((root / 'driver.json').read_text())
+    plan = driver['preflight']
+    plan['experiment'] = 'hot-host-cache-reclaim'
+    for mode in ('off', 'on'):
+        plan['identities'][mode].update(revision=gate.HOT_HOST_REVISION, tree=str(gate.HOT_HOST))
+        plan['env'][mode].update(PYTHONPATH=str(gate.HOT_HOST / 'python'),
+                                 FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR='')
+        command = plan['commands'][mode]
+        index = command.index('--moe-gpu-source')
+        command[index:index + 2] = ['--moe-hot-host-cache', 'retain' if mode == 'off' else 'reclaim']
+    for control, (arm, mode) in zip(driver['arms'], summary.SNAPSHOT_ARMS):
+        start = json.loads((root / (arm + '-server-start.json')).read_text())
+        start.pop('source_layout')
+        start.update(identity=plan['identities'][mode], revision=gate.HOT_HOST_REVISION,
+                     env=plan['env'][mode], command=plan['commands'][mode],
+                     hot_host_cache='retain' if mode == 'off' else 'reclaim')
+        write(root, arm + '-server-start.json', start)
+        change(root, arm + '/metadata.json', lambda d: d.update(server_metadata=start))
+    write(root, 'driver.json', driver)
+    return root
+
+
+def test_hot_host_reports_matched_work_and_os_memory(hot_host_records):
+    result = summary.summarize(hot_host_records, hot_host_cache_reclaim=True)
+    assert result['fixed_work_qualified'] and not result['broad_quality_equivalence']
+    assert result['comparison']['wall_reduction_percent'] == pytest.approx(20)
+    assert result['arms'][0]['memory_before']['worker_bytes']['RssShmem'] == 1024
+    assert result['arms'][1]['hot_host_cache'] == 'reclaim'
+
+
+@pytest.mark.parametrize('change_kind', ['command', 'environment', 'revision', 'native', 'census', 'hook_path'])
+def test_hot_host_rejects_confounded_timing(hot_host_records, change_kind):
+    def mutate(driver):
+        plan = driver['preflight']
+        if change_kind == 'command':
+            plan['commands']['on'].append('--extra')
+        elif change_kind == 'environment':
+            plan['env']['on']['EXTRA'] = '1'
+        elif change_kind == 'native':
+            plan['identities']['on']['native_sha256'] = 'other'
+        elif change_kind == 'revision':
+            for row in plan['identities'].values():
+                row['revision'] = 'other'
+        elif change_kind == 'census':
+            for env in plan['env'].values():
+                env['FREETOKEN_HOT_HOST_CACHE_CENSUS_DIR'] = '/tmp/diagnostic'
+        else:
+            for env in plan['env'].values():
+                env['PYTHONPATH'] += ':/tmp/hook'
+    change(hot_host_records, 'driver.json', mutate)
+    with pytest.raises(ValueError):
+        summary.summarize(hot_host_records, hot_host_cache_reclaim=True)
+
+
+@pytest.mark.parametrize('change_kind', ['marker', 'geometry', 'memory'])
+def test_hot_host_rejects_false_runtime_evidence(hot_host_records, change_kind):
+    start = json.loads((hot_host_records / 'r2-server-start.json').read_text())
+    if change_kind == 'marker':
+        start['hot_host_cache'] = 'retain'
+    elif change_kind == 'geometry':
+        start['geometry']['expert_slots'] += 1
+    else:
+        start['memory_before']['worker_bytes']['RssShmem'] = -1
+    write(hot_host_records, 'r2-server-start.json', start)
+    change(hot_host_records, 'r2/metadata.json', lambda d: d.update(server_metadata=start))
+    with pytest.raises(ValueError):
+        summary.summarize(hot_host_records, hot_host_cache_reclaim=True)
+
+
+@pytest.mark.parametrize('session_number', [1, 2])
+def test_hot_host_answer_drift_suppresses_gain_including_warmup(hot_host_records, session_number):
+    change(hot_host_records, f'r2/session-{session_number}/result.json', lambda d:
+           d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message'].update(
+               content=d['stages'][0]['attempts'][0]['response']['completion']['choices'][0]['message']['content'] + '\n'))
+    result = summary.summarize(hot_host_records, hot_host_cache_reclaim=True)
+    assert not result['fixed_work_qualified']
+    assert result['comparison']['wall_reduction_percent'] is None
+    assert all(order['wall_reduction_percent'] is None for order in result['orders'])
