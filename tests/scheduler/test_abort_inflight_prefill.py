@@ -76,13 +76,13 @@ def _setup():
     return pool, cm, tm, dm, pm, sent, stub
 
 
-def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
+def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None, output_len=4):
     """A launched (forward in flight) hybrid req: handle locked, pages allocated,
     GDN slots held, cached_len advanced -- the state _process_last_data will drain."""
     mr = cm.match_req(SimpleNamespace(input_ids=prompt, input_len=len(prompt),
                                       mm_embeds=None))
-    req = cls(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=4,
-              uid=UID, sampling_params=SamplingParams(max_tokens=4),
+    req = cls(input_ids=prompt, table_idx=tm.allocate(), cached_len=0, output_len=output_len,
+              uid=UID, sampling_params=SamplingParams(max_tokens=output_len),
               cache_handle=mr.cuda_handle)
     req.linear_slot_idx = pool.alloc(1)[0]
     req.mamba_ping_pong = tuple(pool.alloc(2))
@@ -92,6 +92,44 @@ def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
     req.complete_one()
     req.mamba_last_track_seqlen = track_seqlen
     return req
+
+
+def test_ngram_host_stop_restores_state_before_hybrid_cache_donation():
+    from freetoken.verification.runtime import NgramTarget
+    from freetoken.spec_decode import reserve_mtp_window
+
+    pool, cm, tm, dm, _pm, sent, stub = _setup()
+    req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32), output_len=12)
+    req.append_host(torch.tensor([42], dtype=torch.int32))
+    req.sampling_params.stop_strs = ["STOP"]
+    stub._match_stop_str = lambda r: "STOP" if r.input_ids[-1].item() == 52 else None
+    batch = Batch(reqs=[req], phase="decode")
+    batch.padded_reqs = [req]
+    batch.ngram_verify = True
+    reserve_mtp_window(batch, 5)
+    cm.allocate_paged([req])
+    req.cached_len, req.device_len = 17, 18
+    batch.generated_tokens = 5
+    slot = req.linear_slot_idx
+    pool.recurrent_states[:, slot].fill_(17)
+    target = NgramTarget.__new__(NgramTarget)
+    target.owner = batch
+    target.checkpoint = SimpleNamespace(restore=lambda n: pool.recurrent_states[:, slot].fill_(12 + n))
+    stub.engine = SimpleNamespace(ngram_target=target, moe_offload_cache=None,
+                                   resolve_mtp_timing=lambda batch: None)
+    outputs = torch.tensor([51, 52, 53, 54, 55], dtype=torch.int32)
+    last = (SimpleNamespace(batch=batch), (None, outputs, SimpleNamespace(synchronize=lambda: None)))
+    Scheduler._process_last_data(stub, last)
+    assert req.input_ids.tolist() == list(range(1, 13)) + [42, 51, 52]
+    assert (req.cached_len, req.device_len) == (14, 15)
+    assert [message.next_token for message in sent] == [51, 52]
+    assert sent[-1].finished and sent[-1].finish_reason == "stop"
+    assert target.owner is None
+    match = cm.match_req(SimpleNamespace(input_ids=req.input_ids.clone(), input_len=15, mm_embeds=None))
+    assert match.cuda_handle.cached_len == 14
+    # A future request must restore the state at the emitted stop boundary.
+    assert torch.all(pool.recurrent_states[:, match.cuda_handle.node.mamba_value] == 14)
+    cm.check_integrity()
 
 
 def _as_last_data(batch):

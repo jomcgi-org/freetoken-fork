@@ -384,6 +384,12 @@ class Engine:
         self._pool_cls = resolve_pool_class(config.model_config)
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
+        self.ngram_target = None
+        if config.speculative_ngram == "on":
+            if getattr(config.model_config, "qwen4_args", None) is None or config.page_size < 8:
+                raise ValueError("ngram verification requires Qwen Flash and a page size of at least eight")
+            from freetoken.verification.runtime import install
+            install()
 
         self.tp_cpu_group = self._init_communication(config)
         free_min, free_max = self._sync_get_memory()
@@ -554,6 +560,11 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        if config.speculative_ngram == "on":
+            from freetoken.verification.runtime import NgramTarget
+            self.ngram_target = NgramTarget(self)
+            self.ngram_target.initialize()
+            logger.info_rank0("Ngram target ready: width=5, match=8, lookback=8192, exact prefix rollback")
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1227,7 +1238,7 @@ class Engine:
             )
         # Fused K=1 MTP presents two target rows for one request. CUDA-graph padding
         # can also round a batch up to the largest captured size; cover both.
-        mtp_rows = 2 if config.speculative_mtp == "on" else 1
+        mtp_rows = 5 if getattr(config, "speculative_ngram", "off") == "on" else (2 if config.speculative_mtp == "on" else 1)
         max_tokens = max(config.max_running_req, config.cuda_graph_max_bs or 0, mtp_rows)
         # gpt-oss mxfp4 carries clamped-swiglu scalars; other formats use the defaults.
         executor = CpuMoeExecutor(
@@ -1375,6 +1386,8 @@ class Engine:
         if (moe_cache_size is None and num_pages is None and num_mamba_slots is None
                 and num_swa_pages is None):
             return
+        if getattr(self, "ngram_target", None) is not None:
+            raise CacheRebuildRejected("restart with the new cache geometry while ngram verification is enabled")
 
         # 0a. Geometry prevalidation BEFORE any destructive free. An invalid target (moe
         #     slots on a model with no offload cache, moe below num_experts / above the
@@ -1551,7 +1564,10 @@ class Engine:
             started.record(self.stream)
             step_timing_marks = (started, ended)
         with self.ctx.forward_batch(batch):
-            if getattr(batch, "mtp_verify", False):
+            if getattr(batch, "ngram_verify", False):
+                next_tokens_gpu = self.ngram_target.forward(batch)
+                logits = None
+            elif getattr(batch, "mtp_verify", False):
                 next_tokens_gpu = self._forward_mtp_verify(batch)
                 logits = None
             elif (
@@ -1797,6 +1813,8 @@ class Engine:
             )
             if synchronize_staging is not None:
                 synchronize_staging()
+        if getattr(self, "ngram_target", None) is not None:
+            self.ngram_target.close()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

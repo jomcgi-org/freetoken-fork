@@ -156,6 +156,8 @@ class QSAKVCache(MHAKVCache):
 
         num_req_slots = config.max_running_req + 1
         num_speculative_tokens = 0
+        if getattr(config, "speculative_ngram", "off") == "on":
+            num_speculative_tokens = 4
         if getattr(config, "speculative_mtp", "off") == "on":
             from freetoken.spec_decode import MTP_DRAFT_STEPS
 

@@ -163,6 +163,7 @@ class Scheduler(SchedulerIOMixin):
             decode_prefix_snapshot=(
                 os.environ.get("FREETOKEN_DECODE_PREFIX_SNAPSHOT", "0") == "1"
                 and config.speculative_mtp != "on"
+                and getattr(config, "speculative_ngram", "off") != "on"
             ),
         )
         if self.cache_manager.decode_prefix_snapshot:
@@ -684,7 +685,8 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if ENV.DISABLE_OVERLAP_SCHEDULING or self.config.speculative_mtp == "on":
+        if (ENV.DISABLE_OVERLAP_SCHEDULING or self.config.speculative_mtp == "on"
+                or getattr(self.config, "speculative_ngram", "off") == "on"):
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -767,8 +769,10 @@ class Scheduler(SchedulerIOMixin):
                     else next_tokens_cpu[i : i + 1]
                 )
                 finished = False
+                emitted = 0
                 for next_token_tensor in tokens:
                     req.append_host(next_token_tensor.unsqueeze(0))
+                    emitted += 1
                     next_token = int(next_token_tensor.item())
                     # EOS / stop-string -> "stop", output budget exhausted -> "length";
                     # EOS and stop strings win over length. Host length, rather than
@@ -823,6 +827,11 @@ class Scheduler(SchedulerIOMixin):
                     if finished:
                         break
 
+                if getattr(batch, "ngram_verify", False) and emitted < batch.generated_tokens:
+                    allocated = req.cached_len
+                    self.engine.ngram_target.trim(batch, emitted)
+                    self.cache_manager.rollback_paged_tail(req, req.cached_len, allocated)
+
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
                     trace = getattr(self, "continuation_trace", None)
@@ -843,6 +852,8 @@ class Scheduler(SchedulerIOMixin):
                     # None'd GDN ping-pong slots).
                     self.cache_manager.cache_req(req, finished=False)
 
+        if getattr(batch, "ngram_verify", False):
+            self.engine.ngram_target.release(batch)
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
@@ -1635,6 +1646,21 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        if (getattr(self.config, "speculative_ngram", "off") == "on"
+                and batch.is_decode and len(batch.reqs) == 1
+                and not getattr(batch, "lazy_restore_pending", False)):
+            from freetoken.verification.ngram import WIDTH, proposal_for_request
+            from freetoken.spec_decode import reserve_mtp_window
+            req = batch.reqs[0]
+            drafts = proposal_for_request(req)
+            if drafts is not None:
+                batch.ngram_drafts = drafts
+                batch.ngram_verify = True
+                cuts = set() if req.sampling_params.ignore_eos else set(self.eos_token_ids)
+                if self.toolcall_anchor_id is not None and req.toolcall_anchor_len is None:
+                    cuts.add(self.toolcall_anchor_id)
+                batch.ngram_interrupt_ids = tuple(cuts)
+                reserve_mtp_window(batch, WIDTH)
         # Native MTP verifies one greedy request at a time. Reserve seed plus one draft
         # in the paged cache, but keep the batch classified as decode so the target MoE
         # remains on its decode-routed expert path.
@@ -1708,15 +1734,19 @@ class Scheduler(SchedulerIOMixin):
                     ).to(self.device, non_blocking=True)
                 else:
                     batch.linear_table_idx = input_mapping[0].to(torch.int32)
+                    if getattr(batch, "ngram_verify", False):
+                        batch.linear_table_idx = batch.linear_table_idx[:1]
             # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
             # built once here instead of rebuilt in each of the 30 GDN layers. For decode
             # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
-            batch.fla_metadata = build_fla_metadata(batch, self.device)
+            if not getattr(batch, "ngram_verify", False):
+                batch.fla_metadata = build_fla_metadata(batch, self.device)
         if batch.is_decode:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
-        self.engine.attn_backend.prepare_metadata(batch)
+        if not getattr(batch, "ngram_verify", False):
+            self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
@@ -1843,6 +1873,8 @@ class Scheduler(SchedulerIOMixin):
     def _restore_failed_request_lengths(self, forward_input: ForwardInput) -> None:
         """Restore schedule-time logical lengths if OOM happened after engine bookkeeping."""
         batch = forward_input.batch
+        if getattr(batch, "ngram_verify", False):
+            self.engine.ngram_target.cancel(batch)
         if batch.is_decode and getattr(batch, "mtp_verify", False):
             req = batch.reqs[0]
             req.cached_len = int(batch.mtp_original_cached_len)
