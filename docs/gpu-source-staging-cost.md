@@ -38,4 +38,8 @@ model arithmetic, cache replacement, cold storage, RAM pressure or the benefit
 of reclaiming GPU duplicates. The current global GPU-fetch mode also changes
 the CPU/GPU compute split, so its model throughput is a separate question. A
 future placement experiment must preserve that split and existing arithmetic,
-then qualify complete-response wall time. Hardware validation is pending.
+then qualify complete-response wall time.
+
+CUDA execution has passed the byte and native-work assertions across every
+declared miss count. Original serving recovery was also verified. These checks
+qualify the probe; model placement remains a separate experiment.
