@@ -49,12 +49,29 @@ python bench/leaderboard-wall.py summarize --bundle /private/inputs --reports /p
 
 The summary requires the complete task set in both execution orders with an
 identical manifest. It reports task success, calls, output tokens, total wall
-and model-request time by task and order. Agent trajectories may differ, so this
-is task throughput rather than an isolated runtime speedup. Small task samples
-do not establish broad quality equivalence. Detailed records remain private.
+and model-request time by task and order. Completion rate is the fraction of
+attempts that qualify. Successful tasks per hour divides qualified completions
+by all attempt wall time, including failed attempts. A zero wall total produces
+no rate; a zero baseline completion rate produces no throughput ratio. Report
+these alongside raw wall totals, since a quick failure can reduce elapsed time.
+Startup and readiness are excluded, so this rate describes the measured task
+intervals, not sustained service capacity.
+
+Agent trajectories may differ, so this is task throughput rather than an
+isolated runtime speedup. Small task samples do not establish broad quality
+equivalence. Compare published rows only using model-request latency: the
+historical page excludes tools and grading, and its actual concurrency is not
+recorded. The fresh comparison uses one active request. Matching input keys
+does not establish matching historical serving conditions. Detailed records
+remain private.
 
 Focused wrapper checks pass on Mac and Linux. Both frozen graders reject their
 buggy fixtures and accept their references on Linux. The SLO grader has a missing
 `sys` import in its failure-reporting branch; that original behavior is retained
 for comparability, and the final edits are available for review. Fresh model
-runs are pending; no new throughput result is claimed by this source change.
+runs completed in both execution orders, all generated edits were reviewed, and
+automatic recovery returned the original service with a successful completion
+and verified GPU ownership. The run contains a model task failure, which remains
+in the comparison. Completion-rate reporting was added after the run and applies
+to the saved records; it does not change the measured client or serving paths.
+This source change does not publish measured performance payloads.

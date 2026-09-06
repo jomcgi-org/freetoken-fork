@@ -34,6 +34,9 @@ def test_failed_attempts_remain_in_both_orders_and_totals():
     on = result["comparison"]["modes"]["on"]
     assert on["tasks"] == 4 and on["passed"] == 3
     assert on["task_wall_s"] == 54.
+    assert on["completion_rate"] == .75
+    assert on["successful_tasks_per_hour"] == pytest.approx(3 * 3600 / 54)
+    assert result["comparison"]["successful_task_throughput_ratio"] == pytest.approx((3 / 54) / (4 / 40))
     assert result["comparison"]["wall_reduction_percent"] < 0
     assert result["orders"]["B/A"]["wall_reduction_percent"] > 0
 
@@ -63,6 +66,24 @@ def test_transport_failures_with_no_recorded_model_time_still_summarize():
     result = wall.summarize(data, ["one", "two"])
     assert not result["all_tasks_passed"]
     assert result["comparison"]["model_time_reduction_percent"] is None
+    assert result["comparison"]["successful_task_throughput_ratio"] is None
+    for mode in result["comparison"]["modes"].values():
+        assert mode["completion_rate"] == 0
+        assert mode["successful_tasks_per_hour"] == 0
+
+
+@pytest.mark.parametrize("zero_mode", ["off", "on", "both"])
+def test_zero_wall_cannot_produce_an_infinite_completion_rate(zero_mode):
+    data = reports()
+    for report in data:
+        for row in report["records"]:
+            if zero_mode == "both" or row["mode"] == zero_mode:
+                row["task_wall_s"] = 0.
+    result = wall.summarize(data, ["one", "two"])
+    assert result["comparison"]["successful_task_throughput_ratio"] is None
+    for mode, totals in result["comparison"]["modes"].items():
+        if zero_mode == "both" or mode == zero_mode:
+            assert totals["successful_tasks_per_hour"] is None
 
 
 @pytest.mark.parametrize("duration", [-1., float("nan"), float("inf")])

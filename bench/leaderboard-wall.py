@@ -206,8 +206,11 @@ def summarize(reports, task_ids):
            for field in ("task_wall_s", "model_request_s")):
         raise ValueError("comparison requires finite nonnegative wall measurements")
     def totals(selected):
-        return dict(tasks=len(selected), passed=sum(r["completion_qualified"] for r in selected),
-                    task_wall_s=sum(r["task_wall_s"] for r in selected),
+        passed = sum(r["completion_qualified"] for r in selected)
+        elapsed = sum(r["task_wall_s"] for r in selected)
+        return dict(tasks=len(selected), passed=passed, completion_rate=passed / len(selected),
+                    task_wall_s=elapsed,
+                    successful_tasks_per_hour=passed * 3600 / elapsed if elapsed > 0 else None,
                     model_request_s=sum(r["model_request_s"] for r in selected),
                     calls=sum(r["observation"]["calls"] for r in selected),
                     output_tokens=sum(a["completion_tokens"] for r in selected for a in r["cell"]["attempts"]))
@@ -216,8 +219,12 @@ def summarize(reports, task_ids):
         def reduction(field):
             return (100 * (1 - modes["on"][field] / modes["off"][field])
                     if modes["off"][field] > 0 else None)
+        off_rate = modes["off"]["successful_tasks_per_hour"]
+        on_rate = modes["on"]["successful_tasks_per_hour"]
         return dict(modes=modes, wall_reduction_percent=reduction("task_wall_s"),
-                    model_time_reduction_percent=reduction("model_request_s"))
+                    model_time_reduction_percent=reduction("model_request_s"),
+                    successful_task_throughput_ratio=(on_rate / off_rate
+                        if off_rate is not None and off_rate > 0 and on_rate is not None else None))
     return dict(completed=True, all_tasks_passed=all(r["completion_qualified"] for r in rows),
                 comparison=compare(rows), orders={
                     name: compare([r for r in rows if r["arm"] in arms])
