@@ -1,12 +1,14 @@
 # Short leaderboard task wall comparison
 
 `bench/leaderboard-wall.py` runs frozen tasks through the original model-bench
-agent loop and hidden graders. The private input bundle contains the original
-Python harness, registry, task definitions, fixtures, historical result cells and
-reference fixes. Its manifest checks every file before importing the harness,
-then recomputes each historical cache key from the prompt, fixture, verifier,
-model and budgets. References are outside the fixture copied into the agent's
-work directory.
+agent loop and hidden graders. The frozen input bundle contains the original
+Python harness, registry, task definitions, fixtures, published historical rows
+and reference fixes. These can be reconstructed directly from the public source
+repository on the benchmark node. Private cached result cells stay on the
+controller. Compare the reconstructed input keys to those cells before launch.
+The bundle manifest checks every file before importing the harness, then
+recomputes each recorded input key from the prompt, fixture, verifier, model and
+budgets. References are outside the fixture copied into the agent's work directory.
 
 The client preserves the original prompts, file tools, turn and token budgets,
 temperature, served model alias and extra request fields. A grading preflight
@@ -27,6 +29,18 @@ runtime and native identities, qualify serving geometry, and disable invasive
 diagnostics. Source changes, dependency setup and unrelated tests must finish
 before measured model requests begin.
 
+`bench/leaderboard-wall-driver.py` implements the Linux supervisor using the
+previously validated original/selected runtime guard. Its `preflight` action is
+read-only. Its `run` action requires it to be the main process of the
+`astra-leaderboard-wall` systemd unit, with `KillMode=control-group` and the
+existing recovery script configured as `ExecStopPost`. Launch with a fresh
+output directory and an independently confirmed `--keys-verified` assertion.
+It pins the benchmark source, native identities, grading toolchain and geometry,
+reserves a single request slot, and disables invasive telemetry. Each arm gets
+the same short readiness completion before timed work. Startup and readiness
+are outside task timers. Final journal and original-serving audits remain
+required after the unit becomes terminal.
+
 ```sh
 python bench/leaderboard-wall.py qualify --bundle /private/inputs --output /private/qualification.json
 python bench/leaderboard-wall.py run --bundle /private/inputs --qualification /private/qualification.json --arm r1 --output /private/r1.json
@@ -39,5 +53,8 @@ and model-request time by task and order. Agent trajectories may differ, so this
 is task throughput rather than an isolated runtime speedup. Small task samples
 do not establish broad quality equivalence. Detailed records remain private.
 
-Focused wrapper checks pass locally. Linux grader qualification and fresh model
+Focused wrapper checks pass on Mac and Linux. Both frozen graders reject their
+buggy fixtures and accept their references on Linux. The SLO grader has a missing
+`sys` import in its failure-reporting branch; that original behavior is retained
+for comparability, and the final edits are available for review. Fresh model
 runs are pending; no new throughput result is claimed by this source change.

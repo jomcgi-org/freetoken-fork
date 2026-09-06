@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import importlib.util
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,10 @@ spec = importlib.util.spec_from_file_location(
     "leaderboard_wall", Path(__file__).parents[1] / "bench/leaderboard-wall.py")
 wall = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wall)
+driver_spec = importlib.util.spec_from_file_location(
+    "leaderboard_driver", Path(__file__).parents[1] / "bench/leaderboard-wall-driver.py")
+driver = importlib.util.module_from_spec(driver_spec)
+driver_spec.loader.exec_module(driver)
 
 
 def reports():
@@ -131,3 +136,29 @@ def test_symlink_in_fixture_is_rejected(tmp_path):
     (tmp_path / "link").symlink_to(tmp_path.parent)
     with pytest.raises(ValueError, match="symlinks"):
         wall.file_hashes(tmp_path)
+
+
+@pytest.mark.parametrize("state", [dict(ActiveState="inactive", MainPID="10"),
+                                   dict(ActiveState="active", MainPID="11")])
+def test_supervisor_cannot_run_outside_its_owned_unit(state):
+    with pytest.raises(RuntimeError, match="owned systemd unit"):
+        driver.require_owned_unit(state, 10)
+
+
+def test_completed_child_is_not_signalled():
+    child = SimpleNamespace(poll=lambda: 0)
+    driver.stop_child(child)
+
+
+def test_unresponsive_owned_child_is_killed_after_grace_period():
+    events = []
+
+    def wait(*, timeout):
+        events.append(("wait", timeout))
+        if timeout == 90:
+            raise subprocess.TimeoutExpired("owned child", timeout)
+
+    child = SimpleNamespace(poll=lambda: None, terminate=lambda: events.append("terminate"),
+                            wait=wait, kill=lambda: events.append("kill"))
+    driver.stop_child(child)
+    assert events == ["terminate", ("wait", 90), "kill", ("wait", 15)]
