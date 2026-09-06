@@ -33,5 +33,13 @@ thresholds. All thresholds exclude proposer/scheduler costs and repeatedly warm
 the same expert/file working set. These are component costs, never serving wall
 time or a broad quality evaluation. All measured records remain private.
 
-Validation is pending full target-model execution; keep this experiment draft
-until graph capture, exact-state checks and focused Linux tests pass.
+Validation: focused Linux checks pass for saved-state selection, other-slot
+isolation, incomplete-checkpoint rejection, explicit hook gating and report
+qualification. Full target-model execution also completed: the saved seed,
+target predictions, logits and committed state matched ordinary decode in the
+tested windows. Rejected trials and their subsequent ordinary continuation
+passed the same exact comparisons. Both graph variants ran with activation
+tracing disabled, and the external supervisor restored original serving.
+These local checks do not establish coverage of every input, cache boundary or
+sampling setting. A serving integration still requires separate wall-time and
+quality validation.
