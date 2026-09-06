@@ -277,6 +277,7 @@ model wall time have separate meanings.
 | Buffered reads into HOT staging rows | Sustained wall time is 19.6% longer than mmap, with both orders slower; 164 focused Linux/CUDA checks and 25 zero-error memcheck checks pass | [#35](https://github.com/jomcgi-org/freetoken-fork/pull/35), draft; keep mmap HOT staging |
 | Concurrent complete-response client and gate | Fixed-capacity 1/4/4/1 starts: 498.127 to 512.904 seconds, 3.0% longer overall with conflicting orders; mean individual latency 20.755 to 82.122 seconds; 18 client checks pass | [#36](https://github.com/jomcgi-org/freetoken-fork/pull/36), ready as benchmark tooling; no dependable batching gain |
 | Reuse weight unpacking across shared decode routes | At batch four and ten active routes, resident-weight native task time falls 21.2% with five shared experts and 43.8% with ten; 69 Linux/CUDA checks and 352 bitwise-equal timing pairs pass; model wall time pending | [#37](https://github.com/jomcgi-org/freetoken-fork/pull/37), draft; defaults off |
+| Multi-turn Pi task benchmark | All three independent task stages pass in a live integration, 18 model calls and two recovered test failures; 18 focused client checks pass; no agentic A/B speedup measured | [#38](https://github.com/jomcgi-org/freetoken-fork/pull/38), ready as benchmark tooling |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
@@ -384,9 +385,13 @@ is being qualified for the interactive workload. It keeps one agent session
 through code changes, local tests, follow-up requirements, and independent
 cumulative checks. Its timer includes tool execution and check-driven repairs.
 The existing prompt gates disable prefix reuse and cannot represent this path.
-The client has 17 passing focused checks on Linux and macOS; complete live
-integration and paired server timing are still pending. The first development
-attempt passed the initial task stage and reported cached prefixes, then failed
-a truncated tool call under its small output cap. That failure is retained.
-Neither the client addition nor its development run changes the established
-17.8% sustained combined wall-time result.
+The client has 18 passing focused checks on Linux and macOS. Its frozen live
+integration passed all three stages in 464.073 seconds, with 18 model calls,
+16 tool executions, two failed local test commands recovered by Pi, and a
+14406-token final context. Cached prefixes were reported on 17 model calls.
+The earlier failed development attempt under a small output cap is retained.
+The integration used the original diagnostic-enabled service and did not exclude
+other requests, so it establishes no speedup. The benchmark tooling is ready
+for review; paired server timing with diagnostics disabled remains pending.
+Neither this client nor its integration changes the established 17.8% sustained
+combined wall-time result.
