@@ -19,7 +19,10 @@ def setup(monkeypatch, *, enabled=True, page_size=4, num_slots=12):
         key_head_dim=4, value_head_dim=4, conv_kernel_dim=4, output_gate="silu")
     pool = LinearStatePool(
         group, num_slots, torch.bfloat16, torch.device("cpu"), tp_size=1,
-        slot_states=(SlotStateSpec(name="ple_conv", shape=(2, 3), layer_ids=(1,)),))
+        slot_states=(
+            SlotStateSpec(name="ple_conv", shape=(2, 3), layer_ids=(1,)),
+            SlotStateSpec(name="ple_ngram_ctx", shape=(2,), dtype=torch.int32, fill_value=7),
+        ))
     monkeypatch.setattr(core, "_GLOBAL_CTX", Context(page_size=page_size, linear_state_pool=pool))
     table = torch.zeros(4, 128, dtype=torch.int32)
     manager = CacheManager(32, page_size, table, "hybrid_radix", linear_state_pool=pool,
@@ -31,12 +34,15 @@ def mark(pool, slot, length):
     pool.conv_states[:, slot].fill_(length)
     pool.recurrent_states[:, slot].fill_(length + 0.25)
     pool.slot_states["ple_conv"][:, slot].fill_(length + 0.5)
+    pool.slot_states["ple_ngram_ctx"][:, slot] = torch.tensor([length - 1, length], dtype=torch.int32)
 
 
 def assert_state(pool, slot, length):
     assert torch.all(pool.conv_states[:, slot] == length)
     assert torch.all(pool.recurrent_states[:, slot] == length + 0.25)
     assert torch.all(pool.slot_states["ple_conv"][:, slot] == length + 0.5)
+    assert torch.equal(pool.slot_states["ple_ngram_ctx"][:, slot],
+                       torch.tensor([[length - 1, length]], dtype=torch.int32))
 
 
 def pending(length):
