@@ -8,7 +8,8 @@ experts per layer, top-10 routing, H=2560 and I=640. `qwen3.6-27b` is its API
 alias. Measurements use node-4's RTX 4090 and Ryzen 7 7800X3D with 61.91 GiB
 RAM and local NVMe. GLM is outside this performance qualification.
 
-Performance evidence updated on 2026-09-06 after both sustained comparisons.
+Performance evidence updated on 2026-09-06 after the concurrency gate and native
+decode weight-reuse validation.
 
 ## Sustained wall time and the reader regression
 
@@ -274,12 +275,14 @@ model wall time have separate meanings.
 | Selected DISK staging and exact HOT VRAM reuse | Earlier direct CPU comparison: 31.6% lower prose wall time, mixed JSON gains; included in the sustained combined 17.8% result | [#33](https://github.com/jomcgi-org/freetoken-fork/pull/33), draft |
 | Cache-aware staged reads | Short reader gate: 18.3% less wall time; sustained isolation: 6.8% slower overall and 15.7% slower in second halves; 99 CUDA checks pass normally and under memcheck | [#34](https://github.com/jomcgi-org/freetoken-fork/pull/34), draft; keep buffered staging for the sustained workload |
 | Buffered reads into HOT staging rows | Sustained wall time is 19.6% longer than mmap, with both orders slower; 164 focused Linux/CUDA checks and 25 zero-error memcheck checks pass | [#35](https://github.com/jomcgi-org/freetoken-fork/pull/35), draft; keep mmap HOT staging |
-| Concurrent complete-response client | 18 hermetic checks pass locally and on Linux; reports workload elapsed time separately from request latency; no model speedup measured yet | [#36](https://github.com/jomcgi-org/freetoken-fork/pull/36), draft |
+| Concurrent complete-response client and gate | Fixed-capacity 1/4/4/1 starts: 498.127 to 512.904 seconds, 3.0% longer overall with conflicting orders; mean individual latency 20.755 to 82.122 seconds; 18 client checks pass | [#36](https://github.com/jomcgi-org/freetoken-fork/pull/36), ready as benchmark tooling; no dependable batching gain |
+| Reuse weight unpacking across shared decode routes | At batch four and ten active routes, resident-weight native task time falls 21.2% with five shared experts and 43.8% with ten; 69 Linux/CUDA checks and 352 bitwise-equal timing pairs pass; model wall time pending | [#37](https://github.com/jomcgi-org/freetoken-fork/pull/37), draft; defaults off |
 
 The main dependency chain is #27, #28, #30, #32, #33. #31 is independently
 reviewable from #28 and is cherry-picked into #33. #29 remains separate.
 #34 evaluates a DISK prefill reader on top of #33; #35 evaluates HOT staging
-on top of #34, and #36 adds a concurrency client on top of #35. The original
+on top of #34, #36 adds a concurrency client on top of #35, and #37 adds the
+native decode experiment on top of #36. The original
 serving checkout is restored and verified after
 every completed model gate; these changes are delivered in PRs.
 
@@ -336,14 +339,40 @@ The HOT staging comparison at `878d723` also favors the existing mmap path.
 Do not infer a serving gain from a cheaper host-copy operation. Matching
 descriptor advice remains a possible follow-up, with no qualified gain yet.
 
-The next larger question is concurrent request throughput using the preferred
-buffered GPU DISK prefill and mmap HOT staging. The
+The completed concurrent request gate uses the preferred buffered GPU DISK
+prefill and mmap HOT staging. The
 [#36 client](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-concurrent-wall-client/docs/concurrent-wall.md)
 preserves the same scored prompts and complete outputs, measures the entire
 workload's elapsed time, and reports individual response latency separately.
-Keep server admission capacity, runtime, cache geometry, and other policies
-fixed while varying offered client concurrency. Use both start orders with
-diagnostics off. No concurrent-serving speedup is claimed before that gate.
+With server capacity four fixed, twenty-four measured responses take 498.127
+seconds at concurrency one and 512.904 seconds at concurrency four. The 3.0%
+aggregate increase hides conflicting matched orders: four requests are 18.7%
+slower in one and 12.1% faster in the other. Mean individual latency increases
+from 20.755 to 82.122 seconds. All measured JSON pairs have identical text and
+usage, and every start retains identical fidelity answers and 7/8. The complete
+prose review includes omissions and unsupported connections in both modes.
+This finite comparison does not establish a dependable batching gain.
+
+Storage and adaptation remain material context. The two concurrent starts
+read 63.630 and 30.286 GiB during measurement, and the final single-request
+start backs off its HOT interval from 1,000 to 2,000. Those are whole-worker
+counters and actual controller transitions, not isolated causal measurements.
+All four starts have equal geometry, including 3,920 expert slots and 1,024 KV
+pages; the fixed four-request allocation differs from earlier single-capacity
+comparisons. Do not combine their percentages.
+
+The next gate is complete model wall time for
+[#37's native decode weight reuse](https://github.com/jomcgi-org/freetoken-fork/blob/perf/4090-decode-weight-reuse/docs/decode-weight-reuse.md).
+The existing CPU schedule groups routes by expert but repeats weight unpacking
+inside each group. The opt-in AVX-512 VNNI path shares that work across up to four
+routes while retaining the serial decode accumulators, activation handling, and
+original top-k reduction. All 69 focused Linux/CUDA checks pass, including direct
+FP32-bit comparisons and both captured CPU/GPU transports. All 352 paired native
+timing outputs match bitwise. At batch four with ten active routes, native task
+time falls 21.2% with five shared experts and 43.8% with ten, while no sharing is
+effectively flat. These synthetic resident-weight results do not establish model
+throughput. Keep it off by default until a non-debug complete-response gate
+measures the same runtime and binary with reuse off/on in both start orders.
 
 The tested automatic decode-history preference was reverted: it improved
 JSON by 26.8% but slowed prose by 8.6%. That experiment changed only placement
