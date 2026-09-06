@@ -1,5 +1,41 @@
 # Original and optimized runtime comparison with Pi
 
+The completed 2026-09-06 comparison takes **23.1% less measured task wall time**
+with the optimized stack: 1506.667 seconds (25m07s) versus 1158.016 seconds
+(19m18s) across four measured tasks per runtime. All eight measured tasks and
+four warmups pass all three cumulative requirement checks. The original service
+was restored and verified with a real completion.
+
+| Start order | Baseline task wall | Optimized task wall | Reduction |
+| --- | ---: | ---: | ---: |
+| A/B, two tasks each | 665.618 s | 633.515 s | 4.8% |
+| B/A, two tasks each | 841.049 s | 524.501 s | 37.6% |
+| Total, four tasks each | 1506.667 s | 1158.016 s | 23.1% |
+
+This is observed agentic task throughput, with substantial model-behavior
+variation. The optimized tasks use 67 model calls and 22752 output tokens,
+versus 85 calls and 26999 tokens for the baseline. The final baseline task
+spends five failed test runs revising an incorrect expectation before removing
+that test, finishing in 514.508 seconds with 29 calls. Its full elapsed time
+remains in the comparison. Both start orders improve, but their spread and
+unequal generation prevent treating 23.1% as an isolated engine speedup.
+The first order is only 4.8% faster despite similar output-token totals.
+
+Measured tasks contain nine failed tool commands in the baseline and five in
+the optimized runtime. No independent grader repair prompt was required.
+Final implementations, final test results, and repair sequences were reviewed;
+some repairs correct implementation errors, others correct invalid model-written
+tests. All 229 HTTP completions match readiness plus the recorded Pi calls;
+there are no inference errors. This one Cache fixture is a limited quality
+check, not proof of broad quality equivalence.
+
+The [complete record](../bench/results/4090-pi-runtime-wall-20260906.json)
+contains arithmetic, all twelve transcripts and event records, final workspaces,
+full journals, source identities, the frozen controller and client, and recovery
+evidence. Each of its 73 raw files retains exact text and a SHA-256 hash.
+The earlier partial arm reviews are retained as evidence captured during the
+run; the complete record and this document supersede their pending status.
+
 This gate measures the existing throughput stack on a continuing coding task.
 It does not enable the native shared-route decode experiment, change routing,
 or introduce quantization. The baseline is the frozen original `3a67403`
@@ -89,54 +125,48 @@ unsuccessfully as expected and still runs recovery. The
 [complete recovery record](../bench/results/4090-pi-runtime-recovery-20260906.json)
 retains both commands, exit status, output, and verified original completion.
 
-The gate launched on 2026-09-06 at 03:11:30 UTC. The
-[first-arm startup record](../bench/results/4090-pi-runtime-launch-20260906.json)
-confirms the baseline native mapping, both diagnostic flags off, one-request
-capacity, FP8 K/V, and successful readiness completion. Prefix caching leaves
-3753 expert slots with 1024 KV pages; HOT residency remains 2296 rows. This
-differs from the earlier naive-cache experiments. Later arms must match this
-geometry before comparison. The record is partial, with no measured speedup
-yet; the controller and recovery lease were confirmed live at capture.
+The gate ran from 03:11:30 UTC through verified restoration after 04:32 UTC.
+All four starts match 3753 expert slots, 1024 KV pages, 2296 protected HOT rows,
+14 CPU threads, capacity one and graph size one. The 64K K/V allocation is
+0.80 GiB. This differs from the earlier naive-cache experiments.
 
-After all four arms finish and serving is restored, summarize the archived records:
+Summarize the archived records after collection:
 
 ```sh
 python3 bench/pi-agentic-runtime-summary.py \
   /private/tmp/astra-pi-agentic-runtime-20260906 >pi-runtime-summary.json
 ```
 
-The summarizer rejects incomplete schedules, mismatched client configuration,
-server identities or geometry, enabled diagnostics, and inconsistent successful
-checks. It retains all twelve sessions, reports the eight measured sessions and
-both start orders, and omits speedup and checked-task throughput when measured
-tasks fail. Worker storage reads include warmup and are labelled accordingly.
-Input hashes make the summary traceable to its raw records. Review the full
-journals, model outputs, and final files separately; arithmetic and fixture checks
-cannot establish broad quality equivalence. This analysis runs after collection
-and changes neither the frozen client nor the runtime controller.
+To reconstruct those inputs from the published record in a fresh local directory:
 
-Fifteen focused summarizer tests pass on macOS. Its CLI also refuses to summarize
-the live incomplete gate. Linux validation remains pending until the timed model
-comparison ends, to avoid competing with the measured worker.
+```python
+import hashlib
+import json
+from pathlib import Path
 
-The [first baseline arm review](../bench/results/4090-pi-runtime-r1-review-20260906.json)
-records all three successful sessions, their independent checks, final test
-results, source hashes and repair behavior. The two measured tasks total 665.618
-seconds. Its archived journal accounts for exactly 60 requests, matching readiness
-plus 59 Pi model calls, with no inference errors. This is partial evidence; it
-contains no optimized comparison or claim of broad quality equivalence.
+record = json.loads(Path("bench/results/4090-pi-runtime-wall-20260906.json").read_text())
+root = Path("pi-runtime-reconstructed")
+root.mkdir(exist_ok=False)
+for name, item in record["raw_files"].items():
+    data = item["text"].encode()
+    assert hashlib.sha256(data).hexdigest() == item["sha256"]
+    target = root / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+```
 
-The [first optimized arm review](../bench/results/4090-pi-runtime-r2-review-20260906.json)
-also records three successful sessions and exactly the expected 52 requests,
-without inference errors. Its two measured tasks total 633.515 seconds, versus
-665.618 for the first baseline arm, a provisional 4.8% reduction. The reverse
-start order remains pending. The optimized log omits the legacy disk-statistics
-fields. Review distinguishes implementation errors from mistaken model-written
-test expectations; both kinds of repair remain in the elapsed task time.
+Then pass `pi-runtime-reconstructed` to the summarizer. It rejects incomplete
+schedules, mismatched configuration or identities, enabled diagnostic flags and
+inconsistent successful checks. It retains all twelve sessions, excludes only
+the declared warmups from comparison, and omits speedup if measured tasks fail.
+Worker storage counters cover warmup and measured tasks together. The analysis
+cannot establish broad quality equivalence or attribute time to individual
+runtime changes.
 
-The [second optimized arm review](../bench/results/4090-pi-runtime-r3-review-20260906.json)
-retains another three successful tasks and 52 expected requests without inference
-errors. Its measured tasks total 524.501 seconds, with fewer generated tokens and
-model calls than the first optimized arm. That shorter unpaired time is not a
-new runtime gain. The final baseline start matches the same geometry; its results
-and the complete paired analysis remain pending.
+Fifteen focused summarizer checks pass on both Linux and macOS, including
+rejection of incomplete or inconsistent evidence and retention of failed-task
+time. The [Linux validation record](../bench/results/4090-pi-runtime-summary-validation-20260906.json)
+confirms these checks ran after model timing and verified restoration, with the
+same original serving invocation before and after. Nine focused controller
+checks and the live recovery probes also passed before the run. This analysis
+changed neither the frozen controller nor client used for collection.
