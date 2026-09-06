@@ -15,6 +15,98 @@ gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
 
+def source_log(mode):
+    gpu = list(range(20))
+    disk = list(range(20, 48)) if mode == 'off' else list(range(48))
+    bank = (f'MoE bank split residency: 0.00 GiB pinned (cudaHostRegister, '
+            f'{20 if mode == "off" else 0} GPU layers) + '
+            f'0.00 GiB OS-locked (0 CPU layers: []) + 0.00 GiB file-backed '
+            f'({len(disk)} DISK layers: {disk})')
+    paths = f'MoE prefill paths: overlap=0; GPU candidates={gpu}, chosen={gpu}, bytes=0 B; budget=100 B - reserved=0 B = available=100'
+    staging = f'MoE GPU source staging: layers={gpu}; synthetic fixture' if mode == 'on' else ''
+    return '\n'.join([bank, paths, staging])
+
+
+def test_gpu_source_changes_only_explicit_source_flag(monkeypatch, tmp_path):
+    monkeypatch.setattr(gate, 'GPU_SOURCE_STAGING', True)
+    service = tmp_path / 'original.service'
+    service.write_text('ExecStart=/bin/ft --port 8090 --moe-disk-prefill cpu '
+                       '--max-running-requests 1 --kv-disk-cache-gib 1 --moe-collect-stats')
+    monkeypatch.setattr(gate, 'SERVICE', service)
+    commands = {mode: gate.server_command(mode) for mode in gate.MODES}
+    gate.qualify_source_commands(commands)
+    assert gate.server_env('off') == gate.server_env('on')
+    assert gate.server_env('on')['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0'
+    assert gate.runtime_tree('off') == gate.runtime_tree('on') == gate.GPU_SOURCE
+    assert gate.runtime_revision('off') == gate.runtime_revision('on') == gate.GPU_SOURCE_REVISION
+    assert gate.runtime_revision('original') == gate.REVISIONS['original']
+
+
+@pytest.mark.parametrize('change', ['duplicate', 'unrelated', 'wrong', 'missing_value'])
+def test_gpu_source_commands_reject_confounds(change):
+    commands = {'off': ['ft', '--moe-gpu-source', 'pinned'],
+                'on': ['ft', '--moe-gpu-source', 'staged']}
+    if change == 'duplicate':
+        commands['on'] += ['--moe-gpu-source', 'staged']
+    elif change == 'unrelated':
+        commands['on'] += ['--extra']
+    elif change == 'wrong':
+        commands['on'][-1] = 'pinned'
+    else:
+        commands['on'].pop()
+    with pytest.raises(AssertionError):
+        gate.qualify_source_commands(commands)
+
+
+def test_source_layout_allows_backing_changes_but_preserves_gpu_compute():
+    off, on = (gate.source_layout(source_log(mode), mode) for mode in gate.MODES)
+    assert off['gpu_layer_ids'] == on['gpu_layer_ids'] == list(range(20))
+    assert off['file_layer_ids'] == list(range(20, 48))
+    assert on['file_layer_ids'] == list(range(48))
+    with pytest.raises(AssertionError, match='wrong file-backed'):
+        gate.source_layout(source_log('off'), 'on')
+    with pytest.raises(AssertionError, match='wrong pinned'):
+        gate.source_layout(source_log('on').replace('0 GPU layers)', '20 GPU layers)'), 'on')
+    with pytest.raises(AssertionError, match='wrong GPU staging'):
+        gate.source_layout(source_log('on').replace('staging: layers=[0,', 'staging: layers=[99,'), 'on')
+
+
+def test_gpu_placement_ignores_budget_estimate_but_rejects_changed_selection():
+    original = source_log('off')
+    changed_budget = original.replace('budget=100', 'budget=110').replace('available=100', 'available=110')
+    assert gate.gpu_compute_placement(original) == gate.gpu_compute_placement(changed_budget)
+    for before, after in [('chosen=[0,', 'chosen=[99,'), ('candidates=[0,', 'candidates=[99,'),
+                          ('bytes=0', 'bytes=1'), ('reserved=0', 'reserved=1')]:
+        assert gate.gpu_compute_placement(original) != gate.gpu_compute_placement(original.replace(before, after))
+
+
+@pytest.mark.parametrize('action', ['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
+def test_gpu_source_mode_reaches_remote_recovery_and_serving(monkeypatch, action):
+    monkeypatch.setattr(gate, 'GPU_SOURCE_STAGING', True)
+    command = gate.remote_command('/tmp/driver.py', action, 'astra-pi-agentic-source-test')
+    assert command.count('--gpu-source-staging') == 1
+
+
+@pytest.mark.parametrize('unit', ['astra-gpu-source-staging-cost', 'astra-gpu-source-staging-validation'])
+def test_staging_component_job_prevents_model_benchmark(monkeypatch, unit):
+    monkeypatch.setattr(gate, 'server_command', lambda _: ['same'])
+    monkeypatch.setattr(gate, 'server_env', lambda mode: {
+        'FREETOKEN_DECODE_PREFIX_SNAPSHOT': '1' if mode == 'on' else '0'})
+    monkeypatch.setattr(gate, 'live', lambda name: name == unit)
+    with pytest.raises(AssertionError, match='another benchmark is live'):
+        gate.preflight()
+
+
+def test_os_snapshot_uses_bytes_and_preserves_shared_memory(monkeypatch):
+    def read(path):
+        fields = gate.SYSTEM_MEMORY_FIELDS if str(path) == '/proc/meminfo' else gate.WORKER_MEMORY_FIELDS
+        return '\n'.join(f'{key}: {i + 1} kB' for i, key in enumerate(fields))
+    monkeypatch.setattr(gate.Path, 'read_text', read)
+    snapshot = gate.memory_snapshot(123)
+    assert snapshot['worker_bytes']['RssShmem'] == 5 * 1024
+    assert snapshot['system_bytes']['MemAvailable'] == 1024
+
+
 def test_stopping_an_absent_or_inactive_service_is_idempotent(monkeypatch):
     monkeypatch.setattr(gate, 'state', lambda _: {'ActiveState': 'inactive'})
     monkeypatch.setattr(gate, 'run', lambda *_args, **_kwargs: pytest.fail('inactive unit must not be stopped'))

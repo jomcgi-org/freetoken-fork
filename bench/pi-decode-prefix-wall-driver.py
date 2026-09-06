@@ -30,6 +30,9 @@ CARRY = R / 'wt-astra-prefill-snapshot-carry'
 PREFILL_CARRY = False
 PROFILE = R / 'wt-astra-hybrid-profile-retention'
 PROFILE_RETENTION = False
+GPU_SOURCE = R / 'wt-astra-gpu-source-staging'
+GPU_SOURCE_STAGING = False
+GPU_SOURCE_REVISION = '3f1e4dfc860232d4eafb7638423ee883ff879599'
 EXTENSION_SOURCES = {
     '_cpu_moe': 'cpu_moe/cpu_moe_ext.cpp',
     '_pinned_tensor': 'pinned_tensor.cpp',
@@ -128,12 +131,16 @@ def completion(port):
 
 
 def runtime_tree(mode):
+    if GPU_SOURCE_STAGING:
+        return GPU_SOURCE
     if PROFILE_RETENTION:
         return PROFILE if mode == 'on' else CARRY
     return CARRY if PREFILL_CARRY and mode == 'on' else OPT
 
 
 def runtime_revision(mode):
+    if GPU_SOURCE_STAGING and mode != 'original':
+        return GPU_SOURCE_REVISION
     if PROFILE_RETENTION and mode != 'original':
         return PROFILE_RETENTION_REVISIONS[mode]
     return PREFILL_CARRY_REVISIONS[mode] if PREFILL_CARRY and mode != 'original' else REVISIONS[mode]
@@ -144,6 +151,8 @@ def runtime_pair():
 
 
 def experiment_name():
+    if GPU_SOURCE_STAGING:
+        return 'gpu-source-staging'
     if PROFILE_RETENTION:
         return 'hybrid-profile-retention'
     return 'prefill-snapshot-carry' if PREFILL_CARRY else 'decode-prefix-snapshot'
@@ -194,6 +203,9 @@ def server_command(mode):
                 args[args.index(flag) + 1] = value
             else:
                 args.extend([flag, value])
+    if GPU_SOURCE_STAGING:
+        assert '--moe-gpu-source' not in args, 'original service already overrides GPU sources'
+        args.extend(['--moe-gpu-source', 'staged' if mode == 'on' else 'pinned'])
     assert '--moe-collect-stats' not in args and '--moe-step-timing' not in args
     return args
 
@@ -203,20 +215,36 @@ def server_env(mode):
     return dict(CUDA_HOME='/usr/local/cuda-13.0',
                 PATH=f'{SRC}/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin', TMPDIR=str(R / 'tmp'),
                 PYTHONPATH=str(runtime_tree(mode) / 'python'),
-                FREETOKEN_DECODE_PREFIX_SNAPSHOT='1' if mode == 'on' and not runtime_pair() else '0',
+                FREETOKEN_DECODE_PREFIX_SNAPSHOT='1' if mode == 'on' and not runtime_pair() and not GPU_SOURCE_STAGING else '0',
                 FREETOKEN_CONTINUATION_TRACE_DIR='',
                 FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS='128', FREETOKEN_PREFILL_HOT_OVERLAP='0')
 
 
+def qualify_source_commands(commands):
+    normalized = []
+    for mode, value in [('off', 'pinned'), ('on', 'staged')]:
+        command = commands[mode].copy()
+        assert command.count('--moe-gpu-source') == 1, 'missing or duplicate source flag'
+        index = command.index('--moe-gpu-source')
+        assert command[index + 1:index + 2] == [value], 'wrong GPU source flag'
+        del command[index:index + 2]
+        normalized.append(command)
+    assert normalized[0] == normalized[1], 'unrelated GPU source command difference'
+
+
 def preflight(allow_lease=False):
-    assert not (PREFILL_CARRY and PROFILE_RETENTION), 'conflicting experiments'
+    assert sum((PREFILL_CARRY, PROFILE_RETENTION, GPU_SOURCE_STAGING)) <= 1, 'conflicting experiments'
     commands = {mode: server_command(mode) for mode in MODES}
     env = {mode: server_env(mode) for mode in MODES}
-    assert commands['off'] == commands['on']
+    if GPU_SOURCE_STAGING:
+        qualify_source_commands(commands)
+    else:
+        assert commands['off'] == commands['on']
     differences = {key for key in env['off'].keys() | env['on'].keys()
                    if env['off'].get(key) != env['on'].get(key)}
-    assert differences == ({'PYTHONPATH'} if runtime_pair() else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'}), differences
-    if runtime_pair():
+    expected = set() if GPU_SOURCE_STAGING else ({'PYTHONPATH'} if runtime_pair() else {'FREETOKEN_DECODE_PREFIX_SNAPSHOT'})
+    assert differences == expected, differences
+    if runtime_pair() or GPU_SOURCE_STAGING:
         assert all(e['FREETOKEN_DECODE_PREFIX_SNAPSHOT'] == '0' for e in env.values())
     if PROFILE_RETENTION:
         for flag, value in [('--session-expert-prefetch', 'on'), ('--session-protect-experts', '64')]:
@@ -224,6 +252,7 @@ def preflight(allow_lease=False):
             assert commands['off'][commands['off'].index(flag) + 1] == value
     for unit in ['astra-decode-weight-reuse-wall-driver', 'astra-concurrent-wall-driver',
                  'astra-decode-weight-reuse-validation-v2', 'astra-sustained-hot-staging-wall-driver',
+                 'astra-gpu-source-staging-cost', 'astra-gpu-source-staging-validation',
                  'astra-sustained-reader-wall-driver', SERVER, ACTION, *([] if allow_lease else [LEASE])]:
         assert not live(unit), ('another benchmark is live', unit)
     original = state('freetoken-serve')
@@ -231,6 +260,8 @@ def preflight(allow_lease=False):
     workers = gpu_pids()
     assert len(workers) == 1 and original['ControlGroup'] in Path(f'/proc/{workers[0]}/cgroup').read_text()
     runtime_ids = identities()
+    if GPU_SOURCE_STAGING:
+        assert runtime_ids['off'] == runtime_ids['on'], 'GPU source runtime identities differ'
     if runtime_pair():
         for key in ('native', 'native_sha256', 'cpp_sha256', 'native_extensions'):
             assert runtime_ids['off'][key] == runtime_ids['on'][key], key
@@ -252,7 +283,7 @@ def journal(invocation):
     return run('journalctl', '_SYSTEMD_INVOCATION_ID=' + invocation, '--no-pager', '-o', 'cat').stdout
 
 
-def geometry(text):
+def geometry(text, *, source_staging=False):
     lines = re.sub(r'\x1b\[[0-9;]*m', '', text).splitlines()
     markers = ['MoE bank split residency:', 'MoE HOT expert residency:', 'MoE activation dtype:',
                '--moe-cache-auto resolved', 'Allocating 65536 tokens for KV cache',
@@ -268,7 +299,76 @@ def geometry(text):
     assert result['Start capturing CUDA graphs with sizes:'].endswith('[1]')
     assert 'fp8_e4m3' in result['KV cache dtype:']
     assert 'moe_cache_size=3753' in result['--moe-cache-auto resolved']
+    if source_staging:
+        # Only the host backing and overlap counts may change. Preserve the
+        # ordinary GPU selection, HOT residency and all cache geometry checks.
+        del result['MoE bank split residency:']
+        found = [line[line.index('GPU candidates='):] for line in lines
+                 if 'MoE prefill paths:' in line and 'GPU candidates=' in line]
+        assert len(found) == 1, 'missing or ambiguous GPU compute placement'
+        result['GPU compute placement'] = gpu_compute_placement(found[0])
     return result
+
+
+def gpu_compute_placement(text):
+    """Compare placement, excluding the volatile available-host-memory estimate."""
+    result = {}
+    for name in ('candidates', 'chosen'):
+        match = re.search(name + r'=(\[[0-9, ]*\])', text)
+        assert match, ('missing GPU placement field', name)
+        result[name] = json.loads(match[1])
+    for name in ('bytes', 'reserved'):
+        match = re.search(name + r'=(\d+)', text)
+        assert match, ('missing GPU placement field', name)
+        result[name] = int(match[1])
+    return result
+
+
+def source_layout(text, mode):
+    lines = re.sub(r'\x1b\[[0-9;]*m', '', text).splitlines()
+    def one(marker):
+        found = [line[line.index(marker):] for line in lines if marker in line]
+        assert len(found) == 1, ('missing or ambiguous source layout', marker)
+        return found[0]
+    bank = one('MoE bank split residency:')
+    paths = one('MoE prefill paths:')
+    chosen = re.search(r'chosen=(\[[0-9, ]*\])', paths)
+    assert chosen, 'missing GPU layer selection'
+    gpu = json.loads(chosen[1])
+    assert len(gpu) == len(set(gpu)) == 20 and set(gpu) <= set(range(48)), 'wrong GPU layer selection'
+    disk = re.search(r'\((\d+) DISK layers: (\[[0-9, ]*\])\)', bank)
+    pinned = re.search(r', (\d+) GPU layers\)', bank)
+    assert disk and pinned and '0.00 GiB OS-locked (0 CPU layers: [])' in bank, 'wrong host backing'
+    expected_disk = sorted(set(range(48)) - set(gpu)) if mode == 'off' else list(range(48))
+    assert int(disk[1]) == len(expected_disk) and json.loads(disk[2]) == expected_disk, 'wrong file-backed layers'
+    assert int(pinned[1]) == (20 if mode == 'off' else 0), 'wrong pinned layer count'
+    markers = [line[line.index('MoE GPU source staging:'):] for line in lines
+               if 'MoE GPU source staging:' in line]
+    if mode == 'on':
+        assert len(markers) == 1 and markers[0].startswith(
+            'MoE GPU source staging: layers=' + str(sorted(gpu)) + ';'), 'wrong GPU staging selection'
+    else:
+        assert not markers, 'pinned arm enabled GPU staging'
+    return dict(bank=bank, prefill_paths=paths, staging=markers,
+                gpu_layer_ids=gpu, file_layer_ids=expected_disk)
+
+
+WORKER_MEMORY_FIELDS = ('VmRSS', 'VmHWM', 'RssAnon', 'RssFile', 'RssShmem', 'VmLck', 'VmSwap')
+SYSTEM_MEMORY_FIELDS = ('MemAvailable', 'Cached', 'Shmem', 'AnonPages', 'Unevictable', 'Mlocked')
+
+
+def memory_snapshot(pid):
+    """Read OS counters only before/after the client, outside timed requests."""
+    def kib(path, fields):
+        values = dict(line.split(':', 1) for line in path.read_text().splitlines() if ':' in line)
+        result = {}
+        for key in fields:
+            count, unit = values[key].split()
+            assert unit == 'kB' and int(count) >= 0, ('invalid memory counter', key)
+            result[key] = int(count) * 1024
+        return result
+    return dict(worker_bytes=kib(Path(f'/proc/{pid}/status'), WORKER_MEMORY_FIELDS),
+                system_bytes=kib(Path('/proc/meminfo'), SYSTEM_MEMORY_FIELDS))
 
 
 def io_snapshot(pid):
@@ -372,9 +472,10 @@ def remote_main(args):
         assert "speculative_mtp='off'" in text and 'special_token_ckpt=False' in text
         if PROFILE_RETENTION:
             assert "session_expert_prefetch='on'" in text and 'session_protect_experts=64' in text
-        snapshot_enabled = mode == 'on' and not runtime_pair()
+        snapshot_enabled = mode == 'on' and not runtime_pair() and not GPU_SOURCE_STAGING
         assert ('Aligned decode prefix snapshots enabled' in text) == snapshot_enabled
-        shape = geometry(text)
+        shape = geometry(text, source_staging=GPU_SOURCE_STAGING)
+        layout = source_layout(text, mode) if GPU_SOURCE_STAGING else None
         if args.arm != 'r1':
             first = json.loads((out / 'r1-start.json').read_text())
             assert shape == first['geometry'], dict(first=first['geometry'], current=shape)
@@ -385,6 +486,9 @@ def remote_main(args):
                       diagnostics_disabled=True, snapshot_enabled=snapshot_enabled, original_unit=state('freetoken-serve'),
                       identity=plan['identities'][mode], driver_sha256=plan['driver_sha256'],
                       cache_policy='RAM radix reuse on; disk prefix cache and HOT persistence off')
+        if GPU_SOURCE_STAGING:
+            assert ("moe_gpu_source='staged'" if mode == 'on' else "moe_gpu_source='pinned'") in text
+            result.update(source_layout=layout, memory_before=memory_snapshot(worker))
         save(start_path, result)
         (out / (args.arm + '-startup.log')).write_text(text)
         return result
@@ -394,6 +498,8 @@ def remote_main(args):
         assert current['InvocationID'] == before['unit']['InvocationID'] and current['ActiveState'] == 'active'
         result = dict(unit=current, io_after=io_snapshot(before['worker']),
                       gpu_pids=gpu_pids(), original_unit=state('freetoken-serve'))
+        if GPU_SOURCE_STAGING:
+            result['memory_after'] = memory_snapshot(before['worker'])
         assert result['gpu_pids'] == [before['worker']]
         text = journal(current['InvocationID'])
         (out / (args.arm + '-journal.log')).write_text(text)
@@ -423,6 +529,8 @@ def remote_command(script, action, run_id, arm=None):
         command += ['--prefill-snapshot-carry']
     if PROFILE_RETENTION:
         command += ['--hybrid-profile-retention']
+    if GPU_SOURCE_STAGING:
+        command += ['--gpu-source-staging']
     if arm:
         command += ['--arm', arm]
     if action in ('start', 'end'):
@@ -468,6 +576,14 @@ def local_main(args):
                           'native binary, command and environment except PYTHONPATH. Decode snapshots '
                           'and invasive diagnostics off in both arms. Same capacity-one geometry, '
                           'quantization and routing. Retain all failures and both orders.')
+    if GPU_SOURCE_STAGING:
+        plan['design'] = ('Pinned/staged/staged/pinned GPU sources: one warmup and two measured '
+                          'three-turn conversations per fresh server. Identical runtime, native '
+                          'extensions and environment; only --moe-gpu-source differs. Decode '
+                          'snapshots and invasive diagnostics off. Preserve compute placement, '
+                          'HOT residency and cache geometry. Read OS memory counters only before '
+                          'and after the client; these include warmup and are not peak measurements. '
+                          'Host page cache retained. Retain failures and both orders.')
     if not args.fixed_continuation:
         plan.update(pi_version=run(str(args.pi), '--version').stdout.strip(),
                     pi_executable_sha256=sha(args.pi.resolve()))
@@ -603,7 +719,7 @@ def local_main(args):
 
 
 def main():
-    global PREFILL_CARRY, PROFILE_RETENTION
+    global PREFILL_CARRY, PROFILE_RETENTION, GPU_SOURCE_STAGING
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--remote', dest='action', choices=['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])
     parser.add_argument('--run-id', required=True)
@@ -617,17 +733,20 @@ def main():
                              help='compare the pinned prefill-marker fix with its parent; decode snapshots stay off')
     experiments.add_argument('--hybrid-profile-retention', action='store_true',
                              help='compare the pinned expert-profile fix with its parent; decode snapshots stay off')
+    experiments.add_argument('--gpu-source-staging', action='store_true',
+                             help='compare pinned and staged GPU sources on the same runtime; decode snapshots stay off')
     parser.add_argument('--preflight', action='store_true')
     args = parser.parse_args()
     PREFILL_CARRY = args.prefill_snapshot_carry
     PROFILE_RETENTION = args.hybrid_profile_retention
+    GPU_SOURCE_STAGING = args.gpu_source_staging
     if not re.fullmatch(r'astra-pi-agentic-[a-z0-9-]+', args.run_id):
         parser.error('run-id must start astra-pi-agentic- and contain only lowercase letters, digits and hyphens')
     if args.action:
         print(json.dumps(remote_main(args), indent=2), flush=True)
         return 0
-    if runtime_pair() and not args.fixed_continuation:
-        parser.error('runtime-pair experiments require --fixed-continuation')
+    if (runtime_pair() or GPU_SOURCE_STAGING) and not args.fixed_continuation:
+        parser.error('source experiments require --fixed-continuation')
     if not args.output_dir or (not args.pi and not args.fixed_continuation):
         parser.error('local controller requires --output-dir and either --pi or --fixed-continuation')
     return local_main(args)
