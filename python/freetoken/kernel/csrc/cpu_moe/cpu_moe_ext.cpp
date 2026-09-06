@@ -2506,7 +2506,8 @@ struct CpuMoeExecutor {
     const int e = distinct_experts[di];
     int pos = expert_offsets[e];
 #if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
-    if (nvfp4_pair_dot)
+    // Ordinary single-token tasks always retain the same route loop.
+    if (t->num_tokens > 1 && nvfp4_pair_dot)
       for (; pos + 1 < expert_offsets[e + 1]; pos += 2)
         do_pass1_nvfp4_pair(t, e, grouped_routes[pos], grouped_routes[pos + 1], ib);
 #endif
@@ -2583,7 +2584,7 @@ struct CpuMoeExecutor {
     const int e = distinct_experts[di];
     int pos = expert_offsets[e];
 #if CPU_MOE_X86 && defined(CPU_MOE_HAS_AVX512VNNI)
-    if (nvfp4_pair_dot)
+    if (t->num_tokens > 1 && nvfp4_pair_dot)
       for (; pos + 1 < expert_offsets[e + 1]; pos += 2)
         do_pass2_nvfp4_pair(t, e, grouped_routes[pos], grouped_routes[pos + 1], hb);
 #endif
