@@ -1,0 +1,181 @@
+{
+  "phase": "r1-started-partial",
+  "performance_comparison_qualified": false,
+  "captured_utc": "2026-09-06T03:15:27Z",
+  "launch": {
+    "pid": 55719,
+    "command": [
+      "python3",
+      "/private/tmp/freetoken-4090-agentic-runtime-gate/bench/pi-agentic-runtime-driver.py",
+      "--run-id",
+      "astra-pi-agentic-runtime-20260906",
+      "--output-dir",
+      "/private/tmp/astra-pi-agentic-runtime-20260906",
+      "--pi",
+      "/private/tmp/astra-pi-cli/node_modules/.bin/pi"
+    ],
+    "log": "/private/tmp/astra-pi-agentic-runtime-20260906-controller.log",
+    "started_utc": "2026-09-06T03:11:30Z",
+    "revision": "ae7f090234e190897b0c38c9d82c373b94246900"
+  },
+  "controller_process": "  PID  PPID ELAPSED STAT COMMAND\n55719     1   03:57 Ss   /Library/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /private/tmp/freetoken-4090-agentic-runtime-gate/bench/pi-agentic-runtime-driver.py --run-id astra-pi-agentic-runtime-20260906 --output-dir /private/tmp/astra-pi-agentic-runtime-20260906 --pi /private/tmp/astra-pi-cli/node_modules/.bin/pi\n",
+  "server_start": {
+    "arm": "r1",
+    "mode": "baseline",
+    "revision": "3a67403a293be20836604bc25729329997848e09",
+    "unit": {
+      "MainPID": "754804",
+      "Result": "success",
+      "ControlGroup": "/system.slice/astra-pi-agentic-server.service",
+      "ActiveState": "active",
+      "InvocationID": "cbcda8077f1e480097c382d787822315"
+    },
+    "worker": 754827,
+    "health": {
+      "status": "ok",
+      "model": "qwen3.6-27b",
+      "instance_id": "f08a3da8-9ecd-46db-9fd6-a0dab85d7e18",
+      "uptime_s": 0,
+      "maintenance": "serving",
+      "version": "0.1.2"
+    },
+    "startup_completion": {
+      "id": "chatcmpl-0",
+      "object": "chat.completion",
+      "created": 1788664388,
+      "model": "qwen3.6-27b",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "OK"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 2,
+        "total_tokens": 19
+      }
+    },
+    "geometry": {
+      "MoE bank split residency:": "MoE bank split residency: 26.44 GiB pinned (cudaHostRegister, 20 GPU layers) + 0.00 GiB OS-locked (0 CPU layers: []) + 37.02 GiB file-backed (28 DISK layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 15, 16, 23, 25, 31, 32, 35, 36, 39, 40, 41, 42, 43, 44, 45, 46, 47])",
+      "MoE HOT expert residency:": "MoE HOT expert residency: 2296 protected GPU rows across 28 DISK layers, hot_capacity_policy=equal, hot_capacity_rows_min=82, hot_capacity_rows_max=82, hot_staging_gib=0.56, hot_staging_rows=193",
+      "MoE activation dtype:": "MoE activation dtype: bf16 (NVFP4 activation mode requires sm_120, got sm_89)",
+      "--moe-cache-auto resolved": "--moe-cache-auto resolved moe_cache_size=3753 num_pages=1024 (+1 dummy page; prefill_overlap=True)",
+      "Allocating 65536 tokens for KV cache": "Allocating 65536 tokens for KV cache, K + V = 0.80 GiB",
+      "CPU MoE executor ready:": "CPU MoE executor ready: threads=14 (pinned to cores 0..13) isa=avx512bf16+avx512vnni(nvfp4-w4a8) fmt=nvfp4 H=2560 I=640 experts=512 layers=48 top_k=10 act=silu max_tokens=1",
+      "Start capturing CUDA graphs with sizes:": "Start capturing CUDA graphs with sizes: [1]",
+      "KV cache dtype:": "KV cache dtype: kv_dtype=fp8_e4m3, requested=auto, reason=sm_89 and qsa_sparse support FP8 KV"
+    },
+    "native_maps": [
+      "7272cefa8000-7272cefb0000 r--p 00000000 103:00 61112654                  /var/lib/longhorn/nvme-02/freetoken/wt-plegather/python/freetoken/kernel/_cpu_moe.cpython-312-x86_64-linux-gnu.so",
+      "7272cefb0000-7272ceff1000 r-xp 00008000 103:00 61112654                  /var/lib/longhorn/nvme-02/freetoken/wt-plegather/python/freetoken/kernel/_cpu_moe.cpython-312-x86_64-linux-gnu.so",
+      "7272ceff1000-7272ceffe000 r--p 00049000 103:00 61112654                  /var/lib/longhorn/nvme-02/freetoken/wt-plegather/python/freetoken/kernel/_cpu_moe.cpython-312-x86_64-linux-gnu.so",
+      "7272ceffe000-7272cefff000 r--p 00055000 103:00 61112654                  /var/lib/longhorn/nvme-02/freetoken/wt-plegather/python/freetoken/kernel/_cpu_moe.cpython-312-x86_64-linux-gnu.so",
+      "7272cefff000-7272cf000000 rw-p 00056000 103:00 61112654                  /var/lib/longhorn/nvme-02/freetoken/wt-plegather/python/freetoken/kernel/_cpu_moe.cpython-312-x86_64-linux-gnu.so"
+    ],
+    "command": [
+      "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/ft",
+      "serve",
+      "--model",
+      "/var/lib/longhorn/nvme-02/freetoken/models/flash-e2m1.ftw",
+      "--moe-backend",
+      "offload",
+      "--moe-cache-auto",
+      "--max-running-requests",
+      "1",
+      "--linear-state-cache-ratio",
+      "4.0",
+      "--max-extend-length",
+      "2048",
+      "--max-seq-len-override",
+      "100352",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18090",
+      "--moe-disk-prefill",
+      "cpu",
+      "--moe-prefill-hot-split",
+      "on",
+      "--moe-prefill-split-kernel",
+      "grouped",
+      "--moe-bank-hugepages",
+      "off",
+      "--moe-cpu-threads",
+      "14",
+      "--ple-backend",
+      "uring",
+      "--enable-cache-report",
+      "--moe-disk-layer-profile",
+      "/var/lib/longhorn/nvme-02/freetoken/layer-profile-v3.json",
+      "--moe-hot-expert-budget-gib",
+      "6",
+      "--moe-hot-adapt-interval-steps",
+      "auto",
+      "--served-model-name",
+      "qwen3.6-27b",
+      "--moe-cpu-willneed",
+      "recent",
+      "--moe-hot-adapt-prefill-weight",
+      "0.1",
+      "--moe-hot-adapt-histories",
+      "split",
+      "--moe-hot-adapt-aim",
+      "phase",
+      "--kv-disk-cache-dir",
+      "/var/lib/longhorn/nvme-02/freetoken/prefix-cache",
+      "--kv-disk-cache-gib",
+      "0",
+      "--moe-hot-plan-persist",
+      "off",
+      "--cache-type",
+      "radix",
+      "--kv-ladder",
+      "off",
+      "--kv-reserve-tokens",
+      "65536",
+      "--cuda-graph-max-bs",
+      "1"
+    ],
+    "env": {
+      "CUDA_HOME": "/usr/local/cuda-13.0",
+      "PATH": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin",
+      "TMPDIR": "/var/lib/longhorn/nvme-02/freetoken/tmp",
+      "PYTHONPATH": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/python",
+      "FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS": "128",
+      "FREETOKEN_PREFILL_HOT_OVERLAP": "0"
+    },
+    "io_before": {
+      "rchar": "42829165463",
+      "wchar": "117439",
+      "syscr": "109912",
+      "syscw": "290",
+      "read_bytes": "40896602112",
+      "write_bytes": "4096",
+      "cancelled_write_bytes": "4096"
+    },
+    "worker_stat": "754827 (python3) S 754804 754804 754804 0 -1 4194304 10183700 23897 362084 87 2155 9423 2 6 20 0 54 0 25703150 260723781632 10264995 18446744073709551615 4325376 7353021 140726114161264 0 0 0 0 16781312 17410 0 0 0 17 0 0 0 0 0 0 10657224 12220544 17907712 140726114163745 140726114163926 140726114163926 140726114164661 0\n",
+    "diagnostics_disabled": true,
+    "original_unit": {
+      "MainPID": "0",
+      "Result": "success",
+      "ControlGroup": "",
+      "ActiveState": "inactive",
+      "InvocationID": "cb8bbc936c634b5b8e88e1718825d5d8"
+    },
+    "identity": {
+      "revision": "3a67403a293be20836604bc25729329997848e09",
+      "tree": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather",
+      "native": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/python/freetoken/kernel/_cpu_moe.cpython-312-x86_64-linux-gnu.so",
+      "native_sha256": "aad1f3169b9b39829a356877de7e5add9b8c8a0173837f54140871b24e0c0048",
+      "cpp_sha256": "23842a10d3602b7b77733b9a40bd6bdf6c27e561814a8094c10404e1fca7cb9f"
+    },
+    "driver_sha256": "6829b8f07b6e3d223338018fea730c88d0cf50383d44c082d81d39dcbf543ddb",
+    "cache_policy": "RAM radix reuse on; disk prefix cache and HOT persistence off"
+  },
+  "controller_log": "STARTED r1 baseline\n"
+}

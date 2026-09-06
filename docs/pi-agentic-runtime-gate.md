@@ -81,3 +81,12 @@ its invocation, since it was already serving. The timeout probe exits
 unsuccessfully as expected and still runs recovery. The
 [complete recovery record](../bench/results/4090-pi-runtime-recovery-20260906.json)
 retains both commands, exit status, output, and verified original completion.
+
+The gate launched on 2026-09-06 at 03:11:30 UTC. The
+[first-arm startup record](../bench/results/4090-pi-runtime-launch-20260906.json)
+confirms the baseline native mapping, both diagnostic flags off, one-request
+capacity, FP8 K/V, and successful readiness completion. Prefix caching leaves
+3753 expert slots with 1024 KV pages; HOT residency remains 2296 rows. This
+differs from the earlier naive-cache experiments. Later arms must match this
+geometry before comparison. The record is partial, with no measured speedup
+yet; the controller and recovery lease were confirmed live at capture.
