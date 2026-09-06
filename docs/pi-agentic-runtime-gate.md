@@ -125,3 +125,11 @@ results, source hashes and repair behavior. The two measured tasks total 665.618
 seconds. Its archived journal accounts for exactly 60 requests, matching readiness
 plus 59 Pi model calls, with no inference errors. This is partial evidence; it
 contains no optimized comparison or claim of broad quality equivalence.
+
+The [first optimized arm review](../bench/results/4090-pi-runtime-r2-review-20260906.json)
+also records three successful sessions and exactly the expected 52 requests,
+without inference errors. Its two measured tasks total 633.515 seconds, versus
+665.618 for the first baseline arm, a provisional 4.8% reduction. The reverse
+start order remains pending. The optimized log omits the legacy disk-statistics
+fields. Review distinguishes implementation errors from mistaken model-written
+test expectations; both kinds of repair remain in the elapsed task time.

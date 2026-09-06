@@ -1,0 +1,276 @@
+{
+  "captured_utc": "2026-09-06T03:56:47.266848+00:00",
+  "status": "Partial: first optimized arm reviewed; reverse-order arms are still pending.",
+  "arm": "r2",
+  "mode": "optimized",
+  "runtime_revision": "c0775ea48b108dcf31d80091a8d36c81d5239edf",
+  "native_sha256": "c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f",
+  "journal_sha256": "349d24e8c2a330b446f769dc096894c2516dffb72c85ce18c7bc5b19304e69d5",
+  "journal_bytes": 244469,
+  "expected_requests_including_readiness": 52,
+  "observed_http_completion_requests": 52,
+  "observed_inference_errors": [],
+  "startup_warnings": [
+    "PyTorch allocator API deprecation",
+    "QSA backend uses 64-token pages"
+  ],
+  "diagnostic_flags_disabled": true,
+  "source_evidence": {
+    "original": "https://github.com/jomcgi-org/freetoken-fork/blob/3a67403a293be20836604bc25729329997848e09/python/freetoken/scheduler/scheduler.py#L222",
+    "optimized": "https://github.com/jomcgi-org/freetoken-fork/blob/c0775ea48b108dcf31d80091a8d36c81d5239edf/python/freetoken/scheduler/scheduler.py#L222"
+  },
+  "worker_read_bytes_including_warmup": 69015121920,
+  "sessions": [
+    {
+      "ordinal": 1,
+      "warmup": true,
+      "passed": true,
+      "task_wall_s": 394.1748213749961,
+      "model_calls": 15,
+      "tool_calls": 13,
+      "tool_errors": 1,
+      "repair_prompts": 0,
+      "reported_tokens": {
+        "input": 10371,
+        "output": 5420,
+        "cacheRead": 68288,
+        "cacheWrite": 0,
+        "total": 84079
+      },
+      "final_model_written_tests": 31,
+      "stage_checks": [
+        {
+          "stage": 1,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 1,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 1}\n",
+              "wall_s": 0.08362308298819698
+            }
+          ]
+        },
+        {
+          "stage": 2,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 2,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 2}\n",
+              "wall_s": 0.06909412500681356
+            }
+          ]
+        },
+        {
+          "stage": 3,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 3,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 3}\n",
+              "wall_s": 0.0767592079937458
+            }
+          ]
+        }
+      ],
+      "result_sha256": "d189de79ffecab388c164f2abc128b4405313b52750fdc9c9d93f05b5935405b",
+      "final_workspace_sha256": {
+        "cache.py": "75824e5070edfcf6af64703a792b0a17f53e59ae1b284ea26862e1ea95719cd7",
+        "test_cache.py": "69ac602410ee3816837c144078d30ecf30f1c1c5e3ee2388147c39add6862888"
+      },
+      "assistant_review": {
+        "scope": "Read final Cache implementation, cumulative verifier, final test output and failed-tool repair sequence.",
+        "requirements_met": [
+          "Inclusive expiry and nonpositive TTL invalidation",
+          "Stored None and caller defaults",
+          "Unbounded and positive-capacity LRU behavior",
+          "Get and put promotion; missing get preserves order",
+          "Expired entries discarded before live eviction; updates preserve other entries",
+          "Loader calls, cached None, LRU promotion, TTL and exception behavior"
+        ],
+        "repair_observations": [
+          "Pi initially wrote a test expecting replacement of an expired key to evict another live key. It corrected that expectation to preserve the unrelated entry, matching the capacity requirement."
+        ],
+        "broad_quality_equivalence": false
+      }
+    },
+    {
+      "ordinal": 2,
+      "warmup": false,
+      "passed": true,
+      "task_wall_s": 336.8339371669863,
+      "model_calls": 19,
+      "tool_calls": 17,
+      "tool_errors": 2,
+      "repair_prompts": 0,
+      "reported_tokens": {
+        "input": 13463,
+        "output": 6633,
+        "cacheRead": 111424,
+        "cacheWrite": 0,
+        "total": 131520
+      },
+      "final_model_written_tests": 33,
+      "stage_checks": [
+        {
+          "stage": 1,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 1,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 1}\n",
+              "wall_s": 0.07559287498588674
+            }
+          ]
+        },
+        {
+          "stage": 2,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 2,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 2}\n",
+              "wall_s": 0.06283137499121949
+            }
+          ]
+        },
+        {
+          "stage": 3,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 3,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 3}\n",
+              "wall_s": 0.05591916700359434
+            }
+          ]
+        }
+      ],
+      "result_sha256": "668ab8b22dae5c7518cd75e769b089dfca0b4daa81f2ad2ed26f4574bcee6751",
+      "final_workspace_sha256": {
+        "cache.py": "eb2b31b307c88d6f793589b123611c079f325d4985356bd371198cab810cbaf0",
+        "test_cache.py": "0e0d5a175bb7a183731852097f3484c6d3d5f28b449858c1b409ece7a9cf2dc2"
+      },
+      "assistant_review": {
+        "scope": "Read final Cache implementation, cumulative verifier, final test output and failed-tool repair sequence.",
+        "requirements_met": [
+          "Inclusive expiry and nonpositive TTL invalidation",
+          "Stored None and caller defaults",
+          "Unbounded and positive-capacity LRU behavior",
+          "Get and put promotion; missing get preserves order",
+          "Expired entries discarded before live eviction; updates preserve other entries",
+          "Loader calls, cached None, LRU promotion, TTL and exception behavior"
+        ],
+        "repair_observations": [
+          "Pi initially expected get_or_load on a live cached key with a zero TTL argument to remove the cached value. The requirement instead returns the live value without calling the loader.",
+          "Its first test edit fixed one instance but left another inconsistent expectation. The next test command failed again; the subsequent edit corrected the live-hit expectation. Both failed commands remain timed."
+        ],
+        "broad_quality_equivalence": false
+      }
+    },
+    {
+      "ordinal": 3,
+      "warmup": false,
+      "passed": true,
+      "task_wall_s": 296.68105012498563,
+      "model_calls": 17,
+      "tool_calls": 15,
+      "tool_errors": 1,
+      "repair_prompts": 0,
+      "reported_tokens": {
+        "input": 13789,
+        "output": 5804,
+        "cacheRead": 117376,
+        "cacheWrite": 0,
+        "total": 136969
+      },
+      "final_model_written_tests": 36,
+      "stage_checks": [
+        {
+          "stage": 1,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 1,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 1}\n",
+              "wall_s": 0.06226183401304297
+            }
+          ]
+        },
+        {
+          "stage": 2,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 2,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 2}\n",
+              "wall_s": 0.06772720898152329
+            }
+          ]
+        },
+        {
+          "stage": 3,
+          "passed": true,
+          "verification": [
+            {
+              "passed": true,
+              "stage": 3,
+              "exit_code": 0,
+              "output": "{\"passed\": true, \"stage\": 3}\n",
+              "wall_s": 0.07242429198231548
+            }
+          ]
+        }
+      ],
+      "result_sha256": "19630609cc3fbe25a9e121b852e4560953c9e697d1b840e318628a3155796488",
+      "final_workspace_sha256": {
+        "cache.py": "856091de5bade648d90eb85af9c362b2a9ca3826af48f7fccc766f6f80b1f519",
+        "test_cache.py": "88abe5628e338ccc9431055b837abaa12fefddb158928eaa73e5441c68c14766"
+      },
+      "assistant_review": {
+        "scope": "Read final Cache implementation, cumulative verifier, final test output and failed-tool repair sequence.",
+        "requirements_met": [
+          "Inclusive expiry and nonpositive TTL invalidation",
+          "Stored None and caller defaults",
+          "Unbounded and positive-capacity LRU behavior",
+          "Get and put promotion; missing get preserves order",
+          "Expired entries discarded before live eviction; updates preserve other entries",
+          "Loader calls, cached None, LRU promotion, TTL and exception behavior"
+        ],
+        "repair_observations": [
+          "The initial LRU edit called OrderedDict methods on a dict. Pi repaired the container type; final checks pass."
+        ],
+        "broad_quality_equivalence": false
+      }
+    }
+  ],
+  "measured_attempted_task_wall_s": 633.5149872919719,
+  "performance_comparison": null,
+  "broad_quality_equivalence": false,
+  "diagnostic_collection": "The optimized journal contains zero disk prefetch calls status fragments, consistent with its guarded disk/PLE helper calls. Functional HOT adaptation and ordinary scheduler status reporting remain active.",
+  "disk_statistics_status_lines": 0,
+  "provisional_first_order_comparison": {
+    "baseline_measured_wall_s": 665.6179704169917,
+    "optimized_measured_wall_s": 633.5149872919719,
+    "wall_reduction_percent": 4.8230343157514515,
+    "measured_tasks_per_mode": 2,
+    "all_measured_tasks_passed": true,
+    "reverse_order_pending": true
+  }
+}
