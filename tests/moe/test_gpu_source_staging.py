@@ -199,6 +199,7 @@ def test_nvfp4_staged_gpu_layers_match_pinned_prefill_and_captured_decode(tmp_pa
                 value.random_(0, 256)
             elif name.endswith("scale"):
                 value.fill_(0x20)
+                value = value.view(torch.float8_e4m3fn)
             else:
                 value.fill_(0.5)
                 value[:, value.shape[1] // 2:] = 0.25
