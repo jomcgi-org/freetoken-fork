@@ -6,6 +6,7 @@ the server, executes model-written files, or qualifies broad model quality.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -17,6 +18,8 @@ SNAPSHOT_ARMS = [('r1', 'off'), ('r2', 'on'), ('r3', 'on'), ('r4', 'off')]
 CLIENT_FIELDS = ('pi_version', 'pi_executable_sha256', 'command', 'client_host',
                  'python', 'task', 'model_config', 'settings', 'requested_sessions',
                  'budgets', 'sources')
+FIXED_CLIENT_FIELDS = ('command', 'client_host', 'python', 'task', 'model_config',
+                       'requested_sessions', 'budgets', 'sources', 'fixture_sha256')
 
 
 def require(condition, message):
@@ -81,7 +84,8 @@ def compare(rows, mode_names=('baseline', 'optimized')):
                 throughput_ratio=baseline / optimized if complete else None)
 
 
-def summarize(root, *, decode_prefix_snapshot=False):
+def summarize(root, *, decode_prefix_snapshot=False, fixed_continuation=False):
+    decode_prefix_snapshot = decode_prefix_snapshot or fixed_continuation
     hashes = {}
     expected_arms = SNAPSHOT_ARMS if decode_prefix_snapshot else ARMS
     mode_names = ('off', 'on') if decode_prefix_snapshot else ('baseline', 'optimized')
@@ -99,6 +103,10 @@ def summarize(root, *, decode_prefix_snapshot=False):
     require([(a['arm'], a['mode']) for a in driver['arms']] == expected_arms,
             'controller does not contain exactly A/B/B/A')
     plan = driver['preflight']
+    if fixed_continuation:
+        require(plan.get('client_kind') == 'fixed-continuation', 'wrong continuation client')
+    else:
+        require(plan.get('client_kind', 'pi') == 'pi', 'use --fixed-continuation for scripted requests')
     if decode_prefix_snapshot:
         require(plan['identities']['off'] == plan['identities']['on'],
                 'snapshot arms used different runtime identities')
@@ -134,7 +142,8 @@ def summarize(root, *, decode_prefix_snapshot=False):
         require(metadata['server_metadata'] == start, f'{arm}: client/server evidence mismatch')
         require(metadata['trace'] is False and metadata['requested_sessions'] == 3,
                 f'{arm}: wrong client trace or session count')
-        require(metadata['sources']['pi-agentic-wall.py'] == plan['client_sha256'],
+        client_file = 'fixed-continuation-wall.py' if fixed_continuation else 'pi-agentic-wall.py'
+        require(metadata['sources'][client_file] == plan['client_sha256'],
                 f'{arm}: client source mismatch')
         require(client_summary['completed_schedule'] is True
                 and client_summary['cancelled'] is False and client_summary['sessions'] == 3,
@@ -144,7 +153,7 @@ def summarize(root, *, decode_prefix_snapshot=False):
                 and end['gpu_pids'] == [start['worker']], f'{arm}: server changed during session')
         require(all(record['original_unit']['ActiveState'] == 'inactive' for record in (start, end)),
                 f'{arm}: original service was active during comparison')
-        client = {key: metadata[key] for key in CLIENT_FIELDS}
+        client = {key: metadata[key] for key in (FIXED_CLIENT_FIELDS if fixed_continuation else CLIENT_FIELDS)}
         if first_geometry is None:
             first_geometry, first_client = start['geometry'], client
         require(start['geometry'] == first_geometry, f'{arm}: server geometry mismatch')
@@ -176,6 +185,42 @@ def summarize(root, *, decode_prefix_snapshot=False):
             for comparison in [result['comparison'], *result['orders']]:
                 comparison['wall_reduction_percent'] = None
                 comparison['throughput_ratio'] = None
+    if fixed_continuation:
+        spec = importlib.util.spec_from_file_location(
+            'fixed_continuation_client', Path(__file__).with_name('fixed-continuation-wall.py'))
+        client_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(client_module)
+        mismatches = client_module.fixed_work_mismatches(rows)
+        result['fixed_work_qualified'] = not mismatches and all(row['passed'] for row in rows)
+        result['fixed_work_mismatches'] = mismatches
+        result['request_phases'] = {}
+        for mode in ('off', 'on'):
+            phases = {}
+            for name, stage_ids in [('first_request', (1,)), ('continuations', (2, 3))]:
+                responses = [stage['attempts'][0]['response']
+                             for row in measured if row['mode'] == mode
+                             for stage in row['stages'] if stage['stage'] in stage_ids]
+                completed = [r['completion'] for r in responses if 'completion' in r]
+                usages = [r.get('usage', {}) for r in completed]
+                available = [u for u in usages if all(type(u.get(k)) is int for k in
+                             ('prompt_tokens', 'completion_tokens'))]
+                phases[name] = dict(attempted_requests=len(responses),
+                                    completed_requests=len(completed),
+                                    usage_records=len(available),
+                                    attempted_request_wall_s=sum(r['wall_s'] for r in responses),
+                                    prompt_tokens=sum(u['prompt_tokens'] for u in available),
+                                    completion_tokens=sum(u['completion_tokens'] for u in available),
+                                    cached_tokens=sum(u.get('prompt_tokens_details', {}).get(
+                                        'cached_tokens', 0) for u in available))
+            result['request_phases'][mode] = phases
+        result['review_required'] = (
+            'Review service journals and full responses. Matched request bodies, answer bytes and '
+            'token counts control work on this synthetic fixture; they do not prove identical '
+            'internal token IDs, expert routes or broad model quality.')
+        if not result['fixed_work_qualified']:
+            for comparison in [result['comparison'], *result['orders']]:
+                comparison['wall_reduction_percent'] = None
+                comparison['throughput_ratio'] = None
     return result
 
 
@@ -184,12 +229,17 @@ def main():
     parser.add_argument('results', type=Path)
     parser.add_argument('--decode-prefix-snapshot', action='store_true',
                         help='verify the same-runtime snapshot off/on/on/off protocol')
+    parser.add_argument('--fixed-continuation', action='store_true',
+                        help='also require matched scripted requests, answers and token counts')
     args = parser.parse_args()
     try:
-        result = summarize(args.results, decode_prefix_snapshot=args.decode_prefix_snapshot)
+        result = summarize(args.results, decode_prefix_snapshot=args.decode_prefix_snapshot,
+                           fixed_continuation=args.fixed_continuation)
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(1, f'Cannot summarize comparison: {exc}\n')
     print(json.dumps(result, indent=2, allow_nan=False))
+    if args.fixed_continuation and not result['fixed_work_qualified']:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,7 @@
-"""Controlled decode-snapshot off/on Pi sessions on node-4, with remote recovery.
+"""Controlled decode-snapshot off/on sessions on node-4, with remote recovery.
 
 The same file runs as a Mac controller and a Linux service helper. All model
-work is remote; Pi and its fixture tools run on the Mac. No runtime edits.
+work is remote. Select Pi tasks or scripted continuation requests. No runtime edits.
 """
 
 import argparse
@@ -335,8 +335,9 @@ def all_tasks_passed(arms):
 
 def local_main(args):
     here = Path(__file__).resolve().parent
-    client = here / 'pi-agentic-wall.py'
-    assert sha(client) == CLIENT_SHA, 'client changed after Linux qualification'
+    pi_client = here / 'pi-agentic-wall.py'
+    assert sha(pi_client) == CLIENT_SHA, 'Pi client changed after Linux qualification'
+    client = here / ('fixed-continuation-wall.py' if args.fixed_continuation else 'pi-agentic-wall.py')
     assert (here.parent / '.git').is_file(), 'run from a linked worktree'
     assert not run('git', '-C', str(here.parent), 'status', '--porcelain').stdout.strip()
     root = args.output_dir.resolve()
@@ -356,11 +357,13 @@ def local_main(args):
 
     plan = remote('preflight')
     plan.update(local_driver_sha256=sha(Path(__file__)), client_sha256=sha(client),
+                client_kind='fixed-continuation' if args.fixed_continuation else 'pi',
                 local_revision=run('git', '-C', str(here.parent), 'rev-parse', 'HEAD').stdout.strip(),
-                pi_version=run(str(args.pi), '--version').stdout.strip(),
-                pi_executable_sha256=sha(args.pi.resolve()),
-                design='Snapshot off/on/on/off: one warmup and two measured Pi tasks per start. Same runtime and native binary; only FREETOKEN_DECODE_PREFIX_SNAPSHOT differs. All three stages and all failures retained. Same Pi/workspace path, capacity one, graph one, 65536 FP8 KV tokens, 3753 expert slots, radix prefixes enabled, token trace and invasive diagnostics off. Host page cache retained. No model routing or quantization change.')
-    assert plan['pi_version'] == '0.85.1'
+                design='Snapshot off/on/on/off: one warmup and two measured three-turn conversations per start. Same runtime and native binary; only FREETOKEN_DECODE_PREFIX_SNAPSHOT differs. All failures retained. Capacity one, graph one, 65536 FP8 KV tokens, 3753 expert slots, radix prefixes enabled, token trace and invasive diagnostics off. Host page cache retained. No model routing or quantization change.')
+    if not args.fixed_continuation:
+        plan.update(pi_version=run(str(args.pi), '--version').stdout.strip(),
+                    pi_executable_sha256=sha(args.pi.resolve()))
+        assert plan['pi_version'] == '0.85.1'
     save(root / 'preflight.json', plan)
     if args.preflight:
         print(json.dumps(plan, indent=2))
@@ -380,7 +383,7 @@ def local_main(args):
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     from importlib.util import spec_from_file_location, module_from_spec
-    spec = spec_from_file_location('pi_wall_client', client)
+    spec = spec_from_file_location('pi_wall_client', pi_client)
     client_module = module_from_spec(spec)
     spec.loader.exec_module(client_module)
 
@@ -425,11 +428,14 @@ def local_main(args):
             save(root / (arm + '-server-start.json'), start)
             current = root / 'client-current'
             assert not current.exists()
-            command = [sys.executable, str(client), '--pi', str(args.pi.resolve()),
+            assert sha(client) == plan['client_sha256'], 'client changed during comparison'
+            command = [sys.executable, str(client),
                        '--base-url', 'http://127.0.0.1:18092/v1', '--output-dir', str(current),
-                       '--label', mode + '-' + arm, '--server-metadata', str(root / (arm + '-server-start.json')),
-                       '--sessions', '3', '--timeout', '900', '--max-model-calls', '30',
-                       '--max-tokens', '8192', '--context-tokens', '32768', '--repairs', '1']
+                       '--label', mode + '-' + arm, '--server-metadata', str(root / (arm + '-server-start.json'))]
+            if not args.fixed_continuation:
+                command += ['--pi', str(args.pi.resolve()), '--sessions', '3', '--timeout', '900',
+                            '--max-model-calls', '30', '--max-tokens', '8192',
+                            '--context-tokens', '32768', '--repairs', '1']
             print('STARTED ' + arm + ' ' + mode, flush=True)
             with (root / (arm + '-client.log')).open('wb') as log:
                 active_client = subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True)
@@ -496,6 +502,8 @@ def main():
     parser.add_argument('--arm', choices=[arm for arm, _ in ARMS])
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--pi', type=Path)
+    parser.add_argument('--fixed-continuation', action='store_true',
+                        help='use ordinary greedy scripted copying instead of Pi tasks')
     parser.add_argument('--preflight', action='store_true')
     args = parser.parse_args()
     if not re.fullmatch(r'astra-pi-agentic-[a-z0-9-]+', args.run_id):
@@ -503,8 +511,8 @@ def main():
     if args.action:
         print(json.dumps(remote_main(args), indent=2), flush=True)
         return 0
-    if not args.output_dir or not args.pi:
-        parser.error('local controller requires --output-dir and --pi')
+    if not args.output_dir or (not args.pi and not args.fixed_continuation):
+        parser.error('local controller requires --output-dir and either --pi or --fixed-continuation')
     return local_main(args)
 
 
