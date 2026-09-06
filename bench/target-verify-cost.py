@@ -24,6 +24,7 @@ WIDTH_ENV = "FREETOKEN_TARGET_VERIFY_WIDTH"
 COMPACT_ENV = "FREETOKEN_TARGET_VERIFY_COMPACT_ROLLBACK"
 PAIR_ENV = "FREETOKEN_TARGET_VERIFY_CPU_PAIR_COMPARE"
 RELOCATE_ENV = "FREETOKEN_TARGET_VERIFY_RELOCATABLE_STATE"
+BOUNDARY_ENV = "FREETOKEN_TARGET_VERIFY_RELOCATE_BOUNDARY"
 MODES = ("graph_one", "graph_two", "snapshot", "accept", "reject")
 GRAPH_MODES = ("accept_graph", "reject_graph")
 CHECKPOINT_MODES = ("accept_checkpoint", "reject_checkpoint")
@@ -31,6 +32,7 @@ _ACTIVATIONS = {}
 _CHECKPOINT_API = None
 _MULTI_API = None
 _COMPACT_API = None
+_RELOCATION_API = None
 
 
 def verification_width():
@@ -442,28 +444,45 @@ class StateWindow:
     rejection with another ordinary decode checks that those rows are overwritten.
     """
 
-    def __init__(self, engine, req, position, *, width=2):
+    def __init__(self, engine, req, position, *, width=2, allow_reserved_page=False):
         self.engine, self.req = engine, req
         self.page_size = engine.config.page_size
         self.ratio = engine.kv_cache.index_ratio
         self.logical_page = position // self.page_size
         self.base = self.logical_page * self.page_size
-        page_row = engine.page_table[req.table_idx, self.base:self.base + self.page_size]
-        physical = page_row.cpu().tolist()
-        if (len(physical) != self.page_size or physical[0] % self.page_size
-                or physical != list(range(physical[0], physical[0] + self.page_size))):
-            raise RuntimeError("probe window is not in a fully allocated contiguous page")
-        page = physical[0] // self.page_size
-        if page >= engine.num_pages:
-            raise RuntimeError("probe must not use the dummy KV page")
-        self.locations = page_row[position - self.base:position - self.base + width].clone()
-        if self.locations.numel() != width:
-            raise RuntimeError("verification window extends beyond its allocated page")
+        if position < 0 or width < 1 or self.ratio < 1 or self.page_size % self.ratio:
+            raise ValueError("invalid verification window geometry")
         self.views = state_views(engine, req)
-        self.views["kv_page"] = engine.kv_cache._kv_buffer.select(2, page)
-        begin = physical[0] // self.ratio
-        end = begin + self.page_size // self.ratio
-        self.views["cmp_page"] = engine.kv_cache._cmp_k_buffer[:, begin:end]
+        self.page_bases = {}
+        pages = []
+        last_page = (position + width - 1) // self.page_size
+        for logical_page in range(self.logical_page, last_page + 1):
+            base = logical_page * self.page_size
+            row = engine.page_table[req.table_idx, base:base + self.page_size]
+            physical = row.cpu().tolist()
+            if (len(physical) != self.page_size or physical[0] % self.page_size
+                    or physical != list(range(physical[0], physical[0] + self.page_size))):
+                raise RuntimeError("probe window is not in a fully allocated contiguous page")
+            page = physical[0] // self.page_size
+            limit = engine.num_pages + int(allow_reserved_page)
+            if page < 0 or page >= limit or page >= engine.kv_cache._kv_buffer.shape[2]:
+                raise RuntimeError("probe must not use the dummy KV page or an invalid page")
+            if page in pages:
+                raise RuntimeError("verification window aliases two logical pages")
+            pages.append(page)
+            suffix = "" if logical_page == self.logical_page else "/" + str(logical_page)
+            kv_name, cmp_name = "kv_page" + suffix, "cmp_page" + suffix
+            self.views[kv_name] = engine.kv_cache._kv_buffer.select(2, page)
+            begin = physical[0] // self.ratio
+            end = begin + self.page_size // self.ratio
+            if end > engine.kv_cache.cmp_scratch_base:
+                raise RuntimeError("verification page has no compressed-key storage")
+            self.views[cmp_name] = engine.kv_cache._cmp_k_buffer[:, begin:end]
+            self.page_bases[kv_name] = self.page_bases[cmp_name] = base
+        self.physical_pages = tuple(pages)
+        self.locations = engine.page_table[req.table_idx, position:position + width].clone()
+        if self.locations.numel() != width:
+            raise RuntimeError("verification window extends beyond its allocated pages")
         scratch = engine.kv_cache.cmp_scratch_base + req.table_idx
         self.views["cmp_scratch"] = engine.kv_cache._cmp_k_buffer[:, scratch]
 
@@ -479,11 +498,11 @@ class StateWindow:
             wanted = expected[name]
             if name == "cmp_scratch":
                 continue  # A sink, never an attention input.
-            if name == "kv_page":
-                count = committed_end - self.base
+            if name in self.page_bases and name.startswith("kv_page"):
+                count = max(0, min(self.page_size, committed_end - self.page_bases[name]))
                 actual, wanted = actual[:, :, :count], wanted[:, :, :count]
-            elif name == "cmp_page":
-                count = (committed_end - self.base) // self.ratio
+            elif name in self.page_bases:
+                count = max(0, min(self.page_size, committed_end - self.page_bases[name])) // self.ratio
                 actual, wanted = actual[:, :count], wanted[:, :count]
             yield name, actual, wanted
 
@@ -725,7 +744,8 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
         return _MULTI_API["probe"](engine, batch, directory, width=width, base=globals(),
                                     seed_api=_CHECKPOINT_API, repeats=repeats, warmup=warmup,
                                     pair_compare=os.environ.get(PAIR_ENV) == "1",
-                                    relocatable_state=os.environ.get(RELOCATE_ENV) == "1")
+                                    relocatable_state=os.environ.get(RELOCATE_ENV) == "1",
+                                    boundary_relocation=os.environ.get(BOUNDARY_ENV) == "1")
     import torch
     from freetoken.kernel import _cpu_moe
     import hashlib
@@ -787,7 +807,7 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
 
 def install(engine_class):
     """Provision the diagnostic before Engine initializes CUDA; no draft head."""
-    global _CHECKPOINT_API, _MULTI_API, _COMPACT_API
+    global _CHECKPOINT_API, _MULTI_API, _COMPACT_API, _RELOCATION_API
     import torch
     from freetoken.kvcache.qsa_pool import QSAKVCache
     from freetoken.moe.cpu_executor import CpuMoeExecutor
@@ -797,6 +817,11 @@ def install(engine_class):
     if torch.cuda.is_initialized():
         raise RuntimeError("install the probe before Engine initializes CUDA")
     width = verification_width()
+    if os.environ.get(BOUNDARY_ENV) == "1":
+        if os.environ.get(RELOCATE_ENV) != "1" or width == 2:
+            raise RuntimeError("boundary relocation requires wider graphs with relocatable state")
+        import runpy
+        _RELOCATION_API = runpy.run_path(str(Path(__file__).with_name("target_relocation.py")))
     if os.environ.get(RELOCATE_ENV) == "1" and width == 2:
         raise RuntimeError("relocatable state comparison requires the wider target graph diagnostic")
     if os.environ.get(PAIR_ENV) == "1" and width == 2:
@@ -864,12 +889,21 @@ def install(engine_class):
         if (batch.is_decode and batch.size == 1 and batch.padded_size == 1
                 and not batch.lazy_restore_pending):
             req = batch.reqs[0]
+            if _RELOCATION_API is not None:
+                position_ready = (
+                    engine.kv_cache.index_ratio >= 2
+                    and engine.config.page_size % engine.kv_cache.index_ratio == 0
+                    and _RELOCATION_API["eligible_boundary"](
+                        req.cached_len, engine.config.page_size, width, req.remain_len))
+            else:
+                position_ready = (eligible_position(
+                    req.cached_len, page_size=engine.config.page_size,
+                    ratio=engine.kv_cache.index_ratio, remaining=req.remain_len)
+                    and (width == 2 or _MULTI_API["eligible_window"](
+                        req.cached_len, engine.config.page_size, width, req.remain_len)))
             if (req.decode_batch_idx >= 16 and req.sampling_params.is_greedy
                     and req.sampling_params.guided_decoding is None
-                    and eligible_position(req.cached_len, page_size=engine.config.page_size,
-                                          ratio=engine.kv_cache.index_ratio, remaining=req.remain_len)
-                    and (width == 2 or _MULTI_API["eligible_window"](
-                        req.cached_len, engine.config.page_size, width, req.remain_len))):
+                    and position_ready):
                 with torch.inference_mode():
                     probe(engine, batch, directory)
                 # This request is intentionally aborted. Its repeated expert/cache

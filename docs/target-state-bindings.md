@@ -52,3 +52,22 @@ comparison while reusing each graph across adjacent windows in one allocated
 page. Both experiments ended with verified original-serving recovery and a real
 completion. Full-model relocation to other request slots and across page
 boundaries remains unqualified, so serving integration is still pending.
+
+The additional opt-in `FREETOKEN_TARGET_VERIFY_RELOCATE_BOUNDARY=1` targets that
+remaining model check. It requires the relocation setting above. The probe saves
+ordinary seed logits before changing any page mapping, then moves the current KV
+and compressed page into allocated padding storage and uses the old physical page
+for the next logical page. This forces a noncontiguous transition. The diagnostic
+borrows the dummy request row and another allocated linear slot, preserving their
+original contents. It varies the request-table and linear-state slots separately
+across the reused windows, copies continuation state to the selected slots, and
+checks that the inactive request's state remains unchanged.
+
+`StateWindow` snapshots every touched KV and compressed page and compares only
+rows reachable at the retained prefix length. Padding-page access is accepted
+only through the explicit diagnostic argument. Qualification also requires the
+expected slot combinations and physical page transition, plus agreement with the
+seed logits from the original mapping. Borrowed state, page contents and mappings
+are restored on exit or failure. The scheduler allocator is untouched. These
+aliased request rows are confined to the serial diagnostic worker, and its
+request is aborted after the probe. This is not an allocation policy for serving.
