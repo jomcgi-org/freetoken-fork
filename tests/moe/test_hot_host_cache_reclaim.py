@@ -121,6 +121,8 @@ def cache_with_file_rows(tmp_path, policy, device):
     cache.hot_expert_capacity = {0: 2}
     cache._hot_slot_for_row = {0: [8, 9]}
     cache._hot_slots_device = torch.tensor([8, 9], dtype=torch.long, device=device)
+    cache._hot_mapping_host = torch.full((1, 8), -1, dtype=torch.int32,
+                                         pin_memory=device == "cuda")
     return cache, bank, expected, path, payload
 
 
@@ -142,7 +144,11 @@ def test_reload_and_partial_publication_preserve_hot_weights(tmp_path, monkeypat
     assert torch.equal(bank.tensor, expected)
     swaps = (HotSwap(0, 0, 2, 0), HotSwap(0, 1, 5, 1))
     cache._hot_slot_owners = {0: [None, None]}
-    cache.hot_row_for_expert.fill_(-1)
+    cache._replace_hot_mapping([[-1] * 8])
+    if device == "cuda":
+        # The real staging worker waits on retirement's ready event before
+        # filling the pinned stage or allowing the next publication.
+        torch.cuda.synchronize()
     cache._hot_adapt_swaps_pending = swaps
     cache._hot_adapt_worker_installs = False
     cache._hot_adapt_tick_boundary = "decode"
@@ -190,7 +196,8 @@ def test_reclamation_skips_retired_owners_and_warns_once(tmp_path, monkeypatch):
 def test_cli_default_and_override(policy):
     argv = ["--model", "/tmp/nonexistent-model", "--dtype", "bfloat16"]
     if policy:
-        argv += ["--moe-hot-host-cache", policy]
+        argv += ["--moe-hot-host-cache", policy, "--moe-backend", "offload",
+                 "--moe-disk-prefill", "staged"]
     args, _ = parse_args(argv)
     assert args.moe_hot_host_cache == (policy or "retain")
 
