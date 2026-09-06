@@ -44,14 +44,14 @@ ran after the Pi comparison finished and the original service was restored.
 No native or model wall-time result is available for this experiment.
 
 The completed Pi runtime comparison used frozen sources without this option.
-Next measure the component, then compare the resident-skip flag off/on on the
-same prepared sources, mapping geometry and native binary. Use complete requests
+The component result below justifies comparing the resident-skip flag off/on
+on the same prepared sources, mapping geometry and native binary. Use complete requests
 in both start orders, retain all failures, and include both cache warmth and
 worker storage traffic. Keep this option disabled until complete wall-time and
 output checks justify using it.
 
-The [component benchmark](../bench/resident-populate.py) is prepared for Linux timing
-after the correctness checks. It creates a private 256 MiB file, selects alternating
+The [component benchmark](../bench/resident-populate.py) ran on Linux after
+the correctness checks. It creates a private 256 MiB file, selects alternating
 2 MiB rows, and compares both flag orders under warm, cold, and mixed preparation.
 Cache advice targets only that file. It verifies the count of fully resident
 selected rows before each sample, times population plus SHA-256 consumption from
@@ -69,6 +69,43 @@ PYTHONPATH=python python bench/resident-populate.py \
   > /var/lib/longhorn/nvme-02/freetoken/results/resident-populate-component.json
 ```
 
-Only syntax and CLI checks have run locally for this benchmark. Linux execution
-remains pending; neither this preparation nor checksum parity establishes a model
-throughput improvement.
+The [completed Linux component record](../bench/results/4090-populate-resident-component-20260906.json)
+uses 30 samples, including six declared warmups. All samples consume the same
+selected bytes and match the expected checksum. Four measured off/on pairs per
+cache condition alternate their start order:
+
+| Selected-row residency | Flag off, mean | Flag on, mean | Total wall reduction |
+| --- | ---: | ---: | ---: |
+| Fully warm | 64.17 ms | 54.57 ms | 15.0% |
+| Cold | 155.90 ms | 157.44 ms | -1.0% |
+| Half warm | 106.32 ms | 103.37 ms | 2.8% |
+
+All four warm and mixed pairs improve. Three of four cold pairs regress slightly.
+Warm population copies no scratch bytes with the flag on; mixed population copies
+half as many. Physical storage reads match between modes in each condition.
+These timings include the subsequent checksum consumer and probe overhead, but
+exclude file preparation. They establish a component effect, not an inference
+speedup under model memory pressure.
+
+The component process succeeded with serving stopped and no GPU workers. Its
+reused recovery helper rejected the experiment's run-name prefix, so automatic
+restoration failed. The original service was explicitly started and a separate
+detached helper with a valid name verified health and an OK completion. The full
+record retains the failure and remediation. Future gates must validate the exact
+recovery command before stopping serving.
+
+The whole-model comparison remains pending. It must include CPU prefill below
+the 1024-token staged-GPU threshold, alongside longer requests, and retain
+complete response checks and both start orders. Keep the option disabled until
+that comparison establishes its effect on client wall time.
+
+The sustained client now accepts `--mixed-prefill` for the next model gate. It
+balances short and long prompts across JSON, prose, source excerpt and measured
+position. Short backgrounds use 128 tokens; long backgrounds retain the existing
+1400-token excerpt. Output requirements and caps are unchanged. The client uses
+actual server prompt usage to require 2-1023 tokens for the short band and at
+least 1024 for the long band. A wrong band retains the full response and time,
+but marks that request ineligible through its completion field. Prefix caching
+must stay disabled for this gate so the full prompt length describes prefill
+work. Twenty-four focused protocol checks pass on macOS; Linux validation and
+actual tokenizer-band checks remain pending. No model run has used this mode yet.

@@ -1,0 +1,1186 @@
+{
+  "preflight": {
+    "plan": {
+      "identities": {
+        "baseline": {
+          "revision": "3a67403a293be20836604bc25729329997848e09",
+          "tree": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather",
+          "native": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/python/freetoken/kernel/_cpu_moe.cpython-312-x86_64-linux-gnu.so",
+          "native_sha256": "aad1f3169b9b39829a356877de7e5add9b8c8a0173837f54140871b24e0c0048",
+          "cpp_sha256": "23842a10d3602b7b77733b9a40bd6bdf6c27e561814a8094c10404e1fca7cb9f"
+        },
+        "optimized": {
+          "revision": "c0775ea48b108dcf31d80091a8d36c81d5239edf",
+          "tree": "/var/lib/longhorn/nvme-02/freetoken/wt-astra-concurrent-wall-client",
+          "native": "/var/lib/longhorn/nvme-02/freetoken/wt-astra-input-reuse/python/freetoken/kernel/_cpu_moe.cpython-312-x86_64-linux-gnu.so",
+          "native_sha256": "c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f",
+          "cpp_sha256": "43b25ca4b0caaeaf00603921caf0d0b8b2f4579bb442f8696fbae16ccb152caf"
+        }
+      },
+      "original_unit": {
+        "MainPID": "763263",
+        "Result": "success",
+        "ControlGroup": "/system.slice/freetoken-serve.service",
+        "ActiveState": "active",
+        "InvocationID": "a332375ed64442fa8abf1a448dc76acb"
+      },
+      "service_sha256": "30ccb2fa6baef4fc9fc0acc372e03c24947a510d6c6794eae5713b60ad5d717c",
+      "model_config_sha256": "e765305daba0951974308f4d32c075b52a6a45974730d273f2216718a994d624",
+      "layer_profile_sha256": "b43327e354df78ca18ea5e57e6f3c7d5a13db47ecea6d8910b82c84ad61c6ca9",
+      "driver_sha256": "6829b8f07b6e3d223338018fea730c88d0cf50383d44c082d81d39dcbf543ddb",
+      "commands": {
+        "baseline": [
+          "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/ft",
+          "serve",
+          "--model",
+          "/var/lib/longhorn/nvme-02/freetoken/models/flash-e2m1.ftw",
+          "--moe-backend",
+          "offload",
+          "--moe-cache-auto",
+          "--max-running-requests",
+          "1",
+          "--linear-state-cache-ratio",
+          "4.0",
+          "--max-extend-length",
+          "2048",
+          "--max-seq-len-override",
+          "100352",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18090",
+          "--moe-disk-prefill",
+          "cpu",
+          "--moe-prefill-hot-split",
+          "on",
+          "--moe-prefill-split-kernel",
+          "grouped",
+          "--moe-bank-hugepages",
+          "off",
+          "--moe-cpu-threads",
+          "14",
+          "--ple-backend",
+          "uring",
+          "--enable-cache-report",
+          "--moe-disk-layer-profile",
+          "/var/lib/longhorn/nvme-02/freetoken/layer-profile-v3.json",
+          "--moe-hot-expert-budget-gib",
+          "6",
+          "--moe-hot-adapt-interval-steps",
+          "auto",
+          "--served-model-name",
+          "qwen3.6-27b",
+          "--moe-cpu-willneed",
+          "recent",
+          "--moe-hot-adapt-prefill-weight",
+          "0.1",
+          "--moe-hot-adapt-histories",
+          "split",
+          "--moe-hot-adapt-aim",
+          "phase",
+          "--kv-disk-cache-dir",
+          "/var/lib/longhorn/nvme-02/freetoken/prefix-cache",
+          "--kv-disk-cache-gib",
+          "0",
+          "--moe-hot-plan-persist",
+          "off",
+          "--cache-type",
+          "radix",
+          "--kv-ladder",
+          "off",
+          "--kv-reserve-tokens",
+          "65536",
+          "--cuda-graph-max-bs",
+          "1"
+        ],
+        "optimized": [
+          "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/ft",
+          "serve",
+          "--model",
+          "/var/lib/longhorn/nvme-02/freetoken/models/flash-e2m1.ftw",
+          "--moe-backend",
+          "offload",
+          "--moe-cache-auto",
+          "--max-running-requests",
+          "1",
+          "--linear-state-cache-ratio",
+          "4.0",
+          "--max-extend-length",
+          "2048",
+          "--max-seq-len-override",
+          "100352",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "18090",
+          "--moe-disk-prefill",
+          "staged",
+          "--moe-prefill-hot-split",
+          "on",
+          "--moe-prefill-split-kernel",
+          "grouped",
+          "--moe-bank-hugepages",
+          "off",
+          "--moe-cpu-threads",
+          "14",
+          "--ple-backend",
+          "uring",
+          "--enable-cache-report",
+          "--moe-disk-layer-profile",
+          "/var/lib/longhorn/nvme-02/freetoken/layer-profile-v3.json",
+          "--moe-hot-expert-budget-gib",
+          "6",
+          "--moe-hot-adapt-interval-steps",
+          "auto",
+          "--served-model-name",
+          "qwen3.6-27b",
+          "--moe-cpu-willneed",
+          "recent",
+          "--moe-hot-adapt-prefill-weight",
+          "0.1",
+          "--moe-hot-adapt-histories",
+          "split",
+          "--moe-hot-adapt-aim",
+          "phase",
+          "--kv-disk-cache-dir",
+          "/var/lib/longhorn/nvme-02/freetoken/prefix-cache",
+          "--kv-disk-cache-gib",
+          "0",
+          "--moe-hot-plan-persist",
+          "off",
+          "--cache-type",
+          "radix",
+          "--kv-ladder",
+          "off",
+          "--kv-reserve-tokens",
+          "65536",
+          "--cuda-graph-max-bs",
+          "1",
+          "--moe-disk-prefill-io",
+          "buffered",
+          "--moe-hot-staging-io",
+          "mmap"
+        ]
+      },
+      "env": {
+        "baseline": {
+          "CUDA_HOME": "/usr/local/cuda-13.0",
+          "PATH": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin",
+          "TMPDIR": "/var/lib/longhorn/nvme-02/freetoken/tmp",
+          "PYTHONPATH": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/python",
+          "FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS": "128",
+          "FREETOKEN_PREFILL_HOT_OVERLAP": "0"
+        },
+        "optimized": {
+          "CUDA_HOME": "/usr/local/cuda-13.0",
+          "PATH": "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin",
+          "TMPDIR": "/var/lib/longhorn/nvme-02/freetoken/tmp",
+          "PYTHONPATH": "/var/lib/longhorn/nvme-02/freetoken/wt-astra-concurrent-wall-client/python",
+          "FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS": "128",
+          "FREETOKEN_PREFILL_HOT_OVERLAP": "0"
+        }
+      }
+    },
+    "component_revision": "5011e6b9a062120005f17ec00041b946f4aee1f7",
+    "source_sha256": {
+      "tests/test_resident_range_probe.py": "ba50cef7cd95258c66013fb5f99091275040a24cafd501bfe75abb08fd07f986",
+      "tests/moe/test_populate_residency_linux.py": "18f108e26e81e76a21a172ae5e59db8eb29d3c357368b31000853761af137d21",
+      "python/freetoken/moe/host_banks.py": "88c36ea9ee4740bb60ccf9802011e0e1bcc166eac5172a3a3af5270f18d6b8b6",
+      "python/freetoken/moe/resident_range.py": "c40353045ecb455ea48eac46f500aa600af61a7357240ed600015a73573a942c",
+      "bench/resident-populate.py": "ef961dead9e375ef861ef0c373280ef4cb03bfb12e36c135ccfed123541f1324"
+    },
+    "driver_source": "import hashlib, importlib.util, json, os, pathlib, subprocess, time\nR = pathlib.Path('/var/lib/longhorn/nvme-02/freetoken')\nW = R / 'wt-astra-populate-resident'\nOUT = R / 'results/astra-populate-component-20260906'\nHELPER = R / 'tmp/astra-pi-agentic-runtime-20260906-driver.py'\nassert hashlib.sha256(HELPER.read_bytes()).hexdigest() == '6829b8f07b6e3d223338018fea730c88d0cf50383d44c082d81d39dcbf543ddb'\nspec = importlib.util.spec_from_file_location('recovery', HELPER)\nrecovery = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(recovery)\nplan = recovery.preflight()\nrevision = subprocess.check_output(['git', '-C', str(W), 'rev-parse', 'HEAD'], text=True).strip()\nassert revision == '5011e6b9a062120005f17ec00041b946f4aee1f7', revision\nassert (W / '.git').is_file()\nassert not subprocess.check_output(['git', '-C', str(W), 'status', '--porcelain'], text=True).strip()\nvalidated = json.loads((R / 'results/astra-populate-resident-linux-validation-20260906.json').read_text())\nassert validated['returncode'] == 0 and '11 passed' in validated['stdout']\nfor f, h in validated['source_sha256'].items():\n    assert hashlib.sha256((W / f).read_bytes()).hexdigest() == h, f\nOUT.mkdir(exist_ok=False)\nrecovery.save(OUT / 'preflight.json', dict(plan=plan, component_revision=revision,\n              source_sha256=validated['source_sha256'], driver_source=pathlib.Path(__file__).read_text(),\n              recovery_source=HELPER.read_text(), started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))\nrecovery.stop('freetoken-serve')\nrecovery.wait_gpu_release()\nassert recovery.state('freetoken-serve')['ActiveState'] == 'inactive'\ncommand = [str(R / 'wt-plegather/.venv/bin/python'), 'bench/resident-populate.py', '--directory', str(R / 'tmp')]\nenv = dict(os.environ, PYTHONPATH=str(W / 'python'), CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1')\nstart = time.monotonic()\nresult = subprocess.run(command, cwd=W, env=env, capture_output=True, text=True, timeout=120)\nreport = dict(command=command, returncode=result.returncode, process_wall_s=time.monotonic()-start,\n              environment={k:env[k] for k in ('PYTHONPATH','CUDA_VISIBLE_DEVICES','OMP_NUM_THREADS','MKL_NUM_THREADS','OPENBLAS_NUM_THREADS')},\n              stdout=result.stdout, stderr=result.stderr, original_unit=recovery.state('freetoken-serve'),\n              gpu_pids=recovery.gpu_pids(), source_sha256={f:hashlib.sha256((W/f).read_bytes()).hexdigest() for f in validated['source_sha256']})\nrecovery.save(OUT / 'process.json', report)\nprint(json.dumps({k:v for k,v in report.items() if k!='stdout'}, indent=2), flush=True)\nassert report['source_sha256'] == validated['source_sha256']\nassert result.returncode == 0, result.stderr\nparsed = json.loads(result.stdout)\nrecovery.save(OUT / 'component.json', parsed)\nprint(json.dumps(parsed['cases'], indent=2), flush=True)\nassert report['original_unit']['ActiveState']=='inactive' and not report['gpu_pids']\n",
+    "recovery_source": "\"\"\"Controlled original/optimized Pi sessions on node-4, with remote recovery.\n\nThe same file runs as a Mac controller and a Linux service helper. All model\nwork is remote; Pi and its fixture tools run on the Mac. No runtime edits.\n\"\"\"\n\nimport argparse\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport re\nimport select\nimport shlex\nimport signal\nimport socket\nimport subprocess\nimport sys\nimport threading\nimport time\nimport urllib.error\nimport urllib.request\n\n\nR = Path('/var/lib/longhorn/nvme-02/freetoken')\nSRC = R / 'wt-plegather'\nOPT = R / 'wt-astra-concurrent-wall-client'\nSERVER = 'astra-pi-agentic-server'\nLEASE = 'astra-pi-agentic-lease'\nSSH = ['ssh', '-oIdentityAgent=none', '-oIdentitiesOnly=yes', '-oBatchMode=yes',\n       '-oServerAliveInterval=15', '-oServerAliveCountMax=3']\nREVISIONS = {'baseline': '3a67403a293be20836604bc25729329997848e09',\n             'optimized': 'c0775ea48b108dcf31d80091a8d36c81d5239edf'}\nBINARIES = {'baseline': 'aad1f3169b9b39829a356877de7e5add9b8c8a0173837f54140871b24e0c0048',\n            'optimized': 'c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f'}\nCLIENT_SHA = '986875b712ff05862c03417e56e45c18559d82e05af913e134055a84268715d5'\nARMS = [('r1', 'baseline'), ('r2', 'optimized'), ('r3', 'optimized'), ('r4', 'baseline')]\n\n\ndef run(*args, **kwargs):\n    return subprocess.run(args, text=True, check=True, capture_output=True, **kwargs)\n\n\ndef sha(path):\n    return hashlib.sha256(path.read_bytes()).hexdigest()\n\n\ndef save(path, data):\n    temp = path.with_suffix(path.suffix + '.tmp')\n    temp.write_text(json.dumps(data, indent=2) + '\\n')\n    temp.replace(path)\n\n\ndef state(unit):\n    result = run('systemctl', 'show', unit, '-p', 'ActiveState', '-p', 'MainPID',\n                 '-p', 'InvocationID', '-p', 'ControlGroup', '-p', 'Result')\n    return dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)\n\n\ndef live(unit):\n    return state(unit)['ActiveState'] in ('active', 'activating', 'deactivating')\n\n\ndef stop(unit):\n    if state(unit)['ActiveState'] != 'inactive':\n        run('sudo', '-n', 'systemctl', 'stop', unit, timeout=180)\n\n\ndef gpu_pids():\n    result = run('nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader,nounits', timeout=10)\n    return [int(line) for line in result.stdout.splitlines() if line.strip()]\n\n\ndef wait_gpu_release():\n    deadline = time.monotonic() + 45\n    while gpu_pids():\n        if time.monotonic() >= deadline:\n            raise RuntimeError('GPU still has a process after service shutdown')\n        time.sleep(1)\n\n\ndef ready(port):\n    deadline = time.monotonic() + 420\n    while True:\n        try:\n            with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3) as response:\n                result = json.load(response)\n            if result.get('status') == 'error':\n                raise RuntimeError(result)\n            if result.get('status') == 'ok':\n                return result\n        except (urllib.error.URLError, TimeoutError, ConnectionError):\n            pass\n        if time.monotonic() > deadline:\n            raise TimeoutError(f'server on {port} did not become ready')\n        time.sleep(2)\n\n\ndef completion(port):\n    payload = dict(model='qwen3.6-27b', messages=[dict(role='user', content='Reply with only OK.')],\n                   max_tokens=8, temperature=0, chat_template_kwargs=dict(enable_thinking=False))\n    req = urllib.request.Request(f'http://127.0.0.1:{port}/v1/chat/completions',\n                                 data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json'})\n    with urllib.request.urlopen(req, timeout=120) as response:\n        result = json.load(response)\n    assert result['choices'][0]['message']['content'].strip() == 'OK', result\n    return result\n\n\ndef identities():\n    result = {}\n    for mode, tree in [('baseline', SRC), ('optimized', OPT)]:\n        revision = run('git', '-C', str(tree), 'rev-parse', 'HEAD').stdout.strip()\n        assert revision == REVISIONS[mode], (mode, revision)\n        assert not run('git', '-C', str(tree), 'status', '--porcelain').stdout.strip(), tree\n        binaries = list((tree / 'python/freetoken/kernel').glob('_cpu_moe.*.so'))\n        assert len(binaries) == 1\n        native = binaries[0].resolve()\n        assert sha(native) == BINARIES[mode], native\n        result[mode] = dict(revision=revision, tree=str(tree), native=str(native), native_sha256=sha(native),\n                            cpp_sha256=sha(tree / 'python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp'))\n    return result\n\n\ndef server_command(mode):\n    service = Path('/etc/systemd/system/freetoken-serve.service').read_text().replace('\\\\\\n', ' ')\n    args = shlex.split(next(line[10:] for line in service.splitlines() if line.startswith('ExecStart=')))\n    args[0] = str(SRC / '.venv/bin/ft')\n    for flag, value in [('--port', '18090'), ('--moe-disk-prefill', 'cpu' if mode == 'baseline' else 'staged'),\n                        ('--max-running-requests', '1'), ('--kv-disk-cache-gib', '0')]:\n        args[args.index(flag) + 1] = value\n    args.remove('--moe-collect-stats')\n    args.extend(['--moe-hot-plan-persist', 'off', '--cache-type', 'radix', '--kv-ladder', 'off',\n                 '--kv-reserve-tokens', '65536', '--cuda-graph-max-bs', '1'])\n    if mode == 'optimized':\n        args.extend(['--moe-disk-prefill-io', 'buffered', '--moe-hot-staging-io', 'mmap'])\n    assert '--moe-collect-stats' not in args and '--moe-step-timing' not in args\n    return args\n\n\ndef server_env(mode):\n    return dict(CUDA_HOME='/usr/local/cuda-13.0',\n                PATH=f'{SRC}/.venv/bin:/usr/local/cuda-13.0/bin:/usr/bin:/bin', TMPDIR=str(R / 'tmp'),\n                PYTHONPATH=str((SRC if mode == 'baseline' else OPT) / 'python'),\n                FREETOKEN_PREFILL_SELECTIVE_MAX_TOKENS='128', FREETOKEN_PREFILL_HOT_OVERLAP='0')\n\n\ndef preflight(allow_lease=False):\n    for unit in ['astra-decode-weight-reuse-wall-driver', 'astra-concurrent-wall-driver',\n                 'astra-decode-weight-reuse-validation-v2', 'astra-sustained-hot-staging-wall-driver',\n                 'astra-sustained-reader-wall-driver', SERVER, *([] if allow_lease else [LEASE])]:\n        assert not live(unit), ('another benchmark is live', unit)\n    original = state('freetoken-serve')\n    assert original['ActiveState'] == 'active', original\n    workers = gpu_pids()\n    assert len(workers) == 1 and original['ControlGroup'] in Path(f'/proc/{workers[0]}/cgroup').read_text()\n    return dict(identities=identities(), original_unit=original,\n                service_sha256=sha(Path('/etc/systemd/system/freetoken-serve.service')),\n                model_config_sha256=sha(R / 'models/flash-e2m1.ftw/config.json'),\n                layer_profile_sha256=sha(R / 'layer-profile-v3.json'),\n                driver_sha256=sha(Path(__file__)),\n                commands={mode: server_command(mode) for mode in REVISIONS},\n                env={mode: server_env(mode) for mode in REVISIONS})\n\n\ndef journal(invocation):\n    return run('journalctl', '_SYSTEMD_INVOCATION_ID=' + invocation, '--no-pager', '-o', 'cat').stdout\n\n\ndef geometry(text):\n    lines = re.sub(r'\\x1b\\[[0-9;]*m', '', text).splitlines()\n    markers = ['MoE bank split residency:', 'MoE HOT expert residency:', 'MoE activation dtype:',\n               '--moe-cache-auto resolved', 'Allocating 65536 tokens for KV cache',\n               'CPU MoE executor ready:', 'Start capturing CUDA graphs with sizes:', 'KV cache dtype:']\n    result = {}\n    for marker in markers:\n        found = [line[line.index(marker):] for line in lines if marker in line]\n        assert len(found) == 1, (marker, found)\n        result[marker] = found[0]\n    assert 'threads=14' in result['CPU MoE executor ready:']\n    assert 'max_tokens=1' in result['CPU MoE executor ready:']\n    assert 'avx512vnni(nvfp4-w4a8)' in result['CPU MoE executor ready:']\n    assert result['Start capturing CUDA graphs with sizes:'].endswith('[1]')\n    assert 'fp8_e4m3' in result['KV cache dtype:']\n    return result\n\n\ndef io_snapshot(pid):\n    return dict(line.split(': ', 1) for line in Path(f'/proc/{pid}/io').read_text().splitlines())\n\n\ndef hold_connection(stream, idle_s=90):\n    buffer = b''\n    while select.select([stream], [], [], idle_s)[0]:\n        data = os.read(stream.fileno(), 4096)\n        if not data:\n            return dict(lease='closed')\n        buffer += data\n        while b'\\n' in buffer:\n            line, buffer = buffer.split(b'\\n', 1)\n            if line == b'done':\n                return dict(lease='closed')\n            assert line == b'ping', 'invalid lease heartbeat'\n    raise TimeoutError('client stopped renewing the benchmark lease')\n\n\ndef remote_main(args):\n    out = R / 'results' / args.run_id\n    if args.action == 'preflight':\n        assert not out.exists(), out\n        return preflight()\n    if args.action == 'restore':\n        result = dict(started_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))\n        try:\n            stop(SERVER)\n            if state('freetoken-serve')['ActiveState'] not in ('active', 'activating'):\n                wait_gpu_release()\n                run('sudo', '-n', 'systemctl', 'start', 'freetoken-serve', timeout=180)\n            result['health'] = ready(8090)\n            result['completion'] = completion(8090)\n            result['unit'] = state('freetoken-serve')\n            result['verified'] = True\n        except Exception as exc:\n            result.update(verified=False, error=f'{type(exc).__name__}: {exc}')\n            raise\n        finally:\n            out.mkdir(parents=True, exist_ok=True)\n            save(out / 'restoration.json', result)\n        return result\n    if args.action == 'hold':\n        result = preflight(allow_lease=True)\n        out.mkdir(parents=True, exist_ok=False)\n        save(out / 'preflight.json', result)\n        print('LEASE_READY', flush=True)\n        # EOF or a broken connection ends the lease. ExecStopPost restores serving.\n        return hold_connection(sys.stdin)\n    if args.action == 'restoration':\n        return json.loads((out / 'restoration.json').read_text())\n    plan = json.loads((out / 'preflight.json').read_text())\n    assert live(LEASE), 'benchmark lease is not live'\n    assert sha(Path(__file__)) == plan['driver_sha256']\n    start_path = out / (args.arm + '-start.json')\n    if args.action == 'start':\n        assert not start_path.exists(), 'refuse to rerun an existing arm'\n        mode = dict(ARMS)[args.arm]\n        assert identities() == plan['identities']\n        assert sha(Path('/etc/systemd/system/freetoken-serve.service')) == plan['service_sha256']\n        assert sha(R / 'models/flash-e2m1.ftw/config.json') == plan['model_config_sha256']\n        assert sha(R / 'layer-profile-v3.json') == plan['layer_profile_sha256']\n        stop(SERVER)\n        stop('freetoken-serve')\n        wait_gpu_release()\n        command = ['sudo', '-n', 'systemd-run', '--unit=' + SERVER, '--collect', '--uid=jomcgi',\n                   '--working-directory=' + plan['identities'][mode]['tree'],\n                   '--property=KillMode=control-group', '--property=TimeoutStopSec=90',\n                   '--property=RuntimeMaxSec=3400']\n        command += ['--setenv=' + k + '=' + v for k, v in server_env(mode).items()]\n        command += ['--setenv=HOME=/home/jomcgi']\n        run(*(command + server_command(mode)))\n        health = ready(18090)\n        check = completion(18090)\n        unit = state(SERVER)\n        workers = gpu_pids()\n        assert len(workers) == 1\n        worker = workers[0]\n        assert unit['ControlGroup'] in Path(f'/proc/{worker}/cgroup').read_text()\n        maps = [line for line in Path(f'/proc/{worker}/maps').read_text().splitlines() if '_cpu_moe.' in line]\n        assert maps and all(line.split()[-1] == plan['identities'][mode]['native'] for line in maps)\n        actual_env = dict(item.split(b'=', 1) for item in Path(f'/proc/{worker}/environ').read_bytes().split(b'\\0') if b'=' in item)\n        assert all(actual_env[k.encode()].decode() == v for k, v in server_env(mode).items())\n        text = journal(unit['InvocationID'])\n        assert 'moe_collect_stats=False' in text and 'moe_step_timing=False' in text\n        assert \"cache_type='radix'\" in text and \"kv_ladder='off'\" in text\n        assert 'kv_disk_cache_gib=0.0' in text and \"moe_hot_plan_persist='off'\" in text\n        if mode == 'optimized':\n            assert any('DISK staged prefill:' in line and 'file_io=buffered' in line for line in text.splitlines())\n            assert any('MoE HOT staging:' in line and 'file_io=mmap' in line for line in text.splitlines())\n        shape = geometry(text)\n        if args.arm != 'r1':\n            first = json.loads((out / 'r1-start.json').read_text())\n            assert shape == first['geometry'], dict(first=first['geometry'], current=shape)\n        result = dict(arm=args.arm, mode=mode, revision=REVISIONS[mode], unit=unit, worker=worker,\n                      health=health, startup_completion=check, geometry=shape, native_maps=maps,\n                      command=server_command(mode), env=server_env(mode), io_before=io_snapshot(worker),\n                      worker_stat=Path(f'/proc/{worker}/stat').read_text(),\n                      diagnostics_disabled=True, original_unit=state('freetoken-serve'),\n                      identity=plan['identities'][mode], driver_sha256=plan['driver_sha256'],\n                      cache_policy='RAM radix reuse on; disk prefix cache and HOT persistence off')\n        save(start_path, result)\n        (out / (args.arm + '-startup.log')).write_text(text)\n        return result\n    if args.action == 'end':\n        before = json.loads(start_path.read_text())\n        current = state(SERVER)\n        assert current['InvocationID'] == before['unit']['InvocationID'] and current['ActiveState'] == 'active'\n        result = dict(unit=current, io_after=io_snapshot(before['worker']),\n                      gpu_pids=gpu_pids(), original_unit=state('freetoken-serve'))\n        assert result['gpu_pids'] == [before['worker']]\n        text = journal(current['InvocationID'])\n        (out / (args.arm + '-journal.log')).write_text(text)\n        result['journal_sha256'] = sha(out / (args.arm + '-journal.log'))\n        save(out / (args.arm + '-end.json'), result)\n        stop(SERVER)\n        return result\n    raise ValueError(args.action)\n\n\ndef local_main(args):\n    here = Path(__file__).resolve().parent\n    client = here / 'pi-agentic-wall.py'\n    assert sha(client) == CLIENT_SHA, 'client changed after Linux qualification'\n    assert (here.parent / '.git').is_file(), 'run from a linked worktree'\n    assert not run('git', '-C', str(here.parent), 'status', '--porcelain').stdout.strip()\n    root = args.output_dir.resolve()\n    if root.exists():\n        assert sorted(p.name for p in root.iterdir()) == ['preflight.json'], root\n    else:\n        root.mkdir(parents=True)\n    remote_script = R / 'tmp' / (args.run_id + '-driver.py')\n    run('scp', '-oIdentityAgent=none', '-oIdentitiesOnly=yes', '-oBatchMode=yes',\n        str(Path(__file__).resolve()), 'node-4:' + str(remote_script))\n\n    def remote(action, arm=None):\n        command = ['python3', str(remote_script), '--remote', action, '--run-id', args.run_id]\n        if arm:\n            command += ['--arm', arm]\n        return json.loads(run(*(SSH + ['node-4', shlex.join(command)]), timeout=600).stdout)\n\n    plan = remote('preflight')\n    plan.update(local_driver_sha256=sha(Path(__file__)), client_sha256=sha(client),\n                local_revision=run('git', '-C', str(here.parent), 'rev-parse', 'HEAD').stdout.strip(),\n                pi_version=run(str(args.pi), '--version').stdout.strip(),\n                pi_executable_sha256=sha(args.pi.resolve()),\n                design='A/B/B/A: one warmup and two measured Pi sessions per start. All three stages and all failures retained. Same Pi/workspace path, source-verified runtimes, capacity one, graph one, 65536 reserved KV tokens, radix prefixes enabled, diagnostics off. Host page cache retained. No model routing or quantization change.')\n    assert plan['pi_version'] == '0.85.1'\n    save(root / 'preflight.json', plan)\n    if args.preflight:\n        print(json.dumps(plan, indent=2))\n        return 0\n    # The tunnel belongs to this controller, separate from the user's 8090 tunnel.\n    with socket.socket() as probe:\n        probe.bind(('127.0.0.1', 18092))\n    report = dict(preflight=plan, arms=[], completed=False, restored=False)\n    save(root / 'driver.json', report)\n    done = threading.Event()\n    heartbeat_error = []\n    lease = tunnel = active_client = None\n\n    def interrupted(signum, _frame):\n        raise RuntimeError(f'controller interrupted by signal {signum}')\n\n    signal.signal(signal.SIGTERM, interrupted)\n    signal.signal(signal.SIGINT, interrupted)\n    from importlib.util import spec_from_file_location, module_from_spec\n    spec = spec_from_file_location('pi_wall_client', client)\n    client_module = module_from_spec(spec)\n    spec.loader.exec_module(client_module)\n\n    try:\n        restore = shlex.join(['/usr/bin/python3', str(remote_script), '--remote', 'restore', '--run-id', args.run_id])\n        command = ['sudo', '-n', 'systemd-run', '--unit=' + LEASE, '--pipe', '--wait', '--collect', '--uid=jomcgi',\n                   '--property=RuntimeMaxSec=14400', '--property=TimeoutStopSec=600',\n                   '--property=ExecStopPost=' + restore,\n                   '/usr/bin/python3', str(remote_script), '--remote', 'hold', '--run-id', args.run_id]\n        with (root / 'lease-stderr.log').open('wb') as err:\n            lease = subprocess.Popen(SSH + ['node-4', shlex.join(command)], stdin=subprocess.PIPE,\n                                     stdout=subprocess.PIPE, stderr=err, start_new_session=True)\n        deadline = time.monotonic() + 60\n        lease_output = b''\n        while b'LEASE_READY\\n' not in lease_output:\n            if time.monotonic() > deadline or lease.poll() is not None:\n                raise RuntimeError('remote lease did not become ready')\n            if select.select([lease.stdout], [], [], 1)[0]:\n                lease_output += os.read(lease.stdout.fileno(), 65536)\n        (root / 'lease-start.log').write_bytes(lease_output)\n\n        def pulse():\n            try:\n                while not done.is_set():\n                    lease.stdin.write(b'ping\\n')\n                    lease.stdin.flush()\n                    done.wait(20)\n            except Exception as exc:\n                heartbeat_error.append(str(exc))\n\n        heartbeat = threading.Thread(target=pulse, daemon=True)\n        heartbeat.start()\n        with (root / 'tunnel.log').open('wb') as err:\n            tunnel = subprocess.Popen(SSH + ['-oExitOnForwardFailure=yes', '-N',\n                                      '-L', '127.0.0.1:18092:127.0.0.1:18090', 'node-4'],\n                                      stdout=err, stderr=err, start_new_session=True)\n        time.sleep(1)\n        assert tunnel.poll() is None, 'SSH tunnel failed'\n        for arm, mode in ARMS:\n            assert not heartbeat_error and lease.poll() is None\n            start = remote('start', arm)\n            save(root / (arm + '-server-start.json'), start)\n            current = root / 'client-current'\n            assert not current.exists()\n            command = [sys.executable, str(client), '--pi', str(args.pi.resolve()),\n                       '--base-url', 'http://127.0.0.1:18092/v1', '--output-dir', str(current),\n                       '--label', mode + '-' + arm, '--server-metadata', str(root / (arm + '-server-start.json')),\n                       '--sessions', '3', '--timeout', '900', '--max-model-calls', '30',\n                       '--max-tokens', '8192', '--context-tokens', '32768', '--repairs', '1']\n            print('STARTED ' + arm + ' ' + mode, flush=True)\n            with (root / (arm + '-client.log')).open('wb') as log:\n                active_client = subprocess.Popen(command, stdout=log, stderr=log, start_new_session=True)\n                deadline = time.monotonic() + 2850\n                while active_client.poll() is None:\n                    if heartbeat_error or lease.poll() is not None or time.monotonic() > deadline:\n                        raise RuntimeError('client exceeded controller budget or lease failed')\n                    time.sleep(2)\n            result = dict(arm=arm, mode=mode, client_returncode=active_client.returncode)\n            active_client = None\n            # Archive, then reuse exactly the same path for the next arm's prompt.\n            current.rename(root / arm)\n            rows = [json.loads((root / arm / f'session-{n}/result.json').read_text()) for n in (1, 2, 3)]\n            assert all(not row['trace'] for row in rows)\n            result['warmup'] = {k: rows[0].get(k) for k in ['passed', 'task_wall_s', 'model_calls', 'error']}\n            result['measured'] = [{k: row.get(k) for k in ['passed', 'task_wall_s', 'model_calls', 'repair_prompts', 'error']} for row in rows[1:]]\n            result['end'] = remote('end', arm)\n            save(root / (arm + '-server-end.json'), result['end'])\n            report['arms'].append(result)\n            save(root / 'driver.json', report)\n            print('COMPLETED ' + json.dumps(result), flush=True)\n        report['completed'] = True\n    except Exception as exc:\n        report['error'] = f'{type(exc).__name__}: {exc}'\n        print('FAILED ' + report['error'], flush=True)\n    finally:\n        if active_client is not None:\n            # Let the client preserve cancellation evidence and stop its Pi group.\n            active_client.send_signal(signal.SIGTERM)\n            try:\n                active_client.wait(timeout=30)\n            except subprocess.TimeoutExpired:\n                client_module.kill_group(active_client)\n        done.set()\n        if lease is not None:\n            if 'heartbeat' in locals():\n                heartbeat.join(timeout=5)\n            try:\n                lease.stdin.write(b'done\\n')\n                lease.stdin.flush()\n                lease.stdin.close()\n            except (BrokenPipeError, OSError):\n                pass\n            try:\n                lease.wait(timeout=600)\n                report['lease_returncode'] = lease.returncode\n                (root / 'lease-end.log').write_bytes(lease.stdout.read())\n                report['restoration'] = remote('restoration')\n                report['restored'] = report['restoration']['verified']\n            except Exception as exc:\n                report['restoration_error'] = f'{type(exc).__name__}: {exc}'\n        if tunnel is not None:\n            client_module.kill_group(tunnel)\n        save(root / 'driver.json', report)\n        print('FINAL ' + json.dumps({k: report.get(k) for k in ['completed', 'restored', 'error', 'restoration_error']}), flush=True)\n    return 0 if report['completed'] and report['restored'] else 1\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--remote', dest='action', choices=['preflight', 'hold', 'start', 'end', 'restore', 'restoration'])\n    parser.add_argument('--run-id', required=True)\n    parser.add_argument('--arm', choices=[arm for arm, _ in ARMS])\n    parser.add_argument('--output-dir', type=Path)\n    parser.add_argument('--pi', type=Path)\n    parser.add_argument('--preflight', action='store_true')\n    args = parser.parse_args()\n    if not re.fullmatch(r'astra-pi-agentic-[a-z0-9-]+', args.run_id):\n        parser.error('run-id must start astra-pi-agentic- and contain only lowercase letters, digits and hyphens')\n    if args.action:\n        print(json.dumps(remote_main(args), indent=2), flush=True)\n        return 0\n    if not args.output_dir or not args.pi:\n        parser.error('local controller requires --output-dir and --pi')\n    return local_main(args)\n\n\nif __name__ == '__main__':\n    raise SystemExit(main())\n",
+    "started_utc": "2026-09-06T04:41:35Z"
+  },
+  "process": {
+    "command": [
+      "/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python",
+      "bench/resident-populate.py",
+      "--directory",
+      "/var/lib/longhorn/nvme-02/freetoken/tmp"
+    ],
+    "returncode": 0,
+    "process_wall_s": 32.868765392981004,
+    "environment": {
+      "PYTHONPATH": "/var/lib/longhorn/nvme-02/freetoken/wt-astra-populate-resident/python",
+      "CUDA_VISIBLE_DEVICES": "",
+      "OMP_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1",
+      "OPENBLAS_NUM_THREADS": "1"
+    },
+    "stdout": "{\n  \"component_only\": true,\n  \"model_throughput_verified\": false,\n  \"platform\": \"Linux-6.8.0-138-generic-x86_64-with-glibc2.39\",\n  \"revision\": \"5011e6b9a062120005f17ec00041b946f4aee1f7\",\n  \"file_bytes\": 268435473,\n  \"row_bytes\": 2097152,\n  \"scratch_bytes\": 33554432,\n  \"sources\": {\n    \"bench/resident-populate.py\": \"ef961dead9e375ef861ef0c373280ef4cb03bfb12e36c135ccfed123541f1324\",\n    \"python/freetoken/moe/host_banks.py\": \"88c36ea9ee4740bb60ccf9802011e0e1bcc166eac5172a3a3af5270f18d6b8b6\",\n    \"python/freetoken/moe/resident_range.py\": \"c40353045ecb455ea48eac46f500aa600af61a7357240ed600015a73573a942c\"\n  },\n  \"hugepage_policy\": \"off\",\n  \"cache_preparation\": \"Private-file DONTNEED, then selected-row reads for warm/mixed. Fully resident selected-row count is checked before each sample.\",\n  \"cases\": {\n    \"warm\": {\n      \"off\": {\n        \"total_s\": 0.2566653410322033,\n        \"median_total_s\": 0.06442928299657069,\n        \"scratch_bytes_read\": 536870912,\n        \"physical_read_bytes\": 0\n      },\n      \"on\": {\n        \"total_s\": 0.21828024100977927,\n        \"median_total_s\": 0.05419764999533072,\n        \"scratch_bytes_read\": 0,\n        \"physical_read_bytes\": 0\n      },\n      \"wall_reduction_percent\": 14.955311016304263\n    },\n    \"cold\": {\n      \"off\": {\n        \"total_s\": 0.6236130699398927,\n        \"median_total_s\": 0.1563145709806122,\n        \"scratch_bytes_read\": 536870912,\n        \"physical_read_bytes\": 603979776\n      },\n      \"on\": {\n        \"total_s\": 0.6297573350020684,\n        \"median_total_s\": 0.15812446651398204,\n        \"scratch_bytes_read\": 536870912,\n        \"physical_read_bytes\": 603979776\n      },\n      \"wall_reduction_percent\": -0.9852688082319982\n    },\n    \"mixed\": {\n      \"off\": {\n        \"total_s\": 0.4252787780133076,\n        \"median_total_s\": 0.106358896009624,\n        \"scratch_bytes_read\": 536870912,\n        \"physical_read_bytes\": 301989888\n      },\n      \"on\": {\n        \"total_s\": 0.41347187699284405,\n        \"median_total_s\": 0.10328195401234552,\n        \"scratch_bytes_read\": 268435456,\n        \"physical_read_bytes\": 301989888\n      },\n      \"wall_reduction_percent\": 2.7762732661196\n    }\n  },\n  \"samples\": [\n    {\n      \"case\": \"warm\",\n      \"warmup\": true,\n      \"pair\": 0,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.009348966996185482,\n      \"consume_s\": 0.05547584197483957,\n      \"total_s\": 0.06482480897102505,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217859,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": true,\n      \"pair\": 0,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 0,\n      \"populate_s\": 0.000298141036182642,\n      \"consume_s\": 0.055968552944250405,\n      \"total_s\": 0.05626669398043305,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 131,\n        \"wchar\": 0,\n        \"syscr\": 2,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": false,\n      \"pair\": 1,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.009277107019443065,\n      \"consume_s\": 0.055381743994075805,\n      \"total_s\": 0.06465885101351887,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217859,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": false,\n      \"pair\": 1,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 0,\n      \"populate_s\": 0.0002859800006262958,\n      \"consume_s\": 0.05545496504055336,\n      \"total_s\": 0.05574094504117966,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 131,\n        \"wchar\": 0,\n        \"syscr\": 2,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": false,\n      \"pair\": 2,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 0,\n      \"populate_s\": 0.0002848510048352182,\n      \"consume_s\": 0.05388880299869925,\n      \"total_s\": 0.054173654003534466,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 131,\n        \"wchar\": 0,\n        \"syscr\": 2,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": false,\n      \"pair\": 2,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.00959290802711621,\n      \"consume_s\": 0.05531133501790464,\n      \"total_s\": 0.06490424304502085,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217859,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": false,\n      \"pair\": 3,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.009090467006899416,\n      \"consume_s\": 0.05381206498714164,\n      \"total_s\": 0.06290253199404106,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217859,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": false,\n      \"pair\": 3,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 0,\n      \"populate_s\": 0.00028462096815928817,\n      \"consume_s\": 0.05385937500977889,\n      \"total_s\": 0.054143995977938175,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 132,\n        \"wchar\": 0,\n        \"syscr\": 2,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": false,\n      \"pair\": 4,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 0,\n      \"populate_s\": 0.0002899399842135608,\n      \"consume_s\": 0.053931706002913415,\n      \"total_s\": 0.054221645987126976,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 132,\n        \"wchar\": 0,\n        \"syscr\": 2,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"warm\",\n      \"warmup\": false,\n      \"pair\": 4,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 64,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.010383608983829618,\n      \"consume_s\": 0.053816105995792896,\n      \"total_s\": 0.06419971497962251,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217860,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 0,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": true,\n      \"pair\": 0,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.0963324430049397,\n      \"consume_s\": 0.060118372028227895,\n      \"total_s\": 0.1564508150331676,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217860,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": true,\n      \"pair\": 0,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.09769795404281467,\n      \"consume_s\": 0.05970170098589733,\n      \"total_s\": 0.157399655028712,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217860,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": false,\n      \"pair\": 1,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.09819056396372616,\n      \"consume_s\": 0.06006974203046411,\n      \"total_s\": 0.15826030599419028,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": false,\n      \"pair\": 1,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.09791814401978627,\n      \"consume_s\": 0.06003744201734662,\n      \"total_s\": 0.1579555860371329,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": false,\n      \"pair\": 2,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.09839357598684728,\n      \"consume_s\": 0.060548882000148296,\n      \"total_s\": 0.15894245798699558,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": false,\n      \"pair\": 2,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.09631675394484773,\n      \"consume_s\": 0.060099232010543346,\n      \"total_s\": 0.15641598595539108,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": false,\n      \"pair\": 3,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.09611685399431735,\n      \"consume_s\": 0.060096302011515945,\n      \"total_s\": 0.1562131560058333,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": false,\n      \"pair\": 3,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.09757816401543096,\n      \"consume_s\": 0.06071518297540024,\n      \"total_s\": 0.1582933469908312,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": false,\n      \"pair\": 4,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.09447729197563604,\n      \"consume_s\": 0.06008865201147273,\n      \"total_s\": 0.15456594398710877,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"cold\",\n      \"warmup\": false,\n      \"pair\": 4,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 0,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.0926391200046055,\n      \"consume_s\": 0.060084501979872584,\n      \"total_s\": 0.1527236219844781,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 150994944,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": true,\n      \"pair\": 0,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.052468585956376046,\n      \"consume_s\": 0.05856357200536877,\n      \"total_s\": 0.11103215796174482,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": true,\n      \"pair\": 0,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 67108864,\n      \"populate_s\": 0.049696084985043854,\n      \"consume_s\": 0.058755891979672015,\n      \"total_s\": 0.10845197696471587,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 67108997,\n        \"wchar\": 0,\n        \"syscr\": 34,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": false,\n      \"pair\": 1,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.048870902974158525,\n      \"consume_s\": 0.05699275102233514,\n      \"total_s\": 0.10586365399649367,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": false,\n      \"pair\": 1,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 67108864,\n      \"populate_s\": 0.04467705998104066,\n      \"consume_s\": 0.059158063028007746,\n      \"total_s\": 0.1038351230090484,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 67108997,\n        \"wchar\": 0,\n        \"syscr\": 34,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": false,\n      \"pair\": 2,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 67108864,\n      \"populate_s\": 0.04493235104018822,\n      \"consume_s\": 0.058456722006667405,\n      \"total_s\": 0.10338907304685563,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 67108997,\n        \"wchar\": 0,\n        \"syscr\": 34,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": false,\n      \"pair\": 2,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.04844202398089692,\n      \"consume_s\": 0.05842442298308015,\n      \"total_s\": 0.10686644696397707,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": false,\n      \"pair\": 3,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.0481659040087834,\n      \"consume_s\": 0.05868823401397094,\n      \"total_s\": 0.10685413802275434,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": false,\n      \"pair\": 3,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 67108864,\n      \"populate_s\": 0.044797511014621705,\n      \"consume_s\": 0.05837732396321371,\n      \"total_s\": 0.10317483497783542,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 67108997,\n        \"wchar\": 0,\n        \"syscr\": 34,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": false,\n      \"pair\": 4,\n      \"mode\": \"on\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 67108864,\n      \"populate_s\": 0.044782501994632185,\n      \"consume_s\": 0.05829034396447241,\n      \"total_s\": 0.1030728459591046,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 67108997,\n        \"wchar\": 0,\n        \"syscr\": 34,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    },\n    {\n      \"case\": \"mixed\",\n      \"warmup\": false,\n      \"pair\": 4,\n      \"mode\": \"off\",\n      \"resident_rows_before\": 32,\n      \"selected_rows\": 64,\n      \"selected_bytes\": 134217728,\n      \"scratch_bytes_read\": 134217728,\n      \"populate_s\": 0.04815028503071517,\n      \"consume_s\": 0.057544253999367356,\n      \"total_s\": 0.10569453903008252,\n      \"checksum\": \"bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a\",\n      \"io_delta\": {\n        \"rchar\": 134217861,\n        \"wchar\": 0,\n        \"syscr\": 66,\n        \"syscw\": 0,\n        \"read_bytes\": 75497472,\n        \"write_bytes\": 0,\n        \"cancelled_write_bytes\": 0\n      }\n    }\n  ]\n}\n",
+    "stderr": "",
+    "original_unit": {
+      "MainPID": "0",
+      "Result": "success",
+      "ControlGroup": "",
+      "ActiveState": "inactive",
+      "InvocationID": "a332375ed64442fa8abf1a448dc76acb"
+    },
+    "gpu_pids": [],
+    "source_sha256": {
+      "tests/test_resident_range_probe.py": "ba50cef7cd95258c66013fb5f99091275040a24cafd501bfe75abb08fd07f986",
+      "tests/moe/test_populate_residency_linux.py": "18f108e26e81e76a21a172ae5e59db8eb29d3c357368b31000853761af137d21",
+      "python/freetoken/moe/host_banks.py": "88c36ea9ee4740bb60ccf9802011e0e1bcc166eac5172a3a3af5270f18d6b8b6",
+      "python/freetoken/moe/resident_range.py": "c40353045ecb455ea48eac46f500aa600af61a7357240ed600015a73573a942c",
+      "bench/resident-populate.py": "ef961dead9e375ef861ef0c373280ef4cb03bfb12e36c135ccfed123541f1324"
+    }
+  },
+  "component": {
+    "component_only": true,
+    "model_throughput_verified": false,
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.39",
+    "revision": "5011e6b9a062120005f17ec00041b946f4aee1f7",
+    "file_bytes": 268435473,
+    "row_bytes": 2097152,
+    "scratch_bytes": 33554432,
+    "sources": {
+      "bench/resident-populate.py": "ef961dead9e375ef861ef0c373280ef4cb03bfb12e36c135ccfed123541f1324",
+      "python/freetoken/moe/host_banks.py": "88c36ea9ee4740bb60ccf9802011e0e1bcc166eac5172a3a3af5270f18d6b8b6",
+      "python/freetoken/moe/resident_range.py": "c40353045ecb455ea48eac46f500aa600af61a7357240ed600015a73573a942c"
+    },
+    "hugepage_policy": "off",
+    "cache_preparation": "Private-file DONTNEED, then selected-row reads for warm/mixed. Fully resident selected-row count is checked before each sample.",
+    "cases": {
+      "warm": {
+        "off": {
+          "total_s": 0.2566653410322033,
+          "median_total_s": 0.06442928299657069,
+          "scratch_bytes_read": 536870912,
+          "physical_read_bytes": 0
+        },
+        "on": {
+          "total_s": 0.21828024100977927,
+          "median_total_s": 0.05419764999533072,
+          "scratch_bytes_read": 0,
+          "physical_read_bytes": 0
+        },
+        "wall_reduction_percent": 14.955311016304263
+      },
+      "cold": {
+        "off": {
+          "total_s": 0.6236130699398927,
+          "median_total_s": 0.1563145709806122,
+          "scratch_bytes_read": 536870912,
+          "physical_read_bytes": 603979776
+        },
+        "on": {
+          "total_s": 0.6297573350020684,
+          "median_total_s": 0.15812446651398204,
+          "scratch_bytes_read": 536870912,
+          "physical_read_bytes": 603979776
+        },
+        "wall_reduction_percent": -0.9852688082319982
+      },
+      "mixed": {
+        "off": {
+          "total_s": 0.4252787780133076,
+          "median_total_s": 0.106358896009624,
+          "scratch_bytes_read": 536870912,
+          "physical_read_bytes": 301989888
+        },
+        "on": {
+          "total_s": 0.41347187699284405,
+          "median_total_s": 0.10328195401234552,
+          "scratch_bytes_read": 268435456,
+          "physical_read_bytes": 301989888
+        },
+        "wall_reduction_percent": 2.7762732661196
+      }
+    },
+    "samples": [
+      {
+        "case": "warm",
+        "warmup": true,
+        "pair": 0,
+        "mode": "off",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.009348966996185482,
+        "consume_s": 0.05547584197483957,
+        "total_s": 0.06482480897102505,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217859,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": true,
+        "pair": 0,
+        "mode": "on",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 0,
+        "populate_s": 0.000298141036182642,
+        "consume_s": 0.055968552944250405,
+        "total_s": 0.05626669398043305,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 131,
+          "wchar": 0,
+          "syscr": 2,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": false,
+        "pair": 1,
+        "mode": "off",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.009277107019443065,
+        "consume_s": 0.055381743994075805,
+        "total_s": 0.06465885101351887,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217859,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": false,
+        "pair": 1,
+        "mode": "on",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 0,
+        "populate_s": 0.0002859800006262958,
+        "consume_s": 0.05545496504055336,
+        "total_s": 0.05574094504117966,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 131,
+          "wchar": 0,
+          "syscr": 2,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": false,
+        "pair": 2,
+        "mode": "on",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 0,
+        "populate_s": 0.0002848510048352182,
+        "consume_s": 0.05388880299869925,
+        "total_s": 0.054173654003534466,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 131,
+          "wchar": 0,
+          "syscr": 2,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": false,
+        "pair": 2,
+        "mode": "off",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.00959290802711621,
+        "consume_s": 0.05531133501790464,
+        "total_s": 0.06490424304502085,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217859,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": false,
+        "pair": 3,
+        "mode": "off",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.009090467006899416,
+        "consume_s": 0.05381206498714164,
+        "total_s": 0.06290253199404106,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217859,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": false,
+        "pair": 3,
+        "mode": "on",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 0,
+        "populate_s": 0.00028462096815928817,
+        "consume_s": 0.05385937500977889,
+        "total_s": 0.054143995977938175,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 132,
+          "wchar": 0,
+          "syscr": 2,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": false,
+        "pair": 4,
+        "mode": "on",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 0,
+        "populate_s": 0.0002899399842135608,
+        "consume_s": 0.053931706002913415,
+        "total_s": 0.054221645987126976,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 132,
+          "wchar": 0,
+          "syscr": 2,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "warm",
+        "warmup": false,
+        "pair": 4,
+        "mode": "off",
+        "resident_rows_before": 64,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.010383608983829618,
+        "consume_s": 0.053816105995792896,
+        "total_s": 0.06419971497962251,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217860,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 0,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": true,
+        "pair": 0,
+        "mode": "off",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.0963324430049397,
+        "consume_s": 0.060118372028227895,
+        "total_s": 0.1564508150331676,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217860,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": true,
+        "pair": 0,
+        "mode": "on",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.09769795404281467,
+        "consume_s": 0.05970170098589733,
+        "total_s": 0.157399655028712,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217860,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": false,
+        "pair": 1,
+        "mode": "off",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.09819056396372616,
+        "consume_s": 0.06006974203046411,
+        "total_s": 0.15826030599419028,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": false,
+        "pair": 1,
+        "mode": "on",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.09791814401978627,
+        "consume_s": 0.06003744201734662,
+        "total_s": 0.1579555860371329,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": false,
+        "pair": 2,
+        "mode": "on",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.09839357598684728,
+        "consume_s": 0.060548882000148296,
+        "total_s": 0.15894245798699558,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": false,
+        "pair": 2,
+        "mode": "off",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.09631675394484773,
+        "consume_s": 0.060099232010543346,
+        "total_s": 0.15641598595539108,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": false,
+        "pair": 3,
+        "mode": "off",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.09611685399431735,
+        "consume_s": 0.060096302011515945,
+        "total_s": 0.1562131560058333,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": false,
+        "pair": 3,
+        "mode": "on",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.09757816401543096,
+        "consume_s": 0.06071518297540024,
+        "total_s": 0.1582933469908312,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": false,
+        "pair": 4,
+        "mode": "on",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.09447729197563604,
+        "consume_s": 0.06008865201147273,
+        "total_s": 0.15456594398710877,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "cold",
+        "warmup": false,
+        "pair": 4,
+        "mode": "off",
+        "resident_rows_before": 0,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.0926391200046055,
+        "consume_s": 0.060084501979872584,
+        "total_s": 0.1527236219844781,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 150994944,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": true,
+        "pair": 0,
+        "mode": "off",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.052468585956376046,
+        "consume_s": 0.05856357200536877,
+        "total_s": 0.11103215796174482,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": true,
+        "pair": 0,
+        "mode": "on",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 67108864,
+        "populate_s": 0.049696084985043854,
+        "consume_s": 0.058755891979672015,
+        "total_s": 0.10845197696471587,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 67108997,
+          "wchar": 0,
+          "syscr": 34,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": false,
+        "pair": 1,
+        "mode": "off",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.048870902974158525,
+        "consume_s": 0.05699275102233514,
+        "total_s": 0.10586365399649367,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": false,
+        "pair": 1,
+        "mode": "on",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 67108864,
+        "populate_s": 0.04467705998104066,
+        "consume_s": 0.059158063028007746,
+        "total_s": 0.1038351230090484,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 67108997,
+          "wchar": 0,
+          "syscr": 34,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": false,
+        "pair": 2,
+        "mode": "on",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 67108864,
+        "populate_s": 0.04493235104018822,
+        "consume_s": 0.058456722006667405,
+        "total_s": 0.10338907304685563,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 67108997,
+          "wchar": 0,
+          "syscr": 34,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": false,
+        "pair": 2,
+        "mode": "off",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.04844202398089692,
+        "consume_s": 0.05842442298308015,
+        "total_s": 0.10686644696397707,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": false,
+        "pair": 3,
+        "mode": "off",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.0481659040087834,
+        "consume_s": 0.05868823401397094,
+        "total_s": 0.10685413802275434,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": false,
+        "pair": 3,
+        "mode": "on",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 67108864,
+        "populate_s": 0.044797511014621705,
+        "consume_s": 0.05837732396321371,
+        "total_s": 0.10317483497783542,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 67108997,
+          "wchar": 0,
+          "syscr": 34,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": false,
+        "pair": 4,
+        "mode": "on",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 67108864,
+        "populate_s": 0.044782501994632185,
+        "consume_s": 0.05829034396447241,
+        "total_s": 0.1030728459591046,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 67108997,
+          "wchar": 0,
+          "syscr": 34,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      },
+      {
+        "case": "mixed",
+        "warmup": false,
+        "pair": 4,
+        "mode": "off",
+        "resident_rows_before": 32,
+        "selected_rows": 64,
+        "selected_bytes": 134217728,
+        "scratch_bytes_read": 134217728,
+        "populate_s": 0.04815028503071517,
+        "consume_s": 0.057544253999367356,
+        "total_s": 0.10569453903008252,
+        "checksum": "bb786c1330455a43ee8ed9e0b0e06f369bc8ec65db8fdcc504393e7cc614688a",
+        "io_delta": {
+          "rchar": 134217861,
+          "wchar": 0,
+          "syscr": 66,
+          "syscw": 0,
+          "read_bytes": 75497472,
+          "write_bytes": 0,
+          "cancelled_write_bytes": 0
+        }
+      }
+    ]
+  },
+  "component_unit": "Result=exit-code\nExecMainStatus=0\nExecStopPost={ path=/usr/bin/python3 ; argv[]=/usr/bin/python3 /var/lib/longhorn/nvme-02/freetoken/tmp/astra-pi-agentic-runtime-20260906-driver.py --remote restore --run-id astra-populate-component-20260906 ; ignore_errors=no ; start_time=[Sun 2026-09-06 04:42:14 UTC] ; stop_time=[Sun 2026-09-06 04:42:14 UTC] ; pid=765533 ; code=exited ; status=2 }\nId=astra-populate-component-20260906.service\nActiveState=failed\nInvocationID=58bbda39b005416c8d47d55a9f8a9dc2\n",
+  "journal": "  jomcgi : PWD=/var/lib/longhorn/nvme-02/freetoken/wt-astra-populate-resident ; USER=root ; COMMAND=/usr/bin/systemctl stop freetoken-serve\npam_unix(sudo:session): session opened for user root(uid=0) by (uid=1000)\npam_unix(sudo:session): session closed for user root\n{\n  \"command\": [\n    \"/var/lib/longhorn/nvme-02/freetoken/wt-plegather/.venv/bin/python\",\n    \"bench/resident-populate.py\",\n    \"--directory\",\n    \"/var/lib/longhorn/nvme-02/freetoken/tmp\"\n  ],\n  \"returncode\": 0,\n  \"process_wall_s\": 32.868765392981004,\n  \"environment\": {\n    \"PYTHONPATH\": \"/var/lib/longhorn/nvme-02/freetoken/wt-astra-populate-resident/python\",\n    \"CUDA_VISIBLE_DEVICES\": \"\",\n    \"OMP_NUM_THREADS\": \"1\",\n    \"MKL_NUM_THREADS\": \"1\",\n    \"OPENBLAS_NUM_THREADS\": \"1\"\n  },\n  \"stderr\": \"\",\n  \"original_unit\": {\n    \"MainPID\": \"0\",\n    \"Result\": \"success\",\n    \"ControlGroup\": \"\",\n    \"ActiveState\": \"inactive\",\n    \"InvocationID\": \"a332375ed64442fa8abf1a448dc76acb\"\n  },\n  \"gpu_pids\": [],\n  \"source_sha256\": {\n    \"tests/test_resident_range_probe.py\": \"ba50cef7cd95258c66013fb5f99091275040a24cafd501bfe75abb08fd07f986\",\n    \"tests/moe/test_populate_residency_linux.py\": \"18f108e26e81e76a21a172ae5e59db8eb29d3c357368b31000853761af137d21\",\n    \"python/freetoken/moe/host_banks.py\": \"88c36ea9ee4740bb60ccf9802011e0e1bcc166eac5172a3a3af5270f18d6b8b6\",\n    \"python/freetoken/moe/resident_range.py\": \"c40353045ecb455ea48eac46f500aa600af61a7357240ed600015a73573a942c\",\n    \"bench/resident-populate.py\": \"ef961dead9e375ef861ef0c373280ef4cb03bfb12e36c135ccfed123541f1324\"\n  }\n}\n{\n  \"warm\": {\n    \"off\": {\n      \"total_s\": 0.2566653410322033,\n      \"median_total_s\": 0.06442928299657069,\n      \"scratch_bytes_read\": 536870912,\n      \"physical_read_bytes\": 0\n    },\n    \"on\": {\n      \"total_s\": 0.21828024100977927,\n      \"median_total_s\": 0.05419764999533072,\n      \"scratch_bytes_read\": 0,\n      \"physical_read_bytes\": 0\n    },\n    \"wall_reduction_percent\": 14.955311016304263\n  },\n  \"cold\": {\n    \"off\": {\n      \"total_s\": 0.6236130699398927,\n      \"median_total_s\": 0.1563145709806122,\n      \"scratch_bytes_read\": 536870912,\n      \"physical_read_bytes\": 603979776\n    },\n    \"on\": {\n      \"total_s\": 0.6297573350020684,\n      \"median_total_s\": 0.15812446651398204,\n      \"scratch_bytes_read\": 536870912,\n      \"physical_read_bytes\": 603979776\n    },\n    \"wall_reduction_percent\": -0.9852688082319982\n  },\n  \"mixed\": {\n    \"off\": {\n      \"total_s\": 0.4252787780133076,\n      \"median_total_s\": 0.106358896009624,\n      \"scratch_bytes_read\": 536870912,\n      \"physical_read_bytes\": 301989888\n    },\n    \"on\": {\n      \"total_s\": 0.41347187699284405,\n      \"median_total_s\": 0.10328195401234552,\n      \"scratch_bytes_read\": 268435456,\n      \"physical_read_bytes\": 301989888\n    },\n    \"wall_reduction_percent\": 2.7762732661196\n  }\n}\nusage: astra-pi-agentic-runtime-20260906-driver.py [-h]\n                                                   [--remote {preflight,hold,start,end,restore,restoration}]\n                                                   --run-id RUN_ID\n                                                   [--arm {r1,r2,r3,r4}]\n                                                   [--output-dir OUTPUT_DIR]\n                                                   [--pi PI] [--preflight]\nastra-pi-agentic-runtime-20260906-driver.py: error: run-id must start astra-pi-agentic- and contain only lowercase letters, digits and hyphens\n",
+  "recovery_journal": "{\n  \"started_utc\": \"2026-09-06T04:42:42Z\",\n  \"health\": {\n    \"status\": \"ok\",\n    \"model\": \"qwen3.6-27b\",\n    \"instance_id\": \"2663d3e5-68cf-4bb3-b226-1310c42c382a\",\n    \"uptime_s\": 1,\n    \"maintenance\": \"serving\",\n    \"version\": \"0.1.2\"\n  },\n  \"completion\": {\n    \"id\": \"chatcmpl-0\",\n    \"object\": \"chat.completion\",\n    \"created\": 1788669844,\n    \"model\": \"qwen3.6-27b\",\n    \"choices\": [\n      {\n        \"index\": 0,\n        \"message\": {\n          \"role\": \"assistant\",\n          \"content\": \"OK\"\n        },\n        \"finish_reason\": \"stop\"\n      }\n    ],\n    \"usage\": {\n      \"prompt_tokens\": 17,\n      \"completion_tokens\": 2,\n      \"total_tokens\": 19\n    }\n  },\n  \"unit\": {\n    \"MainPID\": \"765698\",\n    \"Result\": \"success\",\n    \"ControlGroup\": \"/system.slice/freetoken-serve.service\",\n    \"ActiveState\": \"active\",\n    \"InvocationID\": \"dffe5899c3a14693ac7242a4d9b3958c\"\n  },\n  \"verified\": true\n}\n",
+  "restoration": {
+    "started_utc": "2026-09-06T04:42:42Z",
+    "health": {
+      "status": "ok",
+      "model": "qwen3.6-27b",
+      "instance_id": "2663d3e5-68cf-4bb3-b226-1310c42c382a",
+      "uptime_s": 1,
+      "maintenance": "serving",
+      "version": "0.1.2"
+    },
+    "completion": {
+      "id": "chatcmpl-0",
+      "object": "chat.completion",
+      "created": 1788669844,
+      "model": "qwen3.6-27b",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "OK"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 17,
+        "completion_tokens": 2,
+        "total_tokens": 19
+      }
+    },
+    "unit": {
+      "MainPID": "765698",
+      "Result": "success",
+      "ControlGroup": "/system.slice/freetoken-serve.service",
+      "ActiveState": "active",
+      "InvocationID": "dffe5899c3a14693ac7242a4d9b3958c"
+    },
+    "verified": true
+  },
+  "original_unit_after": "MainPID=765698\nActiveState=active\nInvocationID=dffe5899c3a14693ac7242a4d9b3958c\n",
+  "analysis": {
+    "component_only": true,
+    "model_throughput_verified": false,
+    "measured_samples": 24,
+    "warmup_samples": 6,
+    "checksum_pairs_match": true,
+    "cases": {
+      "warm": {
+        "off": {
+          "total_s": 0.2566653410322033,
+          "median_total_s": 0.06442928299657069,
+          "scratch_bytes_read": 536870912,
+          "physical_read_bytes": 0
+        },
+        "on": {
+          "total_s": 0.21828024100977927,
+          "median_total_s": 0.05419764999533072,
+          "scratch_bytes_read": 0,
+          "physical_read_bytes": 0
+        },
+        "wall_reduction_percent": 14.955311016304263,
+        "pairs": [
+          {
+            "pair": 1,
+            "order": [
+              "off",
+              "on"
+            ],
+            "wall_reduction_percent": 13.79224318488842
+          },
+          {
+            "pair": 2,
+            "order": [
+              "on",
+              "off"
+            ],
+            "wall_reduction_percent": 16.532954608288254
+          },
+          {
+            "pair": 3,
+            "order": [
+              "off",
+              "on"
+            ],
+            "wall_reduction_percent": 13.923980066386843
+          },
+          {
+            "pair": 4,
+            "order": [
+              "on",
+              "off"
+            ],
+            "wall_reduction_percent": 15.542232540537992
+          }
+        ]
+      },
+      "cold": {
+        "off": {
+          "total_s": 0.6236130699398927,
+          "median_total_s": 0.1563145709806122,
+          "scratch_bytes_read": 536870912,
+          "physical_read_bytes": 603979776
+        },
+        "on": {
+          "total_s": 0.6297573350020684,
+          "median_total_s": 0.15812446651398204,
+          "scratch_bytes_read": 536870912,
+          "physical_read_bytes": 603979776
+        },
+        "wall_reduction_percent": -0.9852688082319982,
+        "pairs": [
+          {
+            "pair": 1,
+            "order": [
+              "off",
+              "on"
+            ],
+            "wall_reduction_percent": 0.1925435156612032
+          },
+          {
+            "pair": 2,
+            "order": [
+              "on",
+              "off"
+            ],
+            "wall_reduction_percent": -1.6152262290665353
+          },
+          {
+            "pair": 3,
+            "order": [
+              "off",
+              "on"
+            ],
+            "wall_reduction_percent": -1.331636232303146
+          },
+          {
+            "pair": 4,
+            "order": [
+              "on",
+              "off"
+            ],
+            "wall_reduction_percent": -1.2063110988933534
+          }
+        ]
+      },
+      "mixed": {
+        "off": {
+          "total_s": 0.4252787780133076,
+          "median_total_s": 0.106358896009624,
+          "scratch_bytes_read": 536870912,
+          "physical_read_bytes": 301989888
+        },
+        "on": {
+          "total_s": 0.41347187699284405,
+          "median_total_s": 0.10328195401234552,
+          "scratch_bytes_read": 268435456,
+          "physical_read_bytes": 301989888
+        },
+        "wall_reduction_percent": 2.7762732661196,
+        "pairs": [
+          {
+            "pair": 1,
+            "order": [
+              "off",
+              "on"
+            ],
+            "wall_reduction_percent": 1.9161732198592518
+          },
+          {
+            "pair": 2,
+            "order": [
+              "on",
+              "off"
+            ],
+            "wall_reduction_percent": 3.253943605230558
+          },
+          {
+            "pair": 3,
+            "order": [
+              "off",
+              "on"
+            ],
+            "wall_reduction_percent": 3.4432948625119475
+          },
+          {
+            "pair": 4,
+            "order": [
+              "on",
+              "off"
+            ],
+            "wall_reduction_percent": 2.4804432613417693
+          }
+        ]
+      }
+    },
+    "recovery_note": "The component process succeeded, but ExecStopPost exited 2 because the reused helper requires an astra-pi-agentic- run ID. The original service was explicitly started, then a separate detached recovery unit verified health and an OK completion using a valid run ID. Both the failed recovery and successful remediation are retained."
+  }
+}

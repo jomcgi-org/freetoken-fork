@@ -2,6 +2,8 @@
 
 import importlib.util
 import json
+import sys
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,12 +62,67 @@ def test_prompt_manifest_is_reproducible_and_varies_within_the_run(tmp_path):
         p.write_text(f"source{i}\n" * 300)
     cases = client.build_cases(Tokenizer(), tmp_path)
     assert cases == client.build_cases(Tokenizer(), tmp_path)
+    assert cases == client.build_cases(Tokenizer(), tmp_path, mixed_prefill=False)
     assert len({c["prompt"] for c in cases}) == len(cases)
     assert {c["source_file"] for c in cases} == set(client.SOURCE_FILES)
     objects = [c["expected"] for c in cases if c["kind"] == "json"]
     assert all(list(obj) == [f"r{i:02}" for i in range(32)] for obj in objects)
     assert len({tuple(obj.values()) for obj in objects}) == len(objects)
     assert all(client.PROSE_REFERENCE in c["prompt"] for c in cases if c["kind"] == "essay")
+
+    mixed = client.build_cases(Tokenizer(), tmp_path, mixed_prefill=True)
+    assert mixed == client.build_cases(Tokenizer(), tmp_path, mixed_prefill=True)
+    measured = [c for c in mixed if not c["warmup"]]
+    assert Counter((c["kind"], c["prefill_band"]) for c in measured) == {
+        (kind, band): 3 for kind in ("json", "essay") for band in ("short", "long")
+    }
+    assert len({(c["source_file"], c["kind"], c["prefill_band"]) for c in measured}) == 12
+    assert Counter(c["prefill_band"] for c in mixed if c["warmup"]) == {"short": 2, "long": 2}
+    for original, case in zip(cases, mixed):
+        assert original["expected"] == case["expected"]
+        assert original["max_tokens"] == case["max_tokens"]
+        excerpt = case["prompt"].split("<background>\n", 1)[1].split("\n</background>", 1)[0]
+        assert len(excerpt) == (128 if case["prefill_band"] == "short" else 1400)
+        if case["prefill_band"] == "long":
+            assert case["prompt"] == original["prompt"]
+
+
+@pytest.mark.parametrize("tokens,band,valid", [
+    (1, "short", False), (2, "short", True), (1023, "short", True),
+    (1024, "short", False), (1023, "long", False), (1024, "long", True),
+])
+def test_prefill_band_uses_actual_prompt_tokens(tokens, band, valid):
+    assert client.prefill_band_matches(tokens, band) is valid
+
+
+def test_unknown_prefill_band_is_rejected():
+    with pytest.raises(ValueError, match="unknown prefill band"):
+        client.prefill_band_matches(1024, "unknown")
+
+
+@pytest.mark.parametrize("tokens,valid", [(511, True), (1024, False)])
+def test_mixed_client_retains_response_when_actual_band_is_wrong(tmp_path, monkeypatch, tokens, valid):
+    output = tmp_path / "responses.jsonl"
+    monkeypatch.setattr(sys, "argv", [str(path), "--tokenizer", "unused", "--output", str(output),
+                                    "--mode", "baseline", "--io-pid", "42", "--mixed-prefill"])
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=lambda *a, **k: object())))
+    case = dict(ordinal=0, block=0, kind="json", warmup=False, prefill_band="short",
+                source_file="unused", prompt="Copy the record.", expected={"r00": 1}, max_tokens=512)
+
+    def prepare(*args, **kwargs):
+        assert kwargs["mixed_prefill"] is True
+        return [case]
+
+    monkeypatch.setattr(client, "build_cases", prepare)
+    result = dict(text='{"r00":1}', finish_reason="stop", wall_s=1.0, ttft_s=0.2, decode_s=0.8,
+                  usage=dict(prompt_tokens=tokens, completion_tokens=7))
+    monkeypatch.setattr(client, "measure_request", lambda *a, **k: (dict(result), {}))
+    client.main()
+    row = json.loads(output.read_text())
+    assert row["prefill_band_valid"] is valid and row["completed"] is valid
+    assert row["passed"] is True
+    assert row["text"] == result["text"] and row["wall_s"] == 1.0
 
 
 @pytest.fixture
