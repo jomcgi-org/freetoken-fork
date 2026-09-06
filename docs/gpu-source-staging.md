@@ -33,5 +33,10 @@ KV and compute-layer geometry fixed when comparing complete-response wall
 time. Measure actual RAM use and storage reads along with that wall time.
 Detailed timing diagnostics should remain disabled for the comparison.
 
-Runtime and model validation are pending. Do not promote the option based only
-on reclaimed pinned bytes or a resident transport benchmark.
+Linux policy and dispatch checks pass. The CUDA fixture matches pinned-source
+outputs exactly across the prefill crossover and repeated captured decode
+misses through the shared staging ring, with native work-count checks. Captured
+decode interleaves real CPU/HOT computation with both staged GPU layers.
+
+Full-model RAM, I/O and wall-time validation remain pending. Do not promote the
+option based only on reclaimed pinned bytes or a resident transport benchmark.
