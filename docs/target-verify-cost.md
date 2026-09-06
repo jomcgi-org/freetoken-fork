@@ -67,6 +67,13 @@ from differences already present between batched and sequential target forwards.
 These measurements do not introduce a tolerance or relax the existing exact
 qualification gate. Keep their values private with the rest of the records.
 
+For localization, use `FREETOKEN_TARGET_VERIFY_LAYER_TRACE=1` in a separate run
+with graph-cost mode off. This deliberately records activation copies inside the
+ordinary decode graph and eager decoder blocks. It compares ordinary graph and
+eager width-one execution, then locates stage differences between fused and
+sequential target execution. It emits no component timings. These invasive
+copies must never be included in a performance comparison.
+
 Rejection restores recurrence, convolution, integer PLE history and QSA pending
 state. It deliberately leaves speculative KV/index writes beyond the committed
 length in place. The check compares all reachable state byte for byte, then

@@ -202,3 +202,19 @@ def test_committed_metrics_exclude_unreachable_tail(monkeypatch):
     window.views["cmp_page"][:, 1].fill_(1)
     assert all(row["exact"] for row in window.metrics(saved, committed_end=7).values())
     assert not window.metrics(saved, committed_end=8)["kv_page"]["exact"]
+
+
+def test_activation_trace_requires_matching_stages():
+    with pytest.raises(RuntimeError, match="stages differ"):
+        probe.activation_comparison({"00/input": None}, {"00/output": None})
+
+
+def test_activation_snapshot_owns_storage(monkeypatch):
+    torch = pytest.importorskip("torch")
+    source = torch.tensor([[1.0, 2.0]])
+    monkeypatch.setattr(probe, "_ACTIVATIONS", {("captured", 1): {"00/input": source}})
+    saved = probe.activation_snapshot("captured", 1)
+    source.fill_(3)
+    assert saved["00/input"].tolist() == [[1.0, 2.0]]
+    with pytest.raises(RuntimeError, match="missing its forward"):
+        probe.activation_snapshot("eager", 2)

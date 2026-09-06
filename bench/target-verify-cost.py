@@ -17,8 +17,10 @@ import time
 
 OUTPUT_ENV = "FREETOKEN_TARGET_VERIFY_COST_DIR"
 GRAPH_ENV = "FREETOKEN_TARGET_VERIFY_GRAPH"
+TRACE_ENV = "FREETOKEN_TARGET_VERIFY_LAYER_TRACE"
 MODES = ("graph_one", "graph_two", "snapshot", "accept", "reject")
 GRAPH_MODES = ("accept_graph", "reject_graph")
+_ACTIVATIONS = {}
 
 
 def eligible_position(position, *, page_size, ratio, remaining):
@@ -117,6 +119,61 @@ def host_contexts(history, position, ids, contexts, boundary):
     if width:
         contexts[1, :-1].copy_(contexts[0, 1:])
         contexts[1, -1].copy_(ids[0])
+
+
+def install_layer_trace():
+    """Explicitly add activation copies to graph/eager decode, never to wall runs."""
+    import torch
+    from freetoken.models.qwen4_exp.model import Qwen4ExpDecoderLayer
+
+    original = Qwen4ExpDecoderLayer.forward
+
+    def forward(layer, hidden, batch):
+        if not batch.is_decode:
+            return original(layer, hidden, batch)
+        mode = "captured" if torch.cuda.is_current_stream_capturing() else "eager"
+        records = _ACTIVATIONS.setdefault((mode, hidden.shape[0]), {})
+
+        def note(stage, value):
+            records[f"{layer._layer_id:02d}/{stage}"] = value.detach().clone()
+
+        # Same operation order as Qwen4ExpDecoderLayer.forward. The only added
+        # operations copy activations to diagnostic-owned tensors.
+        note("input", hidden)
+        if layer.ple is not None:
+            hidden = hidden + layer.ple.forward(hidden, batch)
+            note("after_ple", hidden)
+        block_input, inject = layer.attn_hyper_connection.mix(hidden)
+        note("attn_input", block_input)
+        if layer._is_linear:
+            block_output = layer.linear_attn.forward(block_input)
+        else:
+            block_output = layer.self_attn.forward(block_input, batch)
+        note("attn_output", block_output)
+        hidden = layer.attn_hyper_connection.combine(hidden, block_output, inject)
+        note("after_attention", hidden)
+        block_input, inject = layer.mlp_hyper_connection.mix(hidden)
+        note("mlp_input", block_input)
+        block_output = layer.mlp.forward(block_input)
+        note("mlp_output", block_output)
+        hidden = layer.mlp_hyper_connection.combine(hidden, block_output, inject)
+        note("output", hidden)
+        return hidden
+
+    Qwen4ExpDecoderLayer.forward = forward
+
+
+def activation_snapshot(mode, width):
+    values = _ACTIVATIONS.get((mode, width))
+    if not values:
+        raise RuntimeError("activation trace is missing its forward")
+    return {name: value.clone() for name, value in values.items()}
+
+
+def activation_comparison(actual, expected):
+    if actual.keys() != expected.keys():
+        raise RuntimeError("activation trace stages differ")
+    return {name: difference_metrics(value, expected[name]) for name, value in actual.items()}
 
 
 def install_graph_support():
@@ -319,7 +376,7 @@ class StateWindow:
 
 
 def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, warmup, report,
-               directory, graph_enabled=False):
+               directory, graph_enabled=False, trace_only=False):
     import torch
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.core import Batch
@@ -346,7 +403,7 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
 
     captured_graph = None
 
-    def forward(step=None, *, captured=False, with_logits=False):
+    def forward(step=None, *, captured=False, with_logits=False, ordinary_eager=False):
         if step is None:
             configure_mtp_fused_step(batch, verify_ids, positions, window.locations)
             batch.active_table_idx = fused_rows
@@ -361,7 +418,7 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
                 if step is not None or captured_graph is None:
                     raise RuntimeError("dedicated verification graph is unavailable")
                 logits = captured_graph.replay(batch)
-            elif step is None:
+            elif step is None or ordinary_eager:
                 logits = engine.model.forward(select_last=False)
             else:
                 if not engine.graph_runner.can_use_cuda_graph(batch):
@@ -374,16 +431,30 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
     # Derive an actual accepted candidate, and independent one/two-step state references.
     first, first_logits = forward(0, with_logits=True)
     expected_one = window.capture()
+    first_trace = activation_snapshot("captured", 1) if trace_only else None
     verify_ids[1].copy_(first[0])
     req.input_ids[-1:].copy_(first.cpu().to(req.input_ids.dtype))
     second, second_logits = forward(1, with_logits=True)
     expected_two = window.capture()
+    if trace_only:
+        second_trace = activation_snapshot("captured", 1)
+        sequential_trace = {name: torch.cat((value, second_trace[name]))
+                            for name, value in first_trace.items()}
     good_ids = verify_ids.clone()
     good_history = req.input_ids.clone()
     expected_tokens = torch.cat((first, second))
     wrong_id = (int(first.item()) + 1) % engine.config.model_config.vocab_size
     pool, kv = engine.linear_state_pool, engine.kv_cache
     case = str(position)
+    single_diagnostic = None
+    if trace_only:
+        window.reset(initial)
+        single_tokens, single_logits = forward(0, ordinary_eager=True, with_logits=True)
+        single_diagnostic = dict(
+            tokens_equal=bytes_equal(single_tokens, first),
+            logits=difference_metrics(single_logits, first_logits),
+            state=window.metrics(expected_one, committed_end=position + 1),
+            activations=activation_comparison(activation_snapshot("eager", 1), first_trace))
     window.reset(initial)
     eager_tokens, eager_logits = forward(with_logits=True)
     expected_eager = window.capture()
@@ -391,6 +462,14 @@ def run_window(engine, source_batch, position, seed, host_prefix, *, repeats, wa
         eager_logits, torch.cat((first_logits, second_logits))),
         eager_vs_sequential_state=window.metrics(expected_two, committed_end=position + 2))
     report.setdefault("numerical_checks", {})[case] = diagnostic
+    if trace_only:
+        diagnostic["eager_one_vs_graph_one"] = single_diagnostic
+        diagnostic["fused_vs_sequential_activations"] = activation_comparison(
+            activation_snapshot("eager", 2), sequential_trace)
+        save(directory, report)
+        window.reset(expected_one)
+        engine.stream.synchronize()
+        return first, torch.cat((host_prefix, host_seed))
     if graph_enabled:
         report["stage"] = "capturing verification graph at " + case
         save(directory, report)
@@ -485,8 +564,10 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
     import subprocess
 
     graph_enabled = os.environ.get(GRAPH_ENV) == "1"
+    trace_only = os.environ.get(TRACE_ENV) == "1"
     report = dict(diagnostic_only=True, model_wall_qualified=False, completed=False,
-                  graph_enabled=graph_enabled,
+                  graph_enabled=graph_enabled, trace_only=trace_only,
+                  component_timings_usable=not trace_only,
                   records=[], pid=os.getpid(), speculative_mtp=engine.config.speculative_mtp,
                   graph_sizes=sorted(engine.graph_runner.graph_map),
                   cpu_max_tokens=engine.cpu_moe_executor.max_tokens,
@@ -519,9 +600,11 @@ def probe(engine, batch, directory, *, repeats=4, warmup=1):
         for offset in range(3):
             seed, prefix = run_window(engine, batch, position + offset, seed, prefix,
                                       repeats=repeats, warmup=warmup,
-                                      report=report, directory=directory, graph_enabled=graph_enabled)
-        report["summary"] = summarize(report["records"], graph_enabled=graph_enabled)
-        report["checks_passed"] = all(r["checks_passed"] for r in report["records"])
+                                      report=report, directory=directory, graph_enabled=graph_enabled,
+                                      trace_only=trace_only)
+        if not trace_only:
+            report["summary"] = summarize(report["records"], graph_enabled=graph_enabled)
+            report["checks_passed"] = all(r["checks_passed"] for r in report["records"])
         report["completed"] = True
     except BaseException as exc:
         report["error"] = type(exc).__name__ + ": " + str(exc)
@@ -540,6 +623,10 @@ def install(engine_class):
         raise RuntimeError("explicit private probe output directory is required")
     if torch.cuda.is_initialized():
         raise RuntimeError("install the probe before Engine initializes CUDA")
+    if os.environ.get(TRACE_ENV) == "1":
+        if os.environ.get(GRAPH_ENV) == "1":
+            raise RuntimeError("run activation tracing separately from graph cost measurement")
+        install_layer_trace()
     if os.environ.get(GRAPH_ENV) == "1":
         install_graph_support()
     directory = Path(os.environ[OUTPUT_ENV])
