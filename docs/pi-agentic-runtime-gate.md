@@ -37,6 +37,13 @@ snapshots and journals are collected outside client timing. Those counters
 cover warmup and measured sessions together; they do not isolate expert I/O or
 attribute time to prefill versus decode.
 
+The original runtime still calls its disk/PLE statistics helpers from status
+logging even with the diagnostic flag off. The optimized runtime guards those
+calls, as part of the existing telemetry changes. Accordingly, "off" describes
+the requested flags in both arms, not the absence of every legacy diagnostic
+operation in the baseline. This combined comparison cannot isolate the speedup
+from removing that work.
+
 A remote systemd lease expires if the Mac disconnects or stops sending its
 20-second heartbeat for 90 seconds. Its `ExecStopPost` stops the benchmark
 server and verifies a real completion from the original service. A four-hour
@@ -111,3 +118,10 @@ and changes neither the frozen client nor the runtime controller.
 Fifteen focused summarizer tests pass on macOS. Its CLI also refuses to summarize
 the live incomplete gate. Linux validation remains pending until the timed model
 comparison ends, to avoid competing with the measured worker.
+
+The [first baseline arm review](../bench/results/4090-pi-runtime-r1-review-20260906.json)
+records all three successful sessions, their independent checks, final test
+results, source hashes and repair behavior. The two measured tasks total 665.618
+seconds. Its archived journal accounts for exactly 60 requests, matching readiness
+plus 59 Pi model calls, with no inference errors. This is partial evidence; it
+contains no optimized comparison or claim of broad quality equivalence.
