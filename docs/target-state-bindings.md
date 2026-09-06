@@ -1,0 +1,40 @@
+# Request slots in captured target verification
+
+The wider target diagnostic previously retained rollback state through tensor
+views into the request slot used during graph capture. Copying a different slot
+into the model's input buffers would advance the new request while checkpoint
+copies and restores still addressed the old one.
+
+`SlotStateBindings` reads and writes the original state slabs through persistent
+device indices. Linear state uses the linear slot; QSA pending state uses the
+request-table slot. Full and compact checkpoints share these bindings, including
+the compact checkpoint's initial recurrence and small retained prefix states.
+The existing recurrent update function and its arithmetic remain unchanged.
+
+The diagnostic opt-in is `FREETOKEN_TARGET_VERIFY_RELOCATABLE_STATE=1`, with width
+three or five and the existing graph, serial-linear and checkpoint settings.
+The graph copies incoming slot indices, positions, output locations and every
+QSA row's addressing into persistent buffers. Host PLE staging reads the incoming
+request history. Incompatible geometry, incomplete metadata, out-of-range host
+request slots and pending lazy restores are rejected before buffer updates.
+Graphs without explicit checkpoint bindings reject a change of request slot.
+
+Index contents must remain unchanged from target submission through acceptance
+or rollback. Bindings are installed once before warmup and graph capture; they
+cannot be replaced afterward. The model and checkpoint index buffers must name
+the same request. The scheduler must own all referenced state slots and KV pages.
+
+Focused CPU checks cover every retained prefix at the supported widths, distinct
+linear/request slots, untouched neighbours, activation-buffer reuse and staging
+across noncontiguous page addresses. Explicit CUDA tests replay one captured
+target and its restore graphs across different slots, including the real GDN
+kernel with new inputs. Run those only with exclusive GPU ownership and automatic
+original-serving recovery, after source staging and focused CPU validation.
+
+The current full-model cost harness still captures each token window separately.
+CPU address-copy tests alone do not qualify full-model graph reuse across requests
+or page boundaries. Those model checks, a serving proposer and scheduler, task
+completion checks and separate non-debug wall measurements remain required.
+Gather/scatter operations may add component cost and graph-pool allocations.
+This experiment claims no serving speedup and leaves serving startup unchanged.
+Detailed model records and measured payloads stay private.

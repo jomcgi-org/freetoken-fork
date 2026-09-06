@@ -160,7 +160,8 @@ def install(width):
 
 
 def run_window(engine, source, position, seed, host_prefix, *, width, base, seed_api,
-               report, directory, repeats, warmup, compact_type=None, pair_compare=False):
+               report, directory, repeats, warmup, compact_type=None, pair_compare=False,
+               relocatable_state=False):
     import torch
     from freetoken.attention.linear import build_fla_metadata
     from freetoken.core import Batch
@@ -240,7 +241,8 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
     checkpoint = seed_api["SeedCheckpoint"].from_engine(
         engine, req, base["state_views"](engine, req), width=width)
     with seed_api["capture_context"](checkpoint):
-        graph = base["FusedGraph"](engine, batch)
+        graph = base["FusedGraph"](engine, batch,
+                                   state_checkpoint=checkpoint if relocatable_state else None)
     window.reset(initial)
     graph_tokens, graph_logits = forward(captured=True, with_logits=True)
     checks.update(graph_logits=metrics(graph_logits, reference_logits),
@@ -264,7 +266,8 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
         compact_checkpoint = compact_type.from_engine(
             engine, req, base["state_views"](engine, req), width=width)
         with seed_api["capture_context"](compact_checkpoint):
-            compact_graph = base["FusedGraph"](engine, batch)
+            compact_graph = base["FusedGraph"](
+                engine, batch, state_checkpoint=compact_checkpoint if relocatable_state else None)
         allocator["after_compact_target"] = allocator_state()
         compact_checkpoint.capture_restore_graphs(engine.stream)
         allocator["after_rollback_graphs"] = allocator_state()
@@ -392,7 +395,7 @@ def run_window(engine, source, position, seed, host_prefix, *, width, base, seed
 
 
 def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=1,
-          pair_compare=False):
+          pair_compare=False, relocatable_state=False):
     import hashlib
     import subprocess
     import sys
@@ -405,6 +408,7 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
                   checkpoint_enabled=True, serial_linear=True, records=[],
                   compact_enabled=compact_type is not None,
                   cpu_pair_compare=pair_compare,
+                  relocatable_state=relocatable_state,
                   cpu_max_tokens=engine.cpu_moe_executor.max_tokens,
                   ring_capacity=engine.kv_cache.ring_capacity,
                   native_sha256=hashlib.sha256(Path(_cpu_moe.__file__).read_bytes()).hexdigest(),
@@ -428,7 +432,8 @@ def probe(engine, batch, directory, *, width, base, seed_api, repeats=4, warmup=
             seed, prefix = run_window(engine, batch, position + offset, seed, prefix,
                                       width=width, base=base, seed_api=seed_api, report=report,
                                       directory=directory, repeats=repeats, warmup=warmup,
-                                      compact_type=compact_type, pair_compare=pair_compare)
+                                      compact_type=compact_type, pair_compare=pair_compare,
+                                      relocatable_state=relocatable_state)
         report["summary"] = summarize(report["records"], width, compact_type is not None, pair_compare)
         report["checks_passed"] = (len(report["summary"]) == 4
                                    and all(case["checks_passed"] for case in report["summary"].values()))

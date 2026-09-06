@@ -13,7 +13,7 @@ def make_checkpoint_type(base_type):
 
         def begin(self):
             super().begin()
-            self.initial_recurrent.copy_(self.views["recurrent"])
+            self.initial_recurrent.copy_(self.read_state("recurrent"))
 
         def capture_gdn(self, state_source, *, args=None, kwargs=None, update=None):
             import torch
@@ -50,7 +50,7 @@ def make_checkpoint_type(base_type):
                         or destination.device != actual.device):
                     raise RuntimeError("recurrent input geometry changed")
                 destination.copy_(actual)
-            self.prefixes[step]["conv"][index].copy_(self.views["conv"][index])
+            self.prefixes[step]["conv"][index].copy_(self.read_state("conv", index))
 
         def finish(self):
             super().finish()
@@ -63,13 +63,13 @@ def make_checkpoint_type(base_type):
                 raise RuntimeError("checkpoint is not ready")
             if not 1 <= prefix_len < self.width:
                 raise ValueError("checkpoint prefix is outside the retained range")
-            self.views["recurrent"].copy_(self.initial_recurrent)
+            self.write_state("recurrent", self.initial_recurrent)
             for index in range(len(self.gdn_sources)):
                 for step in range(prefix_len):
                     call = self.updates[(index, step)]
                     call["update"](*call["args"], **call["kwargs"])
             for name, value in self.prefixes[prefix_len - 1].items():
-                self.views[name].copy_(value)
+                self.write_state(name, value)
 
         def capture_restore_graphs(self, stream):
             import torch
