@@ -49,20 +49,38 @@ def propose(tokens, *, match=MATCH, drafts=WIDTH - 1, lookback=LOOKBACK):
     return None
 
 
-def proposal_for_request(req):
+def proposal_eligible(req, *, pending_tokens=0):
+    """Check request constraints before waiting for an overlapped host token."""
+    if pending_tokens not in (0, 1):
+        raise ValueError("ngram lookup supports at most one pending token")
     if (req.device_len < getattr(req, "_ngram_retry_at", 0)
             or req.remain_len < WIDTH or req.cached_len + 1 != req.device_len
-            or req.input_ids.numel() != req.device_len
+            or req.input_ids.numel() + pending_tokens != req.device_len
             or not req.sampling_params.is_greedy
             or req.sampling_params.guided_decoding is not None
             or getattr(req, "guided_state", None) is not None
             or getattr(req, "mm_embeds", None) is not None):
-        return None
+        return False
     lazy = getattr(req, "lazy_kv_restore", None)
     if lazy is not None and not lazy.complete:
-        return None
+        return False
     # Let the ordinary path process and snapshot a newly emitted tool opener.
     anchor = getattr(req, "toolcall_anchor_len", None)
     if anchor is not None and req.cached_len <= anchor:
+        return False
+    return True
+
+
+def proposal_for_request(req, *, pending_token=None):
+    """Inspect causal history without committing a pending sampled host token.
+
+    The caller must fence the host copy before supplying pending_token. A lookup
+    is advisory: drain prior output and recheck eligibility before verification.
+    """
+    pending = int(pending_token is not None)
+    if not proposal_eligible(req, pending_tokens=pending):
         return None
-    return propose(req.input_ids[-LOOKBACK:].tolist())
+    tokens = req.input_ids[-(LOOKBACK - pending):].tolist()
+    if pending:
+        tokens.append(int(pending_token))
+    return propose(tokens)

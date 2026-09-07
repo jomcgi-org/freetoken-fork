@@ -576,6 +576,29 @@ class Scheduler(SchedulerIOMixin):
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
 
+    def _ngram_needs_drain(self, last_data: ForwardData | None) -> bool:
+        """Look ahead using a fenced host token; leave request state untouched."""
+        if last_data is None:
+            return False
+        batch = last_data[0].batch
+        if getattr(batch, "ngram_verify", False):
+            return True
+        if len(batch.reqs) != 1 or getattr(batch, "lazy_restore_pending", False):
+            return False
+        req = batch.reqs[0]
+        if (isinstance(req, ChunkedReq) or req.aborted or req in self.finished_reqs
+                or req not in self.decode_manager.running_reqs):
+            return False
+        from freetoken.verification.ngram import proposal_eligible, proposal_for_request
+
+        if not proposal_eligible(req, pending_tokens=1):
+            return False
+        _, tokens, copy_done = last_data[1]
+        if tokens.numel() != 1:
+            return False
+        copy_done.synchronize()
+        return proposal_for_request(req, pending_token=int(tokens[0].item())) is not None
+
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
         The main loop of overlapping scheduling and execution.
@@ -596,6 +619,14 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+
+        if (getattr(self.config, "speculative_ngram", "off") == "on"
+                and self._ngram_needs_drain(last_data)):
+            # Resolve EOS, stop strings, aborts and cache donation before reserving
+            # speculative pages. Ordinary work with no proposal retains overlap.
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            last_data = self._last_data = None
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -638,6 +669,12 @@ class Scheduler(SchedulerIOMixin):
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
+        self._last_data = None
+        if ongoing_data is not None and getattr(ongoing_data[0].batch, "ngram_verify", False):
+            # Acceptance/host stop rollback owns this graph until output drains.
+            # Never leave a speculative batch pending across the next launch.
+            self._process_last_data(ongoing_data)
+            ongoing_data = None
         self._flush_oom_errors()
         self._flush_abort_acks()
         return ongoing_data
@@ -685,8 +722,7 @@ class Scheduler(SchedulerIOMixin):
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
         # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
-        if (ENV.DISABLE_OVERLAP_SCHEDULING or self.config.speculative_mtp == "on"
-                or getattr(self.config, "speculative_ngram", "off") == "on"):
+        if ENV.DISABLE_OVERLAP_SCHEDULING or self.config.speculative_mtp == "on":
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
                 while True:
@@ -1648,6 +1684,7 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         if (getattr(self.config, "speculative_ngram", "off") == "on"
                 and batch.is_decode and len(batch.reqs) == 1
+                and getattr(self, "_last_data", None) is None
                 and not getattr(batch, "lazy_restore_pending", False)):
             from freetoken.verification.ngram import WIDTH, proposal_for_request
             from freetoken.spec_decode import reserve_mtp_window

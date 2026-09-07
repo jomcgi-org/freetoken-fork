@@ -26,9 +26,14 @@ The previously qualified graph, address bindings and checkpoints now live in
 `freetoken.verification`; the diagnostic entry points import the same code.
 Serving captures the target graph against allocated padding storage at startup,
 restores borrowed storage afterward, and stages real request indices and addresses
-for each replay. The scheduler runs without overlap while this mode is enabled
-and owns the graph until host output processing completes. Only the ordinary
-scheduler allocates real request pages.
+for each replay. Ordinary fallback work retains scheduling overlap. A causal
+lookahead uses the previous sampled token only after its host-copy fence, without
+committing request state. A possible draft makes the scheduler drain prior output
+before allocating the next batch, then recheck eligibility. EOS, stop strings and
+new tool anchors can therefore prevent speculation. Each speculative batch drains
+immediately after its forward and owns the graph until host output processing
+completes. Only the ordinary scheduler allocates real request pages. The explicit
+environment override for serial scheduling remains supported.
 
 Requests without a full causal draft use ordinary decoding. Sampling, guided
 decoding, multimodal inputs, incomplete lazy restores, insufficient output budget
@@ -45,8 +50,8 @@ stop-string holdback.
 
 `--ngram-debug` logs per-window acceptance only when explicitly enabled. It adds
 no activation copies or timing events. Wall-time qualification must run without
-this flag and without the invasive diagnostic probes. Startup capture and serial
-scheduling can affect practical latency, so component measurements do not predict
+this flag and without the invasive diagnostic probes. Startup capture and scheduling
+can affect practical latency, so component measurements do not predict
 the serving result by themselves.
 
 Runtime cache resizing currently rejects while the target graph is present;
@@ -54,6 +59,9 @@ restart with the desired geometry. Keep automatic KV growth disabled during the
 initial serving experiments. Wider serving concurrency, runtime cache resizing,
 actual task completion and improved non-debug wall measurements remain required before
 selecting this path for normal use. Detailed measured records stay private.
+
+The current selective-overlap scheduler awaits Linux and full-model qualification.
+The following model and wall results apply to the preceding serial scheduler.
 
 Validation: 342 focused Linux checks passed, with the three exclusive CUDA checks
 passing separately. Twelve serving fixtures matched ordinary decoding exactly in
@@ -74,12 +82,9 @@ both runs, and every conversation passed its independent checks.
 
 Both orders now favor ngram verification on repetition, but still favor ordinary
 decode on the multi-turn workload. The larger remaining difference is on initial
-turns. Blanket serial scheduling also affects ordinary fallback work, making
-selective overlap a follow-up to investigate before changing arithmetic. Any
-overlapped path must drain prior output before speculation, resolve terminal
-requests before reserving pages, and finish speculative host output before
-launching another batch. These are requirements for future work, not current
-behavior or a demonstrated cause of the timing difference.
+turns. Blanket serial scheduling also affected ordinary fallback work, motivating
+the selective-overlap change. This timing pattern does not by itself demonstrate
+the cause of the difference or qualify the new scheduler.
 
 Original serving recovered with a verified completion after both runs. The
 counterbalanced comparison does not qualify a general serving improvement;

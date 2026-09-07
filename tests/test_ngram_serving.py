@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from freetoken.verification.ngram import propose, proposal_for_request, note_verification
+from freetoken.verification.ngram import (
+    propose, proposal_for_request, proposal_eligible, note_verification,
+)
 from freetoken.verification.runtime import NgramTarget
 from freetoken.verification import runtime
 
@@ -47,6 +49,32 @@ def req_fixture():
     return SimpleNamespace(input_ids=torch.tensor(history), cached_len=len(history) - 1,
                            device_len=len(history), remain_len=20, toolcall_anchor_len=None,
                            sampling_params=SimpleNamespace(is_greedy=True, guided_decoding=None))
+
+
+@pytest.mark.parametrize("last_token", [0, 7])
+def test_pending_host_token_lookup_matches_committed_history_without_mutation(last_token):
+    req = req_fixture()
+    req.input_ids[7] = req.input_ids[-1] = last_token
+    expected = proposal_for_request(req)
+    req.input_ids = req.input_ids[:-1]
+    history = req.input_ids.clone()
+    before = dict(vars(req))
+    assert proposal_eligible(req, pending_tokens=1)
+    assert not proposal_eligible(req)
+    assert proposal_for_request(req) is None
+    assert proposal_for_request(req, pending_token=last_token) == expected == [31, 32, 33, 34]
+    assert torch.equal(req.input_ids, history)
+    assert all(vars(req)[key] is value for key, value in before.items())
+
+
+def test_pending_lookup_requires_exactly_one_missing_host_token():
+    req = req_fixture()
+    assert not proposal_eligible(req, pending_tokens=1)
+    req.input_ids = req.input_ids[:-2]
+    assert proposal_for_request(req, pending_token=7) is None
+    for count in (-1, 2):
+        with pytest.raises(ValueError, match="pending token"):
+            proposal_eligible(req, pending_tokens=count)
 
 
 def test_weak_proposal_pauses_until_exact_retry_position_without_mutating_history():
