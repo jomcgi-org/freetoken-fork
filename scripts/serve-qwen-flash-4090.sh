@@ -1,5 +1,7 @@
 #!/bin/bash
 # Qualified capacity-one Qwen Flash profile for the RTX 4090 + CPU + disk tier.
+# The disk prefix cache is on by default (500 GiB LRU under FREETOKEN_PREFIX_CACHE_DIR);
+# set FREETOKEN_PREFIX_CACHE_GIB=0 to disable it. Keep the directory on local NVMe.
 set -euo pipefail
 if (( $# < 2 )); then
   printf 'Usage: %s MODEL_PATH LAYER_PROFILE_JSON [extra ft serve arguments]\n' "$0" >&2
@@ -28,7 +30,7 @@ exec "${FREETOKEN_BIN:-ft}" serve \
   --moe-hot-adapt-prefill-weight 0.1 --moe-hot-adapt-histories split \
   --moe-hot-adapt-aim phase \
   --kv-disk-cache-dir "${FREETOKEN_PREFIX_CACHE_DIR:-/tmp/freetoken-prefix-cache}" \
-  --kv-disk-cache-gib 0 --moe-hot-plan-persist off --cache-type radix \
+  --kv-disk-cache-gib "${FREETOKEN_PREFIX_CACHE_GIB:-500}" --moe-hot-plan-persist off --cache-type radix \
   --kv-ladder off --kv-reserve-tokens 65536 --cuda-graph-max-bs 1 \
   --moe-disk-prefill-io buffered --moe-hot-staging-io mmap \
   --moe-hot-host-cache reclaim "$@"
