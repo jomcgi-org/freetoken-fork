@@ -1600,7 +1600,11 @@ class Engine:
             # mapping, while file-to-pinned copies continue on a worker thread. Prefill
             # uses the exact flattened token count routed through each MoE layer.
             if batch.is_decode:
-                self.moe_offload_cache.hot_adapt_step_boundary(batch.size)
+                # Ngram verification evaluates every candidate, including rejected
+                # rows. Ordinary graph padding is not real request traffic.
+                routed_tokens = (batch.input_ids.numel()
+                                 if getattr(batch, "ngram_verify", False) else batch.size)
+                self.moe_offload_cache.hot_adapt_step_boundary(routed_tokens)
             else:
                 self.moe_offload_cache.hot_adapt_prefill_boundary()
 
