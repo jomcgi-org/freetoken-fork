@@ -423,6 +423,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-ngram", choices=["off", "on"],
+        default=ServerArgs.speculative_ngram,
+        help="Verify causal ngram drafts with Qwen Flash. Requires one running request; unsupported requests use ordinary decode.",
+    )
+    parser.add_argument(
+        "--ngram-debug", action="store_true", default=ServerArgs.ngram_debug,
+        help="Log per-window ngram acceptance. Keep off for serving wall-time measurements.",
+    )
+
+    parser.add_argument(
         "--mtp-draft-tokens",
         type=int,
         default=ServerArgs.mtp_draft_tokens,
@@ -1259,6 +1269,17 @@ def parse_args(
         help=(
             "Skip the CPU callback, worker notify, and barriers when a DISK decode "
             "layer has no valid CPU routes (default: off)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-nvfp4-pair",
+        choices=["off", "on"],
+        default=ServerArgs.moe_cpu_nvfp4_pair,
+        help=(
+            "Share weight unpacking across pairs of routes in grouped NVFP4 CPU "
+            "decode (default: off). Requires an AVX-512 VNNI CPU extension. "
+            "Single-token tasks retain the ordinary route loop."
         ),
     )
 

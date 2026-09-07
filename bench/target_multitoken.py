@@ -1,5 +1,7 @@
 """Explicit wider target-verification diagnostic with retained prefix state."""
 
+from freetoken.verification.adapters import configure_fused, install_wide as install
+
 import copy
 from contextlib import nullcontext
 from dataclasses import replace
@@ -100,81 +102,8 @@ def close_graphs(graphs, stream):
     graphs.clear()
 
 
-def configure_fused(batch, ids, positions, locations, width):
-    if ids.numel() != width or positions.numel() != width or locations.numel() != width:
-        raise ValueError("fused inputs must match the configured verification width")
-    req = batch.reqs[0]
-    req.cached_len = batch.mtp_original_cached_len
-    req.device_len = batch.mtp_original_device_len + width - 1
-    batch.input_ids, batch.positions, batch.out_loc = ids, positions, locations
-    batch.phase, batch.mtp_fused = "decode", True
 
 
-def install(width):
-    """Keep width-one GDN/QSA math while the outer expert work sees all rows."""
-    import torch
-    from freetoken.core import get_global_ctx
-    from freetoken.models.qwen4_exp.gdn import Qwen4ExpGatedDeltaNet
-    from freetoken.attention.qsa_sparse import QSASparseAttnBackend, QSASparseMetadata
-
-    original_gdn = Qwen4ExpGatedDeltaNet.forward
-    original_metadata = QSASparseAttnBackend.prepare_metadata
-    pin = dict(device="cpu", dtype=torch.int32, pin_memory=True)
-
-    def gdn(layer, hidden):
-        batch = get_global_ctx().batch
-        if not getattr(batch, "mtp_fused", False):
-            return original_gdn(layer, hidden)
-        if hidden.shape[0] != width:
-            raise ValueError("GDN input width differs from verification width")
-        # GDN consumes hidden rows and width-one FLA metadata, not token addresses.
-        # Restore the outer classification even when a primitive raises.
-        batch.mtp_fused = False
-        try:
-            return torch.cat([original_gdn(layer, hidden[i:i + 1]) for i in range(width)], dim=0)
-        finally:
-            batch.mtp_fused = True
-
-    def metadata(backend, batch):
-        if not getattr(batch, "mtp_fused", False):
-            return original_metadata(backend, batch)
-        if batch.input_ids.numel() != width or len(batch.reqs) != 1:
-            raise ValueError("QSA metadata requires one matching-width request")
-        start = int(batch.mtp_original_device_len)
-        batch.attn_metadata = QSASparseMetadata(
-            is_decode=True, last_indices=torch.full((1,), width - 1, device=backend.device, dtype=torch.int32),
-            qo_indptr_cpu=torch.tensor([0, width], **pin),
-            kv_len_cpu=torch.tensor([start + width - 1], **pin))
-        steps = []
-        for step in range(width):
-            one = QSASparseMetadata(
-                is_decode=True, last_indices=torch.zeros(1, device=backend.device, dtype=torch.int32),
-                qo_indptr_cpu=torch.tensor([0, 1], **pin),
-                kv_len_cpu=torch.tensor([start + step], **pin))
-            backend._snapshot_decode(one, batch)
-            steps.append(one)
-        batch.mtp_qsa_metadata = tuple(steps)
-
-    def sparse(backend, q, k, v, index, layer_id, batch):
-        if any(t.shape[0] != width for t in (q, k, v, index.k, index.q)):
-            raise ValueError("QSA inputs differ from verification width")
-        if len(batch.mtp_qsa_metadata) != width:
-            raise ValueError("QSA metadata does not cover every target position")
-        outputs = []
-        for step in range(width):
-            one = SimpleNamespace(
-                padded_reqs=batch.padded_reqs, reqs=batch.reqs,
-                lazy_restore_pending=getattr(batch, "lazy_restore_pending", False),
-                positions=batch.positions[step:step + 1], out_loc=batch.out_loc[step:step + 1],
-                attn_metadata=batch.mtp_qsa_metadata[step])
-            one_index = replace(index, q=index.q[step:step + 1], k=index.k[step:step + 1])
-            outputs.append(backend._qsa_forward_one(q[step:step + 1], k[step:step + 1],
-                                                  v[step:step + 1], one_index, layer_id, one))
-        return torch.cat(outputs, dim=0)
-
-    Qwen4ExpGatedDeltaNet.forward = gdn
-    QSASparseAttnBackend.prepare_metadata = metadata
-    QSASparseAttnBackend._qsa_forward_mtp_k1 = sparse
 
 
 def run_window(engine, source, position, seed, host_prefix, *, width, base, seed_api,

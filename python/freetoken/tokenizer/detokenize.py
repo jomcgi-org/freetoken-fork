@@ -91,6 +91,24 @@ class DetokenizeManager:
         self.decode_map.pop(uid, None)
 
     def detokenize(self, msgs: List[DetokenizeMsg]) -> List[str]:
+        # Each token of a request depends on the offsets committed by its previous
+        # token. Speculative output can contain several messages for the same uid.
+        # Keep distinct requests batched, and drain before a uid appears again.
+        if len(msgs) < 2:
+            return self._detokenize_unique(msgs)
+        seen = set()
+        start = 0
+        output = []
+        for index, msg in enumerate(msgs):
+            if msg.uid in seen:
+                output.extend(self._detokenize_unique(msgs[start:index]))
+                start = index
+                seen.clear()
+            seen.add(msg.uid)
+        output.extend(self._detokenize_unique(msgs[start:]))
+        return output
+
+    def _detokenize_unique(self, msgs: List[DetokenizeMsg]) -> List[str]:
         read_ids: List[List[int]] = []
         surr_ids: List[List[int]] = []
         for msg in msgs:

@@ -158,6 +158,8 @@ class EngineConfig:
     moe_cpu_precb: str = "before"
     # Skip coordinator-side CPU work when a HOT/COLD split has no valid CPU routes.
     moe_cpu_empty_skip: str = "off"
+    # Share NVFP4 weight unpacking across pairs of routes in grouped CPU decode.
+    moe_cpu_nvfp4_pair: str = "off"
     # Optionally suppress repeat WILLNEED advice for recently computed DISK experts.
     moe_cpu_willneed: str = "always"
     moe_cpu_willneed_recent_steps: int = 256
@@ -190,6 +192,9 @@ class EngineConfig:
     # on/off choice instead of a boolean so the CLI and serialized daemon config
     # have one stable spelling.
     speculative_mtp: str = "off"
+    # Causal ngram drafts, verified by the same target with exact prefix rollback.
+    speculative_ngram: str = "off"
+    ngram_debug: bool = False
     # Patch 11-lite intentionally supports one draft only. Keep the explicit
     # knob so attempts to reuse older K>1 launch commands fail loudly.
     mtp_draft_tokens: int = 1
@@ -258,6 +263,13 @@ class EngineConfig:
 
         validate_speculative_mtp(self.speculative_mtp)
         validate_mtp_draft_tokens(self.mtp_draft_tokens)
+        if self.speculative_ngram not in ("off", "on"):
+            raise ValueError("--speculative-ngram must be 'off' or 'on'")
+        if self.speculative_ngram == "on":
+            if self.speculative_mtp != "off" or self.tp_info.size != 1 or self.max_running_req != 1:
+                raise ValueError("--speculative-ngram on requires MTP off, TP size one and one running request")
+        elif self.ngram_debug:
+            raise ValueError("--ngram-debug requires --speculative-ngram on")
         if self.kv_cache_dtype not in ("auto", "bf16", "fp8_e4m3"):
             raise ValueError(
                 "--kv-cache-dtype must be 'auto', 'bf16', or 'fp8_e4m3', got "
@@ -384,6 +396,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-cpu-empty-skip must be 'off' or 'on', got "
                 f"{self.moe_cpu_empty_skip!r}"
+            )
+        if self.moe_cpu_nvfp4_pair not in ("off", "on"):
+            raise ValueError(
+                "--moe-cpu-nvfp4-pair must be 'off' or 'on', got "
+                f"{self.moe_cpu_nvfp4_pair!r}"
             )
         if self.moe_cpu_willneed not in ("always", "recent"):
             raise ValueError(

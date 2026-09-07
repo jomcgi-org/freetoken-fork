@@ -5,6 +5,10 @@ This measures components, never serving throughput. The worker exits after the
 report because repeated forwards alter cache history and adaptation counters.
 """
 
+from freetoken.verification.adapters import (
+    FusedGraph, host_contexts, install_graph_support, install_serial_linear,
+)
+
 import copy
 import importlib.machinery
 import json
@@ -42,26 +46,6 @@ def verification_width():
     return width
 
 
-def install_serial_linear(width=2):
-    """Keep ordinary dense row reduction order inside the two-token diagnostic."""
-    import torch
-    import torch.nn.functional as functional
-    from freetoken.core import get_global_ctx
-
-    original = functional.linear
-
-    def linear(input, weight, bias=None):
-        if input.ndim == 2 and input.shape[0] == width:
-            try:
-                batch = get_global_ctx().batch
-            except AssertionError:
-                batch = None
-            if getattr(batch, "mtp_fused", False):
-                return torch.cat([original(input[i:i + 1], weight, bias)
-                                  for i in range(width)], dim=0)
-        return original(input, weight, bias)
-
-    functional.linear = linear
 
 
 def eligible_position(position, *, page_size, ratio, remaining):
@@ -181,20 +165,6 @@ def difference_metrics(actual, expected):
     return result
 
 
-def host_contexts(history, position, ids, contexts, boundary):
-    """Fill token-ordered PLE contexts from known inputs, including left padding."""
-    if (ids.numel() not in (2, 3, 5) or contexts.shape[0] != ids.numel()
-            or history.numel() < position):
-        raise ValueError("PLE staging requires matching width and complete host history")
-    width = contexts.shape[1]
-    contexts.fill_(boundary)
-    count = min(width, position)
-    if count:
-        contexts[0, width - count:].copy_(history[position - count:position])
-    if width:
-        for step in range(1, ids.numel()):
-            contexts[step, :-1].copy_(contexts[step - 1, 1:])
-            contexts[step, -1].copy_(ids[step - 1])
 
 
 def install_layer_trace():
@@ -252,188 +222,8 @@ def activation_comparison(actual, expected):
     return {name: difference_metrics(value, expected[name]) for name, value in actual.items()}
 
 
-def install_graph_support(width=2):
-    """Diagnostic-only adaptations of the existing feat/mtp-graphs PLE work.
-
-    Retain serial width-one GDN updates. Only provision PLE's second row and make
-    the two constant PLE indptrs capture-safe. Ordinary decode delegates unchanged.
-    """
-    import torch
-    from freetoken.models.qwen4_exp import ple
-    from freetoken.models.qwen4_exp.ple_uring import UringTable
-
-    original_uring = UringTable.__init__
-    original_hash = ple.NGramEmbedding.snapshot_host_hash_constants
-    original_metadata = ple.build_ple_metadata
-    original_conv = ple.PLELayer._short_conv
-    indptrs = {}
-
-    def indptr(device, width):
-        key = (device, width)
-        if key not in indptrs:
-            indptrs[key] = torch.arange(0, width + 1, width, device=device, dtype=torch.int32)
-        return indptrs[key]
-
-    def uring(table, *args, **kwargs):
-        kwargs["max_decode_batch_size"] = max(width, kwargs["max_decode_batch_size"])
-        original_uring(table, *args, **kwargs)
-
-    def hash_constants(embedding, max_batch_size=None):
-        original_hash(embedding, max(width, max_batch_size or 0))
-
-    def metadata(batch, args, device, context_pool=None):
-        if not getattr(batch, "mtp_fused", False):
-            return original_metadata(batch, args, device, context_pool)
-        if context_pool is None:
-            context_pool = ple._ngram_context_pool()
-        slots = batch.linear_table_idx.long()
-        if slots.numel() != 1 or batch.input_ids.numel() != width:
-            raise ValueError("fused probe requires one request and matching token width")
-        return ple.PLEMetadata(input_ids=batch.input_ids, cu_seqlens=indptr(device, width),
-                               seq_lens=(width,), ngram_context=context_pool.index_select(0, slots).long(),
-                               state_slots=slots, fresh_slots=None, is_decode=False, mtp_fused=True)
-
-    def short_conv(layer, x, meta, states):
-        if not meta.mtp_fused:
-            return original_conv(layer, x, meta, states)
-        pieces = []
-        for step in range(width):
-            one = ple.PLEMetadata(input_ids=meta.input_ids[step:step + 1],
-                                   cu_seqlens=indptr(meta.cu_seqlens.device, 1), seq_lens=(1,),
-                                   ngram_context=meta.ngram_context, state_slots=meta.state_slots,
-                                   fresh_slots=None, is_decode=True)
-            pieces.append(layer._decode_conv(x[step:step + 1], one, states))
-        return torch.cat(pieces, dim=0)
-
-    UringTable.__init__ = uring
-    ple.NGramEmbedding.snapshot_host_hash_constants = hash_constants
-    ple.build_ple_metadata = metadata
-    ple.PLELayer._short_conv = short_conv
 
 
-class FusedGraph:
-    """A dedicated diagnostic graph with persistent token and address inputs.
-
-    Passing a state checkpoint explicitly also makes its reads and restores follow
-    the staged request slots. This remains a diagnostic, not a serving scheduler.
-    """
-
-    def __init__(self, engine, source, *, state_checkpoint=None):
-        import torch
-        from freetoken.attention.linear import build_fla_metadata
-
-        self.engine = engine
-        self.width = width = source.input_ids.numel()
-        self.batch = batch = copy.copy(source)
-        batch.input_ids = source.input_ids.clone()
-        batch.positions = source.positions.clone()
-        batch.out_loc = source.out_loc.clone()
-        batch.linear_table_idx = source.linear_table_idx.clone()
-        batch.active_table_idx = source.active_table_idx.clone()
-        batch.fla_metadata = build_fla_metadata(batch, engine.device)
-        self.state_checkpoint = state_checkpoint
-        self.request_key = self._request_key(source)
-        if state_checkpoint is not None:
-            self.linear_state_index = batch.linear_table_idx.to(torch.int64)
-            self.request_state_index = batch.active_table_idx[:1].to(torch.int64)
-            state_checkpoint.bind_engine(engine, self.linear_state_index, self.request_state_index)
-            state_checkpoint.state_bindings.validate_request(source.reqs[0])
-        # Each row owns persistent address tensors. Replay copies new values into
-        # these buffers before the captured QSA scatter plans execute.
-        engine.attn_backend.prepare_metadata(batch)
-        args = engine.model._config.qwen4_args
-        self.ids = torch.empty(width, dtype=torch.int64, pin_memory=True)
-        self.contexts = torch.empty((width, args.ngram_size - 1), dtype=torch.int64, pin_memory=True)
-        self.boundary = args.ngram_boundary_token_id
-        self.copy_done = torch.cuda.Event()
-        self.backends = getattr(engine.model, "_ple_disk_decode", ())
-        if not self.backends:
-            raise RuntimeError("verification graph probe requires staged PLE backends")
-        self.logits = torch.empty((width, engine.config.model_config.vocab_size),
-                                  device=engine.device, dtype=torch.float32)
-        self.graph = torch.cuda.CUDAGraph()
-        self._prepare()
-        with engine.ctx.forward_batch(batch):
-            self.logits.copy_(engine.model.forward(select_last=False))
-        engine.model.finish_cuda_graph_replay(record_event=True)
-        engine.stream.synchronize()
-        self._prepare()
-        with engine.ctx.forward_batch(batch):
-            with torch.cuda.graph(self.graph, stream=engine.stream):
-                self.logits.copy_(engine.model.forward(select_last=False))
-        engine.model.finish_cuda_graph_replay(record_event=False)
-        engine.graph_runner._reset_moe_offload_cache()
-        engine.stream.synchronize()
-
-    def _prepare(self):
-        import torch
-
-        self.ids.copy_(self.batch.input_ids, non_blocking=True)
-        self.copy_done.record(self.engine.stream)
-        self.copy_done.synchronize()
-        req = self.batch.reqs[0]
-        host_contexts(req.input_ids, req.cached_len, self.ids, self.contexts, self.boundary)
-        for ple, backend in self.backends:
-            rows = ple.ple_embedding.host_decode_row_ids(self.contexts, self.ids)
-            backend.prepare_decode(rows)
-            if getattr(backend, "_decode_shape", None) != torch.Size(rows.shape):
-                raise RuntimeError("verification PLE staging did not complete")
-
-    def replay(self, batch):
-        self._stage(batch)
-        self._prepare()
-        self.graph.replay()
-        self.engine.model.finish_cuda_graph_replay(record_event=True)
-        return self.logits
-
-    @staticmethod
-    def _request_key(batch):
-        if len(batch.reqs) != 1 or len(batch.padded_reqs) != 1:
-            raise ValueError("verification graph requires one unpadded request")
-        req = batch.reqs[0]
-        linear = req.linear_slot_idx if req.linear_slot_idx is not None else req.table_idx
-        return req.table_idx, linear
-
-    def _stage(self, batch):
-        request_key = self._request_key(batch)
-        if not getattr(batch, "mtp_fused", False) or batch.phase != "decode":
-            raise ValueError("verification graph requires a fused decode batch")
-        lazy = getattr(batch.reqs[0], "lazy_kv_restore", None)
-        if getattr(batch, "lazy_restore_pending", False) or (lazy is not None and not lazy.complete):
-            raise ValueError("verification graph cannot replay an incomplete lazy KV restore")
-        if self.state_checkpoint is None and request_key != self.request_key:
-            raise RuntimeError("changing request slots requires explicit checkpoint bindings")
-        if self.state_checkpoint is not None:
-            self.state_checkpoint.state_bindings.validate_request(batch.reqs[0])
-        copies = []
-        for name in ("input_ids", "positions", "out_loc", "linear_table_idx", "active_table_idx"):
-            copies.append((getattr(self.batch, name), getattr(batch, name)))
-        if len(batch.mtp_qsa_metadata) != self.width:
-            raise RuntimeError("verification graph requires metadata for every target row")
-        # Restage the address/length inputs as a serving graph would. The scatter
-        # plans are captured operations derived from these persistent inputs.
-        for destination, source in zip(self.batch.mtp_qsa_metadata, batch.mtp_qsa_metadata):
-            for name in ("block_table", "seq_lens", "ring_slots", "token_to_req", "cu_seqlens"):
-                copies.append((getattr(destination, name), getattr(source, name)))
-        # Reject incompatible inputs before partially updating any captured buffer.
-        for destination, source in copies:
-            if (source is None or destination is None or source.shape != destination.shape
-                    or source.dtype != destination.dtype or source.device != destination.device):
-                raise RuntimeError("verification graph input geometry changed")
-        for destination, source in copies:
-            destination.copy_(source)
-        if self.state_checkpoint is not None:
-            self.linear_state_index.copy_(self.batch.linear_table_idx)
-            self.request_state_index.copy_(self.batch.active_table_idx[:1])
-        # Host PLE staging needs the incoming history, not the capture request's.
-        self.batch.reqs = list(batch.reqs)
-        self.batch.padded_reqs = list(batch.padded_reqs)
-        self.batch.mtp_original_cached_len = batch.mtp_original_cached_len
-        self.batch.mtp_original_device_len = batch.mtp_original_device_len
-
-    def close(self):
-        self.engine.stream.synchronize()
-        self.graph.reset()
 
 
 class StateWindow:

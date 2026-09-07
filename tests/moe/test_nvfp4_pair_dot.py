@@ -83,7 +83,8 @@ def test_probe_rejects_invalid_tensor_contracts(probe, change):
         probe(*values, **kwargs)
 
 
-def make_executor(hidden, intermediate, batch, activation="silu", apply_on_input=False, threads=3):
+def make_executor(hidden, intermediate, batch, activation="silu", apply_on_input=False, threads=3,
+                  *, paired=False):
     from freetoken.moe.cpu_executor import CpuMoeExecutor
 
     spec = importlib.util.spec_from_file_location(
@@ -94,7 +95,8 @@ def make_executor(hidden, intermediate, batch, activation="silu", apply_on_input
     return CpuMoeExecutor(cache, top_k=3, activation=activation,
                           apply_router_weight_on_input=apply_on_input,
                           num_threads=threads, max_tokens=batch, device=torch.device("cpu"),
-                          swiglu_limit=1.3, prefill_batch="off")
+                          swiglu_limit=1.3, prefill_batch="off",
+                          moe_cpu_nvfp4_pair="on" if paired else "off")
 
 
 def executor_inputs(hidden, batch, routes):
@@ -111,12 +113,17 @@ def executor_inputs(hidden, batch, routes):
     return x, weights, ids
 
 
-def check_executor(hidden, intermediate, batch, activation, apply_on_input, routes):
-    executor = make_executor(hidden, intermediate, batch, activation, apply_on_input)
-    if not hasattr(executor._ext, "set_nvfp4_pair_dot"):
-        pytest.skip("CPU extension needs rebuilding for pair executor")
-    if not executor._ext.set_nvfp4_pair_dot(True):
-        pytest.skip("pair executor requires NVFP4 and AVX-512 VNNI")
+def check_executor(hidden, intermediate, batch, activation, apply_on_input, routes,
+                   *, startup_pair=False):
+    executor = make_executor(hidden, intermediate, batch, activation, apply_on_input,
+                             paired=startup_pair)
+    if startup_pair:
+        assert executor._nvfp4_pair_enabled
+    else:
+        if not hasattr(executor._ext, "set_nvfp4_pair_dot"):
+            pytest.skip("CPU extension needs rebuilding for pair executor")
+        if not executor._ext.set_nvfp4_pair_dot(True):
+            pytest.skip("pair executor requires NVFP4 and AVX-512 VNNI")
     io = executor._io_for(batch)
     x, weights, ids = executor_inputs(hidden, batch, routes)
     io["x"].copy_(x)
@@ -145,3 +152,9 @@ def test_complete_expert_pair_schedule_is_exact(probe, batch, activation, apply_
 @pytest.mark.parametrize("apply_on_input", [False, True])
 def test_model_expert_dimensions_are_exact(probe, batch, apply_on_input):
     check_executor(2560, 640, batch, "silu", apply_on_input, "mixed")
+
+
+@pytest.mark.parametrize("batch", [1, 2, 5])
+def test_startup_pair_option_is_exact_before_any_task_is_created(probe, batch):
+    probe(*inputs(16, rows=1))  # Skip unsupported native builds before enabling.
+    check_executor(272, 80, batch, "silu", False, "mixed", startup_pair=True)

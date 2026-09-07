@@ -1657,7 +1657,7 @@ struct CpuMoeExecutor {
   nvi8batch_rows_fn nvi8batch_rows = nullptr;  // R_w weight rows x M activations
   const char* nvi8batch_name = "scalar";
   bool use_vnni = false;         // nvfp4 + AVX-VNNI: decode via int8 VPDPBUSD (W4A8)
-  bool nvfp4_pair_dot = false;   // explicit diagnostic opt-in, configured before tasks
+  bool nvfp4_pair_dot = false;   // default off, configured before tasks
   bool use_q4a8 = false;       // q4_0: always W4A8 (llama.cpp Q4_0 x Q8_0); int8 pre-quant
   dsdot_fn dsdot;
   mxgemv_fn mxgemv;
@@ -3660,7 +3660,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("acts_ptr"), py::arg("act_scales_ptr"), py::arg("rows"),
         py::arg("activation_rows"), py::arg("hidden_size"));
   m.def("memops_probe", &cumemops_probe, py::arg("stream"), py::arg("scratch_addr"));
-  // Explicit diagnostic entry point. Serving does not dispatch to the pair kernel.
+  // Explicit diagnostic entry point for the same opt-in grouped decode kernel.
   m.def("nvfp4_pair_dot_probe",
         [](torch::Tensor packed, torch::Tensor scales, torch::Tensor globals,
            torch::Tensor acts, torch::Tensor act_scales, int iterations, bool pair_first) {

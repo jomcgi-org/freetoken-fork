@@ -332,6 +332,7 @@ class CpuMoeExecutor:
         step_timing: bool = False,
         moe_cpu_precb: str = "before",
         moe_cpu_empty_skip: str = "off",
+        moe_cpu_nvfp4_pair: str = "off",
         moe_cpu_willneed: str = "always",
         moe_cpu_willneed_recent_steps: int = 256,
         moe_cpu_willneed_fault_ceiling: float = 2000.0,
@@ -343,6 +344,10 @@ class CpuMoeExecutor:
         from freetoken.kernel import _cpu_moe
 
         fmt = cache.quant_format
+        if moe_cpu_nvfp4_pair not in ("off", "on"):
+            raise ValueError("moe_cpu_nvfp4_pair must be 'off' or 'on'")
+        if moe_cpu_nvfp4_pair == "on" and fmt != "nvfp4":
+            raise ValueError("--moe-cpu-nvfp4-pair on requires NVFP4 CPU experts")
         if fmt not in _WFMT_IDS:
             raise NotImplementedError(
                 f"--moe-backend cpu/hybrid computes experts on the CPU and supports "
@@ -532,6 +537,7 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        self._configure_nvfp4_pair(moe_cpu_nvfp4_pair == "on")
         self._configure_empty_skip(moe_cpu_empty_skip)
         self._configure_pre_run_callback_mode(moe_cpu_precb)
         self._configure_prefill_batch()
@@ -624,6 +630,9 @@ class CpuMoeExecutor:
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
         logger.info_rank0(
+            f"CPU MoE NVFP4 pair dot: {'on' if self._nvfp4_pair_enabled else 'off'}"
+        )
+        logger.info_rank0(
             f"CPU MoE prefill batch: "
             f"{'on' if self._prefill_batch_enabled else 'off'}, "
             f"kernel={getattr(self._ext, 'prefill_batch_kernel_name', lambda: 'unknown')()}, "
@@ -637,6 +646,25 @@ class CpuMoeExecutor:
                 f"expert limits={self._prefill_coalesce_limits}, "
                 f"populate scratch={self._prefill_populate_scratch_bytes / 2**20:.0f} MiB"
             )
+
+    def _configure_nvfp4_pair(self, enabled: bool) -> None:
+        """Configure the fresh native executor before callbacks or tasks exist."""
+        self._nvfp4_pair_enabled = False
+        if not enabled:
+            return
+        setter = getattr(self._ext, "set_nvfp4_pair_dot", None)
+        if setter is None:
+            raise RuntimeError(
+                "the CPU MoE extension needs rebuilding for "
+                "--moe-cpu-nvfp4-pair on; run `python setup.py build_ext "
+                "--inplace` or reinstall the wheel"
+            )
+        if not setter(True):
+            raise RuntimeError(
+                "--moe-cpu-nvfp4-pair on requires NVFP4 and AVX-512 VNNI "
+                "support in the CPU MoE extension"
+            )
+        self._nvfp4_pair_enabled = True
 
     def _configure_empty_skip(self, mode: str) -> None:
         if mode == "on":
