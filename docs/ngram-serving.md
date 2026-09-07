@@ -68,8 +68,11 @@ real speculative windows and host stop rollback observed under the debug flag.
 These fixtures establish the tested behavior, not broad quality equivalence.
 The selective-overlap scheduler passed this renewed model qualification and
 original serving recovered with a verified completion. Its separate non-debug
-wall comparison remains pending. The wall results below apply to the preceding
-serial scheduler.
+comparison also matched complete answers and token counts, with every
+conversation passing independent checks. Repetition favored speculation, while
+multi-turn continuation still favored ordinary decoding. This latest comparison
+has one execution order, so it does not establish a general wall improvement.
+Original serving recovered with a verified completion afterward.
 
 The non-debug comparison used the same runtime source, native extensions, cache
 geometry and request bodies with the ngram flag off and on. Each mode completed
@@ -81,7 +84,8 @@ the non-debug comparison was repeated in both execution orders on unchanged
 source. All request bodies, complete answers and token counts matched across
 both runs, and every conversation passed its independent checks.
 
-Both orders now favor ngram verification on repetition, but still favor ordinary
+Both orders with the preceding serial scheduler favor ngram verification on
+repetition, but still favor ordinary
 decode on the multi-turn workload. The larger remaining difference is on initial
 turns. Blanket serial scheduling also affected ordinary fallback work, motivating
 the selective-overlap change. This timing pattern does not by itself demonstrate
@@ -91,3 +95,12 @@ Original serving recovered with a verified completion after both runs. The
 counterbalanced comparison does not qualify a general serving improvement;
 this mode remains off by default and unselected. Actual agent task completion
 and a separate non-debug wall improvement remain required.
+
+Code editing is a useful next workload because full-file writes can preserve
+long stretches of previously read source. Existing successful leaderboard edits
+contain substantial unchanged text, but final-file overlap is not a measured
+draft acceptance rate. The prior task reports do not retain request transcripts
+or original generated token IDs. Reasoning, tool serialization, intervening
+context and the bounded lookup window can reduce usable matches. Evaluate the
+unchanged task prompts, tools and graders with debug telemetry separately from
+normal wall time before attributing a programming throughput gain to speculation.
