@@ -3,9 +3,9 @@
 `--speculative-ngram on` enables an experimental serving path for one greedy
 Qwen Flash request. It requires TP size one, native MTP off, NVFP4 CPU MoE,
 staged PLE, a page size of at least eight, and ordinary CUDA graph size one.
-The default is off. Initial serving correctness checks pass, but the first
-non-debug comparison regressed wall time on both repetition and multi-turn JSON
-continuation workloads. This path is not selected for normal serving.
+The default is off. Serving correctness checks pass, but the completed non-debug
+comparisons do not establish a general multi-turn serving improvement. This path
+is not selected for normal serving.
 
 The proposer finds the most recent complete occurrence of the current eight-token
 suffix within the last 8192 known tokens. It copies the four following known
@@ -74,8 +74,17 @@ single-token tasks. Its startup integration passed 402 focused Linux checks,
 the three exclusive CUDA checks and twelve real serving fixtures with exact
 answers and completion-token counts. The enabled startup setting, speculative
 windows and host stop rollback were independently verified, followed by a
-verified original-serving completion. The wall records below used pairing off;
-separate non-debug paired-mode wall qualification remains pending.
+verified original-serving completion.
+
+Separate non-debug paired-mode qualification is complete in both execution
+orders, with speculation enabled in both arms. Source, native extensions, CPU
+workspace, cache geometry and request bodies were unchanged between modes.
+All complete answers and completion-token counts matched, and every conversation
+passed independent checks. Pairing favored repetition in both orders, but the
+combined multi-turn result was effectively unchanged and slightly favored pairing
+off. This does not qualify a general serving improvement. Original serving
+recovered with a verified completion after both runs. Pairing remains off by
+default and unselected. The speculation comparisons below used pairing off.
 
 Validation after the known-prefix precheck: 44 focused Mac checks and 374 focused
 Linux checks passed, with the three exclusive CUDA checks passing separately.
@@ -121,3 +130,12 @@ engine throughput improvement. The smaller matched-work repetition gain remains
 a separate result. This small task sample does not establish broad quality
 equivalence. Debug telemetry was off, and original serving recovered with a
 verified completion. Detailed records and independent audit scripts remain private.
+
+This experimental round is closed after the paired-mode comparison. Remaining
+candidates are ordinary concurrent decoding with the paired CPU kernel, batched
+GPU dense operations with numerical and task-quality qualification, lower
+verification synchronization and checkpoint-copy cost, and stronger causal draft
+matching. These are unqualified backlog items, not prerequisites for using the
+previously selected ordinary-serving improvements. Any further experiment should
+have a bounded budget and a workload-specific wall-time acceptance criterion
+before implementation begins.
