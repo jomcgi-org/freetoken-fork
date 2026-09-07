@@ -589,12 +589,17 @@ class Scheduler(SchedulerIOMixin):
         if (isinstance(req, ChunkedReq) or req.aborted or req in self.finished_reqs
                 or req not in self.decode_manager.running_reqs):
             return False
-        from freetoken.verification.ngram import proposal_eligible, proposal_for_request
+        from freetoken.verification.ngram import (
+            LOOKBACK, pending_proposal_possible, proposal_eligible, proposal_for_request,
+        )
 
         if not proposal_eligible(req, pending_tokens=1):
             return False
         _, tokens, copy_done = last_data[1]
         if tokens.numel() != 1:
+            return False
+        known = req.input_ids[-(LOOKBACK - 1):].tolist()
+        if not pending_proposal_possible(known):
             return False
         copy_done.synchronize()
         return proposal_for_request(req, pending_token=int(tokens[0].item())) is not None

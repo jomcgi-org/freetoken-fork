@@ -2,6 +2,7 @@
 
 import random
 import sys
+from itertools import product
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,9 @@ import torch
 
 from freetoken.verification.ngram import (
     propose, proposal_for_request, proposal_eligible, note_verification,
+    pending_proposal_possible,
 )
+from freetoken.verification import ngram
 from freetoken.verification.runtime import NgramTarget
 from freetoken.verification import runtime
 
@@ -42,6 +45,58 @@ def test_proposer_uses_recent_complete_known_continuation_only():
     assert propose([1] * 12) == [1, 1, 1, 1]
     with pytest.raises(ValueError):
         propose([], lookback=1)
+
+
+def test_pending_precheck_keeps_every_minimum_length_binary_proposal():
+    matches = 0
+    for values in product((0, 1), repeat=11):
+        known = list(values)
+        possible = pending_proposal_possible(known)
+        for pending in (0, 1):
+            if reference(known + [pending], 8, 4, 8192) is not None:
+                assert possible
+                matches += 1
+        assert known == list(values)
+    assert matches > 0
+    # Requiring five known following tokens would incorrectly reject this case.
+    assert pending_proposal_possible([0] * 11)
+    assert propose([0] * 12) == [0] * 4
+
+
+def test_pending_precheck_keeps_proposals_through_periodic_and_changed_history():
+    rng = random.Random(914)
+    alphabet = (0, 1, 257, 65536, 2**31 - 1)
+    tokens = []
+    for _ in range(12):
+        pattern = [rng.choice(alphabet) for _ in range(rng.randint(4, 12))]
+        tokens += pattern * 4 + [rng.choice(alphabet)]
+    matches = 0
+    for end in range(len(tokens)):
+        known = tokens[:end]
+        possible = pending_proposal_possible(known)
+        for pending in alphabet:
+            if reference(known + [pending], 8, 4, 8192) is not None:
+                assert possible
+                matches += 1
+    assert matches > 0
+
+
+@pytest.mark.parametrize("lookback", [32, 8192])
+@pytest.mark.parametrize("extra", [-1, 0, 1])
+def test_pending_precheck_uses_the_same_left_lookup_boundary(monkeypatch, lookback, extra):
+    monkeypatch.setattr(ngram, "LOOKBACK", lookback)
+    known = (list(range(8)) + [31, 32, 33, 34]
+             + list(range(100, 100 + lookback + extra - 20)) + list(range(7)))
+    expected = reference(known + [7], 8, 4, lookback)
+    assert (expected is not None) is (extra <= 0)
+    assert pending_proposal_possible(known) is (expected is not None)
+
+
+def test_positive_pending_precheck_does_not_claim_the_unknown_token_matches():
+    known = list(range(8)) + [31, 32, 33, 34] + list(range(7))
+    assert pending_proposal_possible(known)
+    assert propose(known + [99]) is None
+    assert propose(known + [7]) == [31, 32, 33, 34]
 
 
 def req_fixture():

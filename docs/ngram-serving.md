@@ -35,6 +35,13 @@ immediately after its forward and owns the graph until host output processing
 completes. Only the ordinary scheduler allocates real request pages. The explicit
 environment override for serial scheduling remains supported.
 
+Before waiting for a pending host token, the scheduler checks whether the seven
+known preceding tokens have a possible earlier continuation. With no such
+occurrence, ordinary work can launch without that extra fence. This precheck
+requires four known following tokens, since the pending token may itself be the
+final draft. A possible match still requires the full eight-token lookup after
+the copy fence; the proposal policy and target arithmetic are unchanged.
+
 Requests without a full causal draft use ordinary decoding. Sampling, guided
 decoding, multimodal inputs, incomplete lazy restores, insufficient output budget
 and stale host history also fall back. EOS and new tool openers end a verification
@@ -59,6 +66,9 @@ restart with the desired geometry. Keep automatic KV growth disabled during the
 initial serving experiments. Wider serving concurrency, runtime cache resizing,
 and stronger non-debug wall evidence remain required before selecting this path
 for normal use. Detailed measured records stay private.
+
+The real-model and wall records below precede the known-prefix precheck. Its
+renewed model and wall qualification remain pending.
 
 Validation: 364 focused Linux checks passed, with the three exclusive CUDA checks
 passing separately. Twelve serving fixtures matched ordinary decoding exactly in

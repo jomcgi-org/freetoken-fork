@@ -49,6 +49,17 @@ def propose(tokens, *, match=MATCH, drafts=WIDTH - 1, lookback=LOOKBACK):
     return None
 
 
+def pending_proposal_possible(tokens):
+    """Check a necessary condition without reading the pending sampled token.
+
+    Any full match must contain the known MATCH-1 suffix. Only WIDTH-1 known
+    following tokens are required: the pending token may also be the last draft.
+    A positive result still needs the normal lookup after the host-copy fence.
+    """
+    return propose(tokens, match=MATCH - 1, drafts=WIDTH - 1,
+                   lookback=LOOKBACK - 1) is not None
+
+
 def proposal_eligible(req, *, pending_tokens=0):
     """Check request constraints before waiting for an overlapped host token."""
     if pending_tokens not in (0, 1):

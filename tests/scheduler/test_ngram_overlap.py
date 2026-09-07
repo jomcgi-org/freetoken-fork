@@ -144,8 +144,26 @@ def test_ordinary_fallback_still_launches_before_prior_host_drain(reason):
     assert ongoing is not None and "verify" not in f.calls
     assert f.calls.index("ordinary") < f.calls.index(("append", [42]))
     assert [m.next_token for m in f.sent] == [42]
-    if reason in ("backoff", "sampling", "grammar", "lazy", "budget", "off"):
-        assert f.calls.index("ordinary") < f.calls.index("pending_ready")
+    assert f.calls.index("ordinary") < f.calls.index("pending_ready")
+    f.sched._process_last_data(ongoing)
+    f.dm.remove_req(f.req)
+    f.sched._free_req_resources(f.req)
+    f.cm.check_integrity()
+
+
+def test_possible_prefix_still_fences_and_checks_the_actual_pending_token():
+    f = rig()
+
+    def fence():
+        f.calls.append("pending_ready")
+        f.last[1][1].fill_(43)
+
+    f.last[1][2].synchronize = fence
+    ongoing = f.sched.overlap_loop(f.last)
+    assert ongoing is not None and "verify" not in f.calls
+    assert f.calls.index("pending_ready") < f.calls.index("ordinary")
+    assert f.calls.index("ordinary") < f.calls.index(("append", [43]))
+    assert [m.next_token for m in f.sent] == [43]
     f.sched._process_last_data(ongoing)
     f.dm.remove_req(f.req)
     f.sched._free_req_resources(f.req)
