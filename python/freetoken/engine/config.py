@@ -97,6 +97,7 @@ class EngineConfig:
     moe_hot_adapt_halflife_steps: int = 2000
     moe_hot_adapt_interval_steps: str | int = "auto"
     moe_hot_adapt_max_swap_gib: float = 0.5
+    moe_hot_staging_io: str = "mmap"
     moe_hot_adapt_boundary_cap_frac: float = 0.5
     moe_hot_adapt_prefill_weight: float = 1.0
     moe_hot_adapt_histories: str = "shared"
@@ -336,6 +337,8 @@ class EngineConfig:
             raise ValueError("--moe-disk-prefill-min-tokens must be positive")
         if self.moe_disk_prefill_io not in ("buffered", "cached"):
             raise ValueError("--moe-disk-prefill-io must be 'buffered' or 'cached'")
+        if self.moe_hot_staging_io not in ("mmap", "buffered"):
+            raise ValueError("--moe-hot-staging-io must be 'mmap' or 'buffered'")
         if self.moe_disk_prefill_io == "cached" and self.moe_disk_prefill != "staged":
             raise ValueError("--moe-disk-prefill-io cached requires --moe-disk-prefill staged")
         if self.moe_disk_prefill == "staged" and self.moe_disk_decode != "cpu":

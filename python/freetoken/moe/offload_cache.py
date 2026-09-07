@@ -221,6 +221,7 @@ class OffloadMoeCache:
     moe_disk_prefill: str = "cpu"
     moe_disk_prefill_min_tokens: int = 1024
     moe_disk_prefill_io: str = "buffered"
+    moe_hot_staging_io: str = "mmap"
     moe_prefill_coalesce: str = "populate"
     moe_prefill_hot_split: str = "on"
     moe_prefill_split_kernel: str = "grouped"
@@ -265,6 +266,10 @@ class OffloadMoeCache:
             raise ValueError("staged DISK prefill needs a positive token threshold")
         if self.moe_disk_prefill_io not in ("buffered", "cached"):
             raise ValueError("moe_disk_prefill_io must be 'buffered' or 'cached'")
+        if self.moe_hot_staging_io not in ("mmap", "buffered"):
+            raise ValueError("moe_hot_staging_io must be 'mmap' or 'buffered'")
+        if self.moe_hot_staging_io == "buffered" and self.quant_format != "nvfp4":
+            raise ValueError("buffered HOT staging requires native NVFP4 banks")
         if self.moe_disk_prefill_io == "cached" and self.moe_disk_prefill != "staged":
             raise ValueError("cached file reads require staged DISK prefill")
         self._staged_prefill_active = False
@@ -1471,6 +1476,7 @@ class OffloadMoeCache:
                 f"max_swap plus fixed headroom ({budget_bytes} bytes)"
             )
         self.hot_staging_bytes = budget_bytes
+        logger.info_rank0(f"MoE HOT staging: file_io={self.moe_hot_staging_io}")
         # These pools use daemon workers omitted from concurrent.futures' atexit
         # join registry. Explicit shutdown still cleans up responsive workers,
         # while process exit may abandon a wedged copy, fsync, or temporary file.
@@ -1586,21 +1592,29 @@ class OffloadMoeCache:
             raise RuntimeError("HOT swap plan exceeds the allocated staging rows")
         started_at = time.perf_counter()
         copied: set[tuple[int, int]] = set()
-        with torch.inference_mode():
-            for stage_row, swap in enumerate(swaps):
-                # Check once per whole expert row. Once a row starts, every bank
-                # for that row is copied. Preemption bounds additional host staging
-                # to one row, but the H2D install of the staged prefix, up to
-                # self._hot_staging_rows rows, still lands on the scheduler stream
-                # before the next forward and costs 25 to 50 ms on node-4.
-                if stop_event is not None and stop_event.is_set():
-                    break
-                for bank_id, name in enumerate(self.bank_schema):
-                    source = self.bank_sources[name][swap.layer_id]
-                    self._hot_staging[bank_id][stage_row].copy_(
-                        source[swap.incoming_expert]
-                    )
-                copied.add((swap.layer_id, swap.row))
+        reader = None
+        if self.moe_hot_staging_io == "buffered":
+            from freetoken.moe.hot_staging_io import HotRowFileReader
+
+            reader = HotRowFileReader()
+        try:
+            with torch.inference_mode():
+                for stage_row, swap in enumerate(swaps):
+                    # Once a row starts, finish every bank before checking for
+                    # cancellation. Publication installs only this complete prefix.
+                    # H2D installation of that prefix still runs on the scheduler
+                    # stream before its next forward for a single-batch update.
+                    if stop_event is not None and stop_event.is_set():
+                        break
+                    for bank_id, name in enumerate(self.bank_schema):
+                        source = self.bank_sources[name][swap.layer_id]
+                        target = self._hot_staging[bank_id][stage_row]
+                        if reader is None or not reader.copy_row(source, swap.incoming_expert, target):
+                            target.copy_(source[swap.incoming_expert])
+                    copied.add((swap.layer_id, swap.row))
+        finally:
+            if reader is not None:
+                reader.close()
         return copied, time.perf_counter() - started_at
 
     def _install_staged_hot_rows(self, swaps) -> None:

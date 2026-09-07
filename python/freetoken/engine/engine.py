@@ -989,6 +989,7 @@ class Engine:
                 moe_disk_prefill=config.moe_disk_prefill,
                 moe_disk_prefill_min_tokens=getattr(config, "moe_disk_prefill_min_tokens", 1024),
                 moe_disk_prefill_io=getattr(config, "moe_disk_prefill_io", "buffered"),
+                moe_hot_staging_io=getattr(config, "moe_hot_staging_io", "mmap"),
                 moe_prefill_coalesce=getattr(
                     config, "moe_prefill_coalesce", "populate"
                 ),
@@ -2802,6 +2803,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_halflife_steps": 2000,
     "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
+    "moe_hot_staging_io": "mmap",
     "moe_hot_adapt_boundary_cap_frac": 0.5,
     "moe_hot_adapt_prefill_weight": 1.0,
     "moe_hot_adapt_histories": "shared",
