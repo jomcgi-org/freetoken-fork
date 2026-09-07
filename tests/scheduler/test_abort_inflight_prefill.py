@@ -223,3 +223,48 @@ def test_post_terminal_overlap_step_is_dropped():
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()
+
+
+def test_continuation_trace_captures_completion_before_free_once(tmp_path):
+    import json
+    from freetoken.scheduler.continuation_trace import ContinuationTrace
+
+    pool, cm, tm, dm, _pm, sent, stub = _setup()
+    trace = ContinuationTrace(tmp_path)
+    stub.continuation_trace = cm.continuation_trace = trace
+    stub.eos_token_ids = {42}
+    prompt = torch.arange(1, 13, dtype=torch.int32)
+    req = _launch_req(pool, cm, tm, prompt, track_seqlen=8)
+    dm.filter_reqs([req])
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.prompt_admissions = [(UID, len(prompt), 0)]
+    Scheduler._report_prompt_admissions(stub, batch)
+    Scheduler._process_last_data(stub, _as_last_data(batch))
+    Scheduler._process_last_data(stub, _as_last_data(Batch(reqs=[req], phase="decode")))
+    trace.close()
+    events = [json.loads(line) for line in trace.path.read_text().splitlines()]
+    assert [e["kind"] for e in events] == ["header", "admitted", "completed", "footer"]
+    assert events[2]["input_ids"] == list(range(1, 13)) + [42]
+    assert events[2]["cached_len"] == 12
+    assert events[2]["mamba_last_track_seqlen"] == 8
+    assert req.table_idx == -1
+    cm.check_integrity()
+
+
+def test_continuation_trace_does_not_label_abort_as_completion(tmp_path):
+    import json
+    from freetoken.scheduler.continuation_trace import ContinuationTrace
+
+    pool, cm, tm, dm, _pm, sent, stub = _setup()
+    trace = ContinuationTrace(tmp_path)
+    stub.continuation_trace = cm.continuation_trace = trace
+    req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32), track_seqlen=8)
+    dm.filter_reqs([req])
+    stub._last_data = _as_last_data(Batch(reqs=[req], phase="prefill"))
+    Scheduler._process_one_msg(stub, AbortBackendMsg(uid=UID))
+    Scheduler._process_last_data(stub, stub._last_data)
+    trace.close()
+    events = [json.loads(line) for line in trace.path.read_text().splitlines()]
+    assert [e["kind"] for e in events] == ["header", "footer"]
+    assert req.table_idx == -1
+    cm.check_integrity()

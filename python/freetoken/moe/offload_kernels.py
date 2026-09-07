@@ -7,6 +7,10 @@ import triton
 import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
 
+# Measurement escape hatch. Decode-sized route sets keep the scalar path;
+# large sets count and remap tiles without changing the selected experts.
+_PARALLEL_HOT_ROUTING = os.getenv("FREETOKEN_PARALLEL_HOT_ROUTING", "1") != "0"
+
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
 # count). "recency" (default) fetches the experts most-recently active before this step
 # (LRU on the expert -> prioritizes recurring misses, lowering the steady miss rate);
@@ -79,6 +83,10 @@ def ensure_experts_hot(
     1-token decode step each age prior counts by one half-life step. New route
     counts remain unnormalized, so large prefill observations retain their
     proportional traffic weight.
+
+    ``record_stats`` suppresses warmup observations, including adaptation.
+    ``cache.collect_stats`` only controls diagnostic totals; disabling it must
+    not disable the histories used to choose the next HOT set.
     """
     if history not in ("decode", "prefill"):
         raise ValueError("HOT adaptation history must be 'decode' or 'prefill'")
@@ -128,8 +136,8 @@ def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
     )
 
 
-def materialize_layer(cache, layer_id: int) -> None:
-    _materialize_layer_gpu(cache, layer_id)
+def materialize_layer(cache, layer_id: int, *, temporary: bool = False) -> None:
+    _materialize_layer_gpu(cache, layer_id, temporary=temporary)
 
 
 def reset_cache(cache) -> None:
@@ -283,7 +291,12 @@ def _ensure_experts_hot_gpu(
         float(route_weight),
         HOT_ADAPT=cache.hot_adapt_enabled,
         RECORD_STATS=record_stats,
+        COLLECT_STATS=record_stats and getattr(cache, "collect_stats", False),
         WEIGHTED=route_weight != 1.0,
+        ROUTE_BLOCK=(
+            min(1024, triton.next_power_of_2(expert_ids.numel()))
+            if _PARALLEL_HOT_ROUTING and expert_ids.numel() >= 64 else 0
+        ),
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         num_warps=8 if block_c >= 2048 else 4,
@@ -410,7 +423,6 @@ def _ensure_experts_hot_cpu(
         cache.evict_slots[idx] = victim
         cache.src_indices[idx] = hot_row[expert]
 
-    hot_pairs = sum(hot_row[expert] >= 0 for expert in raw)
     if cache.hot_adapt_enabled and record_stats:
         counts = torch.bincount(
             torch.tensor(raw, dtype=torch.long), minlength=cache.num_experts
@@ -420,7 +432,8 @@ def _ensure_experts_hot_cpu(
         if decayed_freq is None:
             decayed_freq = cache.decayed_decode_freq
         decayed_freq[layer_id].mul_(cache._hot_decay_factor).add_(counts)
-    if record_stats:
+    if record_stats and getattr(cache, "collect_stats", False):
+        hot_pairs = sum(hot_row[expert] >= 0 for expert in raw)
         cache.stat_hot_pairs += hot_pairs
         cache.stat_hot_total_pairs += len(raw)
     flat = expert_ids.view(-1)
@@ -431,7 +444,7 @@ def _ensure_experts_hot_cpu(
         )
 
 
-def _materialize_layer_gpu(cache, layer_id: int) -> None:
+def _materialize_layer_gpu(cache, layer_id: int, *, temporary: bool = False) -> None:
     block = triton.next_power_of_2(max(cache.num_experts, cache.cache_size))
     _materialize_layer_kernel[(1,)](
         cache.slot_for_id,
@@ -444,6 +457,7 @@ def _materialize_layer_gpu(cache, layer_id: int) -> None:
         layer_id,
         cache.num_experts,
         cache.cache_size,
+        TEMPORARY=temporary or layer_id in cache.hot_expert_capacity,
         BLOCK=block,
     )
 
@@ -501,6 +515,7 @@ def _materialize_layer_kernel(
     layer_id: tl.constexpr,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
+    TEMPORARY: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     off = tl.arange(0, BLOCK)
@@ -510,19 +525,31 @@ def _materialize_layer_kernel(
 
     base = layer_id * num_experts
     old_id = tl.load(id_of_slot_ptr + slot, mask=slot_mask, other=-1)
-    # Flat ids make "belongs to this layer" a range check instead of a field compare.
-    same_layer = slot_mask & (old_id >= base) & (old_id < base + num_experts)
-    tl.store(id_of_slot_ptr + slot, -1, mask=same_layer)
-    tl.store(usage_ptr + slot, 0, mask=same_layer)
-
-    old_valid = expert_mask & (old_id >= 0) & (~same_layer)
-    tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid)
-
     step = tl.load(step_ptr) + 1
+    if TEMPORARY:
+        old_valid = expert_mask & (old_id >= 0)
+        old_mapping = tl.load(slot_for_id_ptr + old_id, mask=old_valid, other=-1)
+    # Small cache shapes can replicate reads across warps. Finish their ownership
+    # and timestamp snapshots before the elected writers mutate either table.
+    tl.debug_barrier()
+    if TEMPORARY:
+        # Prefill only borrows [0, E). Leave copies unowned so later scratch
+        # reuse preserves permanent HOT mappings. Sparse staging also needs this
+        # rule on ordinary layers: uncopied rows must never become cache hits.
+        tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid & (old_mapping == slot))
+        tl.store(id_of_slot_ptr + slot, -1, mask=expert_mask)
+        tl.store(usage_ptr + slot, 0, mask=expert_mask)
+    else:
+        # Flat ids make "belongs to this layer" a range check.
+        same_layer = slot_mask & (old_id >= base) & (old_id < base + num_experts)
+        tl.store(id_of_slot_ptr + slot, -1, mask=same_layer)
+        tl.store(usage_ptr + slot, 0, mask=same_layer)
+        old_valid = expert_mask & (old_id >= 0) & (~same_layer)
+        tl.store(slot_for_id_ptr + old_id, -1, mask=old_valid)
+        tl.store(id_of_slot_ptr + slot, base + off, mask=expert_mask)
+        tl.store(slot_for_id_ptr + base + off, slot, mask=expert_mask)
+        tl.store(usage_ptr + slot, step, mask=expert_mask)
     tl.store(step_ptr, step)
-    tl.store(id_of_slot_ptr + slot, base + off, mask=expert_mask)
-    tl.store(slot_for_id_ptr + base + off, slot, mask=expert_mask)
-    tl.store(usage_ptr + slot, step, mask=expert_mask)
     tl.store(evict_slots_ptr + off, slot, mask=expert_mask)
     tl.store(src_indices_ptr + off, off, mask=expert_mask)  # layer-local row
     tl.store(num_indices_ptr, num_experts)
@@ -677,7 +704,9 @@ def _ensure_experts_hot_kernel(
     route_weight,
     HOT_ADAPT: tl.constexpr,
     RECORD_STATS: tl.constexpr,
+    COLLECT_STATS: tl.constexpr,
     WEIGHTED: tl.constexpr,
+    ROUTE_BLOCK: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -692,6 +721,9 @@ def _ensure_experts_hot_kernel(
     advance decay by one half-life step; this is the intentional production rule.
     """
     step = tl.load(step_ptr) + 1
+    # The scalar load is replicated across warps. Keep every timestamp reader
+    # ahead of the elected writer, just as for the in-place route rewrite below.
+    tl.debug_barrier()
     tl.store(step_ptr, step)
     base = layer_id * num_experts
     off_e = tl.arange(0, BLOCK_E)
@@ -699,11 +731,18 @@ def _ensure_experts_hot_kernel(
     compact_row = tl.load(hot_row_ptr + base + off_e, mask=e_mask, other=-1)
     eligible = compact_row >= 0
     route_count = tl.zeros((BLOCK_E,), dtype=tl.int32)
-    for i in tl.range(num_active):
-        expert = tl.load(expert_ids_ptr + i)
-        route_count += (off_e == expert).to(tl.int32)
+    if ROUTE_BLOCK:
+        off_r = tl.arange(0, ROUTE_BLOCK)
+        for start in tl.range(0, num_active, ROUTE_BLOCK):
+            positions = start + off_r
+            valid = positions < num_active
+            experts = tl.load(expert_ids_ptr + positions, mask=valid, other=0)
+            route_count += tl.histogram(experts, BLOCK_E, mask=valid)
+    else:
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            route_count += (off_e == expert).to(tl.int32)
     is_active = (route_count > 0) & eligible
-    hot_pairs = tl.sum(tl.where(eligible, route_count, 0))
     if HOT_ADAPT and RECORD_STATS:
         decayed = tl.load(decayed_freq_ptr + base + off_e, mask=e_mask, other=0.0)
         route_count_fp32 = route_count.to(tl.float32)
@@ -721,7 +760,8 @@ def _ensure_experts_hot_kernel(
     num_missing = tl.sum(is_missing.to(tl.int32))
     tl.store(num_indices_ptr, num_missing.to(tl.int64))
     tl.store(num_missing_full_ptr, num_missing.to(tl.int64))
-    if RECORD_STATS:
+    if COLLECT_STATS:
+        hot_pairs = tl.sum(tl.where(eligible, route_count, 0))
         tl.store(stat_hot_pairs_ptr, tl.load(stat_hot_pairs_ptr) + hot_pairs.to(tl.int64))
         tl.store(
             stat_total_pairs_ptr,
@@ -763,12 +803,30 @@ def _ensure_experts_hot_kernel(
             usage = tl.where(
                 off_c == victim, 9223372036854775807, usage
             )
+        if ROUTE_BLOCK:
+            # Victim installation writes the map from scalar lanes. All lanes
+            # must observe those writes before the parallel slot lookup.
+            tl.debug_barrier()
 
-    for i in tl.range(num_active):
-        expert = tl.load(expert_ids_ptr + i)
-        is_hot = tl.load(hot_row_ptr + base + expert) >= 0
-        result = tl.load(slot_for_id_ptr + base + expert)
-        tl.store(expert_ids_ptr + i, tl.where(is_hot, result, -1))
+    if ROUTE_BLOCK:
+        off_r = tl.arange(0, ROUTE_BLOCK)
+        for start in tl.range(0, num_active, ROUTE_BLOCK):
+            positions = start + off_r
+            valid = positions < num_active
+            experts = tl.load(expert_ids_ptr + positions, mask=valid, other=0)
+            # Small tiles have redundant readers in multiple warps. Snapshot
+            # every reader before the elected writers replace IDs in place.
+            tl.debug_barrier()
+            is_hot = tl.load(hot_row_ptr + base + experts, mask=valid, other=-1) >= 0
+            result = tl.load(slot_for_id_ptr + base + experts, mask=valid, other=-1)
+            tl.store(expert_ids_ptr + positions, tl.where(is_hot, result, -1), mask=valid)
+    else:
+        for i in tl.range(num_active):
+            expert = tl.load(expert_ids_ptr + i)
+            tl.debug_barrier()
+            is_hot = tl.load(hot_row_ptr + base + expert) >= 0
+            result = tl.load(slot_for_id_ptr + base + expert)
+            tl.store(expert_ids_ptr + i, tl.where(is_hot, result, -1))
 
 
 @triton.jit(do_not_specialize=["buffer_base"])

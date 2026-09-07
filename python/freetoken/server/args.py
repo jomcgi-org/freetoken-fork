@@ -945,6 +945,27 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-staging-io",
+        choices=("mmap", "buffered"),
+        default=ServerArgs.moe_hot_staging_io,
+        help=(
+            "HOT staging source: mmap keeps tensor copies (default); buffered "
+            "experimentally reads native NVFP4 file rows into existing pinned buffers."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-host-cache",
+        choices=("retain", "reclaim"),
+        default=ServerArgs.moe_hot_host_cache,
+        help=(
+            "Host file cache for GPU HOT experts: retain (default), or experimentally "
+            "reclaim complete file pages after promotion. Requires native NVFP4, "
+            "staged prefill with HOT splitting and madvise paging."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-boundary-cap-frac",
         type=float,
         default=ServerArgs.moe_hot_adapt_boundary_cap_frac,
@@ -1078,19 +1099,40 @@ def parse_args(
         action="store_true",
         default=ServerArgs.moe_collect_stats,
         help=(
-            "Collect per-layer realized decode traffic for GET /v1/moe-layer-profile "
-            "and report protected-slot oracle versus realized route coverage on status lines."
+            "Enable diagnostic MoE route/transfer counters and periodic MoE/PLE "
+            "statistics, including GET /v1/moe-layer-profile and protected-slot "
+            "oracle coverage. Adds GPU reductions and host reads; benchmark client "
+            "wall time without this flag. Cache adaptation remains active without it."
         ),
     )
 
     parser.add_argument(
         "--moe-disk-prefill",
-        choices=["cpu", "copy"],
+        choices=["cpu", "copy", "staged"],
         default=ServerArgs.moe_disk_prefill,
         help=(
             "How DISK layers run prefill: 'cpu' computes routed experts through the "
             "CPU executor (default); 'copy' restores the whole-layer pageable copy "
-            "to the GPU cache for benchmarking."
+            "to the GPU cache for benchmarking; 'staged' reads exactly the routed "
+            "NVFP4 experts through 64 MiB of pinned buffers for GPU computation, "
+            "keeping smaller chunks on CPU."
+        ),
+    )
+    parser.add_argument(
+        "--moe-disk-prefill-min-tokens",
+        type=int,
+        default=ServerArgs.moe_disk_prefill_min_tokens,
+        help="Minimum chunk size for staged DISK GPU prefill (default: %(default)s tokens).",
+    )
+    parser.add_argument(
+        "--moe-disk-prefill-io",
+        choices=["buffered", "cached"],
+        default=ServerArgs.moe_disk_prefill_io,
+        help=(
+            "File reads for staged DISK prefill: 'buffered' uses the page cache "
+            "(default); experimental 'cached' reuses resident rows and uses direct "
+            "I/O for cold rows. Requires --moe-disk-prefill staged and Linux "
+            "file banks supporting direct I/O. Expert routing is unchanged."
         ),
     )
 

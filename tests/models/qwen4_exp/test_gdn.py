@@ -223,6 +223,68 @@ def test_disk_restored_state_has_bit_identical_greedy_continuation(tmp_path):
     store.close()
 
 
+def test_decode_snapshot_donation_preserves_gdn_output_bits():
+    """A donated decode checkpoint resumes the real GDN kernel from its original state."""
+    from types import SimpleNamespace
+    from freetoken.scheduler.cache import CacheManager
+
+    op, _ = _make_layer(3, seed=43)
+    ctx = _ctx(3)
+    _, reqs, _ = _prefill(op, ctx, [63], seed=47)
+    req = Req(reqs[0].input_ids, reqs[0].table_idx, 0, 8, 1,
+              SamplingParams(max_tokens=8), None)
+    pool = ctx.linear_state_pool
+    pool._free_slots.remove(req.table_idx)  # the layer fixture assigned this live slot
+    req.linear_slot_idx = req.table_idx
+    req.mamba_ping_pong = tuple(pool.alloc(2))
+    table = torch.zeros(8, 256, dtype=torch.int32, device=DEV)
+    manager = CacheManager(4, 64, table, "hybrid_radix", linear_state_pool=pool,
+                           decode_prefix_snapshot=True)
+    req.cache_handle = manager.match_req(SimpleNamespace(
+        input_ids=req.input_ids, input_len=63, mm_embeds=None)).cuda_handle
+    manager.lock(req.cache_handle)
+    manager.allocate_paged([req])
+    req.complete_one()
+    req.append_host(torch.zeros(1, dtype=torch.int32))
+
+    hidden = torch.randn(4, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    manager.allocate_paged([req])
+    _decode(op, ctx, [req], hidden[:1])
+    req.complete_one()
+    manager.snapshot_decode_prefix([req])
+    req.append_host(torch.zeros(1, dtype=torch.int32))
+    assert req.cached_len == req.mamba_last_track_seqlen == 64
+    frozen = req.mamba_ping_pong[1 - req.mamba_next_track_idx]
+    saved_conv = pool.conv_states[:, frozen].clone()
+    saved_recurrent = pool.recurrent_states[:, frozen].clone()
+
+    expected = None
+    for index in range(1, 4):
+        manager.allocate_paged([req])
+        out = _decode(op, ctx, [req], hidden[index:index + 1])
+        if index == 1:
+            expected = out.clone()
+        req.complete_one()
+        manager.snapshot_decode_prefix([req])
+        req.append_host(torch.zeros(1, dtype=torch.int32))
+    assert req.cached_len == 67
+    assert req.input_ids.numel() == 68
+    manager.cache_req(req, finished=True)
+    manager.check_integrity()
+    hit = manager.match_req(SimpleNamespace(input_ids=req.input_ids, input_len=68, mm_embeds=None))
+    assert hit.cuda_handle.cached_len == 64
+    assert torch.equal(pool.conv_states[:, hit.mamba_value], saved_conv)
+    assert torch.equal(pool.recurrent_states[:, hit.mamba_value], saved_recurrent)
+
+    live = pool.alloc(1)[0]
+    pool.copy_from(hit.mamba_value, live)
+    resumed = Req(torch.zeros(65, dtype=torch.int32), live, 64, 1, 2,
+                  SamplingParams(max_tokens=1), hit.cuda_handle)
+    actual = _decode(op, ctx, [resumed], hidden[1:2])
+    assert torch.equal(actual, expected)
+    pool.free(live)
+
+
 def test_output_gate_comes_from_the_config():
     """The gate activation is the group config's string, not a hardcoded silu. Both gates track
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""

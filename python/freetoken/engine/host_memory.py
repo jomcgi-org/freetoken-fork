@@ -208,6 +208,7 @@ def _prefill_scratch_gib(config) -> float:
         getattr(config, "moe_backend", "offload") in ("cpu", "hybrid")
         or bool(getattr(config, "moe_cpu_layers", None))
         or bool(getattr(config, "moe_disk_layers", None))
+        or getattr(config, "moe_disk_prefill", "cpu") == "staged"
         or float(getattr(config, "moe_hot_expert_budget_gib", 0.0) or 0.0) > 0
     )
     if (
@@ -224,14 +225,19 @@ def _prefill_scratch_gib(config) -> float:
         )
         total += tokens * (4 * hidden + 8 * top_k)
     if (
-        getattr(config, "moe_disk_prefill", "cpu") == "cpu"
+        getattr(config, "moe_disk_prefill", "cpu") in ("cpu", "staged")
         and getattr(config, "moe_prefill_coalesce", "populate") == "populate"
         and (
             getattr(config, "moe_disk_layers", None)
+            or getattr(config, "moe_disk_prefill", "cpu") == "staged"
             or float(getattr(config, "moe_hot_expert_budget_gib", 0.0) or 0.0) > 0
         )
     ):
         total += 32 << 20
+    if getattr(config, "moe_disk_prefill", "cpu") == "staged":
+        # DiskPrefillStaging owns two fixed 32 MiB pinned buffers. Reserve them
+        # before fitting expert banks, in addition to CPU fallback workspaces.
+        total += 64 << 20
     return total / 2**30
 
 

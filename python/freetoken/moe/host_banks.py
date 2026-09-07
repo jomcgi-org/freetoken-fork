@@ -1085,6 +1085,52 @@ class HostBank:
         """Compatibility name for expert-bank row population."""
         return self.populate_rows(expert_ids, scratch)
 
+    def reclaim_file_rows(self, row_ids, *, tensor=None) -> int:
+        """Advise away full file pages contained in immutable, redundant rows.
+
+        The caller must finish reading these rows into its staging allocation
+        first. Existing tensor addresses remain valid and any later CPU read
+        faults back the original file bytes. Partial pages shared with other
+        rows or file entries are retained. The return value is advised bytes,
+        not a claim that every page was reclaimed by the kernel.
+        """
+        if (not self._disk or self._uffd or self._tmpfs_backed or self._pinned
+                or self._locked or self._uvm_managed or not self._file_path):
+            return 0
+        if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+            raise OSError("file-row reclamation requires POSIX_FADV_DONTNEED")
+        source = self.tensor if tensor is None else tensor
+        if (source.device.type != "cpu" or source.dtype != self.tensor.dtype
+                or source.ndim < 1 or not source.is_contiguous()):
+            raise ValueError("file-row reclamation requires a contiguous CPU bank view")
+        offset = source.data_ptr() - self.addr
+        nbytes = source.numel() * source.element_size()
+        if offset < 0 or offset + nbytes > self.nbytes:
+            raise ValueError("file-row reclamation view is outside its owning bank")
+        stride = source.stride(0) * source.element_size()
+        ranges = coalesced_row_ranges(
+            row_ids, stride, limit=nbytes, base_offset=self._view_offset + offset,
+        )
+        page = mmap.PAGESIZE
+        full_pages = []
+        for start, length in ranges:
+            lo = _round_up(start, page)
+            hi = (start + length) // page * page
+            if hi > lo:
+                full_pages.append((lo, hi - lo))
+        if not full_pages:
+            return 0
+        fd = os.open(self._file_path, os.O_RDONLY)
+        try:
+            for start, length in full_pages:
+                # Remove this mapping's PTEs before requesting file-cache
+                # invalidation. FADV_DONTNEED alone can retain mapped pages.
+                _madvise(self._mapping_addr + start, length, mmap.MADV_DONTNEED)
+                os.posix_fadvise(fd, self._map_offset + start, length, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+        return sum(length for _start, length in full_pages)
+
     def release_rows(self, row_ids) -> int:
         """Mark one-pass DISK rows as non-reusable after prefill.
 

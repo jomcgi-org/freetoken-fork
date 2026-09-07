@@ -97,6 +97,8 @@ class EngineConfig:
     moe_hot_adapt_halflife_steps: int = 2000
     moe_hot_adapt_interval_steps: str | int = "auto"
     moe_hot_adapt_max_swap_gib: float = 0.5
+    moe_hot_staging_io: str = "mmap"
+    moe_hot_host_cache: str = "retain"
     moe_hot_adapt_boundary_cap_frac: float = 0.5
     moe_hot_adapt_prefill_weight: float = 1.0
     moe_hot_adapt_histories: str = "shared"
@@ -114,8 +116,14 @@ class EngineConfig:
     moe_hot_adapt_idle_ms: int = 500
     moe_hot_adapt_idle_min_interval_ms: int = 2000
     # DISK-layer prefill compute: "cpu" reads only routed experts through the CPU
-    # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks.
+    # executor; "copy" restores the whole-layer pageable GPU-copy path for benchmarks;
+    # "staged" copies the original routed union through bounded pinned buffers.
     moe_disk_prefill: str = "cpu"
+    # Staged GPU prefill keeps smaller chunks on the existing CPU path.
+    moe_disk_prefill_min_tokens: int = 1024
+    # Staged file reads: buffered by default; cached reuses resident rows and
+    # reads cold rows directly, without changing which experts execute.
+    moe_disk_prefill_io: str = "buffered"
     # Warm a CPU prefill layer's bounded routed union. "populate" reads the file,
     # "on" keeps advisory WILLNEED, and "off" preserves the original seam behavior.
     # The setting is inert for the DISK copy path.
@@ -321,11 +329,32 @@ class EngineConfig:
             raise ValueError(
                 "--ple-uring-queue-depth must be an integer in [1, 4096]"
             )
-        if self.moe_disk_prefill not in ("cpu", "copy"):
+        if self.moe_disk_prefill not in ("cpu", "copy", "staged"):
             raise ValueError(
-                "--moe-disk-prefill must be 'cpu' or 'copy', got "
+                "--moe-disk-prefill must be 'cpu', 'copy', or 'staged', got "
                 f"{self.moe_disk_prefill!r}"
             )
+        if self.moe_disk_prefill_min_tokens < 1:
+            raise ValueError("--moe-disk-prefill-min-tokens must be positive")
+        if self.moe_disk_prefill_io not in ("buffered", "cached"):
+            raise ValueError("--moe-disk-prefill-io must be 'buffered' or 'cached'")
+        if self.moe_hot_staging_io not in ("mmap", "buffered"):
+            raise ValueError("--moe-hot-staging-io must be 'mmap' or 'buffered'")
+        if self.moe_hot_host_cache not in ("retain", "reclaim"):
+            raise ValueError("--moe-hot-host-cache must be 'retain' or 'reclaim'")
+        if self.moe_hot_host_cache == "reclaim" and (
+            self.moe_backend != "offload" or self.moe_disk_prefill != "staged"
+            or self.moe_disk_decode != "cpu" or self.moe_prefill_hot_split != "on"
+            or self.moe_disk_pager != "madvise" or self.moe_bank_hugepages_tmpfs is not None
+        ):
+            raise ValueError(
+                "HOT host-cache reclamation requires offload, staged DISK prefill, "
+                "CPU DISK decode, HOT prefill splitting, madvise paging and no tmpfs mirror"
+            )
+        if self.moe_disk_prefill_io == "cached" and self.moe_disk_prefill != "staged":
+            raise ValueError("--moe-disk-prefill-io cached requires --moe-disk-prefill staged")
+        if self.moe_disk_prefill == "staged" and self.moe_disk_decode != "cpu":
+            raise ValueError("staged DISK prefill requires --moe-disk-decode cpu")
         if self.moe_prefill_coalesce not in ("populate", "on", "off"):
             raise ValueError(
                 "--moe-prefill-coalesce must be 'populate', 'on', or 'off', got "
