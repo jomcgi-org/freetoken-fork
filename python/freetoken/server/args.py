@@ -1273,6 +1273,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-cpu-nvfp4-pair",
+        choices=["off", "on"],
+        default=ServerArgs.moe_cpu_nvfp4_pair,
+        help=(
+            "Share weight unpacking across pairs of routes in grouped NVFP4 CPU "
+            "decode (default: off). Requires an AVX-512 VNNI CPU extension. "
+            "Single-token tasks retain the ordinary route loop."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-willneed",
         choices=["always", "recent"],
         default=ServerArgs.moe_cpu_willneed,

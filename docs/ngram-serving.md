@@ -68,6 +68,11 @@ with fixed cache geometry. Wider concurrency and runtime cache resizing remain
 unsupported. Stronger non-debug wall evidence is needed before selecting this
 path for normal use. Detailed measured records stay private.
 
+The separate `--moe-cpu-nvfp4-pair on` startup option enables the experimental
+paired CPU kernel for grouped target rows. It defaults off and does not change
+single-token tasks. The serving and wall records below precede this option;
+paired-mode qualification remains pending.
+
 Validation after the known-prefix precheck: 44 focused Mac checks and 374 focused
 Linux checks passed, with the three exclusive CUDA checks passing separately.
 The precheck cases cover exhaustive binary histories, overlapping matches,

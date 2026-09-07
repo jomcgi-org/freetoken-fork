@@ -10,8 +10,15 @@ Activation quantization and expert selection are unchanged.
 The candidate is available through the explicit `nvfp4_pair_dot_probe`
 diagnostic entry point and `CpuMoeExecutor.set_nvfp4_pair_dot`. Configure the
 executor before submitting tasks, with no task in flight. The setter rejects
-unsupported formats and ISAs. Pair dispatch defaults off and the serving startup
-path does not enable it. An enabled grouped decode task pairs routes within each
+unsupported formats and ISAs. Pair dispatch defaults off. Serving can opt in with
+`--moe-cpu-nvfp4-pair on`, which configures the fresh executor before callbacks or
+tasks exist and logs the effective setting once at startup. Default-off startup
+works with older extensions that lack the setter. Enabled CPU execution rejects
+non-NVFP4 formats, missing setters and unsupported ISAs. The setting applies to
+CPU expert tasks, including offload configurations with CPU or DISK layers; it
+does not enable CPU execution for a GPU-only configuration.
+
+An enabled grouped decode task pairs routes within each
 expert, preserves the existing route quantization and activation, and leaves the
 final top-k reduction unchanged. Unpaired routes use the ordinary dot. Single-token
 tasks retain the ordinary route loop even when the setting is enabled.
@@ -56,5 +63,6 @@ was restored and verified after each model experiment.
 Model component timings remain sensitive to execution order and the ordinary
 decode controls vary. These checks establish correctness for the tested windows,
 not a stable serving gain. Separate non-debug wall qualification remains pending,
-and the explicit pair setting remains disabled at startup. Detailed timing
+and the explicit pair setting remains disabled by default. The startup option
+requires renewed serving and non-debug wall qualification. Detailed timing
 payloads stay private.
