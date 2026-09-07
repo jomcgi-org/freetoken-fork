@@ -63,47 +63,36 @@ the serving result by themselves.
 
 Runtime cache resizing currently rejects while the target graph is present;
 restart with the desired geometry. Keep automatic KV growth disabled during the
-initial serving experiments. Wider serving concurrency, runtime cache resizing,
-and stronger non-debug wall evidence remain required before selecting this path
-for normal use. Detailed measured records stay private.
+initial serving experiments. This path currently supports one running request
+with fixed cache geometry. Wider concurrency and runtime cache resizing remain
+unsupported. Stronger non-debug wall evidence is needed before selecting this
+path for normal use. Detailed measured records stay private.
 
-The real-model and wall records below precede the known-prefix precheck. Its
-renewed model and wall qualification remain pending.
-
-Validation: 364 focused Linux checks passed, with the three exclusive CUDA checks
-passing separately. Twelve serving fixtures matched ordinary decoding exactly in
+Validation after the known-prefix precheck: 44 focused Mac checks and 374 focused
+Linux checks passed, with the three exclusive CUDA checks passing separately.
+The precheck cases cover exhaustive binary histories, overlapping matches,
+zero-valued tokens and the left lookup boundary. Twelve serving fixtures matched
+ordinary decoding exactly in
 content, reasoning output, finish reason and completion-token count. They exercise
 repeated text, seven stop strings, three output budgets and a follow-up turn, with
 real speculative windows and host stop rollback observed under the debug flag.
 These fixtures establish the tested behavior, not broad quality equivalence.
-The selective-overlap scheduler passed this renewed model qualification and
-original serving recovered with a verified completion. Its separate non-debug
-comparison also matched complete answers and token counts, with every
-conversation passing independent checks. Repetition favored speculation, while
-multi-turn continuation still favored ordinary decoding. This latest comparison
-has one execution order, so it does not establish a general wall improvement.
-Original serving recovered with a verified completion afterward.
+Original serving recovered with a verified completion after model qualification.
 
-The non-debug comparison used the same runtime source, native extensions, cache
-geometry and request bodies with the ngram flag off and on. Each mode completed
-three repetition requests and three three-turn conversations; the first repetition
-and conversation were warm-ups. All complete answers and token counts matched.
-The first comparison ran off before on and regressed on both workloads. After
-the backoff and routed-token accounting changes passed renewed model checks,
-the non-debug comparison was repeated in both execution orders on unchanged
-source. All request bodies, complete answers and token counts matched across
-both runs, and every conversation passed its independent checks.
+The separate non-debug comparison ran both execution orders on unchanged runtime
+source, native extensions, cache geometry and request bodies. Each mode completed
+three repetition requests and three three-turn conversations per order; the first
+repetition and conversation were warm-ups. All complete answers and token counts
+matched across both runs, and every conversation passed independent checks.
 
-Both orders with the preceding serial scheduler favor ngram verification on
-repetition, but still favor ordinary
-decode on the multi-turn workload. The larger remaining difference is on initial
-turns. Blanket serial scheduling also affected ordinary fallback work, motivating
-the selective-overlap change. This timing pattern does not by itself demonstrate
-the cause of the difference or qualify the new scheduler.
-
-Original serving recovered with a verified completion after both runs. The
-counterbalanced comparison does not qualify a general serving improvement;
-this mode remains off by default and unselected.
+Both orders favored speculation on repetition. Multi-turn continuation favored
+speculation in the first order and ordinary decoding in the reverse order, with
+the combined continuation result favoring ordinary decoding. The initial-turn
+difference was sensitive to execution order, and ordinary decoding favored
+follow-up turns in both orders. This does not qualify a general serving
+improvement or isolate the precheck's contribution from the preceding build.
+The mode remains off by default and unselected. Original serving recovered with
+a verified completion after both runs, and the independent audits remain private.
 
 Code editing is a useful workload because full-file writes can preserve
 long stretches of previously read source. Earlier successful leaderboard edits
@@ -113,8 +102,8 @@ or original generated token IDs. Reasoning, tool serialization, intervening
 context and the bounded lookup window can reduce usable matches. Any diagnostic follow-up must keep debug telemetry separate from normal wall
 time. Final-file reuse alone does not establish a programming throughput gain.
 
-A separate coding comparison ran the same two frozen leaderboard tasks in both
-execution orders, with the original prompts, tools, budgets and graders. All
+Before the precheck, a separate coding comparison ran two frozen leaderboard tasks
+in both execution orders, with the original prompts, tools, budgets and graders. All
 eight attempts passed the grader and permitted-file checks, with no failed model
 calls. Speculation completed the chosen tasks sooner in both orders. It also
 produced substantially fewer tokens, with fewer model calls overall and different
