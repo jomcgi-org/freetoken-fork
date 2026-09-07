@@ -163,6 +163,7 @@ class Scheduler(SchedulerIOMixin):
             decode_prefix_snapshot=(
                 os.environ.get("FREETOKEN_DECODE_PREFIX_SNAPSHOT", "0") == "1"
                 and config.speculative_mtp != "on"
+                and getattr(config, "speculative_ngram", "off") != "on"
             ),
         )
         if self.cache_manager.decode_prefix_snapshot:
@@ -575,6 +576,34 @@ class Scheduler(SchedulerIOMixin):
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
 
+    def _ngram_needs_drain(self, last_data: ForwardData | None) -> bool:
+        """Look ahead using a fenced host token; leave request state untouched."""
+        if last_data is None:
+            return False
+        batch = last_data[0].batch
+        if getattr(batch, "ngram_verify", False):
+            return True
+        if len(batch.reqs) != 1 or getattr(batch, "lazy_restore_pending", False):
+            return False
+        req = batch.reqs[0]
+        if (isinstance(req, ChunkedReq) or req.aborted or req in self.finished_reqs
+                or req not in self.decode_manager.running_reqs):
+            return False
+        from freetoken.verification.ngram import (
+            LOOKBACK, pending_proposal_possible, proposal_eligible, proposal_for_request,
+        )
+
+        if not proposal_eligible(req, pending_tokens=1):
+            return False
+        _, tokens, copy_done = last_data[1]
+        if tokens.numel() != 1:
+            return False
+        known = req.input_ids[-(LOOKBACK - 1):].tolist()
+        if not pending_proposal_possible(known):
+            return False
+        copy_done.synchronize()
+        return proposal_for_request(req, pending_token=int(tokens[0].item())) is not None
+
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
         The main loop of overlapping scheduling and execution.
@@ -595,6 +624,14 @@ class Scheduler(SchedulerIOMixin):
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
+
+        if (getattr(self.config, "speculative_ngram", "off") == "on"
+                and self._ngram_needs_drain(last_data)):
+            # Resolve EOS, stop strings, aborts and cache donation before reserving
+            # speculative pages. Ordinary work with no proposal retains overlap.
+            self.stream.wait_stream(self.engine.stream)
+            self._process_last_data(last_data)
+            last_data = self._last_data = None
 
         # Execute a queued cache rebuild once the scheduler is fully idle (the safe point):
         # no last batch to process, no pending prefill, no running decode. finished_reqs is
@@ -637,6 +674,12 @@ class Scheduler(SchedulerIOMixin):
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
+        self._last_data = None
+        if ongoing_data is not None and getattr(ongoing_data[0].batch, "ngram_verify", False):
+            # Acceptance/host stop rollback owns this graph until output drains.
+            # Never leave a speculative batch pending across the next launch.
+            self._process_last_data(ongoing_data)
+            ongoing_data = None
         self._flush_oom_errors()
         self._flush_abort_acks()
         return ongoing_data
@@ -767,8 +810,10 @@ class Scheduler(SchedulerIOMixin):
                     else next_tokens_cpu[i : i + 1]
                 )
                 finished = False
+                emitted = 0
                 for next_token_tensor in tokens:
                     req.append_host(next_token_tensor.unsqueeze(0))
+                    emitted += 1
                     next_token = int(next_token_tensor.item())
                     # EOS / stop-string -> "stop", output budget exhausted -> "length";
                     # EOS and stop strings win over length. Host length, rather than
@@ -823,6 +868,11 @@ class Scheduler(SchedulerIOMixin):
                     if finished:
                         break
 
+                if getattr(batch, "ngram_verify", False) and emitted < batch.generated_tokens:
+                    allocated = req.cached_len
+                    self.engine.ngram_target.trim(batch, emitted)
+                    self.cache_manager.rollback_paged_tail(req, req.cached_len, allocated)
+
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
                     trace = getattr(self, "continuation_trace", None)
@@ -843,6 +893,8 @@ class Scheduler(SchedulerIOMixin):
                     # None'd GDN ping-pong slots).
                     self.cache_manager.cache_req(req, finished=False)
 
+        if getattr(batch, "ngram_verify", False):
+            self.engine.ngram_target.release(batch)
         self.finished_reqs = new_finished_reqs
         # Stamp each reply with the post-batch KV page occupancy so the frontend (shell
         # status bar) can show live KV usage without a separate query.
@@ -1635,6 +1687,22 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        if (getattr(self.config, "speculative_ngram", "off") == "on"
+                and batch.is_decode and len(batch.reqs) == 1
+                and getattr(self, "_last_data", None) is None
+                and not getattr(batch, "lazy_restore_pending", False)):
+            from freetoken.verification.ngram import WIDTH, proposal_for_request
+            from freetoken.spec_decode import reserve_mtp_window
+            req = batch.reqs[0]
+            drafts = proposal_for_request(req)
+            if drafts is not None:
+                batch.ngram_drafts = drafts
+                batch.ngram_verify = True
+                cuts = set() if req.sampling_params.ignore_eos else set(self.eos_token_ids)
+                if self.toolcall_anchor_id is not None and req.toolcall_anchor_len is None:
+                    cuts.add(self.toolcall_anchor_id)
+                batch.ngram_interrupt_ids = tuple(cuts)
+                reserve_mtp_window(batch, WIDTH)
         # Native MTP verifies one greedy request at a time. Reserve seed plus one draft
         # in the paged cache, but keep the batch classified as decode so the target MoE
         # remains on its decode-routed expert path.
@@ -1708,15 +1776,19 @@ class Scheduler(SchedulerIOMixin):
                     ).to(self.device, non_blocking=True)
                 else:
                     batch.linear_table_idx = input_mapping[0].to(torch.int32)
+                    if getattr(batch, "ngram_verify", False):
+                        batch.linear_table_idx = batch.linear_table_idx[:1]
             # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
             # built once here instead of rebuilt in each of the 30 GDN layers. For decode
             # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
-            batch.fla_metadata = build_fla_metadata(batch, self.device)
+            if not getattr(batch, "ngram_verify", False):
+                batch.fla_metadata = build_fla_metadata(batch, self.device)
         if batch.is_decode:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
-        self.engine.attn_backend.prepare_metadata(batch)
+        if not getattr(batch, "ngram_verify", False):
+            self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
@@ -1843,6 +1915,8 @@ class Scheduler(SchedulerIOMixin):
     def _restore_failed_request_lengths(self, forward_input: ForwardInput) -> None:
         """Restore schedule-time logical lengths if OOM happened after engine bookkeeping."""
         batch = forward_input.batch
+        if getattr(batch, "ngram_verify", False):
+            self.engine.ngram_target.cancel(batch)
         if batch.is_decode and getattr(batch, "mtp_verify", False):
             req = batch.reqs[0]
             req.cached_len = int(batch.mtp_original_cached_len)

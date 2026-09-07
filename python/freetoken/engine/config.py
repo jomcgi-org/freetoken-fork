@@ -190,6 +190,9 @@ class EngineConfig:
     # on/off choice instead of a boolean so the CLI and serialized daemon config
     # have one stable spelling.
     speculative_mtp: str = "off"
+    # Causal ngram drafts, verified by the same target with exact prefix rollback.
+    speculative_ngram: str = "off"
+    ngram_debug: bool = False
     # Patch 11-lite intentionally supports one draft only. Keep the explicit
     # knob so attempts to reuse older K>1 launch commands fail loudly.
     mtp_draft_tokens: int = 1
@@ -258,6 +261,13 @@ class EngineConfig:
 
         validate_speculative_mtp(self.speculative_mtp)
         validate_mtp_draft_tokens(self.mtp_draft_tokens)
+        if self.speculative_ngram not in ("off", "on"):
+            raise ValueError("--speculative-ngram must be 'off' or 'on'")
+        if self.speculative_ngram == "on":
+            if self.speculative_mtp != "off" or self.tp_info.size != 1 or self.max_running_req != 1:
+                raise ValueError("--speculative-ngram on requires MTP off, TP size one and one running request")
+        elif self.ngram_debug:
+            raise ValueError("--ngram-debug requires --speculative-ngram on")
         if self.kv_cache_dtype not in ("auto", "bf16", "fp8_e4m3"):
             raise ValueError(
                 "--kv-cache-dtype must be 'auto', 'bf16', or 'fp8_e4m3', got "

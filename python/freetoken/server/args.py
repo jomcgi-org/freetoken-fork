@@ -423,6 +423,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--speculative-ngram", choices=["off", "on"],
+        default=ServerArgs.speculative_ngram,
+        help="Verify causal ngram drafts with Qwen Flash. Requires one running request; unsupported requests use ordinary decode.",
+    )
+    parser.add_argument(
+        "--ngram-debug", action="store_true", default=ServerArgs.ngram_debug,
+        help="Log per-window ngram acceptance. Keep off for serving wall-time measurements.",
+    )
+
+    parser.add_argument(
         "--mtp-draft-tokens",
         type=int,
         default=ServerArgs.mtp_draft_tokens,

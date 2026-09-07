@@ -107,6 +107,8 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
             else _naive_swa_num_tokens(config)
         )
     num_speculative_tokens = 0
+    if getattr(config, "speculative_ngram", "off") == "on":
+        num_speculative_tokens = 4
     if getattr(config, "speculative_mtp", "off") == "on":
         from freetoken.spec_decode import MTP_DRAFT_STEPS
 
