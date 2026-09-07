@@ -96,6 +96,7 @@ def rig(*, phase="decode", matching=True, cls=None):
             req.device_len = batch.mtp_original_device_len + 2
             batch.generated_tokens = 2
             output = torch.tensor([31, 32], dtype=torch.int32)
+            cm.rollback_paged_tail(req, req.cached_len, batch.mtp_allocated_end)
         else:
             calls.append("ordinary")
             req.complete_one()
@@ -118,11 +119,14 @@ def test_candidate_drains_before_reservation_and_releases_before_next_launch(pha
     assert f.calls.index(("append", [32])) < f.calls.index("release")
     assert [m.next_token for m in f.sent] == [42, 31, 32]
     assert f.target.owner is None and f.sched._last_data is None
+    f.req._ngram_retry_at = f.req.device_len + 16
     ongoing = f.sched.overlap_loop(None)
     assert ongoing is not None
-    assert f.calls.index("release") < len(f.calls) - 1
+    assert f.calls.index("release") < f.calls.index("ordinary")
     f.sched._process_last_data(ongoing)
     assert [m.next_token for m in f.sent] == [42, 31, 32, 80]
+    f.dm.remove_req(f.req)
+    f.sched._free_req_resources(f.req)
     f.cm.check_integrity()
 
 
@@ -143,6 +147,8 @@ def test_ordinary_fallback_still_launches_before_prior_host_drain(reason):
     if reason in ("backoff", "sampling", "grammar", "lazy", "budget", "off"):
         assert f.calls.index("ordinary") < f.calls.index("pending_ready")
     f.sched._process_last_data(ongoing)
+    f.dm.remove_req(f.req)
+    f.sched._free_req_resources(f.req)
     f.cm.check_integrity()
 
 
@@ -168,6 +174,8 @@ def test_new_tool_anchor_is_rechecked_after_pending_host_drain():
     assert "verify" not in f.calls and ongoing is not None
     assert f.calls.index(("append", [42])) < f.calls.index("ordinary")
     f.sched._process_last_data(ongoing)
+    f.dm.remove_req(f.req)
+    f.sched._free_req_resources(f.req)
     f.cm.check_integrity()
 
 
