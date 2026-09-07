@@ -3,8 +3,9 @@
 `--speculative-ngram on` enables an experimental serving path for one greedy
 Qwen Flash request. It requires TP size one, native MTP off, NVFP4 CPU MoE,
 staged PLE, a page size of at least eight, and ordinary CUDA graph size one.
-The default is off. Initial serving correctness checks pass; non-debug wall-time
-and task-completion qualification remain pending. This makes no new wall-time claim.
+The default is off. Initial serving correctness checks pass, but the first
+non-debug comparison regressed wall time on both repetition and multi-turn JSON
+continuation workloads. This path is not selected for normal serving.
 
 The proposer finds the most recent complete occurrence of the current eight-token
 suffix within the last 8192 known tokens. It copies the four following known
@@ -44,7 +45,7 @@ the serving result by themselves.
 Runtime cache resizing currently rejects while the target graph is present;
 restart with the desired geometry. Keep automatic KV growth disabled during the
 initial serving experiments. Wider serving concurrency, runtime cache resizing,
-actual task completion and non-debug wall measurements remain required before
+actual task completion and improved non-debug wall measurements remain required before
 selecting this path for normal use. Detailed measured records stay private.
 
 Validation: 328 focused Linux checks passed, with the three exclusive CUDA checks
@@ -53,3 +54,10 @@ content, reasoning output, finish reason and completion-token count. They exerci
 repeated text, seven stop strings, three output budgets and a follow-up turn, with
 real speculative windows and host stop rollback observed under the debug flag.
 These fixtures establish the tested behavior, not broad quality equivalence.
+
+The non-debug comparison used the same runtime source, native extensions, cache
+geometry and request bodies with the ngram flag off and on. Each mode completed
+three repetition requests and three three-turn conversations; the first repetition
+and conversation were warm-ups. All complete answers and token counts matched.
+The first comparison ran off before on. Scheduling overhead and discarded draft
+work still need investigation; component gains did not translate into serving gains.
