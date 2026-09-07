@@ -140,6 +140,8 @@ class NgramTarget:
         if self.owner is not batch or not 1 <= emitted <= batch.generated_tokens:
             raise RuntimeError("ngram trim has no matching owned prefix")
         if emitted < batch.generated_tokens:
+            if getattr(self, "debug_logger", None) is not None:
+                self.debug_logger.info_rank0(f"Ngram host stop trim: accepted={batch.generated_tokens}, emitted={emitted}")
             self.checkpoint.restore(emitted)
             req = batch.reqs[0]
             req.cached_len = batch.mtp_original_cached_len + emitted
