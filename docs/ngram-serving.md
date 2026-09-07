@@ -70,8 +70,12 @@ path for normal use. Detailed measured records stay private.
 
 The separate `--moe-cpu-nvfp4-pair on` startup option enables the experimental
 paired CPU kernel for grouped target rows. It defaults off and does not change
-single-token tasks. The serving and wall records below precede this option;
-paired-mode qualification remains pending.
+single-token tasks. Its startup integration passed 402 focused Linux checks,
+the three exclusive CUDA checks and twelve real serving fixtures with exact
+answers and completion-token counts. The enabled startup setting, speculative
+windows and host stop rollback were independently verified, followed by a
+verified original-serving completion. The wall records below used pairing off;
+separate non-debug paired-mode wall qualification remains pending.
 
 Validation after the known-prefix precheck: 44 focused Mac checks and 374 focused
 Linux checks passed, with the three exclusive CUDA checks passing separately.

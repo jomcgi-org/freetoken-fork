@@ -63,6 +63,11 @@ was restored and verified after each model experiment.
 Model component timings remain sensitive to execution order and the ordinary
 decode controls vary. These checks establish correctness for the tested windows,
 not a stable serving gain. Separate non-debug wall qualification remains pending,
-and the explicit pair setting remains disabled by default. The startup option
-requires renewed serving and non-debug wall qualification. Detailed timing
-payloads stay private.
+and the explicit pair setting remains disabled by default. The startup integration
+subsequently passed 402 focused Linux checks, all three exclusive CUDA checks and
+twelve real serving fixtures exactly in content, reasoning output, finish reason
+and completion-token count. The native setting was enabled before graph capture;
+speculative windows and host stop rollback were exercised. Independent checks
+verified the saved answers, effective startup setting and original-serving
+recovery with a completion. This is correctness qualification; separate non-debug
+paired-mode wall qualification remains pending. Detailed timing payloads stay private.
