@@ -197,20 +197,20 @@ class FusedGraph:
             self.state_checkpoint.state_bindings.validate_request(batch.reqs[0])
         copies = []
         for name in ("input_ids", "positions", "out_loc", "linear_table_idx", "active_table_idx"):
-            copies.append((getattr(self.batch, name), getattr(batch, name)))
+            copies.append((name, getattr(self.batch, name), getattr(batch, name)))
         if len(batch.mtp_qsa_metadata) != self.width:
             raise RuntimeError("verification graph requires metadata for every target row")
         # Restage the address/length inputs as a serving graph would. The scatter
         # plans are captured operations derived from these persistent inputs.
         for destination, source in zip(self.batch.mtp_qsa_metadata, batch.mtp_qsa_metadata):
             for name in ("block_table", "seq_lens", "ring_slots", "token_to_req", "cu_seqlens"):
-                copies.append((getattr(destination, name), getattr(source, name)))
+                copies.append((name, getattr(destination, name), getattr(source, name)))
         # Reject incompatible inputs before partially updating any captured buffer.
-        for destination, source in copies:
+        for name, destination, source in copies:
             if (source is None or destination is None or source.shape != destination.shape
                     or source.dtype != destination.dtype or source.device != destination.device):
-                raise RuntimeError("verification graph input geometry changed")
-        for destination, source in copies:
+                raise RuntimeError("verification graph input geometry changed: " + name)
+        for _, destination, source in copies:
             destination.copy_(source)
         if self.state_checkpoint is not None:
             self.linear_state_index.copy_(self.batch.linear_table_idx)
@@ -301,4 +301,3 @@ def install_wide(width):
     Qwen4ExpGatedDeltaNet.forward = gdn
     QSASparseAttnBackend.prepare_metadata = metadata
     QSASparseAttnBackend._qsa_forward_mtp_k1 = sparse
-

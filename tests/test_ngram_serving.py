@@ -141,3 +141,55 @@ def test_failed_forward_releases_ownership(target):
     with pytest.raises(RuntimeError, match="execution failure"):
         target.target.forward(target.batch)
     assert target.target.owner is None
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_startup_capture_matches_scheduler_index_types_and_restores_padding(monkeypatch, failure):
+    monkeypatch.setitem(sys.modules, "freetoken.attention.linear",
+                        SimpleNamespace(build_fla_metadata=lambda batch, device: None))
+    pool = SimpleNamespace(conv_states=torch.ones(1, 2, 2), recurrent_states=torch.ones(1, 2, 3),
+                            slot_states={"ple_conv": torch.ones(1, 2, 2),
+                                         "ple_ngram_ctx": torch.ones(1, 2, 8, dtype=torch.int64)},
+                            _state_layer_index={"ple_conv": {2: 0}})
+    kv = SimpleNamespace(index_ratio=4, cmp_scratch_base=6,
+                         _kv_buffer=torch.ones(1, 2, 3, 8, 1, 2),
+                         _cmp_k_buffer=torch.ones(1, 8, 2),
+                         _pending_ring=torch.ones(2, 1, 8, 2))
+    engine = SimpleNamespace(device="cpu", config=SimpleNamespace(page_size=8, ngram_debug=False),
+                             num_pages=2, page_table=torch.zeros(2, 16, dtype=torch.int32),
+                             linear_state_pool=pool, kv_cache=kv,
+                             model=SimpleNamespace(_ple_disk_decode=[object()]),
+                             cpu_moe_executor=SimpleNamespace(quant_format="nvfp4"),
+                             graph_runner=SimpleNamespace(graph_map={1: object()}),
+                             stream=SimpleNamespace(synchronize=lambda: None),
+                             attn_backend=SimpleNamespace(_idx_slot={7: 0}, prepare_metadata=lambda batch: None),
+                             dummy_req=SimpleNamespace(table_idx=1, linear_slot_idx=0))
+    buffers = [engine.page_table, kv._kv_buffer, kv._cmp_k_buffer, kv._pending_ring,
+               pool.conv_states, pool.recurrent_states, *pool.slot_states.values()]
+    before = [value.clone() for value in buffers]
+
+    def capture(engine, batch, *, state_checkpoint):
+        assert batch.active_table_idx.dtype == torch.int64
+        assert batch.active_table_idx.tolist() == [1] * 5
+        assert batch.linear_table_idx.dtype == torch.int32
+        assert batch.out_loc.tolist() == [16, 17, 18, 19, 20]
+        assert batch.positions.tolist() == list(range(5))
+        # Simulate exactly the storage a dummy target is allowed to mutate.
+        engine.page_table[1, :8].fill_(99)
+        kv._kv_buffer[:, :, 2].fill_(99)
+        kv._cmp_k_buffer[:, 4:6].fill_(99)
+        kv._cmp_k_buffer[:, 7].fill_(99)
+        for value in runtime.state_views(engine, batch.reqs[0]).values():
+            value.fill_(99)
+        if failure:
+            raise RuntimeError("capture failure")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(runtime.adapters, "FusedGraph", capture)
+    target = NgramTarget(engine)
+    if failure:
+        with pytest.raises(RuntimeError, match="capture failure"):
+            target.initialize()
+    else:
+        target.initialize()
+    assert all(torch.equal(value, prior) for value, prior in zip(buffers, before))

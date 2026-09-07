@@ -60,7 +60,8 @@ class NgramTarget:
         batch = Batch(reqs=[req], phase="decode")
         batch.padded_reqs = [req]
         batch.linear_table_idx = torch.tensor([req.linear_slot_idx], device=engine.device, dtype=torch.int32)
-        batch.active_table_idx = torch.full((WIDTH,), req.table_idx, device=engine.device, dtype=torch.int32)
+        # Scheduler._make_input_tuple supplies int64 request rows.
+        batch.active_table_idx = torch.full((WIDTH,), req.table_idx, device=engine.device, dtype=torch.int64)
         batch.mtp_original_cached_len, batch.mtp_original_device_len = 0, 1
         kv = engine.kv_cache
         page_size, page = engine.config.page_size, engine.num_pages
