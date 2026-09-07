@@ -3,8 +3,8 @@
 `--speculative-ngram on` enables an experimental serving path for one greedy
 Qwen Flash request. It requires TP size one, native MTP off, NVFP4 CPU MoE,
 staged PLE, a page size of at least eight, and ordinary CUDA graph size one.
-The default is off. This is awaiting full serving qualification and makes no
-new wall-time claim.
+The default is off. Initial serving correctness checks pass; non-debug wall-time
+and task-completion qualification remain pending. This makes no new wall-time claim.
 
 The proposer finds the most recent complete occurrence of the current eight-token
 suffix within the last 8192 known tokens. It copies the four following known
@@ -30,6 +30,11 @@ has been captured. If a stop string ends inside an accepted chunk, host output
 processing restores the corresponding prefix before caching or freeing the
 request and returns any unused pages.
 
+Detokenization commits each request's token offsets before processing its next
+token, including when several accepted tokens arrive together. Distinct requests
+remain batched. This preserves serial text assembly, Unicode fragments, EOS and
+stop-string holdback.
+
 `--ngram-debug` logs per-window acceptance only when explicitly enabled. It adds
 no activation copies or timing events. Wall-time qualification must run without
 this flag and without the invasive diagnostic probes. Startup capture and serial
@@ -41,3 +46,10 @@ restart with the desired geometry. Keep automatic KV growth disabled during the
 initial serving experiments. Wider serving concurrency, runtime cache resizing,
 actual task completion and non-debug wall measurements remain required before
 selecting this path for normal use. Detailed measured records stay private.
+
+Validation: 328 focused Linux checks passed, with the three exclusive CUDA checks
+passing separately. Twelve serving fixtures matched ordinary decoding exactly in
+content, reasoning output, finish reason and completion-token count. They exercise
+repeated text, seven stop strings, three output budgets and a follow-up turn, with
+real speculative windows and host stop rollback observed under the debug flag.
+These fixtures establish the tested behavior, not broad quality equivalence.
