@@ -66,7 +66,22 @@ The non-debug comparison used the same runtime source, native extensions, cache
 geometry and request bodies with the ngram flag off and on. Each mode completed
 three repetition requests and three three-turn conversations; the first repetition
 and conversation were warm-ups. All complete answers and token counts matched.
-The first comparison ran off before on. Scheduling overhead and discarded draft
-work still need investigation; component gains did not translate into serving gains.
-The backoff and routed-token accounting changes passed the renewed model checks.
-Their non-debug wall qualification remains pending before any performance claim.
+The first comparison ran off before on and regressed on both workloads. After
+the backoff and routed-token accounting changes passed renewed model checks,
+the non-debug comparison was repeated in both execution orders on unchanged
+source. All request bodies, complete answers and token counts matched across
+both runs, and every conversation passed its independent checks.
+
+Both orders now favor ngram verification on repetition, but still favor ordinary
+decode on the multi-turn workload. The larger remaining difference is on initial
+turns. Blanket serial scheduling also affects ordinary fallback work, making
+selective overlap a follow-up to investigate before changing arithmetic. Any
+overlapped path must drain prior output before speculation, resolve terminal
+requests before reserving pages, and finish speculative host output before
+launching another batch. These are requirements for future work, not current
+behavior or a demonstrated cause of the timing difference.
+
+Original serving recovered with a verified completion after both runs. The
+counterbalanced comparison does not qualify a general serving improvement;
+this mode remains off by default and unselected. Actual agent task completion
+and a separate non-debug wall improvement remain required.
