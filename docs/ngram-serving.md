@@ -57,8 +57,8 @@ the serving result by themselves.
 Runtime cache resizing currently rejects while the target graph is present;
 restart with the desired geometry. Keep automatic KV growth disabled during the
 initial serving experiments. Wider serving concurrency, runtime cache resizing,
-actual task completion and improved non-debug wall measurements remain required before
-selecting this path for normal use. Detailed measured records stay private.
+and stronger non-debug wall evidence remain required before selecting this path
+for normal use. Detailed measured records stay private.
 
 Validation: 364 focused Linux checks passed, with the three exclusive CUDA checks
 passing separately. Twelve serving fixtures matched ordinary decoding exactly in
@@ -93,14 +93,23 @@ the cause of the difference or qualify the new scheduler.
 
 Original serving recovered with a verified completion after both runs. The
 counterbalanced comparison does not qualify a general serving improvement;
-this mode remains off by default and unselected. Actual agent task completion
-and a separate non-debug wall improvement remain required.
+this mode remains off by default and unselected.
 
-Code editing is a useful next workload because full-file writes can preserve
-long stretches of previously read source. Existing successful leaderboard edits
+Code editing is a useful workload because full-file writes can preserve
+long stretches of previously read source. Earlier successful leaderboard edits
 contain substantial unchanged text, but final-file overlap is not a measured
 draft acceptance rate. The prior task reports do not retain request transcripts
 or original generated token IDs. Reasoning, tool serialization, intervening
-context and the bounded lookup window can reduce usable matches. Evaluate the
-unchanged task prompts, tools and graders with debug telemetry separately from
-normal wall time before attributing a programming throughput gain to speculation.
+context and the bounded lookup window can reduce usable matches. Any diagnostic follow-up must keep debug telemetry separate from normal wall
+time. Final-file reuse alone does not establish a programming throughput gain.
+
+A separate coding comparison ran the same two frozen leaderboard tasks in both
+execution orders, with the original prompts, tools, budgets and graders. All
+eight attempts passed the grader and permitted-file checks, with no failed model
+calls. Speculation completed the chosen tasks sooner in both orders. It also
+produced substantially fewer tokens, with fewer model calls overall and different
+final edits. The reduced task wall time therefore does not isolate a general
+engine throughput improvement. The smaller matched-work repetition gain remains
+a separate result. This small task sample does not establish broad quality
+equivalence. Debug telemetry was off, and original serving recovered with a
+verified completion. Detailed records and independent audit scripts remain private.
