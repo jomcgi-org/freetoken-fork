@@ -60,15 +60,16 @@ initial serving experiments. Wider serving concurrency, runtime cache resizing,
 actual task completion and improved non-debug wall measurements remain required before
 selecting this path for normal use. Detailed measured records stay private.
 
-The current selective-overlap scheduler awaits Linux and full-model qualification.
-The following model and wall results apply to the preceding serial scheduler.
-
-Validation: 342 focused Linux checks passed, with the three exclusive CUDA checks
+Validation: 364 focused Linux checks passed, with the three exclusive CUDA checks
 passing separately. Twelve serving fixtures matched ordinary decoding exactly in
 content, reasoning output, finish reason and completion-token count. They exercise
 repeated text, seven stop strings, three output budgets and a follow-up turn, with
 real speculative windows and host stop rollback observed under the debug flag.
 These fixtures establish the tested behavior, not broad quality equivalence.
+The selective-overlap scheduler passed this renewed model qualification and
+original serving recovered with a verified completion. Its separate non-debug
+wall comparison remains pending. The wall results below apply to the preceding
+serial scheduler.
 
 The non-debug comparison used the same runtime source, native extensions, cache
 geometry and request bodies with the ngram flag off and on. Each mode completed
