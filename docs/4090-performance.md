@@ -26,7 +26,12 @@ checkpoint. The default endpoint is `http://127.0.0.1:8090`.
 This is the measured capacity-one configuration: 14 CPU threads, a 6 GiB HOT
 budget, 65536 reserved KV tokens, one-row CUDA graphs and FP8 KV. It keeps
 ordinary in-memory prefix caching and prefill state carry. Disk prefix
-persistence and automatic KV growth are disabled. Different RAM budgets, CPU
+persistence is on by default with a 500 GiB LRU budget under
+`FREETOKEN_PREFIX_CACHE_DIR` (`FREETOKEN_PREFIX_CACHE_GIB=0` disables it, and
+the directory belongs on local NVMe). Automatic KV growth is disabled. The
+cache key covers the checkpoint fingerprint and runtime geometry (dtype, KV
+dtype, page size, TP shape), not the serving knobs, so a warmed prefix survives
+budget and thread tuning. Different RAM budgets, CPU
 thread counts, context capacities and concurrency require separate measurement.
 The launch profile makes the selected settings explicit without changing
 generic defaults for other models and hardware.
