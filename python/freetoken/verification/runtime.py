@@ -3,7 +3,7 @@
 import copy
 
 from . import adapters, checkpoint
-from .ngram import WIDTH
+from .ngram import WIDTH, note_verification
 
 
 _INSTALLED = False
@@ -129,6 +129,9 @@ class NgramTarget:
             req.device_len = batch.mtp_original_device_len + count
             batch.generated_tokens = count
             batch.mtp_fused = False
+            # Score the draft before EOS/tool cuts; a terminal token is not a
+            # failed prediction. The next probe belongs to this request only.
+            note_verification(req, matched)
             if self.debug_logger is not None:
                 self.debug_logger.info_rank0(f"Ngram verify: drafted={WIDTH - 1}, matched={matched}, emitted={count}")
             return accepted

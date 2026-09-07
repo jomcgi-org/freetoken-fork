@@ -8,6 +8,19 @@ MATCH = 8
 LOOKBACK = 8192
 
 
+def note_verification(req, matched):
+    """Pause weak drafts without changing the target's output distribution."""
+    if not 0 <= matched < WIDTH:
+        raise ValueError("invalid ngram acceptance length")
+    if matched < 2:
+        weak = min(getattr(req, "_ngram_weak_windows", 0) + 1, 5)
+        req._ngram_weak_windows = weak
+        req._ngram_retry_at = req.device_len + (16 << (weak - 1))
+    else:
+        req._ngram_weak_windows = 0
+        req._ngram_retry_at = 0
+
+
 def propose(tokens, *, match=MATCH, drafts=WIDTH - 1, lookback=LOOKBACK):
     """Copy a prior continuation of the current suffix from known tokens only.
 
@@ -37,7 +50,8 @@ def propose(tokens, *, match=MATCH, drafts=WIDTH - 1, lookback=LOOKBACK):
 
 
 def proposal_for_request(req):
-    if (req.remain_len < WIDTH or req.cached_len + 1 != req.device_len
+    if (req.device_len < getattr(req, "_ngram_retry_at", 0)
+            or req.remain_len < WIDTH or req.cached_len + 1 != req.device_len
             or req.input_ids.numel() != req.device_len
             or not req.sampling_params.is_greedy
             or req.sampling_params.guided_decoding is not None

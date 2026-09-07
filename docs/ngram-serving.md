@@ -15,6 +15,13 @@ predictions determine the accepted prefix and bonus token. Every rejected suffix
 is discarded, and mutable state is restored to the retained prefix. Expert
 selection and model precision are unchanged.
 
+When fewer than two draft tokens match, the request waits 16 ordinary decoded
+tokens before probing again. Consecutive weak proposals double that delay up to
+256 tokens; a productive proposal resets it. The pause is local to the request,
+and fallback still uses ordinary target decoding. EOS and tool cuts do not score
+an otherwise matching proposal as weak. HOT adaptation counts every evaluated
+target row, including candidates that verification later rejects.
+
 The previously qualified graph, address bindings and checkpoints now live in
 `freetoken.verification`; the diagnostic entry points import the same code.
 Serving captures the target graph against allocated padding storage at startup,
@@ -48,7 +55,7 @@ initial serving experiments. Wider serving concurrency, runtime cache resizing,
 actual task completion and improved non-debug wall measurements remain required before
 selecting this path for normal use. Detailed measured records stay private.
 
-Validation: 328 focused Linux checks passed, with the three exclusive CUDA checks
+Initial implementation validation: 328 focused Linux checks passed, with the three exclusive CUDA checks
 passing separately. Twelve serving fixtures matched ordinary decoding exactly in
 content, reasoning output, finish reason and completion-token count. They exercise
 repeated text, seven stop strings, three output budgets and a follow-up turn, with
@@ -61,3 +68,5 @@ three repetition requests and three three-turn conversations; the first repetiti
 and conversation were warm-ups. All complete answers and token counts matched.
 The first comparison ran off before on. Scheduling overhead and discarded draft
 work still need investigation; component gains did not translate into serving gains.
+The subsequent backoff and routed-token accounting changes require renewed model
+and non-debug wall qualification before making any performance claim.

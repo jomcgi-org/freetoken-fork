@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from freetoken.verification.ngram import propose, proposal_for_request
+from freetoken.verification.ngram import propose, proposal_for_request, note_verification
 from freetoken.verification.runtime import NgramTarget
 from freetoken.verification import runtime
 
@@ -47,6 +47,49 @@ def req_fixture():
     return SimpleNamespace(input_ids=torch.tensor(history), cached_len=len(history) - 1,
                            device_len=len(history), remain_len=20, toolcall_anchor_len=None,
                            sampling_params=SimpleNamespace(is_greedy=True, guided_decoding=None))
+
+
+def test_weak_proposal_pauses_until_exact_retry_position_without_mutating_history():
+    req = req_fixture()
+    history = req.input_ids.clone()
+    note_verification(req, 0)
+    assert torch.equal(req.input_ids, history)
+    assert req._ngram_retry_at == 36
+    for length in (20, 35, 36):
+        req.input_ids = torch.cat((torch.full((length - 20,), 99), history))
+        req.cached_len, req.device_len = length - 1, length
+        actual = proposal_for_request(req)
+        assert actual == ([31, 32, 33, 34] if length == 36 else None)
+
+
+def test_repeated_weak_proposals_back_off_with_a_bounded_delay():
+    req = req_fixture()
+    for delay in (16, 32, 64, 128, 256, 256, 256):
+        note_verification(req, 1)
+        assert req._ngram_retry_at - req.device_len == delay
+        req.device_len = req._ngram_retry_at + 2
+
+
+@pytest.mark.parametrize("matched", [2, 3, 4])
+def test_productive_proposal_resets_only_its_requests_backoff(matched):
+    first, second = req_fixture(), req_fixture()
+    note_verification(first, 0)
+    assert proposal_for_request(first) is None
+    assert proposal_for_request(second) == [31, 32, 33, 34]
+    note_verification(first, matched)
+    assert first._ngram_weak_windows == 0
+    assert proposal_for_request(first) == [31, 32, 33, 34]
+    note_verification(first, 0)
+    assert first._ngram_retry_at - first.device_len == 16
+
+
+@pytest.mark.parametrize("matched", [-1, 5])
+def test_invalid_acceptance_does_not_change_request_backoff(matched):
+    req = req_fixture()
+    before = dict(vars(req))
+    with pytest.raises(ValueError, match="acceptance"):
+        note_verification(req, matched)
+    assert vars(req) == before
 
 
 @pytest.mark.parametrize("reason", ["budget", "host_lag", "extend", "sampling", "grammar",
@@ -104,6 +147,7 @@ def test_every_target_acceptance_commits_exact_prefix_and_holds_ownership(target
     assert output.tolist() == tokens[:matched + 1]
     assert t.batch.reqs[0].cached_len == 11 + matched
     assert t.batch.reqs[0].device_len == 12 + matched
+    assert t.batch.reqs[0]._ngram_retry_at == (28 + matched if matched < 2 else 0)
     assert t.restored == ([matched + 1] if matched < 4 else [])
     assert t.target.owner is t.batch
     with pytest.raises(RuntimeError, match="owned"):
@@ -121,6 +165,7 @@ def test_eos_or_tool_opener_limits_the_committed_window(target, position):
     assert output.tolist() == list(range(11, 12 + position))
     assert target.batch.generated_tokens == position + 1
     assert target.batch.reqs[0].cached_len == 11 + position
+    assert target.batch.reqs[0]._ngram_retry_at == 0
 
 
 def test_host_stop_trims_full_acceptance_before_release(target):
