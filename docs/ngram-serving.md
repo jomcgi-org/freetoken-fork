@@ -55,7 +55,7 @@ initial serving experiments. Wider serving concurrency, runtime cache resizing,
 actual task completion and improved non-debug wall measurements remain required before
 selecting this path for normal use. Detailed measured records stay private.
 
-Initial implementation validation: 328 focused Linux checks passed, with the three exclusive CUDA checks
+Validation: 342 focused Linux checks passed, with the three exclusive CUDA checks
 passing separately. Twelve serving fixtures matched ordinary decoding exactly in
 content, reasoning output, finish reason and completion-token count. They exercise
 repeated text, seven stop strings, three output budgets and a follow-up turn, with
@@ -68,5 +68,5 @@ three repetition requests and three three-turn conversations; the first repetiti
 and conversation were warm-ups. All complete answers and token counts matched.
 The first comparison ran off before on. Scheduling overhead and discarded draft
 work still need investigation; component gains did not translate into serving gains.
-The subsequent backoff and routed-token accounting changes require renewed model
-and non-debug wall qualification before making any performance claim.
+The backoff and routed-token accounting changes passed the renewed model checks.
+Their non-debug wall qualification remains pending before any performance claim.
