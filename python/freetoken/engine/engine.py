@@ -708,6 +708,8 @@ class Engine:
         # Otherwise load_expert_banks gives the model module a setup hook first, then
         # falls back to per-quant providers, and the engine wires the banks into cache.
         cache_factory = getattr(self.model, "make_offload_moe_cache", None)
+        if cache_factory is not None and config.moe_disk_prefill == "staged":
+            raise NotImplementedError("staged DISK prefill requires the standard expert cache")
         if cache_factory is not None and config.moe_cache_auto:
             raise ValueError(
                 "--moe-cache-auto is not supported for models with a custom "
@@ -985,6 +987,10 @@ class Engine:
                 prefill_overlap=config.moe_prefill_overlap,
                 prefill_hit_d2d=config.moe_prefill_hit_d2d,
                 moe_disk_prefill=config.moe_disk_prefill,
+                moe_disk_prefill_min_tokens=getattr(config, "moe_disk_prefill_min_tokens", 1024),
+                moe_disk_prefill_io=getattr(config, "moe_disk_prefill_io", "buffered"),
+                moe_hot_staging_io=getattr(config, "moe_hot_staging_io", "mmap"),
+                moe_hot_host_cache=getattr(config, "moe_hot_host_cache", "retain"),
                 moe_prefill_coalesce=getattr(
                     config, "moe_prefill_coalesce", "populate"
                 ),
@@ -1243,7 +1249,7 @@ class Engine:
             moe_cpu_willneed_fault_ceiling=config.moe_cpu_willneed_fault_ceiling,
             prefill_coalesce=(
                 getattr(config, "moe_prefill_coalesce", "populate")
-                if config.moe_disk_prefill == "cpu"
+                if config.moe_disk_prefill in ("cpu", "staged")
                 else "off"
             ),
             prefill_coalesce_budget_bytes=int(
@@ -1253,7 +1259,7 @@ class Engine:
             max_prefill_tokens=getattr(config, "max_extend_tokens", 2048),
         )
         if (
-            config.moe_disk_prefill == "cpu"
+            config.moe_disk_prefill in ("cpu", "staged")
             and "disk" in getattr(cache, "layer_residency", ())
             and not hasattr(executor._ext, "run_task_sync")
         ):
@@ -1262,6 +1268,8 @@ class Engine:
                 "`python setup.py build_ext --inplace` or reinstall the wheel"
             )
         cache.set_cpu_executor(executor)
+        if config.moe_disk_prefill == "staged":
+            cache.init_disk_prefill_staging()
         cache.init_disk_gpufetch(
             executor,
             max_tokens=max_tokens,
@@ -1784,6 +1792,11 @@ class Engine:
     def shutdown(self) -> None:
         if self.moe_offload_cache is not None:
             self.moe_offload_cache.shutdown_hot_adaptation()
+            synchronize_staging = getattr(
+                self.moe_offload_cache, "synchronize_disk_prefill_staging", None
+            )
+            if synchronize_staging is not None:
+                synchronize_staging()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
@@ -2791,6 +2804,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_halflife_steps": 2000,
     "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
+    "moe_hot_staging_io": "mmap",
+    "moe_hot_host_cache": "retain",
     "moe_hot_adapt_boundary_cap_frac": 0.5,
     "moe_hot_adapt_prefill_weight": 1.0,
     "moe_hot_adapt_histories": "shared",
@@ -2805,6 +2820,8 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_idle_ms": 500,
     "moe_hot_adapt_idle_min_interval_ms": 2000,
     "moe_disk_prefill": "cpu",
+    "moe_disk_prefill_min_tokens": 1024,
+    "moe_disk_prefill_io": "buffered",
     "moe_prefill_coalesce": "populate",
     "moe_prefill_hot_split": "on",
     "moe_prefill_split_kernel": "grouped",
@@ -2885,7 +2902,7 @@ def _gate_ple_settings(config, model_config, override) -> bool:
 def _validate_disk_prefill_task_size(config, cache) -> None:
     """Reject scheduler chunks that cannot fit the native task token field."""
     if (
-        config.moe_disk_prefill != "cpu"
+        config.moe_disk_prefill not in ("cpu", "staged")
         or "disk" not in getattr(cache, "layer_residency", ())
     ):
         return

@@ -1551,7 +1551,8 @@ def test_new_request_abandons_idle_tick_at_next_row_boundary(monkeypatch):
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs CUDA")
-def test_cuda_idle_tick_publishes_without_advancing_token_clock(monkeypatch):
+@pytest.mark.parametrize("hot_capacity", [1, 2])
+def test_cuda_idle_tick_publishes_without_advancing_token_clock(monkeypatch, hot_capacity):
     import torch
 
     from freetoken.moe.host_banks import HostResidency
@@ -1578,7 +1579,7 @@ def test_cuda_idle_tick_publishes_without_advancing_token_clock(monkeypatch):
         sources,
         layer_residency=[HostResidency.DISK.value],
         hot_expert_ids={0: ()},
-        hot_expert_capacity={0: 1},
+        hot_expert_capacity={0: hot_capacity},
     )
     cache.configure_hot_adaptation(
         half_life_steps=2,
@@ -1590,14 +1591,33 @@ def test_cuda_idle_tick_publishes_without_advancing_token_clock(monkeypatch):
     )
     try:
         assert cache._hot_adapt_idle_tracker is not None
+        assert not cache.collect_stats
+        cache.decayed_decode_freq[0, 2] = 5.0
         cache.decayed_decode_freq[0, 3] = 10.0
+        install = cache._install_staged_hot_rows
+
+        def delayed_install(swaps):
+            # A second idle tick must wait for the first H2D copy before reusing
+            # its pinned staging row, without a diagnostic readback as a fence.
+            torch.cuda._sleep(5_000_000)
+            install(swaps)
+
+        def unexpected_readback():
+            raise AssertionError("disabled diagnostics read live GPU histories")
+
+        monkeypatch.setattr(cache, "_install_staged_hot_rows", delayed_install)
+        monkeypatch.setattr(cache, "decayed_hot_pair_rate", unexpected_readback)
         cache._hot_adapt_idle_tracker.note_routed_pairs()
         token_before = cache.hot_adapt_routed_tokens
 
         cache.hot_adapt_while_idle(lambda: False)
 
-        assert cache.hot_expert_ids == {0: (3,)}
+        assert cache.hot_expert_ids == {0: (3,) if hot_capacity == 1 else (2, 3)}
         assert cache.hot_adapt_routed_tokens == token_before
+        for row, expert in enumerate(cache._hot_slot_owners[0]):
+            slot = cache._hot_slot_for_row[0][row]
+            for name, bank in sources.items():
+                assert torch.equal(cache.bank_caches[name][slot].cpu(), bank[0][expert])
     finally:
         cache.shutdown_hot_adaptation()
 

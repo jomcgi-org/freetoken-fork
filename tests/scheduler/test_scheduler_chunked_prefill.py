@@ -138,6 +138,55 @@ def test_chunked_prompt_admission_reports_complete_length_once():
     assert all(items == [] for items in admissions[1:])
 
 
+def test_continuation_trace_keeps_full_prompt_without_extra_cache_match(tmp_path, monkeypatch):
+    import json
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.continuation_trace import ContinuationTrace
+    from freetoken.scheduler.utils import PendingReq
+
+    cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    trace = ContinuationTrace(tmp_path)
+    cm.continuation_trace = trace
+    prompt_len = 3 * CHUNK
+    matches = []
+    original = cm.match_req
+
+    def counted(req):
+        matches.append(req.uid)
+        return original(req)
+
+    monkeypatch.setattr(cm, "match_req", counted)
+    pm.pending_list = [PendingReq(UID, torch.arange(prompt_len, dtype=torch.int32),
+                                  SamplingParams(max_tokens=4))]
+    while pm.runnable:
+        batch = pm.schedule_next_batch(CHUNK)
+        cm.allocate_paged(batch.reqs)
+        for req in batch.reqs:
+            req.complete_one()
+    trace.close()
+    events = [json.loads(line) for line in trace.path.read_text().splitlines()]
+    assert matches == [UID]
+    assert [e["kind"] for e in events] == ["header", "match", "footer"]
+    assert events[1]["input_ids"] == list(range(prompt_len))
+
+
+def test_disabled_continuation_trace_does_not_convert_prompt(tmp_path, monkeypatch):
+    from freetoken.core import SamplingParams
+    from freetoken.scheduler.utils import PendingReq
+
+    _cm, _tm, _dm, pm = _build_managers(num_pages=64)
+    pm.pending_list = [PendingReq(UID, torch.arange(CHUNK, dtype=torch.int32),
+                                  SamplingParams(max_tokens=4))]
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unexpected diagnostic token conversion")
+
+    # An empty page-size-one radix lookup does not need tolist itself.
+    monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
+    assert pm.schedule_next_batch(CHUNK) is not None
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_batched_prefill_carries_each_new_prompt_admission():
     from freetoken.core import SamplingParams
     from freetoken.scheduler.utils import PendingReq

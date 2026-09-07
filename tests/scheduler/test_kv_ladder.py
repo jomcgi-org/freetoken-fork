@@ -852,11 +852,11 @@ def test_idle_drain_rebuilds_before_admitting_the_request():
 
 
 @pytest.mark.parametrize(
-    ("cpu_executor", "expected_hot_rate"),
-    [(object(), "94.00%"), (None, "n/a")],
+    ("cpu_executor", "collect_stats", "expected_hot_rate"),
+    [(object(), True, "94.00%"), (None, True, "n/a"), (object(), False, "n/a")],
 )
 def test_growth_status_line_exposes_preserved_hot_rate_and_ple_faults(
-    monkeypatch, cpu_executor, expected_hot_rate
+    monkeypatch, cpu_executor, collect_stats, expected_hot_rate
 ):
     from freetoken.scheduler import scheduler as scheduler_module
     from freetoken.scheduler.scheduler import Scheduler
@@ -870,19 +870,24 @@ def test_growth_status_line_exposes_preserved_hot_rate_and_ple_faults(
     )
     scheduler._kv_ladder_waiting = [msg]
     scheduler._kv_ladder_starvation_uid = None
+    def diagnostic(value):
+        assert collect_stats, "disabled diagnostics must not read GPU/PLE statistics"
+        return value
+
     moe = SimpleNamespace(
         cache_size=20,
         hot_expert_capacity={3: 4, 7: 4},
         prefill_overlap=False,
         cpu_executor=cpu_executor,
-        disk_prefetch_stats=lambda **_kwargs: {"hot_pair_rate": 0.94},
+        collect_stats=collect_stats,
+        disk_prefetch_stats=lambda **_kwargs: diagnostic({"hot_pair_rate": 0.94}),
     )
     scheduler.engine = SimpleNamespace(
         num_pages=32,
         max_seq_len=32,
         moe_offload_cache=moe,
         model=SimpleNamespace(
-            ple_disk_stats=lambda **_kwargs: {"ple_major_faults": 400_000}
+            ple_disk_stats=lambda **_kwargs: diagnostic({"ple_major_faults": 400_000})
         ),
     )
     events = []
@@ -917,7 +922,7 @@ def test_growth_status_line_exposes_preserved_hot_rate_and_ple_faults(
     ]
     assert "protected_rows=8" in logs[-1]
     assert f"realized_hot_rate={expected_hot_rate}" in logs[-1]
-    assert "ple_major_faults=400000" in logs[-1]
+    assert f"ple_major_faults={'400000' if collect_stats else 'n/a'}" in logs[-1]
 
 
 def test_idle_drain_rechecks_cache_manager_rebuild_gate():

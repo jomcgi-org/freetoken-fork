@@ -1486,6 +1486,49 @@ def test_prefill_hot_split_selects_and_normalizes_prefill_history(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("histories,normalize", [("shared", "off"), ("split", "tokens")])
+@pytest.mark.parametrize("adapt,stats", [(False, False), (True, False), (False, True)])
+def test_staged_prefill_preserves_routes_weights_and_optional_hot_observations(
+    monkeypatch, histories, normalize, adapt, stats,
+):
+    layer, hidden, weights, ids, calls, _cpu_out, gpu_out = _prefill_hot_split_fixture(
+        monkeypatch, hot_slots=[7, -1, 9, -1], histories=histories,
+        prefill_normalize=normalize,
+    )
+    cache = layer.offload_cache
+    cache.moe_disk_prefill = "staged"
+    cache.hot_expert_capacity = {0: 2}
+    cache.hot_adapt_enabled = adapt
+    cache.collect_stats = stats
+    cache.collect_decode_freq = False
+    cache.begin_prefill = lambda tokens: calls.append(("begin", tokens))
+    cache.stage_disk_prefill_layer = lambda layer_id, routed: calls.append(
+        ("stage", routed.clone())
+    )
+    bank_views = cache.bank_views
+    cache.bank_views = lambda _experts: bank_views()
+    cache.alphas_for_layer = lambda _layer_id: None
+    original = ids.clone()
+    result = layer._prefill_routed(hidden, weights, ids)
+    assert torch.equal(result, gpu_out)
+    assert torch.equal(ids, original)
+    assert torch.equal(next(c[1] for c in calls if c[0] == "stage"), original)
+    gemm = next(c for c in calls if c[0] == "gpu")
+    assert torch.equal(gemm[1], weights)
+    assert torch.equal(gemm[2], original)
+    assert gemm[3:] == (4, True)
+    assert not any(c[0] in ("cpu", "prepare", "prefetch", "stats") for c in calls)
+    observations = [c for c in calls if c[0] == "adapt"]
+    assert len(observations) == int(adapt or stats)
+    if observations:
+        expected = {"route_weight": 0.25}
+        if histories == "split":
+            expected = {"route_weight": pytest.approx(0.25 / 3), "history": "prefill"}
+        assert observations[0][2] == expected
+        assert torch.equal(observations[0][1], original)
+        assert ("adapt_tokens", 3) in calls
+
+
 def test_decode_hot_split_uses_default_route_weight(monkeypatch):
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer
@@ -1666,6 +1709,7 @@ def test_prefill_hot_split_stats_report_and_reset():
     cache.cpu_executor = SimpleNamespace(
         disk_prefetch_stats=lambda reset=False: {}
     )
+    cache.collect_stats = True
     raw = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
     cache.record_prefill_hot_split(
         raw, torch.tensor([[True, False], [True, False]])
@@ -2218,7 +2262,8 @@ def test_disk_gpufetch_decode_matches_cpu_executor(tmp_path):
 
 @pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path, monkeypatch, rebuild):
     from freetoken.checkpoint.ftw import load_ftw_banks
     from freetoken.distributed import set_tp_info, try_get_tp_info
     from freetoken.layers.moe import OffloadMoELayer
@@ -2254,13 +2299,26 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
         prefill_overlap=False,
         decode_target="cpu",
     )
+    cache.collect_stats = True
     cache.cpu_layer_ids = frozenset({0})
-    cache.set_bank_sources(
-        banks.sources,
-        layer_residency=banks.layer_residency,
-        hot_sources=banks.hot_sources,
-        hot_expert_ids=banks.hot_expert_ids,
-    )
+    original_empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if tensor.is_cuda and tensor.dtype == torch.bfloat16 and tensor.ndim == 3:
+            tensor.fill_(float("nan"))
+        return tensor
+
+    # Allocator reuse must not decide whether zero-weight cold routes stay
+    # finite. Force untouched GPU bank rows to contain NaNs deterministically.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", poisoned_empty)
+        cache.set_bank_sources(
+            banks.sources,
+            layer_residency=banks.layer_residency,
+            hot_sources=banks.hot_sources,
+            hot_expert_ids=banks.hot_expert_ids,
+        )
     row_bytes = sum(
         source[0][0].numel() * source[0].element_size()
         for source in banks.sources.values()
@@ -2269,6 +2327,10 @@ def test_disk_hot_cold_split_matches_pure_cpu_decode(tmp_path):
         half_life_steps=2, interval_steps=0,
         max_swap_bytes=row_bytes, expert_bytes=row_bytes,
     )
+    if rebuild:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch, "empty", poisoned_empty)
+            cache.rebuild(cache_size=experts + 2)
     executor = CpuMoeExecutor(
         cache,
         top_k=top_k,
@@ -2345,6 +2407,7 @@ def test_disk_hot_cold_split_prefill_matches_pure_cpu_prefill(tmp_path):
         decode_target="cpu",
         moe_prefill_hot_split="on",
     )
+    cache.collect_stats = True
     cache.cpu_layer_ids = frozenset({0})
     cache.set_bank_sources(
         banks.sources,
