@@ -121,6 +121,27 @@ failed `root-*` run is retained: it exposed the template's rejection of a
 system-only conversation, which the two-query fallback addresses. The controller
 restored the original serving configuration after validation.
 
+### Final-chunk restart validation at the selected chunk size
+
+The same revision and fixture also passed with the selected 2048-token chunk
+size, placing the 4416-token root inside the final chunk after two full chunks.
+The seed retained both the shared root and the normal 4544-token continuation
+checkpoint. Each phase again used a fresh server process and eager restore.
+
+| Second query | Cached tokens | First text | Request wall | Output tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Restored shared root | 4416 | 7.05 s | 12.89 s | 81 |
+| Empty cache | 0 | 22.11 s | 34.87 s | 81 |
+
+The requests, answer bytes and output counts matched exactly. All three phases
+passed the ordered JSON-copy check. First text was 68% faster and request wall
+time was 63% lower for this single restored/cold comparison. These are narrow
+fixture results, not a broad decode or quality qualification. Artifacts use
+the `root3-*` prefix in the same private results directory. The original serving
+configuration was restored after the test. A separate offline check using the
+actual model tokenizer and a tool schema also found identical shared-root tokens
+across different user queries.
+
 For the RadixArk Qwen3.8 Flash-Next geometry at TP=1 and bf16, a 32,768-token entry is about
 902.4 MiB before its small safetensors header:
 
