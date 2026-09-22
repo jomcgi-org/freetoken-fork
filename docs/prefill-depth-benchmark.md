@@ -385,3 +385,35 @@ The larger chunk reduced cold first-text latency by 45%, with repeat wall within
 part of the evidence. The controller restored healthy serving, and the matched
 continuation qualification began only after all six follow-up responses passed
 exact parity. This is still a candidate profile pending that qualification.
+
+
+## Continuation qualification of the fixed-interval candidate
+
+`guardqual2` compared unchanged `11654ed` at 2048/automatic against `39f5dc2`
+at 8192/fixed-1000. Each ran the existing three-conversation, three-turn protocol
+with its original prompts, budgets and graders. Conversation 1 was the prescribed
+warm-up. Each arm had its own initially empty 2 GiB disk-prefix cache and lazy
+restore enabled. All 18 responses passed and matched in complete requests,
+messages, finish reasons, prompt counts and output counts.
+
+| Profile | Warm-up | Measured conversation 2 | Measured conversation 3 | Measured mean |
+| --- | ---: | ---: | ---: | ---: |
+| Original / 2048 / auto | 95.54 s | 72.47 s | 66.52 s | 69.50 s |
+| Decode-only faults / 8192 / 1000 | 109.04 s | 72.54 s | 79.56 s | 76.05 s |
+
+The candidate's measured mean was 9.4% slower. This prevents selecting the
+fixed-interval profile despite its favorable long-prefill sample. Saved startup
+adaptation logs show another material policy difference: the first automatic
+prefill boundary consumed 12 ticks and planned 1,148 swaps, while fixed cadence
+consumed two ticks and planned 386. The initial prompts were about 2.1k tokens.
+This makes reduced initial HOT-cache adaptation a plausible contributor, not a
+proven sole cause. The larger-chunk candidate needs a comparison retaining the
+selected automatic cadence before introducing further runtime changes.
+
+The queued coding test was stopped before taking the GPU, preserving its frozen
+protocol for a qualified finalist. A follow-up runs the original continuation
+workload followed by the 100k depth workload in each fresh server, candidate
+first and control second, with automatic cadence and disk-prefix persistence
+disabled in both. This holds cadence constant and measures long prefill after
+ordinary conversation activity, rather than relying on one clock phase from an
+otherwise fresh server. No new serving default has been selected.
