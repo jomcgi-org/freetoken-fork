@@ -1256,7 +1256,8 @@ class Engine:
                 getattr(config, "moe_pager_budget_gib", 40.0) * 2**30
             ),
             prefill_batch=getattr(config, "moe_cpu_prefill_batch", "on"),
-            max_prefill_tokens=getattr(config, "max_extend_tokens", 2048),
+            prefill_batch_lazy=config.moe_disk_prefill == "staged",
+            max_prefill_tokens=_cpu_prefill_workspace_tokens(config),
         )
         if (
             config.moe_disk_prefill in ("cpu", "staged")
@@ -2897,6 +2898,16 @@ def _gate_ple_settings(config, model_config, override) -> bool:
             f"ignoring PLE settings: {', '.join(ignored)}"
         )
     return False
+
+
+def _cpu_prefill_workspace_tokens(config) -> int:
+    """Bound CPU scratch by the largest chunk that can take the CPU path."""
+    capacity = getattr(config, "max_extend_tokens", 2048)
+    if config.moe_disk_prefill == "staged":
+        # begin_prefill selects GPU staging at the inclusive crossover. Keep one
+        # slot for the native API when every nonempty chunk uses GPU staging.
+        capacity = min(capacity, max(1, config.moe_disk_prefill_min_tokens - 1))
+    return capacity
 
 
 def _validate_disk_prefill_task_size(config, cache) -> None:
