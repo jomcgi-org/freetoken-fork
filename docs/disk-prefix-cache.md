@@ -158,6 +158,31 @@ case. No corruption, fingerprint mismatch or dropped write was reported.
 Artifacts use `root4-*` in the same private directory. The bounded controller
 completed successfully and restored the original serving configuration.
 
+### Matched continuation check of the merged runtime
+
+On 2026-09-22, baseline `4fbc4eb` and merged candidate `11654ed` each ran
+three three-turn conversations with the existing `fixed-continuation-wall.py`
+protocol. Each arm started a fresh server with 2048-token chunks, 100352
+reserved KV tokens, lazy restore enabled, and its own empty 2 GiB disk-prefix
+directory. Native kernels and all performance settings were unchanged.
+
+| Runtime | Warm-up conversation | Measured conversation 2 | Measured conversation 3 | Measured mean |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline | 96.23 s | 77.83 s | 71.14 s | 74.49 s |
+| Merged root fix | 98.68 s | 77.78 s | 70.77 s | 74.27 s |
+
+All 18 responses passed. The protocol's `fixed_work_mismatches` check found
+identical requests, complete answer messages, finish reasons, prompt counts
+and output counts across arms. The measured mean differed by 0.3%, which is
+consistent with preserved continuation performance in this small sample, not
+evidence of a general speedup or broad model quality equivalence. This ordinary
+continuation workload complements the shared-root restart checks above.
+
+Artifacts use `rootqual1-*` in the same private results directory. The per-arm
+`.revision` files identify each runtime; the common metadata file records the
+baseline revision. The controller completed successfully and restored the
+original service configuration before the next scheduled experiment.
+
 For the RadixArk Qwen3.8 Flash-Next geometry at TP=1 and bf16, a 32,768-token entry is about
 902.4 MiB before its small safetensors header:
 
