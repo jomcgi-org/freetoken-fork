@@ -311,3 +311,33 @@ previous uninstrumented experiment; the instrumented 2048 rate was 8.57 tok/s.
 Synchronization and counters alter execution, and these samples also vary across
 fresh starts. They do not establish a speedup or qualify a new serving profile.
 An uninstrumented comparison of the fix and unchanged controls is required.
+
+
+## First uninstrumented fault-policy comparison
+
+The `guard1` comparison ran the experimental policy (`39f5dc2`) at 8192 chunks
+and fixed interval 1000, unchanged `11654ed` with the same chunk/interval, then
+unchanged `11654ed` at the selected 2048/automatic settings. Other settings and
+the 100k manifest were held fixed. Each arm restarted from empty prefix state.
+
+| Policy / chunks / interval | Cold TTFT | Cold wall | Cold answer decode | Repeat TTFT | Repeat wall | Repeat decode | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Decode-only faults / 8192 / 1000 | 171.37 s | 178.77 s | 11.10 tok/s | 5.86 s | 8.47 s | 31.56 tok/s | 26.61 tok/s |
+| Original / 8192 / 1000 | 160.80 s | 167.78 s | 11.79 tok/s | 2.65 s | 6.04 s | 24.64 tok/s | 25.51 tok/s |
+| Original / 2048 / auto | 268.25 s | 278.53 s | 8.17 tok/s | 1.70 s | 5.68 s | 20.77 tok/s | 24.82 tok/s |
+
+All nine responses passed and matched exactly across arms in request hashes,
+complete text, reasoning, finish reasons and usage. Cold hits were zero and
+repeats reused 99,904 tokens. The controller completed and restored the selected
+serving service. Artifacts use `guard1-*` in the same private results directory.
+
+The candidate reduced cold first-text latency by 36% relative to the selected
+profile and had higher client-observed decode rates in all three phases in this
+sample. However, the cached repeat's total wall time increased by 49%, due to
+its longer first-text wait. Against the same-size unchanged arm, repeat decode
+improved by 28% while total repeat wall increased by 40%. These observations
+separate generated-token rate from whole-request performance; they do not
+establish a uniformly faster profile. The ten-second cold-TTFT difference
+between same-size arms also cautions against attributing a single fresh-start
+measurement to the decode-only policy. A follow-up tests the candidate at 2048
+and repeats the 8192 arm before continuation qualification or deployment.
