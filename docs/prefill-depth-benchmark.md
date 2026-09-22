@@ -269,8 +269,8 @@ of one retains the native API's minimum one-row capacity, allocated only if used
 The governor deliberately retains its conservative full-chunk allowance.
 
 The initial lazy-allocation revision passed 40 targeted Linux tests with no skips.
-The bounded-capacity follow-up is pending Linux tests and matched node-4
-measurements. Tests
+The bounded-capacity follow-up passed all 75 targeted Linux tests with no skips.
+Matched node-4 performance measurements remain pending. Tests
 cover zero initial native batch bytes in lazy mode, allocation on first prefill,
 serial-reference numerical parity, repeat-buffer reuse, and one-time setup
 failure handling. No faster serving profile has been qualified by this change.
