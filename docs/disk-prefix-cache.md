@@ -59,6 +59,9 @@ Configured coding-harness requests can also materialize the stable system-and-to
 own entry. The tokenizer recognizes a configured system prompt signature, renders the leading
 system run with the same tool schemas and template arguments, and takes the exact token common
 prefix with the full prompt. The boundary is rounded down to the hybrid recurrence alignment.
+If the template requires a user turn, two distinct probe queries supply that turn;
+only their shared token prefix is compared with the real request. Probe queries
+are never sent to the model, and a failed probe leaves normal tokenization intact.
 
 The root entry is written only when all of these conditions hold:
 
