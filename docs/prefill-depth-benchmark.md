@@ -144,8 +144,8 @@ memory-governor fix.
 
 Artifacts use `long1-*-chunk-*.jsonl`, corresponding command/journal files,
 `long1-host-pressure.jsonl` and `summarize-long-pressure.py` in the same private
-results directory. A matched three-turn continuation comparison and additional
-prefill-to-decode transition measurements remain pending. The harness-root
+results directory. The continuation and prefill-to-decode transition comparisons
+below extend this screening. The harness-root
 restart check also exposed a separate tokenizer-template rejection of system-only
 messages; PR #85 addresses that alongside final-chunk snapshots and remains
 pending real serving validation. No serving default has been changed.
@@ -172,3 +172,42 @@ sample is broadly similar total wall time, not proof of a general agent-quality
 or decode-speed improvement, and it does not remove the 100k repeat regression.
 Full results are under `cont1-*-chunk-*/session-*/result.json` beside the exact
 launch commands and journals in the private results directory.
+
+## Prefill-to-decode transition screening
+
+Three additional 8192-token arms used the same 100k manifest and baseline runtime.
+They tested `--moe-hot-adapt-post-prefill-tick on` with prefill swap caps of 0.1
+and 0.01, followed by cap 0.01 with the tick off. The extra tick starts adaptation
+toward decode after prefill; it does not change the model or allocate a larger
+protected expert cache.
+
+| Prefill cap / post-prefill tick | Cold TTFT | Cold wall | Cold answer decode | Repeat wall | Repeat decode | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.1 / on | 138.06 s | 148.08 s | 8.13 tok/s | 6.83 s | 21.35 tok/s | 24.73 tok/s |
+| 0.01 / on | 145.51 s | 154.06 s | 9.56 tok/s | 7.16 s | 19.53 tok/s | 24.26 tok/s |
+| 0.01 / off | 133.40 s | 142.00 s | 9.48 tok/s | 7.45 s | 17.67 tok/s | 23.90 tok/s |
+
+Across all six 100k arms, all 18 responses passed and each phase had identical
+request hashes, answer bytes, input counts and output counts. Prefix-hit counts
+also stayed fixed at zero for cold requests and 99,904 for repeats. The tick
+improved repeat decode relative to the 0.1-cap/no-tick arm, but slowed decode
+during the cold answer. The smallest cap without the tick had the fastest cold
+TTFT, almost 2x the 2048 control, while its repeat remained 18% longer and its
+independent decode rate about 8% lower. No tested configuration demonstrated
+both the cold-prefill gain and preserved decode across these measurements.
+
+Keep the serving default at 2048. The binding qualification issue in this sweep
+is cached/decode performance, not an observed allocation failure. Larger chunks
+also showed higher host pressure; a successful allocation is not sufficient
+evidence for selecting them. The next work is to explain and validate the
+prefill-to-decode cache transition, repeat comparisons in reversed order, and
+complete the harness-root serving/restart check. The experiments establish a
+promising prefill opportunity, not a new qualified serving profile.
+
+Additional response artifacts use `long2-posttick-*.jsonl` and
+`long3-cap001off-*.jsonl`, with launch commands, journals and pressure samples
+beside them. The benchmark harness passed six targeted tests on both the local
+development machine and node-4 Linux. The screening covered 42 depth-benchmark
+responses plus 18 continuation responses; all passed their narrow fidelity
+checks. Controllers completed successfully and restored the original service
+configuration after each comparison.

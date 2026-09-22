@@ -56,3 +56,32 @@ runtime source, correctness checks and source-only diagnostic helpers.
 Further batching, dense-operation and speculative-verification work is a
 separate backlog. Give future experiments a bounded budget and an explicit
 workload wall-time target, preserving all task failures and quality checks.
+
+## Prefill chunk screening, 2026-09-22
+
+The selected profile retains 2048-token chunks. A node-4 screening sweep with
+100352 reserved KV tokens found faster cold prefill at 8192, but slower cached
+decode. Both sizes kept 20 PINNED and 28 DISK layers, 6 GiB protected HOT and
+the same model/native runtime. Disk-prefix persistence was disabled in every
+arm, in-memory radix reuse stayed enabled, and servers restarted between arms.
+
+| Actual prompt tokens | 2048 TTFT | 8192 TTFT | 2048 input tokens / TTFT | 8192 input tokens / TTFT |
+| --- | ---: | ---: | ---: | ---: |
+| 7959 | 46.61 / 33.61 s | 12.86 s | 171 / 237 tok/s | 619 tok/s |
+| 31958 | 82.38 / 96.37 s | 52.30 s | 388 / 332 tok/s | 611 tok/s |
+| 99959 | 267.03 s | 167.77 s | 374 tok/s | 596 tok/s |
+
+Slash-separated controls are the first and last observations in the short-depth
+sweep, not confidence bounds. The 100k comparison had one observation per arm.
+Throughput here is prompt tokens divided by client first-text latency, not a
+kernel-only prefill timer. The governor reported zero budget remainder and
+charged 0.37 GiB versus 1.18 GiB prefill scratch. No allocation failure bound
+the larger setting, but sampled host pressure increased.
+
+At 100k, the ordinary 8192 arm's cached repeat took 8.36 seconds versus 6.30
+for 2048. Limiting prefill swaps and enabling a post-prefill adaptation tick
+changed the tradeoff without demonstrating preserved decode across the tested
+phases. Re-chunking can change floating-point results; these JSON-copy answers
+matched exactly, but that is not broad quality equivalence. See the
+[full protocol, depth results and continuation checks](prefill-depth-benchmark.md)
+for configuration details, fidelity checks and remaining qualification work.

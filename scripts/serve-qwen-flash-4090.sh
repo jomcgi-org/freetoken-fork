@@ -2,6 +2,8 @@
 # Qualified capacity-one Qwen Flash profile for the RTX 4090 + CPU + disk tier.
 # The disk prefix cache is on by default (500 GiB LRU under FREETOKEN_PREFIX_CACHE_DIR);
 # set FREETOKEN_PREFIX_CACHE_GIB=0 to disable it. Keep the directory on local NVMe.
+# Retain 2048-token chunks: the 2026-09-22 8192-token sweep sped up cold prefill
+# but regressed cached decode. See docs/prefill-depth-benchmark.md for the data.
 set -euo pipefail
 if (( $# < 2 )); then
   printf 'Usage: %s MODEL_PATH LAYER_PROFILE_JSON [extra ft serve arguments]\n' "$0" >&2
