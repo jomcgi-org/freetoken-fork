@@ -211,3 +211,37 @@ development machine and node-4 Linux. The screening covered 42 depth-benchmark
 responses plus 18 continuation responses; all passed their narrow fidelity
 checks. Controllers completed successfully and restored the original service
 configuration after each comparison.
+
+## Adaptation-clock follow-up
+
+Saved journals exposed a clock-phase difference: the 2048 control first reranked
+for decode at routed token 99,992, while the 8192 arms without a forced tick
+waited until 100,134, during the cached repeat. The automatic fill interval is
+166 tokens. Its first chunk consumes ticks through 1992 or 8134 respectively;
+switching to the steady 1000-token interval retains that offset in
+`HotAdaptTokenClock.set_interval`. Both forced-tick arms additionally logged
+bandwidth back-off from interval 1000 to 2000 after their first decode tick.
+
+A fresh comparison tested the original 2048/automatic control followed by 8192
+with cap 0.1 and explicit `--moe-hot-adapt-interval-steps 1000`. The candidate's
+first decode rerank moved to token 100,000 as predicted, with no automatic
+back-off. Model, native extension, prompt and cache configuration stayed fixed.
+
+| Configuration | Cold TTFT | Cold wall | Cold answer decode | Repeat wall | Repeat decode | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 / auto / uncapped | 265.54 s | 270.82 s | 15.66 tok/s | 5.57 s | 21.31 tok/s | 24.38 tok/s |
+| 8192 / fixed 1000 / cap 0.1 | 149.77 s | 160.43 s | 7.65 tok/s | 6.31 s | 22.33 tok/s | 22.82 tok/s |
+
+All six additional responses passed and matched across arms in request hashes,
+answer bytes and input/output counts. Repeat hits remained 99,904 tokens. The
+candidate's repeat decode improved relative to the earlier automatic 8192/0.1
+arm, consistent with the timing hypothesis. Its repeat wall was still 13% longer
+than the fresh control, cold-answer decode was slower, and independent decode
+was about 6% slower. Clock alignment alone did not qualify the faster profile;
+the earlier and later observations also show why one control is insufficient.
+Retain 2048 pending a validated solution to the remaining transition costs.
+
+Artifacts use `clock1-*-chunk-*.jsonl`, matching command/journal files and
+`clock1-host-pressure.jsonl` in the same results directory. Including this
+follow-up, 48 depth responses and 18 continuation responses passed their narrow
+checks. No serving default was changed.
