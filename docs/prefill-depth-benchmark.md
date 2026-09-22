@@ -417,3 +417,41 @@ first and control second, with automatic cadence and disk-prefix persistence
 disabled in both. This holds cadence constant and measures long prefill after
 ordinary conversation activity, rather than relying on one clock phase from an
 otherwise fresh server. No new serving default has been selected.
+
+
+## Automatic cadence after ordinary continuation
+
+`auto1` completed the continuation protocol followed by the 100k workload on
+fresh servers: `39f5dc2`/8192 first, `11654ed`/2048 second, automatic adaptation
+and disk-prefix persistence disabled in both. All 18 continuation responses and
+all six depth responses passed, with exact full-request, message, finish and
+usage parity. The prescribed first conversation was excluded from the measured
+continuation mean. Cold refers to the prefix cache, not the OS page cache.
+
+| Metric | Original / 2048 | Decode-only faults / 8192 |
+| --- | ---: | ---: |
+| Measured continuation mean | 65.99 s | 67.70 s |
+| 100k cold TTFT | 252.41 s | 125.91 s |
+| 100k cold wall | 255.83 s | 129.63 s |
+| Cold answer decode | 24.25 tok/s | 22.17 tok/s |
+| Repeat TTFT | 2.55 s | 1.54 s |
+| Repeat wall | 5.53 s | 4.63 s |
+| Repeat decode | 27.66 tok/s | 26.64 tok/s |
+| Independent request wall | 19.05 s | 20.92 s |
+| Independent request decode | 31.23 tok/s | 27.24 tok/s |
+
+The candidate halved cold first-text latency, but continuation averaged 2.6%
+slower and independent decode was 12.8% slower. It is not qualified for
+promotion. Both repeats reused 99,904 tokens; both cold requests had zero hits.
+A two-second host observer covered at least 95% of both cold windows. On-node
+comparisons found higher memory pressure, I/O pressure and disk reads for the
+candidate. Detailed host counters remain on node-4. These are host-wide
+observations, with phase endpoints observed up to two seconds late, not proof
+that one subsystem caused the slowdown.
+
+Source inspection shows that increasing `host_cache_reserve_gib` reduces both
+derived pinned-expert and pager budgets (28:22 split after fixed costs). It can
+therefore increase disk residency rather than simply adding free page cache.
+The next isolated screening comparison keeps `11654ed` and automatic cadence
+in both arms and changes only chunks from 2048 to 4096. No larger default or
+fault-policy change has been selected.
