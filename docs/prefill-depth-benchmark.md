@@ -261,9 +261,16 @@ The host-memory governor still charges the full possible workspace. This keeps
 expert placement and the fallback memory allowance unchanged. Setup is attempted
 once; missing kernels or allocation failure retain the serial fallback without
 repeated allocation attempts. The workspace remains allocated if CPU fallback
-is used. This change does not claim to release buffers after CPU prefill.
+is used. Its capacity is now bounded by the smaller of the scheduler chunk and
+one below the staged crossover (1023 rows at the default 1024-token threshold).
+Chunks at or above the threshold stage on the GPU. This preserves the saving
+after short continuations without releasing and reallocating buffers. A threshold
+of one retains the native API's minimum one-row capacity, allocated only if used.
+The governor deliberately retains its conservative full-chunk allowance.
 
-Validation is pending Linux native tests and matched node-4 measurements. Tests
+The initial lazy-allocation revision passed 40 targeted Linux tests with no skips.
+The bounded-capacity follow-up is pending Linux tests and matched node-4
+measurements. Tests
 cover zero initial native batch bytes in lazy mode, allocation on first prefill,
 serial-reference numerical parity, repeat-buffer reuse, and one-time setup
 failure handling. No faster serving profile has been qualified by this change.
