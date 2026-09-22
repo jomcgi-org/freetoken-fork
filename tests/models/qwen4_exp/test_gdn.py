@@ -285,6 +285,45 @@ def test_decode_snapshot_donation_preserves_gdn_output_bits():
     pool.free(live)
 
 
+def test_final_prefill_root_and_deepest_snapshots_match_stopped_prefills():
+    """Both request-owned snapshots carry the state at their own token boundary."""
+    op, _ = _make_layer(3, seed=61)
+    ctx = _ctx(3)
+    hidden = torch.randn(160, HIDDEN, device=DEV, dtype=torch.bfloat16)
+    req = Req(torch.zeros(160, dtype=torch.int32), 1, 0, 8, 1,
+              SamplingParams(), None, cache_anchor_len=64, cache_anchor_persistable=True)
+    req.linear_slot_idx = 1
+    req.mamba_ping_pong = (5, 6)
+    batch = Batch(reqs=[req], phase="prefill")
+    batch.padded_reqs = batch.reqs
+    with ctx.forward_batch(batch):
+        op.forward(hidden)
+    assert req.cache_anchor_track_slot == 6
+    assert req.mamba_last_track_seqlen == 128
+    saved = {
+        boundary: (ctx.linear_state_pool.conv_states[:, slot].clone(),
+                   ctx.linear_state_pool.recurrent_states[:, slot].clone())
+        for boundary, slot in ((64, 6), (128, 5))
+    }
+    for boundary, (conv, recurrent) in saved.items():
+        stopped = _ctx(3)
+        reference_req = Req(torch.zeros(boundary, dtype=torch.int32), 1, 0, 8, 2,
+                            SamplingParams(), None)
+        prefix = Batch(reqs=[reference_req], phase="prefill")
+        prefix.padded_reqs = prefix.reqs
+        with stopped.forward_batch(prefix):
+            op.forward(hidden[:boundary])
+        pool = stopped.linear_state_pool
+        torch.testing.assert_close(conv, pool.conv_states[:, 1], rtol=RTOL, atol=ATOL)
+        torch.testing.assert_close(recurrent, pool.recurrent_states[:, 1], rtol=RTOL, atol=ATOL)
+        pool.conv_states[:, 2].copy_(conv)
+        pool.recurrent_states[:, 2].copy_(recurrent)
+        restored_req = Req(reference_req.input_ids, 2, 0, 8, 3, SamplingParams(), None)
+        expected = _decode(op, stopped, [reference_req], hidden[boundary:boundary + 1])
+        actual = _decode(op, stopped, [restored_req], hidden[boundary:boundary + 1])
+        torch.testing.assert_close(actual, expected, rtol=RTOL, atol=ATOL)
+
+
 def test_output_gate_comes_from_the_config():
     """The gate activation is the group config's string, not a hardcoded silu. Both gates track
     their own reference, and the two are far apart -- so a stuck activation cannot pass."""

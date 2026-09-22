@@ -63,19 +63,23 @@ prefix with the full prompt. The boundary is rounded down to the hybrid recurren
 The root entry is written only when all of these conditions hold:
 
 * a nonzero disk-prefix budget created a `DiskPrefixStore` for a hybrid radix cache
-* the request is split across multiple prefill chunks
-* the aligned anchor lies strictly inside the current non-final chunk
+* the aligned anchor lies strictly inside the current prefill chunk, including a
+  single or final chunk
 * the anchor is also aligned to the disk cache page size
 * the request still owns a valid table row and the bounded writer accepts the job
 
 The scheduler stages that snapshot directly to disk. It never inserts the harness root into the
 live radix tree and never changes KV page or recurrent-slot ownership. The live tree therefore
 keeps exactly the same deepest checkpoint it would keep for a prompt with no harness match.
-Single-chunk prompts, anchors reached only by the final chunk, disabled disk storage, unaligned
-anchors, and unknown clients retain the normal cache behavior. A later session whose first user
+For a final chunk, the unused request-owned ping-pong slot holds the root while
+the usual slot holds the deepest continuation checkpoint. The scheduler stages
+the root before donating or freeing either slot; no extra prefill is needed.
+Anchors exactly at the chunk edge, disabled disk storage, unaligned anchors,
+and unknown clients retain the normal cache behavior. A later session whose first user
 message differs can restore a successfully written root, including after restart.
 
-Scheduler status lines expose `harness_anchor_persisted`,
+Scheduler status lines expose `harness_anchor_persisted`, its
+`harness_anchor_persisted_intermediate` and `harness_anchor_persisted_final` breakdown,
 `harness_anchor_skipped_final_chunk`, `harness_anchor_skipped_no_store`, and
 `harness_anchor_skipped_unaligned` alongside the other disk-prefix counters.
 

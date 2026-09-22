@@ -228,7 +228,6 @@ class PrefillAdder:
         req.cache_anchor_persistable = bool(
             anchor is not None
             and self.cache_manager.disk_prefix_store is not None
-            and isinstance(req, ChunkedReq)
             and req.extend_len > 0
             and req.cached_len < anchor < req.cached_len + req.extend_len
         )
@@ -239,6 +238,7 @@ class PrefillAdder:
         if (
             anchor is not None
             and not isinstance(req, ChunkedReq)
+            and not req.cache_anchor_persistable
             and req.cached_len <= anchor <= req.cached_len + req.extend_len
         ):
             self.cache_manager.note_harness_anchor("skipped_final_chunk")

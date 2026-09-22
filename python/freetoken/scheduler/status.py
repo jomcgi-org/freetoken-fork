@@ -274,6 +274,8 @@ class SchedulerStatusReporter:
             f"corrupt: {stats['corrupt_entries']}, "
             f"fingerprint_mismatch: {stats['fingerprint_mismatches']}, "
             f"harness_anchor_persisted: {stats.get('harness_anchor_persisted', 0)}, "
+            f"harness_anchor_persisted_intermediate: {stats.get('harness_anchor_persisted_intermediate', 0)}, "
+            f"harness_anchor_persisted_final: {stats.get('harness_anchor_persisted_final', 0)}, "
             f"harness_anchor_skipped_final_chunk: "
             f"{stats.get('harness_anchor_skipped_final_chunk', 0)}, "
             f"harness_anchor_skipped_no_store: "

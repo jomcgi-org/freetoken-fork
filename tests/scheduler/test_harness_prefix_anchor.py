@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 
 from freetoken.core import Batch, Context, Req, SamplingParams
@@ -80,7 +81,7 @@ def test_harness_anchor_wins_over_deepest_prefill_track(monkeypatch):
     assert req.mamba_last_track_seqlen == 64
 
 
-def test_final_and_single_chunk_harnesses_keep_the_normal_deepest_track(monkeypatch):
+def test_final_harness_tracks_root_and_preserves_deepest_boundary(monkeypatch):
     import freetoken.core as core
     from freetoken.attention.linear import build_fla_metadata
 
@@ -113,8 +114,9 @@ def test_final_and_single_chunk_harnesses_keep_the_normal_deepest_track(monkeypa
 
     normal = tracked_boundary(None, False)
     assert tracked_boundary(64, False) == normal == [128]
-    # Even a wrongly marked final Req cannot override the normal tracked boundary.
-    assert tracked_boundary(64, True) == normal
+    assert tracked_boundary(64, True) == [128, 64]
+    # A root coinciding with the deepest snapshot shares it without duplicate writes.
+    assert tracked_boundary(128, True) == normal
 
 
 def test_prefill_admission_aligns_and_carries_harness_anchor(monkeypatch):
@@ -190,7 +192,8 @@ def test_persistence_guard_counts_missing_store():
     assert manager.harness_anchor_stats()["harness_anchor_skipped_no_store"] == 1
 
 
-def test_final_chunk_drops_anchor_and_counts_skip(tmp_path):
+@pytest.mark.parametrize("cached_len", [0, 64])
+def test_final_chunk_keeps_interior_anchor_without_counting_skip(tmp_path, cached_len):
     from freetoken.kvcache.disk_prefix_cache import DiskPrefixStore
     from freetoken.scheduler.prefill import PrefillAdder
     from freetoken.scheduler.utils import PendingReq
@@ -202,26 +205,26 @@ def test_final_chunk_drops_anchor_and_counts_skip(tmp_path):
         disk_prefix_store=store,
         note_harness_anchor=store.note_harness_anchor,
     )
-    page_table = torch.zeros(1, 128, dtype=torch.int32)
+    page_table = torch.zeros(1, 256, dtype=torch.int32)
     table = SimpleNamespace(token_pool=page_table)
     pending = PendingReq(
         5,
-        torch.arange(100, dtype=torch.int32),
+        torch.arange(cached_len + 100, dtype=torch.int32),
         SamplingParams(max_tokens=1),
-        cache_anchor_len=64,
+        cache_anchor_len=cached_len + 64,
         cache_anchor_kind="opencode",
     )
     req = PrefillAdder(100, 0, cache, table)._add_one_req(
         pending,
         cache_handle=None,
         table_idx=0,
-        cached_len=0,
+        cached_len=cached_len,
     )
 
     assert type(req) is Req
-    assert req.cache_anchor_len is None
-    assert not req.cache_anchor_persistable
-    assert store.stats()["harness_anchor_skipped_final_chunk"] == 1
+    assert req.cache_anchor_len == cached_len + 64
+    assert req.cache_anchor_persistable
+    assert store.stats()["harness_anchor_skipped_final_chunk"] == 0
     store.close()
 
 
@@ -263,7 +266,8 @@ def test_only_nonfinal_chunk_strictly_containing_anchor_opts_in():
     assert at_end.cache_anchor_len is None
 
 
-def test_chunked_anchor_persistence_does_not_touch_radix_ownership(monkeypatch):
+@pytest.mark.parametrize("final", [False, True])
+def test_anchor_persistence_does_not_touch_radix_ownership(monkeypatch, final):
     class Store:
         def __init__(self):
             self.stats = {}
@@ -288,7 +292,7 @@ def test_chunked_anchor_persistence_does_not_touch_radix_ownership(monkeypatch):
     pool = _pool()
     from freetoken.scheduler.prefill import ChunkedReq
 
-    req = ChunkedReq(
+    req = (Req if final else ChunkedReq)(
         input_ids=torch.arange(129, dtype=torch.int32),
         table_idx=0,
         cached_len=128,
@@ -304,6 +308,11 @@ def test_chunked_anchor_persistence_does_not_touch_radix_ownership(monkeypatch):
     req.mamba_ping_pong = tuple(pool.alloc(2))
     req.mamba_next_track_idx = 1
     req.mamba_last_track_seqlen = 64
+    if final:
+        # The deepest continuation snapshot lives in the other slot.
+        req.cache_anchor_track_slot = req.mamba_ping_pong[0]
+        req.mamba_last_track_seqlen = 128
+        req.mamba_next_track_idx = 0
     queued = []
     monkeypatch.setattr(
         manager,
@@ -314,7 +323,13 @@ def test_chunked_anchor_persistence_does_not_touch_radix_ownership(monkeypatch):
     )
     free_before = manager.free_slots.clone()
 
-    manager.persist_intermediate_cache_anchor(req)
+    if final:
+        manager.persist_final_cache_anchor(req)
+        assert req.cache_anchor_track_slot is None
+        assert req.mamba_last_track_seqlen == 128
+        assert req.mamba_next_track_idx == 0
+    else:
+        manager.persist_intermediate_cache_anchor(req)
 
     assert len(queued) == 1
     assert queued[0][0] is req
@@ -402,10 +417,12 @@ def test_intermediate_anchor_guards_unaligned_and_invalid_table(tmp_path):
     store.close()
 
 
-def test_real_store_round_trip_for_intermediate_harness_root(tmp_path):
+@pytest.mark.parametrize("final", [False, True])
+def test_real_store_round_trip_for_harness_root(tmp_path, monkeypatch, final):
     from freetoken.kvcache.disk_prefix_cache import DiskPrefixStore
     from freetoken.scheduler.prefill import ChunkedReq
 
+    _stub_fla_metadata_dependencies(monkeypatch)
     store = DiskPrefixStore(tmp_path, 1 << 20, identity="harness-root")
     pool = _pool()
     kv_cache = SimpleNamespace(
@@ -428,7 +445,7 @@ def test_real_store_round_trip_for_intermediate_harness_root(tmp_path):
     )
     root = torch.arange(64, dtype=torch.int32)
     request_a_ids = torch.cat((root, torch.arange(64, 129, dtype=torch.int32)))
-    req = ChunkedReq(
+    req = (Req if final else ChunkedReq)(
         input_ids=request_a_ids,
         table_idx=0,
         cached_len=128,
@@ -446,10 +463,24 @@ def test_real_store_round_trip_for_intermediate_harness_root(tmp_path):
     frozen = req.mamba_ping_pong[0]
     pool.conv_states[:, frozen].fill_(7)
     pool.recurrent_states[:, frozen].fill_(11)
-
-    manager.persist_intermediate_cache_anchor(req)
+    if final:
+        req.cache_anchor_track_slot = frozen
+        req.mamba_last_track_seqlen = 128
+        req.mamba_next_track_idx = 0
+        deepest = req.mamba_ping_pong[1]
+        pool.conv_states[:, deepest].fill_(17)
+        pool.recurrent_states[:, deepest].fill_(23)
+        manager.persist_final_cache_anchor(req)
+        manager._queue_disk_prefix(req, 128, page_table[0, :128], deepest)
+        # Queued snapshots must be immutable before slots are reused.
+        pool.conv_states[:, frozen].fill_(99)
+        pool.recurrent_states[:, frozen].fill_(99)
+    else:
+        manager.persist_intermediate_cache_anchor(req)
     store.flush()
     assert store.stats()["harness_anchor_persisted"] == 1
+    assert store.stats()["harness_anchor_persisted_final"] == int(final)
+    assert store.stats()["harness_anchor_persisted_intermediate"] == int(not final)
     store.close()
 
     reader = DiskPrefixStore(tmp_path, 1 << 20, identity="harness-root")
@@ -459,4 +490,31 @@ def test_real_store_round_trip_for_intermediate_harness_root(tmp_path):
     assert entry is not None
     assert entry.length == 64
     assert torch.equal(entry.tensors["token_ids"], root)
+    assert torch.all(entry.tensors["conv"] == 7)
+    assert torch.all(entry.tensors["recurrent"] == 11)
+    if final:
+        full = reader.lookup_longest(request_a_ids)
+        assert full.length == 128
+        assert torch.all(full.tensors["conv"] == 17)
+        assert torch.all(full.tensors["recurrent"] == 23)
     reader.close()
+
+
+def test_decode_snapshot_waits_for_final_prefill_root():
+    manager = object.__new__(CacheManager)
+    manager.decode_prefix_snapshot = True
+    manager.page_size = 64
+    manager.linear_state_pool = SimpleNamespace(
+        copy_from=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("pending root must not be overwritten by overlapped decode")
+        )
+    )
+    req = Req(torch.arange(129), 0, 128, 10, 1, SamplingParams(),
+              SimpleNamespace(cached_len=0), cache_anchor_track_slot=2)
+    req.linear_slot_idx = 0
+    req.mamba_ping_pong = (1, 2)
+    req.mamba_next_track_idx = 1
+    req.mamba_last_track_seqlen = 64
+    manager.snapshot_decode_prefix([req])
+    assert req.mamba_next_track_idx == 1
+    assert req.mamba_last_track_seqlen == 64

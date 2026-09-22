@@ -53,10 +53,13 @@ class Req:
     # aligns the raw template boundary to the hybrid recurrence checkpoint grid.
     cache_anchor_len: int | None = None
     cache_anchor_kind: str | None = None
-    # True only for a non-final ChunkedReq whose current extend strictly contains
-    # cache_anchor_len and whose CacheManager has a writable disk-prefix store.
+    # True only when the current extend strictly contains cache_anchor_len and
+    # CacheManager has a writable disk-prefix store.
     # The linear metadata path requires this opt-in before changing its tracked boundary.
     cache_anchor_persistable: bool = False
+    # Final-prefill root snapshot in request-owned ping-pong storage. It is staged
+    # before normal cache donation, preserving the deepest continuation snapshot.
+    cache_anchor_track_slot: int | None = None
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---

@@ -388,6 +388,21 @@ class CacheManager:
         this scheduler explicitly avoids. Staging is safe here: the scheduler stream
         waits for the engine stream before draining the completed chunk.
         """
+        self._persist_cache_anchor(req, final=False)
+
+    def persist_final_cache_anchor(self, req: Req) -> None:
+        """Stage the final-prefill root before ordinary snapshot donation or freeing.
+
+        Both snapshots belong to the request until this drain. Copying the root
+        does not transfer either slot or KV ownership; the ordinary deepest
+        snapshot remains available for the existing continuation-cache path.
+        """
+        try:
+            self._persist_cache_anchor(req, final=True)
+        finally:
+            req.cache_anchor_track_slot = None
+
+    def _persist_cache_anchor(self, req: Req, *, final: bool) -> None:
         length = req.cache_anchor_len
         store = self.disk_prefix_store
         if length is not None and (not self.is_hybrid or store is None):
@@ -403,9 +418,11 @@ class CacheManager:
             or store is None
             or length is None
             or not getattr(req, "cache_anchor_persistable", False)
-            or not isinstance(req, ChunkedReq)
-            or req.mamba_last_track_seqlen != length
+            or (not final and not isinstance(req, ChunkedReq))
+            or (not final and req.mamba_last_track_seqlen != length)
+            or (final and req.cache_anchor_track_slot is None)
             or req.mamba_ping_pong is None
+            or (final and req.cache_anchor_track_slot not in req.mamba_ping_pong)
             or length <= 0
             or length > req.cached_len
             or req.table_idx == -1
@@ -414,11 +431,12 @@ class CacheManager:
         token_ids = req.input_ids[:length]
         if store.contains(token_ids):
             return
-        frozen_idx = 1 - req.mamba_next_track_idx
-        frozen = req.mamba_ping_pong[frozen_idx]
+        frozen = (req.cache_anchor_track_slot if final
+                  else req.mamba_ping_pong[1 - req.mamba_next_track_idx])
         page_indices = self.page_table[req.table_idx, :length]
         if self._queue_disk_prefix(req, length, page_indices, frozen):
             self.note_harness_anchor("persisted")
+            self.note_harness_anchor("persisted_final" if final else "persisted_intermediate")
 
     def note_harness_anchor(self, outcome: str) -> None:
         """Record one anchor outcome, including disabled-store drops for unit observability."""
@@ -524,6 +542,9 @@ class CacheManager:
             boundary = req.cached_len
             if (
                 req.aborted
+                # The overlapped first decode must not overwrite the final-prefill
+                # root before the preceding batch's drain stages its disk write.
+                or getattr(req, "cache_anchor_track_slot", None) is not None
                 or req.table_idx < 0
                 or req.mm_embeds is not None
                 or req.linear_slot_idx is None
