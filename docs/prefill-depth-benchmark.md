@@ -246,3 +246,34 @@ Artifacts use `clock1-*-chunk-*.jsonl`, matching command/journal files and
 `clock1-host-pressure.jsonl` in the same results directory. Including this
 follow-up, 48 depth responses and 18 continuation responses passed their narrow
 checks. No serving default was changed.
+
+## Uncapped fixed-interval follow-up
+
+A reversed-order comparison on the same runtime tested 8192-token chunks with
+fixed interval 1000 and no prefill swap cap, then a fresh 2048/automatic control.
+This separates the earlier fixed-interval candidate from its restrictive 0.1
+prefill swap cap. All other settings and the 100k manifest remained unchanged.
+
+| Configuration | Cold TTFT | Cold wall | Cold answer decode | Repeat wall | Repeat decode | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192 / fixed 1000 / uncapped | 151.28 s | 160.22 s | 9.15 tok/s | 6.45 s | 23.18 tok/s | 25.92 tok/s |
+| 2048 / auto / uncapped | 268.31 s | 274.81 s | 12.72 tok/s | 6.09 s | 24.11 tok/s | 25.98 tok/s |
+
+All six responses passed. Comparisons performed on node-4 confirmed identical
+request hashes, complete answers, prompt counts and output counts for each
+phase. Cold hits remained zero and repeats reused 99,904 tokens. Independent
+request wall time was 22.09 versus 21.99 seconds. The candidate substantially
+reduced cold prefill and preserved independent decode in this sample, but its
+cold-answer decode remained slower and its repeat wall was 5.9% longer.
+This is not yet an unqualified replacement for the selected profile.
+
+The candidate's first decode adaptation tick reported 36.63% protected-expert
+pair coverage, similar to the earlier automatic control's 36.53%, rather than
+the capped fixed-interval candidate's 23.74%. Placement alone therefore does
+not explain the remaining cold-answer penalty. These counters do not isolate
+host page-cache effects or adaptation work overlapping the transition.
+
+Artifacts use `clock2-*.jsonl` and matching commands/journals in the same private
+directory. The controller completed successfully and restored the original
+configuration. Including this follow-up, 54 depth responses passed the narrow
+fidelity checks; no larger chunk default was selected.
