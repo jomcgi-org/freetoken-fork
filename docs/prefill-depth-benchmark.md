@@ -58,3 +58,44 @@ Do not change the default until the harness-root persistence gap in #81 is
 addressed or its effect on the chosen profile has been explicitly qualified.
 Larger chunks can cause more system roots to fall inside a final chunk, where
 the existing implementation does not persist them independently.
+
+## Initial node-4 screening, 2026-09-22
+
+Runtime `4fbc4ebf3f7d0c4039893b0471faf231c7a15ba0`, RTX 4090, 61.91 GiB host
+RAM, 100352 reserved KV tokens, 14 CPU threads and 6 GiB protected HOT budget.
+All arms kept 20 PINNED and 28 DISK layers, 82 protected rows per DISK layer,
+3589 expert slots, and 2.12 GiB free GPU memory after graph capture. The CPU
+extension SHA-256 was
+`c88ed9f877a5a6c4cb3eb4c172b0a7a953794e3ff1104a12b8dcb0f22fb4810f`.
+
+The order was 2048, 8192, 4096, 2048. Each server started from its static expert
+profile with empty prefix state. Each arm ran an approximately 8k source prompt,
+its cached repeat and a separate decode request, then the same sequence at 32k.
+Actual input counts were 7959 and 31958. This is one fixture per depth and two
+control observations, not a confidence interval or a selected serving default.
+
+| Chunk size / order | Cold TTFT, 8k | Cold TTFT, 32k | Decode during cold 32k answer | Independent decode after 32k |
+| --- | ---: | ---: | ---: | ---: |
+| 2048 / first | 46.61 s | 82.38 s | 11.87 tok/s | 29.16 tok/s |
+| 8192 / second | 12.86 s | 52.30 s | 5.30 tok/s | 29.52 tok/s |
+| 4096 / third | 20.62 s | 70.26 s | 10.12 tok/s | 31.09 tok/s |
+| 2048 / last | 33.61 s | 96.37 s | 10.21 tok/s | 29.12 tok/s |
+
+All 24 responses passed the JSON-copy checks. The cold and repeat answers each
+used 81 output tokens; independent decode used 451. All cold requests reported
+zero cached tokens. The 8192 cold 32k request completed in 67.91 s versus
+89.22 and 104.32 s for the controls, but its immediate decode and cached repeat
+were slower: repeat wall was 4.70 s versus 3.63 and 3.68 s. Independent subsequent
+decode recovered to the control rate. That transient cost remains part of the
+qualification, not a discarded measurement.
+
+The governor charged prefill scratch of 0.37, 0.64 and 1.18 GiB for chunks 2048,
+4096 and 8192 respectively. Expert layer placement was unchanged and no host
+pressure warning appeared in the saved arm journals. These startup estimates
+do not substitute for the pending 100k pressure measurement.
+
+Private full-response artifacts, manifests, launch commands and journals are in
+`node-4:/var/lib/longhorn/nvme-02/freetoken/results/prefill-depth-20260922/`,
+using `screen3-*.jsonl`. Earlier controller setup failures are preserved under
+different names and excluded from this table. The original serving service was
+restored successfully after the sweep.
