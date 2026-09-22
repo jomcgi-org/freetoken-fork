@@ -142,6 +142,22 @@ configuration was restored after the test. A separate offline check using the
 actual model tokenizer and a tool schema also found identical shared-root tokens
 across different user queries.
 
+### Restart validation with lazy restore enabled
+
+The same 2048-token final-chunk check passed at revision `06f30d8` with
+`--lazy-restore on`, matching the selected serving mode. The restored second
+query reused 4416 tokens after restart, with first text in 6.98 s and request
+wall time of 12.86 s. The identical query against an empty cache took 22.17 s
+to first text and 32.26 s total. All three phases passed; restored and cold
+requests, answer bytes and 81-token output counts matched exactly.
+
+The restore reported one hit, 173,329,400 bytes restored, 36 streamed blocks,
+zero faulted blocks and 50.06 ms of eager restore work. This exercises the
+configured lazy path but does not establish coverage of every fault-on-demand
+case. No corruption, fingerprint mismatch or dropped write was reported.
+Artifacts use `root4-*` in the same private directory. The bounded controller
+completed successfully and restored the original serving configuration.
+
 For the RadixArk Qwen3.8 Flash-Next geometry at TP=1 and bf16, a 32,768-token entry is about
 902.4 MiB before its small safetensors header:
 
