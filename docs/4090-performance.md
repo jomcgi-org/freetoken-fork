@@ -8,6 +8,26 @@ weight reuse, gated diagnostic work, prefill-marker carry and reclamation of
 redundant HOT checkpoint pages. Expert selection and model precision are
 unchanged. Every selected expert still contributes to the model result.
 
+On 2026-09-22, node-4 was promoted to merged revision `11654ed`, adding the
+harness-root snapshot and tokenizer fixes from #85. Eager and lazy restart
+checks reused the shared root, and a matched continuation comparison preserved
+request/answer parity across 18 responses with measured means of 74.27 seconds
+for the candidate and 74.49 seconds for the previous runtime. See
+[disk-prefix qualification details](disk-prefix-cache.md).
+
+The deployment retained 2048-token chunks, the existing native kernels, 100352
+reserved KV tokens and the 500 GiB prefix-cache budget. Its health check and
+exact-JSON inference smoke check passed. The selected checkout is
+`/var/lib/longhorn/nvme-02/freetoken/wt-root-merged-20260922`, selected by
+`freetoken-serve.service.d/60-root-runtime.conf`. The prior
+`50-selected-runtime.conf` and `wt-astra-qualified-runtime` checkout remain
+intact: removing only the 60 override, reloading systemd and restarting the
+service restores that configuration. Deployment evidence is under the private
+`results/prefill-depth-20260922/root-promotion-*` artifacts on node-4.
+
+This delivers shared-prefix reuse; it does not qualify a larger prefill chunk
+or resolve the cold-prefill-to-decode performance tradeoff described below.
+
 Install this revision following the repository's build instructions, including
 rebuilding the native CPU extension. An older installed extension does not
 contain the selected CPU changes. Use the NVFP4 Qwen Flash checkpoint and its
