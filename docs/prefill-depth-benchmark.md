@@ -99,3 +99,53 @@ Private full-response artifacts, manifests, launch commands and journals are in
 using `screen3-*.jsonl`. Earlier controller setup failures are preserved under
 different names and excluded from this table. The original serving service was
 restored successfully after the sweep.
+
+## 100k screening and host pressure
+
+The same runtime then ran one fixed 99,959-token prompt with 81 output tokens,
+its immediate repeat, and a separate 451-token decode request. The order was
+8192, 8192 with `--moe-hot-adapt-prefill-run-cap-frac 0.1`, then 2048. The cap
+limits expert-cache swaps during a prefill run to a fraction of the HOT budget;
+zero disables this additional cap. All other profile settings stayed fixed,
+including disabled disk-prefix persistence and enabled in-memory radix reuse.
+
+| Chunk / prefill swap cap | Cold TTFT | Cold wall | Cold answer decode | Repeat wall | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8192 / disabled | 167.77 s | 175.43 s | 10.71 tok/s | 8.36 s | 25.13 tok/s |
+| 8192 / 0.1 | 141.73 s | 147.38 s | 14.65 tok/s | 8.70 s | 24.03 tok/s |
+| 2048 / disabled | 267.03 s | 272.32 s | 15.77 tok/s | 6.30 s | 26.09 tok/s |
+
+All nine responses passed, with identical request hashes, answer bytes and output
+counts across arms for each phase. Cold requests had zero cached tokens; repeats
+had 99,904. Repeat TTFT was 2.67, 2.68 and 2.72 seconds respectively, so the
+repeat regression was after first text. Repeat decode estimates were 14.38,
+13.54 and 23.14 tok/s. The capped candidate improved cold TTFT by 1.88x, but its
+38% longer repeat wall and lower subsequent decode rate prevent a claim that it
+preserves decode performance. These are single observations, not a qualified
+default or a confidence interval.
+
+Two-second samples of `/proc/meminfo`, `/proc/pressure`, `/proc/vmstat` and
+`/proc/diskstats` were correlated with each cold request's client interval:
+
+| Chunk / cap | Sampled / request seconds | Min available RAM | Memory full stall | I/O full stall | Main NVMe reads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8192 / disabled | 164.4 / 175.4 | 28.65 GiB | 14.17% | 26.69% | 76.86 GiB |
+| 8192 / 0.1 | 144.2 / 147.4 | 28.47 GiB | 9.43% | 21.05% | 59.44 GiB |
+| 2048 / disabled | 270.5 / 272.3 | 29.47 GiB | 2.20% | 10.85% | 51.25 GiB |
+
+Stall percentages use deltas of the kernel's cumulative `full` pressure counters,
+not averages of its rolling averages. NVMe reads use sector-counter deltas for
+`nvme1n1`. These are whole-host counters, not process-exclusive attribution. The
+monitor started after the first request began, and two-second sampling also
+omits interval edges. Available memory alone did not capture the pressure:
+larger chunks were faster despite more sampled disk traffic and stall time.
+This motivates the host-budget diagnosis in #82, but does not prove a specific
+memory-governor fix.
+
+Artifacts use `long1-*-chunk-*.jsonl`, corresponding command/journal files,
+`long1-host-pressure.jsonl` and `summarize-long-pressure.py` in the same private
+results directory. A matched three-turn continuation comparison and additional
+prefill-to-decode transition measurements remain pending. The harness-root
+restart check also exposed a separate tokenizer-template rejection of system-only
+messages; PR #85 addresses that alongside final-chunk snapshots and remains
+pending real serving validation. No serving default has been changed.
