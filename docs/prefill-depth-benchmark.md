@@ -147,8 +147,9 @@ Artifacts use `long1-*-chunk-*.jsonl`, corresponding command/journal files,
 results directory. The continuation and prefill-to-decode transition comparisons
 below extend this screening. The harness-root
 restart check also exposed a separate tokenizer-template rejection of system-only
-messages; PR #85 addresses that alongside final-chunk snapshots and remains
-pending real serving validation. No serving default has been changed.
+messages; PR #85 addresses that alongside final-chunk snapshots. Its eager-restore
+restart checks subsequently passed at both 2048 and 8192 tokens, as documented
+in `docs/disk-prefix-cache.md` on that branch. No serving default has been changed.
 
 ## Matched continuation screening
 
@@ -201,7 +202,7 @@ is cached/decode performance, not an observed allocation failure. Larger chunks
 also showed higher host pressure; a successful allocation is not sufficient
 evidence for selecting them. The next work is to explain and validate the
 prefill-to-decode cache transition, repeat comparisons in reversed order, and
-complete the harness-root serving/restart check. The experiments establish a
+qualify harness-root reuse with the selected lazy-restore configuration. The experiments establish a
 promising prefill opportunity, not a new qualified serving profile.
 
 Additional response artifacts use `long2-posttick-*.jsonl` and
