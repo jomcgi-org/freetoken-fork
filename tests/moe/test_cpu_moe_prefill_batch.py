@@ -111,6 +111,7 @@ def _bare_executor(extension, *, requested=True):
     executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
     executor._ext = extension
     executor._prefill_batch_requested = requested
+    executor._prefill_batch_setup_attempted = False
     executor._prefill_batch_enabled = False
     executor._prefill_batch_warned = False
     executor._prefill_batch_degrades = 0
@@ -142,6 +143,7 @@ def test_missing_kernel_or_setup_failure_degrades_to_serial(extension):
     executor = _bare_executor(extension)
 
     executor._configure_prefill_batch()
+    executor._configure_prefill_batch()
 
     assert executor._prefill_batch_enabled is False
     assert executor._prefill_batch_degrades == 1
@@ -151,6 +153,7 @@ def test_successful_setup_is_one_time_and_reports_native_bytes():
     extension = _SetupExtension()
     executor = _bare_executor(extension)
 
+    executor._configure_prefill_batch()
     executor._configure_prefill_batch()
 
     assert extension.setup_calls == [2048]
@@ -245,6 +248,7 @@ def test_batch_run_failure_disables_it_and_retries_serial():
     executor._prefill_io = None
     executor._prefill_capacity = 0
     executor._prefill_batch_enabled = True
+    executor._prefill_batch_setup_attempted = True
     executor._prefill_batch_rows = 0
     executor._prefill_batch_gemms = 0
 
@@ -260,7 +264,8 @@ def test_batch_run_failure_disables_it_and_retries_serial():
     assert executor._prefill_batch_degrades == 1
 
 
-def test_native_batch_matches_serial_and_reuses_workspace():
+@pytest.mark.parametrize("lazy", [False, True])
+def test_native_batch_matches_serial_and_reuses_workspace(lazy):
     try:
         from freetoken.kernel import _cpu_moe
     except ImportError:
@@ -291,8 +296,14 @@ def test_native_batch_matches_serial_and_reuses_workspace():
         device=torch.device("cpu"),
     )
     serial = CpuMoeExecutor(cache, prefill_batch="off", **common)
-    batched = CpuMoeExecutor(cache, prefill_batch="on", **common)
-    if not batched._prefill_batch_enabled:
+    batched = CpuMoeExecutor(
+        cache, prefill_batch="on", prefill_batch_lazy=lazy, **common
+    )
+    if lazy:
+        assert batched._ext.prefill_batch_buffer_bytes() == 0
+        assert not batched._prefill_batch_enabled
+        assert not batched._prefill_batch_setup_attempted
+    elif not batched._prefill_batch_enabled:
         pytest.skip("native batched NVFP4 kernel unavailable on this CPU build")
 
     x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
@@ -300,13 +311,15 @@ def test_native_batch_matches_serial_and_reuses_workspace():
         torch.int32
     )
     weights = torch.rand(tokens, top_k, dtype=torch.float32)
-    before = batched._ext.prefill_batch_buffer_bytes()
-    assert before == _prefill_batch_buffer_nbytes(
+    expected_bytes = _prefill_batch_buffer_nbytes(
         tokens, top_k, hidden, intermediate
     )
 
     expected = serial.prefill(0, x, weights, ids).float()
     actual = batched.prefill(0, x, weights, ids).float()
+    assert batched._prefill_batch_enabled  # Lazy setup must use the batched path.
+    assert batched._prefill_batch_setup_attempted
+    assert batched._ext.prefill_batch_buffer_bytes() == expected_bytes
     again = batched.prefill(0, x, weights, ids).float()
 
     # W4A8 dot products accumulate in fp32. The activated intermediate and each
@@ -314,7 +327,7 @@ def test_native_batch_matches_serial_and_reuses_workspace():
     # The tolerance covers that extra per-route bf16 store and reduction ordering.
     torch.testing.assert_close(actual, expected, rtol=5e-2, atol=6e-2)
     torch.testing.assert_close(again, actual, rtol=0, atol=0)
-    assert batched._ext.prefill_batch_buffer_bytes() == before
+    assert batched._ext.prefill_batch_buffer_bytes() == expected_bytes
     assert batched._prefill_batch_rows == 2 * tokens * top_k
     assert batched._prefill_batch_gemms == 4 * len(torch.unique(ids))
 

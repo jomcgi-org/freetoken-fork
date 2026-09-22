@@ -1256,6 +1256,7 @@ class Engine:
                 getattr(config, "moe_pager_budget_gib", 40.0) * 2**30
             ),
             prefill_batch=getattr(config, "moe_cpu_prefill_batch", "on"),
+            prefill_batch_lazy=config.moe_disk_prefill == "staged",
             max_prefill_tokens=getattr(config, "max_extend_tokens", 2048),
         )
         if (
