@@ -277,3 +277,33 @@ Artifacts use `clock2-*.jsonl` and matching commands/journals in the same privat
 directory. The controller completed successfully and restored the original
 configuration. Including this follow-up, 54 depth responses passed the narrow
 fidelity checks; no larger chunk default was selected.
+
+
+## Decode fault-guard boundary diagnosis
+
+A follow-up on merged runtime `11654ed` enabled `--moe-step-timing`,
+`--moe-collect-stats` and ten-step decode logs for the 8192/fixed-1000 and
+2048/automatic arms. All six responses passed and matched exactly across arms,
+including request hashes, complete text, reasoning, finish reasons and usage.
+Artifacts use `diag1-*` in the same private directory.
+
+The 8192 cold-answer windows reported one prefetch guard trip and no skipped
+expert advice, although each window's reported major-fault rate was below the
+configured 2000 faults per decode step ceiling. Code inspection and two failing
+regressions identified an accounting error: the guard's initial baseline included
+startup faults, and its next sample after prefill counted all intervening prefill
+faults as one decode interval. These counters are process-wide, so they cannot
+attribute faults exclusively to CPU expert pages.
+
+The fix establishes a baseline at the first decode and invalidates that baseline
+at existing prefill/cache-reset boundaries. It preserves measured decode history,
+recent expert touches and any active 256-step pressure hold. Genuine excessive
+faults between consecutive decode steps still activate the guard. Both new tests
+fail before the change; 37 targeted timing, prefetch, lookahead and statistics
+tests pass on node-4 Linux after it.
+
+The instrumented 8192 cold-answer rate was 14.97 tok/s, versus 9.15 tok/s in the
+previous uninstrumented experiment; the instrumented 2048 rate was 8.57 tok/s.
+Synchronization and counters alter execution, and these samples also vary across
+fresh starts. They do not establish a speedup or qualify a new serving profile.
+An uninstrumented comparison of the fix and unchanged controls is required.
