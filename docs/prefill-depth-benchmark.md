@@ -277,3 +277,294 @@ Artifacts use `clock2-*.jsonl` and matching commands/journals in the same privat
 directory. The controller completed successfully and restored the original
 configuration. Including this follow-up, 54 depth responses passed the narrow
 fidelity checks; no larger chunk default was selected.
+
+
+## Decode fault-guard boundary diagnosis
+
+A follow-up on merged runtime `11654ed` enabled `--moe-step-timing`,
+`--moe-collect-stats` and ten-step decode logs for the 8192/fixed-1000 and
+2048/automatic arms. All six responses passed and matched exactly across arms,
+including request hashes, complete text, reasoning, finish reasons and usage.
+Artifacts use `diag1-*` in the same private directory.
+
+The 8192 cold-answer windows reported one prefetch guard trip and no skipped
+expert advice, although each window's reported major-fault rate was below the
+configured 2000 faults per decode step ceiling. Code inspection and two behavior
+tests confirmed that the guard's initial baseline included
+startup faults, and its next sample after prefill counted all intervening prefill
+faults as one decode interval. These counters are process-wide, so they cannot
+attribute faults exclusively to CPU expert pages.
+
+The experimental policy establishes a baseline at the first decode and invalidates that baseline
+at existing prefill/cache-reset boundaries. It preserves measured decode history,
+recent expert touches and any active 256-step pressure hold. Genuine excessive
+faults between consecutive decode steps still activate the guard. Both new behavior tests
+fail before the change; 37 targeted timing, prefetch, lookahead and statistics
+tests pass on node-4 Linux after it. These tests establish the changed accounting,
+not a performance improvement. The original rationale in `bench/RESULTS.md`
+explicitly used prefill faults to detect loss of the resident working set.
+Excluding those faults therefore changes that pressure policy and needs measured
+qualification before deployment.
+
+The instrumented 8192 cold-answer rate was 14.97 tok/s, versus 9.15 tok/s in the
+previous uninstrumented experiment; the instrumented 2048 rate was 8.57 tok/s.
+Synchronization and counters alter execution, and these samples also vary across
+fresh starts. They do not establish a speedup or qualify a new serving profile.
+An uninstrumented comparison of the fix and unchanged controls is required.
+
+
+## First uninstrumented fault-policy comparison
+
+The `guard1` comparison ran the experimental policy (`39f5dc2`) at 8192 chunks
+and fixed interval 1000, unchanged `11654ed` with the same chunk/interval, then
+unchanged `11654ed` at the selected 2048/automatic settings. Other settings and
+the 100k manifest were held fixed. Each arm restarted from empty prefix state.
+
+| Policy / chunks / interval | Cold TTFT | Cold wall | Cold answer decode | Repeat TTFT | Repeat wall | Repeat decode | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Decode-only faults / 8192 / 1000 | 171.37 s | 178.77 s | 11.10 tok/s | 5.86 s | 8.47 s | 31.56 tok/s | 26.61 tok/s |
+| Original / 8192 / 1000 | 160.80 s | 167.78 s | 11.79 tok/s | 2.65 s | 6.04 s | 24.64 tok/s | 25.51 tok/s |
+| Original / 2048 / auto | 268.25 s | 278.53 s | 8.17 tok/s | 1.70 s | 5.68 s | 20.77 tok/s | 24.82 tok/s |
+
+All nine responses passed and matched exactly across arms in request hashes,
+complete text, reasoning, finish reasons and usage. Cold hits were zero and
+repeats reused 99,904 tokens. The controller completed and restored the selected
+serving service. Artifacts use `guard1-*` in the same private results directory.
+
+The candidate reduced cold first-text latency by 36% relative to the selected
+profile and had higher client-observed decode rates in all three phases in this
+sample. However, the cached repeat's total wall time increased by 49%, due to
+its longer first-text wait. Against the same-size unchanged arm, repeat decode
+improved by 28% while total repeat wall increased by 40%. These observations
+separate generated-token rate from whole-request performance; they do not
+establish a uniformly faster profile. The ten-second cold-TTFT difference
+between same-size arms also cautions against attributing a single fresh-start
+measurement to the decode-only policy. A follow-up tests the candidate at 2048
+and repeats the 8192 arm before continuation qualification or deployment.
+
+
+## Fault policy at the selected chunk size
+
+The next completed arm kept 2048 chunks and the automatic adaptation interval,
+changing only the fault-accounting policy. Its three responses passed and
+matched the preceding unchanged 2048 arm exactly, including full messages,
+request hashes, finish reasons and usage.
+
+| Policy | Cold TTFT | Cold wall | Cold answer decode | Repeat TTFT | Repeat wall | Repeat decode | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original, preceding control | 268.25 s | 278.53 s | 8.17 tok/s | 1.70 s | 5.68 s | 20.77 tok/s | 24.82 tok/s |
+| Decode-only faults | 267.22 s | 274.44 s | 11.33 tok/s | 2.71 s | 5.40 s | 30.74 tok/s | 27.26 tok/s |
+
+Cold first-text latency was essentially unchanged, as expected for a policy
+applied at decode boundaries. All three decode-rate estimates improved in this
+sample. The repeat's first-text wait increased, but faster generation reduced
+its total wall time by about 5%. This is one fresh-start observation, not an
+isolated causal estimate or completed qualification.
+
+The arm's artifacts are `guard2-0-chunk-2048-cap-0.0-interval-auto.*`. The
+controller then failed before starting its second arm because systemd still
+had the shared transient service name loaded. Recovery restored serving; the
+completed measurements were retained. Only the unrun 8192 repeat was launched
+under `guard2b`, using a distinct service name. Continuation qualification also
+uses a distinct service per arm to avoid this launch conflict.
+
+
+The repeated 8192/fixed-1000 candidate (`guard2b`) subsequently completed and
+passed all three requests. It matched both completed 2048 arms exactly in full
+responses, requests, finish reasons and usage. With the same experimental fault
+policy in both chunk sizes:
+
+| Chunks / interval | Cold TTFT | Cold wall | Cold answer decode | Repeat TTFT | Repeat wall | Repeat decode | Independent wall | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 / auto | 267.22 s | 274.44 s | 11.33 tok/s | 2.71 s | 5.40 s | 30.74 tok/s | 21.33 s | 27.26 tok/s |
+| 8192 / 1000 | 147.38 s | 153.59 s | 13.19 tok/s | 2.88 s | 5.42 s | 32.67 tok/s | 21.26 s | 27.32 tok/s |
+
+The larger chunk reduced cold first-text latency by 45%, with repeat wall within
+0.4% and essentially unchanged independent decode in this pair. The earlier
+8.47-second candidate repeat is retained above; fresh-start variability remains
+part of the evidence. The controller restored healthy serving, and the matched
+continuation qualification began only after all six follow-up responses passed
+exact parity. This is still a candidate profile pending that qualification.
+
+
+## Continuation qualification of the fixed-interval candidate
+
+`guardqual2` compared unchanged `11654ed` at 2048/automatic against `39f5dc2`
+at 8192/fixed-1000. Each ran the existing three-conversation, three-turn protocol
+with its original prompts, budgets and graders. Conversation 1 was the prescribed
+warm-up. Each arm had its own initially empty 2 GiB disk-prefix cache and lazy
+restore enabled. All 18 responses passed and matched in complete requests,
+messages, finish reasons, prompt counts and output counts.
+
+| Profile | Warm-up | Measured conversation 2 | Measured conversation 3 | Measured mean |
+| --- | ---: | ---: | ---: | ---: |
+| Original / 2048 / auto | 95.54 s | 72.47 s | 66.52 s | 69.50 s |
+| Decode-only faults / 8192 / 1000 | 109.04 s | 72.54 s | 79.56 s | 76.05 s |
+
+The candidate's measured mean was 9.4% slower. This prevents selecting the
+fixed-interval profile despite its favorable long-prefill sample. Saved startup
+adaptation logs show another material policy difference: the first automatic
+prefill boundary consumed 12 ticks and planned 1,148 swaps, while fixed cadence
+consumed two ticks and planned 386. The initial prompts were about 2.1k tokens.
+This makes reduced initial HOT-cache adaptation a plausible contributor, not a
+proven sole cause. The larger-chunk candidate needs a comparison retaining the
+selected automatic cadence before introducing further runtime changes.
+
+The queued coding test was stopped before taking the GPU, preserving its frozen
+protocol for a qualified finalist. A follow-up runs the original continuation
+workload followed by the 100k depth workload in each fresh server, candidate
+first and control second, with automatic cadence and disk-prefix persistence
+disabled in both. This holds cadence constant and measures long prefill after
+ordinary conversation activity, rather than relying on one clock phase from an
+otherwise fresh server. No new serving default has been selected.
+
+
+## Automatic cadence after ordinary continuation
+
+`auto1` completed the continuation protocol followed by the 100k workload on
+fresh servers: `39f5dc2`/8192 first, `11654ed`/2048 second, automatic adaptation
+and disk-prefix persistence disabled in both. All 18 continuation responses and
+all six depth responses passed, with exact full-request, message, finish and
+usage parity. The prescribed first conversation was excluded from the measured
+continuation mean. Cold refers to the prefix cache, not the OS page cache.
+
+| Metric | Original / 2048 | Decode-only faults / 8192 |
+| --- | ---: | ---: |
+| Measured continuation mean | 65.99 s | 67.70 s |
+| 100k cold TTFT | 252.41 s | 125.91 s |
+| 100k cold wall | 255.83 s | 129.63 s |
+| Cold answer decode | 24.25 tok/s | 22.17 tok/s |
+| Repeat TTFT | 2.55 s | 1.54 s |
+| Repeat wall | 5.53 s | 4.63 s |
+| Repeat decode | 27.66 tok/s | 26.64 tok/s |
+| Independent request wall | 19.05 s | 20.92 s |
+| Independent request decode | 31.23 tok/s | 27.24 tok/s |
+
+The candidate halved cold first-text latency, but continuation averaged 2.6%
+slower and independent decode was 12.8% slower. It is not qualified for
+promotion. Both repeats reused 99,904 tokens; both cold requests had zero hits.
+A two-second host observer covered at least 95% of both cold windows. On-node
+comparisons found higher memory pressure, I/O pressure and disk reads for the
+candidate. Detailed host counters remain on node-4. These are host-wide
+observations, with phase endpoints observed up to two seconds late, not proof
+that one subsystem caused the slowdown.
+
+Source inspection shows that increasing `host_cache_reserve_gib` reduces both
+derived pinned-expert and pager budgets (28:22 split after fixed costs). It can
+therefore increase disk residency rather than simply adding free page cache.
+The next isolated screening comparison keeps `11654ed` and automatic cadence
+in both arms and changes only chunks from 2048 to 4096. No larger default or
+fault-policy change has been selected.
+
+
+## Intermediate chunks with the original fault policy
+
+`mid1` isolated chunk size on unchanged `11654ed`: 2048 first, then 4096,
+automatic cadence and no disk-prefix persistence in both. Each fresh server ran
+the original continuation protocol before the 100k workload. All 18 continuation
+responses and six depth responses passed with exact full-response, request,
+finish and usage parity. The first conversation remained warm-up.
+
+| Metric | 2048 | 4096 |
+| --- | ---: | ---: |
+| Measured continuation mean | 66.51 s | 67.40 s |
+| 100k cold TTFT | 253.59 s | 169.61 s |
+| 100k cold wall | 256.96 s | 173.51 s |
+| Cold answer decode | 24.71 tok/s | 21.19 tok/s |
+| Repeat TTFT | 2.57 s | 2.63 s |
+| Repeat wall | 5.84 s | 5.51 s |
+| Repeat decode | 25.20 tok/s | 28.64 tok/s |
+| Independent request wall | 19.29 s | 27.74 s |
+| Independent request decode | 30.71 tok/s | 19.44 tok/s |
+
+The 33% cold-TTFT gain does not qualify this profile: independent decode was
+37% slower and cold-answer decode was 14% slower. Continuation differed by 1.3%
+in this small sample. Both cold requests had zero prefix hits; both repeats
+reused 99,904 tokens. The host observer covered at least 95% of both cold windows
+and again found higher memory pressure, I/O pressure and disk reads for the
+larger chunk. Host-wide counters remain on node-4 and are not causal attribution.
+
+The controller completed successfully and restarted the selected 2048 serving
+service. The prepared three-repetition depth sweep remains unstarted. Further
+work should investigate the memory/cache-pressure tradeoff before promoting a
+larger default. This comparison did not use the experimental fault policy.
+
+
+## Increasing host reserve at 4096 chunks
+
+`reserve1` tested unchanged `11654ed` with automatic adaptation and no persistent
+prefix cache. The order was 4096 with 16 GiB host reserve, 4096 with default
+reserve, then the selected 2048/default-reserve control. Preflight used actual
+model geometry and the saved startup budget; the running candidate matched its
+predicted reduction in pinned layers. No startup pressure warning appeared for
+the candidate. Each fresh server ran continuation before the 100k workload.
+All 27 continuation responses and nine depth responses passed with exact parity.
+
+| Metric | 4096 / reserve 16 GiB | 4096 / default reserve | 2048 / default reserve |
+| --- | ---: | ---: | ---: |
+| Measured continuation mean | 65.63 s | 69.79 s | 70.55 s |
+| Cold TTFT | 180.78 s | 169.37 s | 258.03 s |
+| Cold wall | 184.71 s | 172.97 s | 261.68 s |
+| Cold answer decode | 20.93 tok/s | 23.03 tok/s | 22.75 tok/s |
+| Repeat TTFT | 1.66 s | 2.76 s | 2.62 s |
+| Repeat wall | 4.57 s | 5.55 s | 5.70 s |
+| Repeat decode | 28.35 tok/s | 29.62 tok/s | 26.73 tok/s |
+| Independent wall | 21.65 s | 22.61 s | 19.67 s |
+| Independent decode | 26.69 tok/s | 25.04 tok/s | 30.13 tok/s |
+
+The larger reserve improved continuation and cached-repeat wall time, but
+independent decode remained 11% slower than the selected control. Cold-answer
+decode was also slower. It is not qualified for promotion. All cold requests
+had zero prefix hits and all repeats reused 99,904 tokens.
+
+The observer covered at least 95% of every cold window and 80% of every
+independent-decode window, with endpoints observed up to two seconds late.
+During cold prefill, the larger reserve had higher host memory pressure, I/O
+pressure, disk reads and read rate than both controls. During independent
+decode, its I/O pressure and reads were no higher than either control, but
+memory pressure was higher. Detailed host counters remain on node-4. These
+host-wide comparisons are observational; neither lower I/O nor a larger
+configured reserve establishes preserved decode performance. The experiment
+completed successfully and restarted the selected serving service.
+
+
+## Decode-only fault accounting at 4096 chunks
+
+`guardmid1` compared patched `39f5dc2` at 4096 and 2048, then unchanged
+`11654ed` at 2048. All used automatic adaptation, default host reserve, zero
+persistent prefix cache, and the same continuation-before-100k protocol.
+Native library hashes matched. All 27 continuation and nine depth responses
+passed with exact full-request, output, finish and usage parity.
+
+| Metric | Patched / 4096 | Patched / 2048 | Original / 2048 |
+| --- | ---: | ---: | ---: |
+| Measured continuation mean | 67.07 s | 69.23 s | 68.49 s |
+| Cold TTFT | 163.88 s | 254.74 s | 257.11 s |
+| Cold wall | 167.48 s | 258.16 s | 260.99 s |
+| Cold answer decode | 22.92 tok/s | 24.35 tok/s | 21.24 tok/s |
+| Repeat TTFT | 1.58 s | 1.77 s | 1.59 s |
+| Repeat wall | 4.50 s | 5.25 s | 4.67 s |
+| Repeat decode | 28.19 tok/s | 23.95 tok/s | 26.76 tok/s |
+| Independent wall | 20.95 s | 19.81 s | 19.96 s |
+| Independent decode | 27.30 tok/s | 29.65 tok/s | 29.32 tok/s |
+
+The patched 4096 profile cut cold TTFT by 36% relative to the selected control,
+but independent decode remained 7% slower. The patched 2048 repeat was also
+slower than the unchanged control. These single fresh-start samples do not
+qualify either profile. All cold requests had zero prefix hits; repeats reused
+99,904 tokens. The controller completed and restarted the selected service.
+
+Cold pressure coverage exceeded 95% and independent-decode coverage exceeded
+80% for each arm. The larger patched chunk had higher cold memory/I/O pressure
+and read rate than both controls; total cold reads were higher than patched
+2048 but no higher than original 2048. During independent decode, all four
+pressure/read comparisons were no higher than either control, despite lower
+decode throughput. These host-wide observations therefore do not establish
+I/O pressure as the sole cause. Detailed counters remain on node-4.
+
+A separate workspace investigation found that CPU-prefill scratch remains
+allocated after use. Historical instrumented logs confirm CPU batch use below
+the 1024-token staging threshold in both chunk profiles, including chunks
+larger than 128 tokens. Deferring allocation can avoid unused startup memory,
+but short continuations can allocate it again; persistent memory savings need
+further lifecycle work and validation.
