@@ -341,3 +341,29 @@ establish a uniformly faster profile. The ten-second cold-TTFT difference
 between same-size arms also cautions against attributing a single fresh-start
 measurement to the decode-only policy. A follow-up tests the candidate at 2048
 and repeats the 8192 arm before continuation qualification or deployment.
+
+
+## Fault policy at the selected chunk size
+
+The next completed arm kept 2048 chunks and the automatic adaptation interval,
+changing only the fault-accounting policy. Its three responses passed and
+matched the preceding unchanged 2048 arm exactly, including full messages,
+request hashes, finish reasons and usage.
+
+| Policy | Cold TTFT | Cold wall | Cold answer decode | Repeat TTFT | Repeat wall | Repeat decode | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Original, preceding control | 268.25 s | 278.53 s | 8.17 tok/s | 1.70 s | 5.68 s | 20.77 tok/s | 24.82 tok/s |
+| Decode-only faults | 267.22 s | 274.44 s | 11.33 tok/s | 2.71 s | 5.40 s | 30.74 tok/s | 27.26 tok/s |
+
+Cold first-text latency was essentially unchanged, as expected for a policy
+applied at decode boundaries. All three decode-rate estimates improved in this
+sample. The repeat's first-text wait increased, but faster generation reduced
+its total wall time by about 5%. This is one fresh-start observation, not an
+isolated causal estimate or completed qualification.
+
+The arm's artifacts are `guard2-0-chunk-2048-cap-0.0-interval-auto.*`. The
+controller then failed before starting its second arm because systemd still
+had the shared transient service name loaded. Recovery restored serving; the
+completed measurements were retained. Only the unrun 8192 repeat was launched
+under `guard2b`, using a distinct service name. Continuation qualification also
+uses a distinct service per arm to avoid this launch conflict.
