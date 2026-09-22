@@ -289,18 +289,22 @@ Artifacts use `diag1-*` in the same private directory.
 
 The 8192 cold-answer windows reported one prefetch guard trip and no skipped
 expert advice, although each window's reported major-fault rate was below the
-configured 2000 faults per decode step ceiling. Code inspection and two failing
-regressions identified an accounting error: the guard's initial baseline included
+configured 2000 faults per decode step ceiling. Code inspection and two behavior
+tests confirmed that the guard's initial baseline included
 startup faults, and its next sample after prefill counted all intervening prefill
 faults as one decode interval. These counters are process-wide, so they cannot
 attribute faults exclusively to CPU expert pages.
 
-The fix establishes a baseline at the first decode and invalidates that baseline
+The experimental policy establishes a baseline at the first decode and invalidates that baseline
 at existing prefill/cache-reset boundaries. It preserves measured decode history,
 recent expert touches and any active 256-step pressure hold. Genuine excessive
-faults between consecutive decode steps still activate the guard. Both new tests
+faults between consecutive decode steps still activate the guard. Both new behavior tests
 fail before the change; 37 targeted timing, prefetch, lookahead and statistics
-tests pass on node-4 Linux after it.
+tests pass on node-4 Linux after it. These tests establish the changed accounting,
+not a performance improvement. The original rationale in `bench/RESULTS.md`
+explicitly used prefill faults to detect loss of the resident working set.
+Excluding those faults therefore changes that pressure policy and needs measured
+qualification before deployment.
 
 The instrumented 8192 cold-answer rate was 14.97 tok/s, versus 9.15 tok/s in the
 previous uninstrumented experiment; the instrumented 2048 rate was 8.57 tok/s.
