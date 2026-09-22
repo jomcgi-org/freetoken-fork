@@ -685,7 +685,8 @@ class CpuMoeExecutor:
         self._willneed_fault_window_sum = 0
         self._willneed_fault_window_pos = 0
         self._willneed_fault_window_samples = 0
-        self._willneed_fault_last_major = self._disk_major_fault_base
+        # Establish the baseline at the first decode, excluding model startup.
+        self._willneed_fault_last_major = None
         self._willneed_guard_steps_remaining = 0
 
     def _configure_prefill_batch(self) -> None:
@@ -1338,6 +1339,10 @@ class CpuMoeExecutor:
         """Make the next decode step cold after a prefill or cache reset boundary."""
         self._disk_previous_experts = {}
         self._disk_predicted_experts = {}
+        if getattr(self, "_moe_cpu_willneed", "always") == "recent":
+            # The next decode must not charge prefill/cache work to one decode
+            # interval. Preserve actual decode history and any active guard hold.
+            self._willneed_fault_last_major = None
 
     def _update_willneed_fault_guard(self) -> None:
         """Advance the rolling major-fault guard at a decode-step boundary."""

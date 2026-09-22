@@ -310,6 +310,8 @@ def test_prefill_willneed_never_consults_or_updates_recent_touches():
 
 def test_willneed_fault_guard_forces_256_always_steps_then_resumes(monkeypatch):
     executor, advised = _willneed_executor("recent", recent_steps=256, ceiling=1)
+    monkeypatch.setattr(cpu_executor, "_process_faults", lambda: (0, 0))
+    executor.begin_decode_step()
     monkeypatch.setattr(cpu_executor, "_process_faults", lambda: (0, 3000))
 
     executor.begin_decode_step()
@@ -323,6 +325,43 @@ def test_willneed_fault_guard_forces_256_always_steps_then_resumes(monkeypatch):
     assert executor._willneed_guard_trips == 1
     assert all(selected == [3, 7] for _, selected in advised[:256])
     assert advised[256] == (1, [])
+
+
+def test_willneed_guard_does_not_charge_startup_faults_to_decode(monkeypatch):
+    executor, advised = _willneed_executor("recent", recent_steps=256, ceiling=1)
+    monkeypatch.setattr(cpu_executor, "_process_faults", lambda: (0, 10000))
+    executor.begin_decode_step()
+    executor.prefetch_experts(1, [3, 7])
+    executor.begin_decode_step()
+    executor.prefetch_experts(1, [3, 7])
+    assert executor._willneed_guard_trips == 0
+    assert advised == [(1, [3, 7]), (1, [])]
+
+
+def test_prefill_faults_are_excluded_but_decode_faults_still_trip_guard(monkeypatch):
+    executor, advised = _willneed_executor("recent", recent_steps=256, ceiling=1)
+    major = [0]
+    monkeypatch.setattr(cpu_executor, "_process_faults", lambda: (0, major[0]))
+    executor.begin_decode_step()
+    executor.prefetch_experts(1, [3, 7])
+    executor.begin_decode_step()
+    executor.reset_disk_lookahead()
+    major[0] = 10000  # Non-decode work between the two decode runs.
+    executor.begin_decode_step()
+    executor.prefetch_experts(1, [3, 7])
+    assert executor._willneed_guard_trips == 0
+    assert advised[-1] == (1, [])
+    major[0] += 4  # Faults from a real decode interval still count.
+    executor.begin_decode_step()
+    executor.prefetch_experts(1, [3, 7])
+    assert executor._willneed_guard_trips == 1
+    assert advised[-1] == (1, [3, 7])
+    executor.reset_disk_lookahead()
+    major[0] += 10000
+    executor.begin_decode_step()
+    executor.prefetch_experts(1, [3, 7])
+    assert executor._willneed_guard_trips == 1
+    assert advised[-1] == (1, [3, 7])  # Retain the existing pressure hold.
 
 
 def test_willneed_stats_reset_counts_but_preserve_guard_trips(monkeypatch):
