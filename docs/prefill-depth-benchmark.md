@@ -149,3 +149,26 @@ prefill-to-decode transition measurements remain pending. The harness-root
 restart check also exposed a separate tokenizer-template rejection of system-only
 messages; PR #85 addresses that alongside final-chunk snapshots and remains
 pending real serving validation. No serving default has been changed.
+
+## Matched continuation screening
+
+The existing `fixed-continuation-wall.py` protocol ran three conversations of
+three turns each, first on 2048 chunks and then on 8192 with the 0.1 prefill swap
+cap. Each arm restarted from the same qualified runtime with disk-prefix storage
+disabled. Conversation 1 was the prescribed warm-up; conversations 2 and 3 were
+measured. Initial prompts were about 2k tokens, and answers about 448 tokens.
+
+| Chunk / cap | Warm-up conversation | Measured conversation 2 | Measured conversation 3 | Measured mean |
+| --- | ---: | ---: | ---: | ---: |
+| 2048 / disabled | 98.25 s | 68.63 s | 64.48 s | 66.55 s |
+| 8192 / 0.1 | 91.42 s | 67.25 s | 64.13 s | 65.69 s |
+
+All 18 responses passed. The protocol's `fixed_work_mismatches` check found no
+differences in request bodies, answer messages, finish reasons, prompt counts or
+output counts. The candidate reused 2048 tokens on turn 2 versus 1984 for the
+control; both reused 2944 on turn 3. The measured mean improved by only 1.3%,
+while the combined measured follow-up turns were about 1.6% slower. This small
+sample is broadly similar total wall time, not proof of a general agent-quality
+or decode-speed improvement, and it does not remove the 100k repeat regression.
+Full results are under `cont1-*-chunk-*/session-*/result.json` beside the exact
+launch commands and journals in the private results directory.
