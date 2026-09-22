@@ -92,6 +92,8 @@ class TokenizeManager:
         exact template-safe boundary without assuming how a model spells role markers.
         Any generation suffix emitted by the standalone template stops contributing
         at the first token where it differs from the full conversation render.
+        Templates requiring a user turn are probed with two different queries;
+        only the token prefix shared by both probes can become an anchor.
         """
         prompt = self.render_prompt(msg)
         input_ids = self._encode_prompt(prompt, templated=isinstance(msg.text, list))
@@ -104,7 +106,7 @@ class TokenizeManager:
                 msg.tools,
                 self._sanitize_effort(msg.chat_template_kwargs or {}),
             )
-        except Exception:  # a template may reject a system-only conversation
+        except Exception:  # unsupported preamble templates must not reject a request
             return input_ids, None, None
         anchor = _common_prefix_len(input_ids, preamble_ids)
         if anchor <= 0 or anchor >= input_ids.numel():
@@ -128,8 +130,25 @@ class TokenizeManager:
         if cached is not None:
             self._preamble_cache.move_to_end(key)
             return cached
-        rendered_preamble = self._render(messages, tools, chat_template_kwargs)
-        encoded = self._encode_prompt(rendered_preamble, templated=True)
+        try:
+            rendered_preamble = self._render(messages, tools, chat_template_kwargs)
+            encoded = self._encode_prompt(rendered_preamble, templated=True)
+        except Exception:
+            # Qwen templates can require a user query even when rendering just
+            # the stable system instructions. Compare different probe turns so
+            # no query-specific tokens enter the cached prefix. The real request
+            # is compared against this prefix again before choosing its anchor.
+            probes = [
+                self._render(
+                    [*messages, {"role": "user", "content": content}],
+                    tools,
+                    chat_template_kwargs,
+                )
+                for content in ("A", "Z")
+            ]
+            left, right = [self._encode_prompt(p, templated=True) for p in probes]
+            rendered_preamble = probes[0]
+            encoded = left[:_common_prefix_len(left, right)].clone()
         cached = (rendered_preamble, encoded)
         self._preamble_cache[key] = cached
         self._preamble_cache.move_to_end(key)

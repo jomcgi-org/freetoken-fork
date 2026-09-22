@@ -145,6 +145,66 @@ def test_unknown_client_does_not_get_a_harness_anchor():
     assert kind is None
 
 
+@pytest.mark.parametrize("user", ["A", "Z", "a different task"])
+def test_user_required_template_anchors_before_query_and_reuses_probe(user):
+    class UserRequiredTokenizer(HarnessTokenizer):
+        def __init__(self):
+            self.renders = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.renders += 1
+            if not any(m["role"] == "user" for m in messages):
+                raise ValueError("No user query found in messages.")
+            assert kwargs["enable_thinking"] is False
+            return super().apply_chat_template(messages, **kwargs)
+
+    tokenizer = UserRequiredTokenizer()
+    manager = TokenizeManager(tokenizer)
+    tools = [{"type": "function", "function": {"name": "read"}}]
+    msg = TokenizeMsg(
+        uid=1,
+        text=[
+            {"role": "system", "content": "You are OpenCode, stable instructions"},
+            {"role": "user", "content": user},
+        ],
+        sampling_params=SamplingParams(),
+        tools=tools,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    full, anchor, kind = manager.tokenize_with_cache_anchor(msg)
+    rendered = "".join(map(chr, full.tolist()))
+    expected = rendered[:rendered.index("<user>") + len("<user>")]
+    assert kind == "opencode"
+    assert anchor == len(expected)
+    assert full[:anchor].tolist() == list(map(ord, expected))
+    assert tokenizer.renders == 4  # real prompt, rejected system, two probes
+    msg.text[-1]["content"] = "new session"
+    _, next_anchor, _ = manager.tokenize_with_cache_anchor(msg)
+    assert next_anchor == anchor
+    assert tokenizer.renders == 5  # only the real prompt is rendered again
+
+
+def test_probe_failure_does_not_reject_real_request():
+    class RejectProbeTokenizer(HarnessTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            if messages[-1].get("content") != "valid task":
+                raise ValueError("unsupported probe")
+            return super().apply_chat_template(messages, **kwargs)
+
+    manager = TokenizeManager(RejectProbeTokenizer())
+    msg = TokenizeMsg(
+        uid=1,
+        text=[
+            {"role": "system", "content": "You are OpenCode, ready"},
+            {"role": "user", "content": "valid task"},
+        ],
+        sampling_params=SamplingParams(),
+    )
+    full, anchor, kind = manager.tokenize_with_cache_anchor(msg)
+    assert full.numel() > 0
+    assert (anchor, kind) == (None, None)
+
+
 def test_empty_harness_configuration_disables_detection():
     manager = TokenizeManager(HarnessTokenizer(), harness_prefixes=())
     msg = TokenizeMsg(

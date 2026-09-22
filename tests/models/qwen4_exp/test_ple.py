@@ -686,7 +686,8 @@ def _no_eos_tokens(n, start=0):
     return [(t + start) * 13 % (VOCAB - 8) + 8 for t in range(n)]
 
 
-def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
+@pytest.mark.parametrize("with_root", [False, True])
+def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary(with_root):
     """The snapshot in the donated slot equals the state a prefill truncated at the boundary leaves."""
     from freetoken.kernel.fla.chunk import CHUNK_SIZE
 
@@ -696,23 +697,27 @@ def test_track_snapshot_equals_a_prefill_stopped_at_the_boundary():
     layer = _make_layer(config)
     pool = _state_pool(config)
     live, dst = 1, 5
-    tokens = _no_eos_tokens(CHUNK_SIZE + 6)
+    tokens = _no_eos_tokens(CHUNK_SIZE * (2 if with_root else 1) + 6)
     req = _tracked_req(0, 0, tokens, live=live, ping_pong=(dst, 6))
+    if with_root:
+        req.cache_anchor_len = CHUNK_SIZE
+        req.cache_anchor_persistable = True
     batch = _track_batch(req, tokens, pool)
 
     fla = batch.fla_metadata
-    assert fla.track_dst.tolist() == [dst]
-    assert req.mamba_last_track_seqlen == CHUNK_SIZE
-    assert fla.track_boundary_row.tolist() == [CHUNK_SIZE]
+    boundaries = [2 * CHUNK_SIZE, CHUNK_SIZE] if with_root else [CHUNK_SIZE]
+    assert fla.track_dst.tolist() == ([dst, 6] if with_root else [dst])
+    assert req.mamba_last_track_seqlen == boundaries[0]
+    assert fla.track_boundary_row.tolist() == boundaries
 
     R = torch.randn(len(tokens), args.ple_state_width)
     slab = pool.slot_state("ple_conv", args.ple_layer_ids[0])
     layer.forward(R, batch, meta=_meta([tokens], [[EOS, EOS]], slots=[live]), conv_states=slab)
-    got = pool.slot_state("ple_conv", args.ple_layer_ids[0])[dst].clone()
-
-    stopped = torch.zeros_like(slab)
-    _forward(layer, R[:CHUNK_SIZE], _meta([tokens[:CHUNK_SIZE]], [[EOS, EOS]], slots=[live]), stopped)
-    assert torch.equal(got, stopped[live])
+    for boundary, slot in zip(boundaries, fla.track_dst.tolist()):
+        got = pool.slot_state("ple_conv", args.ple_layer_ids[0])[slot].clone()
+        stopped = torch.zeros_like(slab)
+        _forward(layer, R[:boundary], _meta([tokens[:boundary]], [[EOS, EOS]], slots=[live]), stopped)
+        assert torch.equal(got, stopped[live])
 
 
 def test_prefix_hit_matches_the_uncached_run():

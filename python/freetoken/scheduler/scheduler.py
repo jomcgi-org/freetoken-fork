@@ -756,6 +756,8 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
+                if batch.is_prefill and getattr(req, "cache_anchor_track_slot", None) is not None:
+                    self.cache_manager.persist_final_cache_anchor(req)
                 if req.restore_started_at is not None and self.disk_prefix_store is not None:
                     self.disk_prefix_store.note_first_token_after_restore(
                         (time.perf_counter() - req.restore_started_at) * 1000.0

@@ -266,6 +266,8 @@ class DiskPrefixStore:
             "write_errors": 0,
             "lru_evictions": 0,
             "harness_anchor_persisted": 0,
+            "harness_anchor_persisted_intermediate": 0,
+            "harness_anchor_persisted_final": 0,
             "harness_anchor_skipped_final_chunk": 0,
             "harness_anchor_skipped_no_store": 0,
             "harness_anchor_skipped_unaligned": 0,
@@ -391,6 +393,8 @@ class DiskPrefixStore:
         key = f"harness_anchor_{outcome}"
         if key not in (
             "harness_anchor_persisted",
+            "harness_anchor_persisted_intermediate",
+            "harness_anchor_persisted_final",
             "harness_anchor_skipped_final_chunk",
             "harness_anchor_skipped_no_store",
             "harness_anchor_skipped_unaligned",

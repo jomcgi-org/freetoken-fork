@@ -121,20 +121,21 @@ def _build_track_metadata(reqs, cu_host, device, pin):
     for i, r in enumerate(reqs):
         if r.mamba_ping_pong is None:
             continue
-        # Only a prefill-validated disk anchor may select an earlier snapshot. Ordinary and
-        # final requests always preserve the existing deepest-boundary policy.
+        # Intermediate chunks may aim their usual snapshot at a harness root.
+        # Final chunks keep their deepest snapshot and use the other request-owned
+        # ping-pong slot for the root, so continuation reuse does not regress.
         anchor = (
             r.cache_anchor_len
             if getattr(r, "cache_anchor_persistable", False)
             else None
         )
-        if (
+        valid_anchor = (
             anchor is not None
-            and isinstance(r, ChunkedReq)
             and r.extend_len > 0
             and r.cached_len < anchor < r.cached_len + r.extend_len
             and (anchor - r.cached_len) % CHUNK_SIZE == 0
-        ):
+        )
+        if valid_anchor and isinstance(r, ChunkedReq):
             c = (anchor - r.cached_len) // CHUNK_SIZE
         else:
             # deepest mid-chunk boundary strictly inside the extend (h has the per-chunk state;
@@ -150,6 +151,17 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         boundary_rows.append(off + c * CHUNK_SIZE)
         r.mamba_last_track_seqlen = boundary
         r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
+        if valid_anchor and not isinstance(r, ChunkedReq):
+            if anchor == boundary:
+                r.cache_anchor_track_slot = dst[-1]
+            else:
+                root_c = (anchor - r.cached_len) // CHUNK_SIZE
+                root_dst = r.mamba_ping_pong[r.mamba_next_track_idx]
+                dst.append(root_dst)
+                h_row.append(boh[i] + root_c)
+                conv_src.append([off + root_c * CHUNK_SIZE - km1 + j for j in range(km1)])
+                boundary_rows.append(off + root_c * CHUNK_SIZE)
+                r.cache_anchor_track_slot = root_dst
     if not dst:
         return empty
     to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)

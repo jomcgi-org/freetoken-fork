@@ -59,25 +59,104 @@ Configured coding-harness requests can also materialize the stable system-and-to
 own entry. The tokenizer recognizes a configured system prompt signature, renders the leading
 system run with the same tool schemas and template arguments, and takes the exact token common
 prefix with the full prompt. The boundary is rounded down to the hybrid recurrence alignment.
+If the template requires a user turn, two distinct probe queries supply that turn;
+only their shared token prefix is compared with the real request. Probe queries
+are never sent to the model, and a failed probe leaves normal tokenization intact.
 
 The root entry is written only when all of these conditions hold:
 
 * a nonzero disk-prefix budget created a `DiskPrefixStore` for a hybrid radix cache
-* the request is split across multiple prefill chunks
-* the aligned anchor lies strictly inside the current non-final chunk
+* the aligned anchor lies strictly inside the current prefill chunk, including a
+  single or final chunk
 * the anchor is also aligned to the disk cache page size
 * the request still owns a valid table row and the bounded writer accepts the job
 
 The scheduler stages that snapshot directly to disk. It never inserts the harness root into the
 live radix tree and never changes KV page or recurrent-slot ownership. The live tree therefore
 keeps exactly the same deepest checkpoint it would keep for a prompt with no harness match.
-Single-chunk prompts, anchors reached only by the final chunk, disabled disk storage, unaligned
-anchors, and unknown clients retain the normal cache behavior. A later session whose first user
+For a final chunk, the unused request-owned ping-pong slot holds the root while
+the usual slot holds the deepest continuation checkpoint. The scheduler stages
+the root before donating or freeing either slot; no extra prefill is needed.
+Anchors exactly at the chunk edge, disabled disk storage, unaligned anchors,
+and unknown clients retain the normal cache behavior. A later session whose first user
 message differs can restore a successfully written root, including after restart.
 
-Scheduler status lines expose `harness_anchor_persisted`,
+Scheduler status lines expose `harness_anchor_persisted`, its
+`harness_anchor_persisted_intermediate` and `harness_anchor_persisted_final` breakdown,
 `harness_anchor_skipped_final_chunk`, `harness_anchor_skipped_no_store`, and
 `harness_anchor_skipped_unaligned` alongside the other disk-prefix counters.
+
+### Single-chunk restart validation on node-4
+
+On 2026-09-22, revision `06f30d8` passed a real serving check with the Qwen
+Flash 4090 profile, 8192-token prefill chunks, 100352 reserved KV tokens,
+a fresh 2 GiB disk-prefix directory, and eager restore (`--lazy-restore off`).
+Each phase used a fresh server process. A 4561-token OpenCode-style system/user
+request created a 4416-token shared root and the normal 4544-token continuation
+checkpoint. The final-anchor persistence counter incremented once.
+
+After restart, a different user query sharing only the system prefix restored
+4416 tokens, leaving 145 to prefill. The cache reported one hit, 173,329,400
+bytes restored and 31.28 ms of eager restore work. The same second query was
+then run with a fresh empty cache:
+
+| Second query | Cached tokens | First text | Request wall | Output tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Restored shared root | 4416 | 7.33 s | 14.14 s | 81 |
+| Empty cache | 0 | 14.40 s | 26.61 s | 81 |
+
+The restored and cold requests had identical request hashes, complete answer
+bytes and output counts, and both passed the ordered JSON-copy check. This
+proves root reuse across the tested restart and preserves the deeper saved
+checkpoint; it is one narrow fidelity/timing sample, not broad quality
+equivalence or a new chunk-size qualification. Separate Linux scheduler/cache
+regressions and CUDA GDN/PLE snapshot parity checks cover snapshot ownership
+and state correctness. The tokenizer's 22 targeted tests also passed on Linux,
+and the actual model tokenizer detected a stable root for different user queries.
+
+Private artifacts are under
+`node-4:/var/lib/longhorn/nvme-02/freetoken/results/prefill-depth-20260922/`,
+using `root2-*.json`, matching journals/commands and `root2-cache/`. The earlier
+failed `root-*` run is retained: it exposed the template's rejection of a
+system-only conversation, which the two-query fallback addresses. The controller
+restored the original serving configuration after validation.
+
+### Final-chunk restart validation at the selected chunk size
+
+The same revision and fixture also passed with the selected 2048-token chunk
+size, placing the 4416-token root inside the final chunk after two full chunks.
+The seed retained both the shared root and the normal 4544-token continuation
+checkpoint. Each phase again used a fresh server process and eager restore.
+
+| Second query | Cached tokens | First text | Request wall | Output tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Restored shared root | 4416 | 7.05 s | 12.89 s | 81 |
+| Empty cache | 0 | 22.11 s | 34.87 s | 81 |
+
+The requests, answer bytes and output counts matched exactly. All three phases
+passed the ordered JSON-copy check. First text was 68% faster and request wall
+time was 63% lower for this single restored/cold comparison. These are narrow
+fixture results, not a broad decode or quality qualification. Artifacts use
+the `root3-*` prefix in the same private results directory. The original serving
+configuration was restored after the test. A separate offline check using the
+actual model tokenizer and a tool schema also found identical shared-root tokens
+across different user queries.
+
+### Restart validation with lazy restore enabled
+
+The same 2048-token final-chunk check passed at revision `06f30d8` with
+`--lazy-restore on`, matching the selected serving mode. The restored second
+query reused 4416 tokens after restart, with first text in 6.98 s and request
+wall time of 12.86 s. The identical query against an empty cache took 22.17 s
+to first text and 32.26 s total. All three phases passed; restored and cold
+requests, answer bytes and 81-token output counts matched exactly.
+
+The restore reported one hit, 173,329,400 bytes restored, 36 streamed blocks,
+zero faulted blocks and 50.06 ms of eager restore work. This exercises the
+configured lazy path but does not establish coverage of every fault-on-demand
+case. No corruption, fingerprint mismatch or dropped write was reported.
+Artifacts use `root4-*` in the same private directory. The bounded controller
+completed successfully and restored the original serving configuration.
 
 For the RadixArk Qwen3.8 Flash-Next geometry at TP=1 and bf16, a 32,768-token entry is about
 902.4 MiB before its small safetensors header:
