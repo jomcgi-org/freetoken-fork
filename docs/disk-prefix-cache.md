@@ -158,6 +158,27 @@ case. No corruption, fingerprint mismatch or dropped write was reported.
 Artifacts use `root4-*` in the same private directory. The bounded controller
 completed successfully and restored the original serving configuration.
 
+### Larger-chunk candidate with lazy restore
+
+The experimental fault-policy revision `39f5dc2` also passed the same three-phase
+restart check with 8192-token chunks, fixed adaptation interval 1000 and lazy
+restore enabled. Each phase used a fresh server; seed and restore shared a
+private 2 GiB disk-prefix directory, while the cold phase used an empty one.
+
+| Second query | Cached tokens | First text | Request wall |
+| --- | ---: | ---: | ---: |
+| Restored shared root | 4416 | 7.34 s | 16.89 s |
+| Empty cache | 0 | 10.96 s | 22.15 s |
+
+All three phases passed. Restored and cold requests, complete text, reasoning,
+finish reasons and prompt/output counts matched exactly. The restore reported
+36 streamed blocks, zero faulted blocks and 59.31 ms of eager work. As with the
+earlier lazy check, this does not cover every fault-on-demand case. The bounded
+controller completed and restored serving; artifacts use `root5-*` in the same
+private directory. This validates prefix persistence for that candidate, not its
+overall performance: the fixed-interval profile failed the separate continuation
+performance comparison and remains unselected.
+
 ### Matched continuation check of the merged runtime
 
 On 2026-09-22, baseline `4fbc4eb` and merged candidate `11654ed` each ran
