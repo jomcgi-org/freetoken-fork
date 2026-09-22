@@ -246,3 +246,24 @@ Artifacts use `clock1-*-chunk-*.jsonl`, matching command/journal files and
 `clock1-host-pressure.jsonl` in the same results directory. Including this
 follow-up, 48 depth responses and 18 continuation responses passed their narrow
 checks. No serving default was changed.
+
+
+## Deferred CPU workspace experiment
+
+Staged GPU prefill constructs a CPU MoE executor for decode and fallback, but
+previously allocated the native CPU-prefill batch workspace immediately. That
+workspace scales with maximum chunk size even if staged prefill never calls the
+CPU batch path. The staged profile now defers native batch setup until its first
+actual CPU-prefill call. Ordinary CPU prefill keeps eager setup. The startup log
+reports `deferred` with zero allocated batch bytes until that first call.
+
+The host-memory governor still charges the full possible workspace. This keeps
+expert placement and the fallback memory allowance unchanged. Setup is attempted
+once; missing kernels or allocation failure retain the serial fallback without
+repeated allocation attempts. The workspace remains allocated if CPU fallback
+is used. This change does not claim to release buffers after CPU prefill.
+
+Validation is pending Linux native tests and matched node-4 measurements. Tests
+cover zero initial native batch bytes in lazy mode, allocation on first prefill,
+serial-reference numerical parity, repeat-buffer reuse, and one-time setup
+failure handling. No faster serving profile has been qualified by this change.
