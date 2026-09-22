@@ -367,3 +367,21 @@ had the shared transient service name loaded. Recovery restored serving; the
 completed measurements were retained. Only the unrun 8192 repeat was launched
 under `guard2b`, using a distinct service name. Continuation qualification also
 uses a distinct service per arm to avoid this launch conflict.
+
+
+The repeated 8192/fixed-1000 candidate (`guard2b`) subsequently completed and
+passed all three requests. It matched both completed 2048 arms exactly in full
+responses, requests, finish reasons and usage. With the same experimental fault
+policy in both chunk sizes:
+
+| Chunks / interval | Cold TTFT | Cold wall | Cold answer decode | Repeat TTFT | Repeat wall | Repeat decode | Independent wall | Independent decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2048 / auto | 267.22 s | 274.44 s | 11.33 tok/s | 2.71 s | 5.40 s | 30.74 tok/s | 21.33 s | 27.26 tok/s |
+| 8192 / 1000 | 147.38 s | 153.59 s | 13.19 tok/s | 2.88 s | 5.42 s | 32.67 tok/s | 21.26 s | 27.32 tok/s |
+
+The larger chunk reduced cold first-text latency by 45%, with repeat wall within
+0.4% and essentially unchanged independent decode in this pair. The earlier
+8.47-second candidate repeat is retained above; fresh-start variability remains
+part of the evidence. The controller restored healthy serving, and the matched
+continuation qualification began only after all six follow-up responses passed
+exact parity. This is still a candidate profile pending that qualification.
