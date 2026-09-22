@@ -86,6 +86,41 @@ Scheduler status lines expose `harness_anchor_persisted`, its
 `harness_anchor_skipped_final_chunk`, `harness_anchor_skipped_no_store`, and
 `harness_anchor_skipped_unaligned` alongside the other disk-prefix counters.
 
+### Single-chunk restart validation on node-4
+
+On 2026-09-22, revision `06f30d8` passed a real serving check with the Qwen
+Flash 4090 profile, 8192-token prefill chunks, 100352 reserved KV tokens,
+a fresh 2 GiB disk-prefix directory, and eager restore (`--lazy-restore off`).
+Each phase used a fresh server process. A 4561-token OpenCode-style system/user
+request created a 4416-token shared root and the normal 4544-token continuation
+checkpoint. The final-anchor persistence counter incremented once.
+
+After restart, a different user query sharing only the system prefix restored
+4416 tokens, leaving 145 to prefill. The cache reported one hit, 173,329,400
+bytes restored and 31.28 ms of eager restore work. The same second query was
+then run with a fresh empty cache:
+
+| Second query | Cached tokens | First text | Request wall | Output tokens |
+| --- | ---: | ---: | ---: | ---: |
+| Restored shared root | 4416 | 7.33 s | 14.14 s | 81 |
+| Empty cache | 0 | 14.40 s | 26.61 s | 81 |
+
+The restored and cold requests had identical request hashes, complete answer
+bytes and output counts, and both passed the ordered JSON-copy check. This
+proves root reuse across the tested restart and preserves the deeper saved
+checkpoint; it is one narrow fidelity/timing sample, not broad quality
+equivalence or a new chunk-size qualification. Separate Linux scheduler/cache
+regressions and CUDA GDN/PLE snapshot parity checks cover snapshot ownership
+and state correctness. The tokenizer's 22 targeted tests also passed on Linux,
+and the actual model tokenizer detected a stable root for different user queries.
+
+Private artifacts are under
+`node-4:/var/lib/longhorn/nvme-02/freetoken/results/prefill-depth-20260922/`,
+using `root2-*.json`, matching journals/commands and `root2-cache/`. The earlier
+failed `root-*` run is retained: it exposed the template's rejection of a
+system-only conversation, which the two-query fallback addresses. The controller
+restored the original serving configuration after validation.
+
 For the RadixArk Qwen3.8 Flash-Next geometry at TP=1 and bf16, a 32,768-token entry is about
 902.4 MiB before its small safetensors header:
 
