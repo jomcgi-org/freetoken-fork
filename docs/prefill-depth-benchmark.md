@@ -304,3 +304,38 @@ measurements. Tests
 cover zero initial native batch bytes in lazy mode, allocation on first prefill,
 serial-reference numerical parity, repeat-buffer reuse, and one-time setup
 failure handling. No faster serving profile has been qualified by this change.
+
+## Matched chunk curve on the deferred-workspace candidate, 2026-09-22
+
+The bounded-capacity candidate (644dcc1) passed its 75 targeted Linux tests with
+no skips, then ran on node-4 against a fresh 11654ed control. Four arms shared
+one manifest: three repetitions each at 8k, 32k and 100k prompt depth, plus the
+three-session fixed continuation workload before every depth measurement.
+Order: control 2048, candidate 2048, candidate 4096, candidate 8192. Every arm
+started with an empty disk prefix cache and the automatic HOT adaptation
+interval. All 108 depth responses and 12 continuation responses passed, with
+exact text, reasoning, finish-reason and usage parity across arms.
+
+| Arm | 8k cold TTFT | 32k cold TTFT | 100k cold TTFT | 100k repeat wall | 100k post-prefill decode | Continuation walls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| control 2048 | 23.45 s | 72.49 s | 222.34 s | 4.25 s | 27.10 tok/s | 70.9 / 64.5 s |
+| candidate 2048 | 25.01 s | 72.80 s | 226.09 s | 4.33 s | 20.88 tok/s | 78.6 / 65.5 s |
+| candidate 4096 | 16.50 s | 44.28 s | 135.40 s | 4.73 s | 27.56 tok/s | 77.6 / 67.5 s |
+| candidate 8192 | 9.95 s | 33.41 s | 88.64 s | 4.31 s | 26.44 tok/s | 69.7 / 67.9 s |
+
+Values are means of three runs. The candidate at 2048 matched the control,
+which is the expected result for a change that only defers and bounds CPU
+scratch. Cold TTFT fell 2.5x at every depth with 8192-token chunks, and the
+earlier cached-repeat penalty did not reproduce: 8192 repeat walls were 4.06,
+3.78 and 4.31 seconds at 8k, 32k and 100k against 3.69, 3.67 and 4.25 for the
+control. The 4096 arm's 8k repeat mean of 7.40 seconds came from a single
+stalled run (14.95 s, 6.4 tok/s); its other two runs matched the control.
+Post-prefill decode at 100k was within run-to-run noise of the control for
+4096 and 8192; the candidate-2048 value of 20.88 tok/s came from one 100k run
+at 16 tok/s and is not attributable to the code change, since the same code at
+larger chunks did not show it.
+
+Artifacts use `workspacecurve1-*` in the private results directory, with
+`workspacecurve1-host-pressure.jsonl` sampled alongside. This is the first
+measurement in which a larger chunk improved cold prefill without a matched
+cached-decode or continuation regression.
