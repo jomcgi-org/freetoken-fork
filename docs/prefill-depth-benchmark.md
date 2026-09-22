@@ -455,3 +455,36 @@ therefore increase disk residency rather than simply adding free page cache.
 The next isolated screening comparison keeps `11654ed` and automatic cadence
 in both arms and changes only chunks from 2048 to 4096. No larger default or
 fault-policy change has been selected.
+
+
+## Intermediate chunks with the original fault policy
+
+`mid1` isolated chunk size on unchanged `11654ed`: 2048 first, then 4096,
+automatic cadence and no disk-prefix persistence in both. Each fresh server ran
+the original continuation protocol before the 100k workload. All 18 continuation
+responses and six depth responses passed with exact full-response, request,
+finish and usage parity. The first conversation remained warm-up.
+
+| Metric | 2048 | 4096 |
+| --- | ---: | ---: |
+| Measured continuation mean | 66.51 s | 67.40 s |
+| 100k cold TTFT | 253.59 s | 169.61 s |
+| 100k cold wall | 256.96 s | 173.51 s |
+| Cold answer decode | 24.71 tok/s | 21.19 tok/s |
+| Repeat TTFT | 2.57 s | 2.63 s |
+| Repeat wall | 5.84 s | 5.51 s |
+| Repeat decode | 25.20 tok/s | 28.64 tok/s |
+| Independent request wall | 19.29 s | 27.74 s |
+| Independent request decode | 30.71 tok/s | 19.44 tok/s |
+
+The 33% cold-TTFT gain does not qualify this profile: independent decode was
+37% slower and cold-answer decode was 14% slower. Continuation differed by 1.3%
+in this small sample. Both cold requests had zero prefix hits; both repeats
+reused 99,904 tokens. The host observer covered at least 95% of both cold windows
+and again found higher memory pressure, I/O pressure and disk reads for the
+larger chunk. Host-wide counters remain on node-4 and are not causal attribution.
+
+The controller completed successfully and restarted the selected 2048 serving
+service. The prepared three-repetition depth sweep remains unstarted. Further
+work should investigate the memory/cache-pressure tradeoff before promoting a
+larger default. This comparison did not use the experimental fault policy.
