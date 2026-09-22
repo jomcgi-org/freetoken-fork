@@ -305,3 +305,48 @@ Matched node-4 performance measurements remain pending. Tests
 cover zero initial native batch bytes in lazy mode, allocation on first prefill,
 serial-reference numerical parity, repeat-buffer reuse, and one-time setup
 failure handling. No faster serving profile has been qualified by this change.
+
+
+### Bounded workspace screening
+
+Three fresh runs compared revision `644dcc1` at 4096 and 2048 tokens against
+selected revision `11654ed` at 2048. All used automatic HOT cadence, no prefill
+swap cap, the default host reserve, disabled disk prefix caching, and the same
+continuation schedule followed by the frozen 100k cold/repeat/post-decode case.
+
+| Metric | Bounded 4096 | Bounded 2048 | Selected 2048 |
+| --- | ---: | ---: | ---: |
+| Measured continuation mean | 65.44 s | 68.11 s | 69.89 s |
+| Cold TTFT | 172.84 s | 262.66 s | 261.36 s |
+| Cold wall | 176.33 s | 266.16 s | 265.05 s |
+| Cold answer decode | 23.77 tok/s | 23.81 tok/s | 22.34 tok/s |
+| Repeat TTFT | 5.06 s | 2.57 s | 1.53 s |
+| Repeat wall | 7.87 s | 5.58 s | 4.56 s |
+| Repeat decode | 29.41 tok/s | 27.37 tok/s | 27.19 tok/s |
+| Subsequent decode | 27.36 tok/s | 31.04 tok/s | 26.90 tok/s |
+
+All 27 continuation calls and nine depth responses passed with exact request,
+answer, and token-count parity across profiles. Cold hits were zero; repeat hits
+were 99,904 tokens. The controller restored the selected service and its health
+check passed. Candidate logs confirmed deferred 1023-row capacity with no CPU
+batch degradation warnings. Native libraries were identical across profiles.
+
+The larger candidate reduced cold TTFT by 34% and preserved the measured decode
+rates against this fresh baseline, but repeat wall regressed by 73%. The smaller
+candidate also regressed repeat wall by 22%. Neither result qualifies a serving
+change from this sample. Continuation usage includes short CPU-prefill inputs
+before the depth phase, so first CPU allocation during the repeat is not a
+supported explanation. Compare repeated 8k/32k/100k cases before choosing a
+profile or attributing the repeat delay to the workspace change.
+
+Host-wide pressure samples covered at least 95% of cold requests and 80% of
+subsequent-decode requests. The 4096 candidate had higher memory and I/O stall
+percentages than the 2048 candidate in both phases, without greater total reads.
+Against the selected baseline, cold pressure/read metrics were higher; after
+prefill only memory stall percentage was higher, while I/O stalls and reads were
+not. Both candidate post-decode windows included swap-ins but no swap-outs or
+reclaim scans. These host-wide observations do not identify the affected process
+or establish causality. Detailed counters remain on node-4.
+
+Artifacts are `lazybench1-*-chunk-*` and `lazybench1-host-pressure.jsonl` under
+the existing results directory. PR performance qualification remains incomplete.
