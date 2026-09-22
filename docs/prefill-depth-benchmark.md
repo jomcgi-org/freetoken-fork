@@ -526,3 +526,45 @@ memory pressure was higher. Detailed host counters remain on node-4. These
 host-wide comparisons are observational; neither lower I/O nor a larger
 configured reserve establishes preserved decode performance. The experiment
 completed successfully and restarted the selected serving service.
+
+
+## Decode-only fault accounting at 4096 chunks
+
+`guardmid1` compared patched `39f5dc2` at 4096 and 2048, then unchanged
+`11654ed` at 2048. All used automatic adaptation, default host reserve, zero
+persistent prefix cache, and the same continuation-before-100k protocol.
+Native library hashes matched. All 27 continuation and nine depth responses
+passed with exact full-request, output, finish and usage parity.
+
+| Metric | Patched / 4096 | Patched / 2048 | Original / 2048 |
+| --- | ---: | ---: | ---: |
+| Measured continuation mean | 67.07 s | 69.23 s | 68.49 s |
+| Cold TTFT | 163.88 s | 254.74 s | 257.11 s |
+| Cold wall | 167.48 s | 258.16 s | 260.99 s |
+| Cold answer decode | 22.92 tok/s | 24.35 tok/s | 21.24 tok/s |
+| Repeat TTFT | 1.58 s | 1.77 s | 1.59 s |
+| Repeat wall | 4.50 s | 5.25 s | 4.67 s |
+| Repeat decode | 28.19 tok/s | 23.95 tok/s | 26.76 tok/s |
+| Independent wall | 20.95 s | 19.81 s | 19.96 s |
+| Independent decode | 27.30 tok/s | 29.65 tok/s | 29.32 tok/s |
+
+The patched 4096 profile cut cold TTFT by 36% relative to the selected control,
+but independent decode remained 7% slower. The patched 2048 repeat was also
+slower than the unchanged control. These single fresh-start samples do not
+qualify either profile. All cold requests had zero prefix hits; repeats reused
+99,904 tokens. The controller completed and restarted the selected service.
+
+Cold pressure coverage exceeded 95% and independent-decode coverage exceeded
+80% for each arm. The larger patched chunk had higher cold memory/I/O pressure
+and read rate than both controls; total cold reads were higher than patched
+2048 but no higher than original 2048. During independent decode, all four
+pressure/read comparisons were no higher than either control, despite lower
+decode throughput. These host-wide observations therefore do not establish
+I/O pressure as the sole cause. Detailed counters remain on node-4.
+
+A separate workspace investigation found that CPU-prefill scratch remains
+allocated after use. Historical instrumented logs confirm CPU batch use below
+the 1024-token staging threshold in both chunk profiles, including chunks
+larger than 128 tokens. Deferring allocation can avoid unused startup memory,
+but short continuations can allocate it again; persistent memory savings need
+further lifecycle work and validation.
