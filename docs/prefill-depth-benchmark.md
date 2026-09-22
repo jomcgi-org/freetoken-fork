@@ -488,3 +488,41 @@ The controller completed successfully and restarted the selected 2048 serving
 service. The prepared three-repetition depth sweep remains unstarted. Further
 work should investigate the memory/cache-pressure tradeoff before promoting a
 larger default. This comparison did not use the experimental fault policy.
+
+
+## Increasing host reserve at 4096 chunks
+
+`reserve1` tested unchanged `11654ed` with automatic adaptation and no persistent
+prefix cache. The order was 4096 with 16 GiB host reserve, 4096 with default
+reserve, then the selected 2048/default-reserve control. Preflight used actual
+model geometry and the saved startup budget; the running candidate matched its
+predicted reduction in pinned layers. No startup pressure warning appeared for
+the candidate. Each fresh server ran continuation before the 100k workload.
+All 27 continuation responses and nine depth responses passed with exact parity.
+
+| Metric | 4096 / reserve 16 GiB | 4096 / default reserve | 2048 / default reserve |
+| --- | ---: | ---: | ---: |
+| Measured continuation mean | 65.63 s | 69.79 s | 70.55 s |
+| Cold TTFT | 180.78 s | 169.37 s | 258.03 s |
+| Cold wall | 184.71 s | 172.97 s | 261.68 s |
+| Cold answer decode | 20.93 tok/s | 23.03 tok/s | 22.75 tok/s |
+| Repeat TTFT | 1.66 s | 2.76 s | 2.62 s |
+| Repeat wall | 4.57 s | 5.55 s | 5.70 s |
+| Repeat decode | 28.35 tok/s | 29.62 tok/s | 26.73 tok/s |
+| Independent wall | 21.65 s | 22.61 s | 19.67 s |
+| Independent decode | 26.69 tok/s | 25.04 tok/s | 30.13 tok/s |
+
+The larger reserve improved continuation and cached-repeat wall time, but
+independent decode remained 11% slower than the selected control. Cold-answer
+decode was also slower. It is not qualified for promotion. All cold requests
+had zero prefix hits and all repeats reused 99,904 tokens.
+
+The observer covered at least 95% of every cold window and 80% of every
+independent-decode window, with endpoints observed up to two seconds late.
+During cold prefill, the larger reserve had higher host memory pressure, I/O
+pressure, disk reads and read rate than both controls. During independent
+decode, its I/O pressure and reads were no higher than either control, but
+memory pressure was higher. Detailed host counters remain on node-4. These
+host-wide comparisons are observational; neither lower I/O nor a larger
+configured reserve establishes preserved decode performance. The experiment
+completed successfully and restarted the selected serving service.
