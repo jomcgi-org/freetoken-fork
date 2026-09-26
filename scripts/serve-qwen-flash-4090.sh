@@ -2,8 +2,10 @@
 # Qualified capacity-one Qwen Flash profile for the RTX 4090 + CPU + disk tier.
 # The disk prefix cache is on by default (500 GiB LRU under FREETOKEN_PREFIX_CACHE_DIR);
 # set FREETOKEN_PREFIX_CACHE_GIB=0 to disable it. Keep the directory on local NVMe.
-# Retain 2048-token chunks: the 2026-09-22 8192-token sweep sped up cold prefill
-# but regressed cached decode. See docs/prefill-depth-benchmark.md for the data.
+# Prefill chunk: 8192 tokens by default (FREETOKEN_PREFILL_CHUNK overrides). The
+# 2026-09-22 matched curve on the deferred-workspace runtime cut 100k cold TTFT
+# from 222 s to 89 s with exact parity and no cached-repeat or continuation
+# regression. See docs/prefill-depth-benchmark.md for the data.
 set -euo pipefail
 if (( $# < 2 )); then
   printf 'Usage: %s MODEL_PATH LAYER_PROFILE_JSON [extra ft serve arguments]\n' "$0" >&2
@@ -21,7 +23,7 @@ exec "${FREETOKEN_BIN:-ft}" serve \
   --model "$model_path" \
   --moe-backend offload --moe-cache-auto \
   --max-running-requests 1 --linear-state-cache-ratio 4.0 \
-  --max-extend-length 2048 --max-seq-len-override 100352 \
+  --max-extend-length "${FREETOKEN_PREFILL_CHUNK:-8192}" --max-seq-len-override 100352 \
   --host 127.0.0.1 --port 8090 \
   --moe-disk-prefill staged --moe-prefill-hot-split on \
   --moe-prefill-split-kernel grouped --moe-bank-hugepages off \
