@@ -2902,12 +2902,11 @@ def _gate_ple_settings(config, model_config, override) -> bool:
 
 def _cpu_prefill_workspace_tokens(config) -> int:
     """Bound CPU scratch by the largest chunk that can take the CPU path."""
-    capacity = getattr(config, "max_extend_tokens", 2048)
-    if config.moe_disk_prefill == "staged":
-        # begin_prefill selects GPU staging at the inclusive crossover. Keep one
-        # slot for the native API when every nonempty chunk uses GPU staging.
-        capacity = min(capacity, max(1, config.moe_disk_prefill_min_tokens - 1))
-    return capacity
+    from freetoken.engine.host_memory import cpu_prefill_workspace_tokens
+
+    # Shared with the host-memory governor so the charged scratch matches the
+    # workspace the executor can allocate (one row below the staged crossover).
+    return cpu_prefill_workspace_tokens(config)
 
 
 def _validate_disk_prefill_task_size(config, cache) -> None:
