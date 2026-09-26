@@ -339,3 +339,28 @@ Artifacts use `workspacecurve1-*` in the private results directory, with
 `workspacecurve1-host-pressure.jsonl` sampled alongside. This is the first
 measurement in which a larger chunk improved cold prefill without a matched
 cached-decode or continuation regression.
+
+## Larger chunks and the governor's scratch charge, 2026-09-26
+
+A follow-up on the same candidate (644dcc1) tried 16384-token chunks with the
+same manifest. The arm started healthy with the usual 2.12 GiB of free GPU
+memory, but its first cold 8k prompt took 13.59 s against 9.95 s at 8192, and
+the three-session continuation workload prefilled 2k-token chunks three to five
+times slower than at 2048 or 8192. The sweep was stopped after the first 8k
+case rather than continuing to 32768.
+
+The startup log explains it. The host-memory governor still charged CPU prefill
+scratch for the full scheduler chunk: 2.27 GiB at 16384 against 1.18 GiB at
+8192. That lowered the derived pinned-bank budget from 26.70 to 25.89 GiB, which
+fit 19 GPU prefill layers instead of 20 and mapped 29 MoE layers to DISK instead
+of 28, with 80 rather than 82 protected HOT experts per layer. Every chunk then
+staged one more layer's experts from host memory. The staged executor never
+allocates that scratch: its workspace is bounded one row below the staged
+crossover (1023 rows), so the charge was for memory that could not be used.
+
+The governor now charges the same bounded workspace the executor can allocate,
+through a helper shared by both. The charge no longer grows with chunk size in
+staged mode, and ordinary CPU prefill keeps the full-chunk charge. Targeted
+Linux tests (76, including a new chunk-independence check) passed with no
+skips. Artifacts use `workspacecurve2-*`; the fixed tree is measured under
+`workspacecurve3-*` at 16384 and 8192.
