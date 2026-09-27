@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import os
 import queue
@@ -23,7 +24,6 @@ from typing import Any, Callable, Mapping, Sequence
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import save_file
 
 
 FORMAT = "freetoken_disk_prefix"
@@ -32,6 +32,77 @@ _READABLE_VERSIONS = frozenset((VERSION,))
 _SUFFIX = ".safetensors"
 _TMP_MARKER = ".tmp-"
 BLOCK_INDEX_TENSOR = "qsa_block_index"
+
+logger = logging.getLogger(__name__)
+
+_SAFETENSORS_DTYPES: dict[torch.dtype, str] = {
+    torch.bool: "BOOL",
+    torch.uint8: "U8",
+    torch.int8: "I8",
+    torch.int16: "I16",
+    torch.int32: "I32",
+    torch.int64: "I64",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.float32: "F32",
+    torch.float64: "F64",
+}
+for _name, _tag in (
+    ("uint16", "U16"),
+    ("uint32", "U32"),
+    ("uint64", "U64"),
+    ("float8_e4m3fn", "F8_E4M3"),
+    ("float8_e5m2", "F8_E5M2"),
+):
+    if hasattr(torch, _name):
+        _SAFETENSORS_DTYPES[getattr(torch, _name)] = _tag
+
+
+def write_safetensors_file(
+    path: str | os.PathLike[str],
+    tensors: Mapping[str, torch.Tensor],
+    metadata: Mapping[str, str] | None = None,
+) -> int:
+    """Write a safetensors file straight from host tensors and fsync it.
+
+    ``safetensors.torch.save_file`` first serialises every tensor into an in-memory
+    ``bytes`` copy, so a 1.4 GiB prefix entry briefly needs a second 1.4 GiB of
+    anonymous memory. This writer emits the same format (8-byte little-endian header
+    length, space-padded JSON header, contiguous little-endian data) from the tensors'
+    own storage. Returns the number of bytes written.
+    """
+    ordered = sorted(tensors.items(), key=lambda item: item[0])
+    header: dict[str, Any] = {}
+    if metadata:
+        header["__metadata__"] = {str(k): str(v) for k, v in metadata.items()}
+    views: list[torch.Tensor] = []
+    offset = 0
+    for name, value in ordered:
+        if value.device.type != "cpu":
+            raise ValueError(f"disk prefix tensor {name!r} is not on the host")
+        tag = _SAFETENSORS_DTYPES.get(value.dtype)
+        if tag is None:
+            raise ValueError(f"unsupported safetensors dtype {value.dtype} for {name!r}")
+        value = value.detach().contiguous()
+        raw = value.reshape(-1).view(torch.uint8)
+        header[name] = {
+            "dtype": tag,
+            "shape": list(value.shape),
+            "data_offsets": [offset, offset + raw.numel()],
+        }
+        offset += raw.numel()
+        views.append(raw)
+    encoded = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    with open(path, "wb") as f:
+        f.write(len(encoded).to_bytes(8, "little"))
+        f.write(encoded)
+        for raw in views:
+            if raw.numel():
+                f.write(memoryview(raw.numpy()))
+        f.flush()
+        os.fsync(f.fileno())
+    return 8 + len(encoded) + offset
 
 
 def _stable_json_value(value: Any) -> Any:
@@ -265,6 +336,8 @@ class DiskPrefixStore:
             "write_drops": 0,
             "write_errors": 0,
             "lru_evictions": 0,
+            "staged_bytes_live": 0,
+            "staged_bytes_peak": 0,
             "harness_anchor_persisted": 0,
             "harness_anchor_persisted_intermediate": 0,
             "harness_anchor_persisted_final": 0,
@@ -377,12 +450,18 @@ class DiskPrefixStore:
         ids = token_ids.detach().to(device="cpu", dtype=torch.int32).contiguous()
         payload = {name: value.detach() for name, value in tensors.items()}
         payload["token_ids"] = ids
+        staged = tensor_nbytes(payload)
+        with self._lock:
+            live = int(self._stats["staged_bytes_live"]) + staged
+            self._stats["staged_bytes_live"] = live
+            self._stats["staged_bytes_peak"] = max(int(self._stats["staged_bytes_peak"]), live)
         try:
             self._queue.put_nowait(_WriteJob(ids, payload, ready))
             return True
         except queue.Full:
             with self._lock:
                 self._stats["write_drops"] += 1
+                self._stats["staged_bytes_live"] = int(self._stats["staged_bytes_live"]) - staged
             return False
 
     def note_write_drop(self) -> None:
@@ -406,46 +485,57 @@ class DiskPrefixStore:
     def _writer_main(self) -> None:
         while True:
             job = self._queue.get()
-            tmp: Path | None = None
+            if job is None:
+                self._queue.task_done()
+                return
+            staged = tensor_nbytes(job.tensors)
             try:
-                if job is None:
-                    return
-                if job.ready is not None:
-                    job.ready.synchronize()
-                tensors = {
-                    name: value.detach().to(device="cpu").contiguous()
-                    for name, value in job.tensors.items()
-                }
-                path = self._path_for(job.token_ids)
-                tmp = path.with_name(path.name + _TMP_MARKER + uuid.uuid4().hex)
-                save_file(tensors, str(tmp), metadata=self._metadata(job.token_ids, tensors))
-                with tmp.open("rb") as f:
-                    os.fsync(f.fileno())
-                os.replace(tmp, path)
+                self._write_job(job)
+            finally:
+                # Drop the staged host copy before blocking on the next job. Holding the
+                # frame's reference while idle kept the last entry's buffers resident.
+                del job
+                with self._lock:
+                    self._stats["staged_bytes_live"] = (
+                        int(self._stats["staged_bytes_live"]) - staged
+                    )
+                self._queue.task_done()
+
+    def _write_job(self, job: _WriteJob) -> None:
+        tmp: Path | None = None
+        try:
+            if job.ready is not None:
+                job.ready.synchronize()
+            tensors = job.tensors
+            path = self._path_for(job.token_ids)
+            tmp = path.with_name(path.name + _TMP_MARKER + uuid.uuid4().hex)
+            write_safetensors_file(
+                tmp, tensors, metadata=self._metadata(job.token_ids, tensors)
+            )
+            del tensors
+            os.replace(tmp, path)
+            try:
+                dir_fd = os.open(self.directory, os.O_RDONLY)
                 try:
-                    dir_fd = os.open(self.directory, os.O_RDONLY)
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+            key = token_chain_hash(self.identity, job.token_ids)
+            with self._lock:
+                self._entries[(job.token_ids.numel(), key)] = path
+                self._lengths.add(job.token_ids.numel())
+                self._stats["writes"] += 1
+            self._enforce_budget()
+        except Exception:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
-                key = token_chain_hash(self.identity, job.token_ids)
-                with self._lock:
-                    self._entries[(job.token_ids.numel(), key)] = path
-                    self._lengths.add(job.token_ids.numel())
-                    self._stats["writes"] += 1
-                self._enforce_budget()
-            except Exception:
-                if tmp is not None:
-                    try:
-                        tmp.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                with self._lock:
-                    self._stats["write_errors"] += 1
-            finally:
-                self._queue.task_done()
+            with self._lock:
+                self._stats["write_errors"] += 1
 
     def lookup_longest(
         self,
@@ -1004,17 +1094,27 @@ class LazyKVRestore:
 def stage_tensors_for_write(
     tensors: Mapping[str, torch.Tensor], device: torch.device
 ) -> tuple[dict[str, torch.Tensor], Any | None]:
-    """Issue nonblocking device-to-host copies and return their completion fence."""
+    """Copy tensors into pageable host memory that the writer releases after the write.
+
+    Staging never allocates pinned memory: torch's pinned-host caching allocator keeps
+    freed blocks (rounded up to a power of two) for the life of the process, which left
+    about 2.25 GiB of page-locked memory resident per written 100k entry and took that
+    much page cache from the streamed DISK expert banks. The copies complete before
+    this returns, so no fence is needed.
+    """
     if device.type != "cuda":
         return {name: value.detach().cpu().clone() for name, value in tensors.items()}, None
     staged: dict[str, torch.Tensor] = {}
     for name, value in tensors.items():
-        host = torch.empty_like(value, device="cpu", pin_memory=True)
-        host.copy_(value, non_blocking=True)
+        host = _host_staging_empty(value.shape, value.dtype)
+        host.copy_(value)
         staged[name] = host
-    ready = torch.cuda.Event()
-    ready.record()
-    return staged, ready
+    return staged, None
+
+
+def _host_staging_empty(shape, dtype: torch.dtype) -> torch.Tensor:
+    """Pageable host buffer for one staged entry; freed when the writer drops the job."""
+    return torch.empty(tuple(shape), dtype=dtype, device="cpu")
 
 
 def stage_hybrid_prefix_for_write(
@@ -1026,7 +1126,12 @@ def stage_hybrid_prefix_for_write(
     table_idx: int | None,
     extra_tensors: Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[dict[str, torch.Tensor], Any | None]:
-    """Stage a hybrid prefix with one reusable per-layer GPU gather buffer."""
+    """Stage a hybrid prefix with one reusable per-layer GPU gather buffer.
+
+    The host side is pageable memory owned by the write job and released once the entry
+    is on disk (see ``stage_tensors_for_write``). Device-to-host copies into pageable
+    memory are synchronous, so the returned fence is always ``None`` on CUDA.
+    """
     from freetoken.spec_decode import request_state_views
 
     device = kv_cache.device
@@ -1041,10 +1146,11 @@ def stage_hybrid_prefix_for_write(
         tensors.update(extra_tensors or {})
         return stage_tensors_for_write(tensors, device)
 
+    started = time.perf_counter()
     locations = kv_indices.to(torch.long)
     flat = kv_cache._kv_buffer.flatten(2, 3)
     kv_shape = (flat.shape[0], flat.shape[1], locations.numel(), *flat.shape[3:])
-    host_kv = torch.empty(kv_shape, dtype=flat.dtype, device="cpu", pin_memory=True)
+    host_kv = _host_staging_empty(kv_shape, flat.dtype)
     scratch = torch.empty(
         (flat.shape[0], locations.numel(), *flat.shape[3:]),
         dtype=flat.dtype,
@@ -1053,7 +1159,7 @@ def stage_hybrid_prefix_for_write(
     for layer in range(flat.shape[1]):
         torch.index_select(flat[:, layer], 1, locations, out=scratch)
         for slab in range(flat.shape[0]):
-            host_kv[slab, layer].copy_(scratch[slab], non_blocking=True)
+            host_kv[slab, layer].copy_(scratch[slab])
     staged: dict[str, torch.Tensor] = {"qsa_kv": host_kv}
     page_size = getattr(kv_cache, "_page_size", None)
     if page_size is not None:
@@ -1069,18 +1175,15 @@ def stage_hybrid_prefix_for_write(
                 f"QSA disk prefix length {locations.numel()} is not group-aligned to {ratio}"
             )
         rows = locations[::ratio] // ratio
-        host_index = torch.empty(
-            (cmp_buffer.shape[0], rows.numel(), cmp_buffer.shape[2]),
-            dtype=cmp_buffer.dtype,
-            device="cpu",
-            pin_memory=True,
+        host_index = _host_staging_empty(
+            (cmp_buffer.shape[0], rows.numel(), cmp_buffer.shape[2]), cmp_buffer.dtype
         )
         index_scratch = torch.empty(
             (rows.numel(), cmp_buffer.shape[2]), dtype=cmp_buffer.dtype, device=device
         )
         for layer in range(cmp_buffer.shape[0]):
             torch.index_select(cmp_buffer[layer], 0, rows, out=index_scratch)
-            host_index[layer].copy_(index_scratch, non_blocking=True)
+            host_index[layer].copy_(index_scratch)
         staged["qsa_index"] = host_index
 
     req = type("DiskSnapshotReq", (), {
@@ -1092,31 +1195,26 @@ def stage_hybrid_prefix_for_write(
     )
     for name in ("conv", "recurrent", "qsa_pending"):
         if name in views:
-            host = torch.empty(
-                views[name].shape,
-                dtype=views[name].dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            host.copy_(views[name], non_blocking=True)
+            host = _host_staging_empty(views[name].shape, views[name].dtype)
+            host.copy_(views[name])
             staged[name] = host
     for name, value in views.get("slot_states", {}).items():
-        host = torch.empty(
-            value.shape, dtype=value.dtype, device="cpu", pin_memory=True
-        )
-        host.copy_(value, non_blocking=True)
+        host = _host_staging_empty(value.shape, value.dtype)
+        host.copy_(value)
         staged[f"slot_state.{name}"] = host
 
     for name, value in (extra_tensors or {}).items():
-        host = torch.empty(
-            value.shape, dtype=value.dtype, device="cpu", pin_memory=True
-        )
-        host.copy_(value, non_blocking=True)
+        host = _host_staging_empty(value.shape, value.dtype)
+        host.copy_(value)
         staged[name] = host
 
-    ready = torch.cuda.Event()
-    ready.record()
-    return staged, ready
+    logger.info(
+        "Disk prefix staged %d tokens (%.2f GiB) to pageable host memory in %.0f ms",
+        int(locations.numel()),
+        tensor_nbytes(staged) / 2**30,
+        (time.perf_counter() - started) * 1000.0,
+    )
+    return staged, None
 
 
 __all__ = [
@@ -1135,4 +1233,5 @@ __all__ = [
     "tensor_nbytes",
     "token_chain_hash",
     "validate_block_index",
+    "write_safetensors_file",
 ]

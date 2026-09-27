@@ -508,3 +508,130 @@ def test_fp8_disk_restore_round_trip_uses_uint8_views(cpu_byte_store):
     assert torch.equal(restored.view(torch.uint8), source.view(torch.uint8))
     assert len(cpu_byte_store) == 2
     assert all(call[0].dtype == call[3].dtype == torch.uint8 for call in cpu_byte_store)
+
+
+def _sized_payload(rows: int) -> dict[str, torch.Tensor]:
+    return {
+        "qsa_kv": torch.arange(2 * 3 * rows * 8, dtype=torch.bfloat16).view(2, 3, rows, 8),
+        "conv": torch.arange(12, dtype=torch.bfloat16).view(3, 4),
+    }
+
+
+def test_staging_does_not_grow_or_outlive_writes_of_different_sizes(tmp_path):
+    import gc
+    import weakref
+
+    class Fence:
+        def synchronize(self):
+            pass
+
+    store = _store(tmp_path, budget=1 << 26)
+    small = _sized_payload(64)
+    large = _sized_payload(1024)
+    small_bytes = sum(t.numel() * t.element_size() for t in small.values()) + 4 * 4
+    large_bytes = sum(t.numel() * t.element_size() for t in large.values()) + 4 * 4
+
+    fences = []
+    for ids, payload in (
+        (torch.arange(4, dtype=torch.int32), small),
+        (torch.arange(100, 104, dtype=torch.int32), large),
+    ):
+        fence = Fence()
+        fences.append(weakref.ref(fence))
+        assert store.enqueue(ids, payload, ready=fence)
+        del fence
+        store.flush()
+        assert store.stats()["staged_bytes_live"] == 0
+
+    stats = store.stats()
+    assert stats["writes"] == 2 and stats["write_errors"] == 0
+    # Sequential entries reuse the budget of the largest one; they never accumulate.
+    assert stats["staged_bytes_peak"] == max(small_bytes, large_bytes)
+    # The idle writer holds no reference to the last job or its staged tensors.
+    gc.collect()
+    assert all(ref() is None for ref in fences)
+
+    entry = store.lookup_longest(torch.arange(100, 105, dtype=torch.int32), longer_than=0)
+    assert entry is not None and entry.length == 4
+    for name, tensor in large.items():
+        assert torch.equal(entry.tensors[name], tensor)
+    store.close()
+
+
+def test_dropped_enqueue_releases_its_staged_bytes(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Fence:
+        def synchronize(self):
+            entered.set()
+            assert release.wait(timeout=2)
+
+    store = DiskPrefixStore(tmp_path, 1 << 20, identity="bounded", queue_size=1)
+    assert store.enqueue(torch.tensor([1]), _payload(), ready=Fence())
+    assert entered.wait(timeout=2)
+    assert store.enqueue(torch.tensor([2]), _payload())
+    live = store.stats()["staged_bytes_live"]
+    assert not store.enqueue(torch.tensor([3]), _payload())
+    assert store.stats()["staged_bytes_live"] == live
+    release.set()
+    store.flush()
+    assert store.stats()["staged_bytes_live"] == 0
+    store.close()
+
+
+def test_cuda_staging_uses_pageable_host_memory(monkeypatch):
+    from freetoken.kvcache import disk_prefix_cache as module
+
+    real_empty = torch.empty
+    real_empty_like = torch.empty_like
+
+    def no_pin_empty(*args, **kwargs):
+        assert not kwargs.get("pin_memory"), "disk prefix staging must not pin host memory"
+        return real_empty(*args, **kwargs)
+
+    def no_pin_empty_like(*args, **kwargs):
+        assert not kwargs.get("pin_memory"), "disk prefix staging must not pin host memory"
+        return real_empty_like(*args, **kwargs)
+
+    monkeypatch.setattr(module.torch, "empty", no_pin_empty)
+    monkeypatch.setattr(module.torch, "empty_like", no_pin_empty_like)
+    payload = _payload()
+    staged, ready = module.stage_tensors_for_write(payload, torch.device("cuda"))
+    assert ready is None
+    for name, tensor in payload.items():
+        assert torch.equal(staged[name], tensor)
+        assert staged[name].data_ptr() != tensor.data_ptr()
+
+
+def test_streaming_writer_matches_safetensors_reader(tmp_path):
+    from safetensors.torch import load_file
+
+    from freetoken.kvcache.disk_prefix_cache import write_safetensors_file
+
+    tensors = {
+        "bf16": torch.randn(3, 5).to(torch.bfloat16),
+        "f32": torch.randn(7),
+        "i32": torch.tensor([1, -2, 3], dtype=torch.int32),
+        "i64": torch.tensor(9, dtype=torch.int64),
+        "u8": torch.arange(11, dtype=torch.uint8),
+        "empty": torch.empty(0, 4, dtype=torch.float16),
+        "strided": torch.arange(24, dtype=torch.float32).view(4, 6)[:, ::2],
+    }
+    if hasattr(torch, "float8_e4m3fn"):
+        tensors["fp8"] = torch.randn(4, 4).to(torch.float8_e4m3fn)
+    path = tmp_path / "entry.safetensors"
+    written = write_safetensors_file(path, tensors, metadata={"format": FORMAT, "n": "1"})
+    assert written == path.stat().st_size
+    loaded = load_file(str(path))
+    assert set(loaded) == set(tensors)
+    for name, tensor in tensors.items():
+        assert loaded[name].dtype == tensor.dtype
+        assert loaded[name].shape == tensor.shape
+        assert torch.equal(
+            loaded[name].reshape(-1).view(torch.uint8),
+            tensor.contiguous().reshape(-1).view(torch.uint8),
+        )
+    with safe_open(str(path), framework="pt", device="cpu") as handle:
+        assert handle.metadata() == {"format": FORMAT, "n": "1"}
+        assert torch.equal(handle.get_slice("bf16")[1:2], tensors["bf16"][1:2])
