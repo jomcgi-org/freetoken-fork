@@ -29,3 +29,31 @@ set. Entries are read at most once per restore, so no reuse is lost. The
 change is in `disk_prefix_cache._drop_file_pages`, called from the writer and
 from the restore completion path, and is best effort on platforms without the
 advice. Measured as `workspacecurve5-*` with the same protocol.
+
+## Result of the page-drop attempt
+
+`workspacecurve5-*` ran the drop-after-write-and-restore change with the same
+protocol. All 27 responses passed with exact parity, but the gap did not close:
+100k cold TTFT was 96.3, 141.9 and 138.8 s with 14.5, 58.0 and 58.6 GiB read
+from NVMe per request. The cache-off control on the same tree read 10.2, 7.6
+and 6.8 GiB for its three 100k requests with no memory stall. The change was
+reverted so the branch matches the qualified measurements.
+
+The entry's own pages are therefore not what keeps the bank working set small.
+After the first 100k entry is written, roughly 4 to 5 GiB less of the DISK
+banks stays resident for every later chunk, and the effect persists across
+requests. Candidates for the next session, in order: pinned host staging
+buffers retained per written entry (`stage_hybrid_prefix_for_write` allocates
+pinned copies and `save_file` serialises a second in-memory copy), the write
+path's transient 3 GiB pushing the process into swap (the serve cgroup carried
+1.2 GiB of swap after the day's runs), and radix-cache retention of the
+previous 100k prefix on the GPU changing what the pager must stream. Each is
+testable with the `workspacecurve4` protocol by instrumenting host RSS, pinned
+allocations and `memory.swap.current` around the entry write.
+
+Live-server consequence: with the prefix cache on, 100k cold TTFT is 139 to
+166 s rather than the 90 s the cache-off arms show, still 1.6 to 1.9x faster
+than the 261 s the previous 2048 profile measured under the same cache. Cached
+repeats and continuation sessions keep their full benefit. Turning the cache
+off would trade that for the cold number, which is the wrong trade for coding
+sessions.
