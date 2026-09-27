@@ -57,3 +57,26 @@ than the 261 s the previous 2048 profile measured under the same cache. Cached
 repeats and continuation sessions keep their full benefit. Turning the cache
 off would trade that for the cold number, which is the wrong trade for coding
 sessions.
+
+## Cgroup trace through a live 100k request
+
+Sampling `freetoken-serve`'s cgroup every 15 s through one 100k request on
+the live server (prefix cache on) showed two things. During the prefill the
+kernel swapped the engine's anonymous memory almost entirely (anon 2.84 to
+0.08 GiB, swap 0 to 2.78 GiB) while bank file pages grew from 29 to 58 GiB.
+After the entry write completed, shmem rose from 27.08 to 29.33 GiB and stayed
+there. A second test after a fresh restart with `vm.swappiness=10` and two
+unused 100k prompts changed nothing on the swap side (anon still swapped,
+147 s and 146 s TTFT, 62.6 and 64.3 GiB read) and repeated the shmem step:
+27.07 to 29.33 to 31.58 GiB, one 2.25 GiB step per written 100k entry, never
+released. Swappiness was restored to 60.
+
+Pinned host memory for each written entry is therefore retained after the
+write. The staging path allocates pinned tensors per entry
+(`stage_hybrid_prefix_for_write`), and torch's pinned-host caching allocator
+keeps such blocks rather than returning them to the OS, so every distinct
+entry size grows the resident pinned set. Each step removes that much page
+cache from the streamed DISK banks, which is the bank working-set shrink the
+arms measured. The next change should stage entries through one reusable
+pinned buffer (or pageable memory) and confirm shmem returns to its baseline
+after the write, then re-run the `workspacecurve4` protocol.
