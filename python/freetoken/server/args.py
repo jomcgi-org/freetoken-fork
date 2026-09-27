@@ -1000,17 +1000,6 @@ def parse_args(
     )
 
     parser.add_argument(
-        "--moe-hot-adapt-idle-aim",
-        choices=["decode", "prefill"],
-        default=ServerArgs.moe_hot_adapt_idle_aim,
-        help=(
-            "Under --moe-hot-adapt-aim phase, the history idle ticks aim at: the decode "
-            "history, or the prefill blend a prefill tick uses, since every request "
-            "starts with a prefill (default: decode)."
-        ),
-    )
-
-    parser.add_argument(
         "--moe-hot-adapt-prefill-blend",
         type=float,
         default=ServerArgs.moe_hot_adapt_prefill_blend,

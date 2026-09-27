@@ -1304,7 +1304,6 @@ class OffloadMoeCache:
         prefill_weight: float = 1.0,
         histories: str = "shared",
         aim: str = "blend",
-        idle_aim: str = "decode",
         prefill_blend: float = 0.25,
         prefill_normalize: str = "off",
         prefill_run_cap_frac: float = 0.0,
@@ -1348,8 +1347,6 @@ class OffloadMoeCache:
             raise ValueError("HOT adaptation histories must be 'shared' or 'split'")
         if aim not in ("blend", "phase"):
             raise ValueError("HOT adaptation aim must be 'blend' or 'phase'")
-        if idle_aim not in ("decode", "prefill"):
-            raise ValueError("HOT adaptation idle aim must be 'decode' or 'prefill'")
         if (
             isinstance(prefill_blend, bool)
             or not math.isfinite(prefill_blend)
@@ -1401,7 +1398,6 @@ class OffloadMoeCache:
         self.hot_adapt_prefill_weight = float(prefill_weight)
         self.hot_adapt_histories = histories
         self.hot_adapt_aim = aim
-        self.hot_adapt_idle_aim = idle_aim
         self.hot_adapt_prefill_blend = float(prefill_blend)
         self.hot_adapt_prefill_normalize = prefill_normalize
         self.decayed_prefill_freq = (
@@ -1530,7 +1526,7 @@ class OffloadMoeCache:
             idle = f"{idle_ms} ms"
         logger.info_rank0(
             f"MoE HOT adaptation intervals: mode={mode}, "
-            f"aim={self.hot_adapt_aim}, idle_aim={self.hot_adapt_idle_aim}, "
+            f"aim={self.hot_adapt_aim}, "
             f"unit=routed_tokens, "
             f"hot_budget_gib={self.hot_adapt_hot_budget_bytes / 2**30:.2f}, "
             f"max_swap_gib={self.hot_adapt_max_swap_bytes / 2**30:.2f}, "
@@ -1985,15 +1981,6 @@ class OffloadMoeCache:
         assert self._hot_mapping_host is not None
         return self._hot_mapping_host.tolist()
 
-    def _hot_adapt_aims_prefill(self, boundary: str | None) -> bool:
-        """Whether a phase-aimed tick at ``boundary`` targets the prefill blend."""
-        if boundary == "prefill":
-            return True
-        return (
-            boundary == "idle"
-            and getattr(self, "hot_adapt_idle_aim", "decode") == "prefill"
-        )
-
     def _plan_hot_adaptation(
         self,
         ready,
@@ -2026,7 +2013,7 @@ class OffloadMoeCache:
                 for layer_id in self.hot_expert_capacity
             }
             if getattr(self, "hot_adapt_aim", "blend") == "phase":
-                if self._hot_adapt_aims_prefill(boundary):
+                if boundary == "prefill":
                     # Keep the active prefill covered while still retaining bounded
                     # evidence from the decode history.
                     counts = blend_histories(
@@ -2730,9 +2717,7 @@ class OffloadMoeCache:
             decode_counts = dict(enumerate(counts))
             prefill_counts = dict(enumerate(self.decayed_prefill_freq.tolist()))
             if getattr(self, "hot_adapt_aim", "blend") == "phase":
-                if self._hot_adapt_aims_prefill(
-                    getattr(self, "_hot_adapt_tick_boundary", None)
-                ):
+                if getattr(self, "_hot_adapt_tick_boundary", None) == "prefill":
                     blended = blend_histories(
                         prefill_counts,
                         decode_counts,
