@@ -364,3 +364,62 @@ staged mode, and ordinary CPU prefill keeps the full-chunk charge. Targeted
 Linux tests (76, including a new chunk-independence check) passed with no
 skips. Artifacts use `workspacecurve2-*`; the fixed tree is measured under
 `workspacecurve3-*` at 16384 and 8192.
+
+## Fixed-governor sweep and promotion, 2026-09-26
+
+With the bounded governor charge, a 16384-token arm started with the same
+placement as 8192: 0.23 GiB scratch, 26.77 GiB pinned budget, 20 GPU prefill
+layers, 28 DISK layers and 82 protected HOT experts. Its three 8k cold requests
+took 14.41, 11.78 and 10.13 s, converging on the 8192 figure as the page cache
+warmed, so the per-chunk cost is not worse at 16384. The first 32k request then
+failed: the scheduler reported a CUDA out-of-memory while prefilling the first
+16384-token chunk with 64 MiB of GPU memory free and 22.9 GiB allocated by
+PyTorch. The server recovered and rejected the request with
+`server_out_of_memory`; the sweep continued to its 8192 control. Peak GPU
+memory sampled through that 8192 arm was 23.67 GiB of 24.56, so 12288 is not
+expected to fit either. On this 24 GiB card, 8192 is the largest chunk that
+completes the 100k workload.
+
+The 8192 control on the fixed tree passed all 27 depth responses with exact
+parity against the 2048 control and the earlier 8192 arm.
+
+| Arm | 8k cold TTFT | 32k cold TTFT | 100k cold TTFT | 100k repeat wall | Continuation walls |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| control 2048 (2026-09-22) | 23.45 s | 72.49 s | 222.34 s | 4.25 s | 86.2 / 70.9 / 64.5 s |
+| candidate 8192 (2026-09-22) | 9.95 s | 33.41 s | 88.64 s | 4.31 s | 88.0 / 69.7 / 67.9 s |
+| fixed 8192 (2026-09-26) | 12.97 s | 32.25 s | 89.64 s | 6.14 s | 104.0 / 86.1 / 78.1 s |
+
+Cold prefill matched the earlier 8192 arm at 32k and 100k; the 8k mean carries
+the post-restart warm-up of its first run. Decode-heavy phases were slower than
+on 2026-09-22 in this arm, and the same slowdown appeared in the deployment
+checks below, so it is treated as host state rather than a code effect: the
+fixed tree's 16384 arm, run minutes earlier, completed its continuation
+sessions in 101.9, 71.8 and 69.7 s.
+
+### Host memory attribution
+
+The serving cgroup, not unrelated host activity, is what swaps. Before the
+sweeps the host had no swap in use. During the 26-minute fixed-governor sweep
+the host swapped out 1,035,684 pages and swapped in 168,733, with memory-stall
+time of 1.0% and IO-stall time of 6.6%. Afterwards `freetoken-serve`'s cgroup
+reported `memory.current` of 55.9 GiB and `memory.swap.current` of 1.15 GiB on
+a 61.9 GiB host, with 28.1 GiB shmem (the pinned expert banks) and 25.8 GiB of
+file-backed bank pages, and only 1.7 GiB anonymous. The swapped pages are the
+part of the process the kernel may evict once the pinned banks and the pager's
+file pages fill memory. The zone-normal free list was also heavily fragmented
+(141,509 movable allocation stalls, 43,436 compaction stalls cumulative). This
+explains why larger chunks previously showed more stalls without reading more
+data, and it points at reserve sizing and swap avoidance, not chunking, as the
+next decode lever.
+
+### Promotion
+
+The fixed tree (branch `perf/prefill-chunk-finalist-20260926`) was deployed to
+`freetoken-serve` with `--max-extend-length 8192`, the disk prefix cache on,
+and the previous drop-in saved for rollback. Verification on the live server
+passed a short completion, 8k and 32k cold requests with correct JSON answers,
+their cached repeats (7,936 and 31,936 reused tokens) and a decode check.
+Cold TTFT right after restart was 13.06 s at 8k and 57.54 s at 32k, the usual
+warm-up; repeat TTFT was 1.57 and 1.38 s. The three-session continuation
+workload then passed in 94.2, 84.6 and 79.7 s. The serving script's default
+chunk is now 8192, overridable with `FREETOKEN_PREFILL_CHUNK`.

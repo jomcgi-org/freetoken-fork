@@ -79,7 +79,13 @@ workload wall-time target, preserving all task failures and quality checks.
 
 ## Prefill chunk screening, 2026-09-22
 
-The selected profile retains 2048-token chunks. A node-4 screening sweep with
+Update 2026-09-26: the selected profile now uses 8192-token chunks. On the
+deferred-workspace runtime the matched curve cut 100k cold TTFT from 222 s to
+89 s with exact parity and no cached-repeat or continuation regression, and a
+bounded host-governor charge keeps expert placement unchanged. 16384 does not
+fit the 24 GiB card. See the [depth benchmark](prefill-depth-benchmark.md).
+
+The original screening below retained 2048. A node-4 screening sweep with
 100352 reserved KV tokens found faster cold prefill at 8192, but slower cached
 decode. Both sizes kept 20 PINNED and 28 DISK layers, 6 GiB protected HOT and
 the same model/native runtime. Disk-prefix persistence was disabled in every
