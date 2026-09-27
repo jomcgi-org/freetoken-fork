@@ -580,106 +580,28 @@ def test_dropped_enqueue_releases_its_staged_bytes(tmp_path):
     store.close()
 
 
-class _FakeCudaHost:
-    """Stand-ins for cudaHostRegister/Unregister and the copy fence on this CPU suite."""
+def test_cuda_staging_uses_pageable_host_memory(monkeypatch):
+    from freetoken.kvcache import disk_prefix_cache as module
 
-    def __init__(self, monkeypatch, *, register_ok=True):
-        from freetoken.kvcache import disk_prefix_cache as module
+    real_empty = torch.empty
+    real_empty_like = torch.empty_like
 
-        self.registered: list[tuple[int, int]] = []
-        self.unregistered: list[int] = []
-        self.fences = []
-        owner = self
+    def no_pin_empty(*args, **kwargs):
+        assert not kwargs.get("pin_memory"), "disk prefix staging must not pin host memory"
+        return real_empty(*args, **kwargs)
 
-        class Fence:
-            def __init__(self):
-                self.synchronized = 0
-                owner.fences.append(self)
+    def no_pin_empty_like(*args, **kwargs):
+        assert not kwargs.get("pin_memory"), "disk prefix staging must not pin host memory"
+        return real_empty_like(*args, **kwargs)
 
-            def synchronize(self):
-                self.synchronized += 1
-
-        def register(ptr, nbytes):
-            owner.registered.append((ptr, nbytes))
-            return register_ok
-
-        real_empty = torch.empty
-        real_empty_like = torch.empty_like
-
-        def no_pin_empty(*args, **kwargs):
-            assert not kwargs.get("pin_memory"), "staging must bypass the pinned caching allocator"
-            return real_empty(*args, **kwargs)
-
-        def no_pin_empty_like(*args, **kwargs):
-            assert not kwargs.get("pin_memory"), "staging must bypass the pinned caching allocator"
-            return real_empty_like(*args, **kwargs)
-
-        monkeypatch.setattr(module, "_cuda_host_register", register)
-        monkeypatch.setattr(module, "_cuda_host_unregister", owner.unregistered.append)
-        monkeypatch.setattr(module, "_record_copy_fence", Fence)
-        monkeypatch.setattr(module.torch, "empty", no_pin_empty)
-        monkeypatch.setattr(module.torch, "empty_like", no_pin_empty_like)
-        self.module = module
-
-
-def test_cuda_staging_pins_only_until_the_copy_fence(monkeypatch):
-    cuda = _FakeCudaHost(monkeypatch)
+    monkeypatch.setattr(module.torch, "empty", no_pin_empty)
+    monkeypatch.setattr(module.torch, "empty_like", no_pin_empty_like)
     payload = _payload()
-    staged, ready = cuda.module.stage_tensors_for_write(payload, torch.device("cuda"))
-    assert isinstance(ready, cuda.module.TransientHostPin)
-    assert len(cuda.registered) == 1 and cuda.unregistered == []
-    ptr, nbytes = cuda.registered[0]
-    assert nbytes >= sum(t.numel() * t.element_size() for t in payload.values())
+    staged, ready = module.stage_tensors_for_write(payload, torch.device("cuda"))
+    assert ready is None
     for name, tensor in payload.items():
         assert torch.equal(staged[name], tensor)
         assert staged[name].data_ptr() != tensor.data_ptr()
-        assert ptr <= staged[name].data_ptr() < ptr + nbytes
-    ready.synchronize()
-    assert cuda.fences[0].synchronized == 1
-    assert cuda.unregistered == [ptr]
-    ready.synchronize()
-    assert cuda.unregistered == [ptr]
-    for name, tensor in payload.items():
-        assert torch.equal(staged[name], tensor)
-
-
-def test_dropped_staging_unpins_without_a_write(monkeypatch):
-    import gc
-
-    cuda = _FakeCudaHost(monkeypatch)
-    staged, ready = cuda.module.stage_tensors_for_write(_payload(), torch.device("cuda"))
-    ptr = cuda.registered[0][0]
-    del staged, ready
-    gc.collect()
-    assert cuda.unregistered == [ptr]
-
-
-def test_staging_falls_back_to_synchronous_copies_when_pinning_fails(monkeypatch):
-    cuda = _FakeCudaHost(monkeypatch, register_ok=False)
-    payload = _payload()
-    staged, ready = cuda.module.stage_tensors_for_write(payload, torch.device("cuda"))
-    assert not ready.registered
-    ready.synchronize()
-    assert cuda.unregistered == []
-    for name, tensor in payload.items():
-        assert torch.equal(staged[name], tensor)
-
-
-def test_store_write_unpins_each_staged_entry_once(tmp_path, monkeypatch):
-    cuda = _FakeCudaHost(monkeypatch)
-    store = _store(tmp_path, budget=1 << 26)
-    for ids, rows in ((torch.arange(4, dtype=torch.int32), 64), (torch.arange(9, 13, dtype=torch.int32), 512)):
-        payload = _sized_payload(rows)
-        staged, ready = cuda.module.stage_tensors_for_write(payload, torch.device("cuda"))
-        assert store.enqueue(ids, staged, ready=ready)
-        del staged, ready
-        store.flush()
-        assert store.stats()["staged_bytes_live"] == 0
-    assert cuda.unregistered == [ptr for ptr, _ in cuda.registered]
-    entry = store.lookup_longest(torch.arange(9, 14, dtype=torch.int32), longer_than=0)
-    assert entry is not None
-    assert torch.equal(entry.tensors["qsa_kv"], _sized_payload(512)["qsa_kv"])
-    store.close()
 
 
 def test_streaming_writer_matches_safetensors_reader(tmp_path):

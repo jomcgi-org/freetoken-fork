@@ -11,7 +11,6 @@ import dataclasses
 import hashlib
 import json
 import math
-import mmap
 import os
 import queue
 import threading
@@ -1093,116 +1092,30 @@ class LazyKVRestore:
             self._on_complete()
 
 
-_STAGING_ALIGN = 64
-
-
-def _cuda_host_register(ptr: int, nbytes: int) -> bool:
-    """Page-lock an existing host range; False (never raises) if CUDA refuses."""
-    try:
-        cudart = torch.cuda.cudart()
-        return int(cudart.cudaHostRegister(ptr, nbytes, 0)) == 0
-    except Exception:
-        return False
-
-
-def _cuda_host_unregister(ptr: int) -> None:
-    torch.cuda.cudart().cudaHostUnregister(ptr)
-
-
-def _record_copy_fence():
-    fence = torch.cuda.Event()
-    fence.record()
-    return fence
-
-
-class TransientHostPin:
-    """Host staging for one prefix entry, page-locked only while its copies run.
-
-    The region is a fresh anonymous mapping, so it is page-aligned and returned to the
-    OS when the last staged tensor is dropped after the write. It is registered with
-    CUDA so device-to-host copies stay asynchronous (the scheduler does not wait for
-    the decode step already queued behind the prefill), and unregistered as soon as the
-    copies complete. Nothing goes through torch's pinned-host caching allocator, which
-    keeps freed blocks (rounded up to a power of two) for the life of the process: that
-    left about 2.25 GiB page-locked per written 100k entry and took the same amount of
-    page cache from the streamed DISK expert banks.
-
-    The write job's ``ready`` fence is this object: ``synchronize`` waits for the copies
-    and unpins. If the job is dropped without a write, ``__del__`` does the same.
-    """
-
-    def __init__(self, nbytes: int) -> None:
-        # Private anonymous memory: a shared anonymous mapping would be shmem-backed.
-        self._mm = mmap.mmap(
-            -1,
-            max(int(nbytes), 1),
-            flags=mmap.MAP_PRIVATE,
-            prot=mmap.PROT_READ | mmap.PROT_WRITE,
-        )
-        self._base = torch.frombuffer(self._mm, dtype=torch.uint8)
-        self._ptr = self._base.data_ptr()
-        self._offset = 0
-        self._fence = None
-        self.registered = _cuda_host_register(self._ptr, len(self._mm))
-
-    @property
-    def nbytes(self) -> int:
-        return len(self._mm)
-
-    def take(self, shape, dtype: torch.dtype) -> torch.Tensor:
-        shape = tuple(int(dim) for dim in shape)
-        count = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
-        start = -(-self._offset // _STAGING_ALIGN) * _STAGING_ALIGN
-        if start + count > len(self._mm):
-            raise ValueError("transient host staging region is too small")
-        self._offset = start + count
-        return self._base[start : start + count].view(dtype).view(shape)
-
-    def copy_into(self, value: torch.Tensor) -> torch.Tensor:
-        host = self.take(value.shape, value.dtype)
-        host.copy_(value, non_blocking=self.registered)
-        return host
-
-    def record(self) -> None:
-        self._fence = _record_copy_fence()
-
-    def synchronize(self) -> None:
-        fence, self._fence = self._fence, None
-        if fence is not None:
-            fence.synchronize()
-        if self.registered:
-            self.registered = False
-            _cuda_host_unregister(self._ptr)
-
-    def __del__(self) -> None:
-        try:
-            self.synchronize()
-        except Exception:
-            pass
-
-
-def _staging_nbytes(specs) -> int:
-    total = 0
-    for shape, dtype in specs:
-        total = -(-total // _STAGING_ALIGN) * _STAGING_ALIGN
-        total += math.prod(int(d) for d in shape) * torch.empty((), dtype=dtype).element_size()
-    return total
-
-
 def stage_tensors_for_write(
     tensors: Mapping[str, torch.Tensor], device: torch.device
 ) -> tuple[dict[str, torch.Tensor], Any | None]:
-    """Copy tensors into transient host staging and return the write fence.
+    """Copy tensors into pageable host memory that the writer releases after the write.
 
-    See ``TransientHostPin``: the staging is released by the writer after the write and
-    is page-locked only until the copies complete.
+    Staging never allocates pinned memory: torch's pinned-host caching allocator keeps
+    freed blocks (rounded up to a power of two) for the life of the process, which left
+    about 2.25 GiB of page-locked memory resident per written 100k entry and took that
+    much page cache from the streamed DISK expert banks. The copies complete before
+    this returns, so no fence is needed.
     """
     if device.type != "cuda":
         return {name: value.detach().cpu().clone() for name, value in tensors.items()}, None
-    pin = TransientHostPin(_staging_nbytes((v.shape, v.dtype) for v in tensors.values()))
-    staged = {name: pin.copy_into(value) for name, value in tensors.items()}
-    pin.record()
-    return staged, pin
+    staged: dict[str, torch.Tensor] = {}
+    for name, value in tensors.items():
+        host = _host_staging_empty(value.shape, value.dtype)
+        host.copy_(value)
+        staged[name] = host
+    return staged, None
+
+
+def _host_staging_empty(shape, dtype: torch.dtype) -> torch.Tensor:
+    """Pageable host buffer for one staged entry; freed when the writer drops the job."""
+    return torch.empty(tuple(shape), dtype=dtype, device="cpu")
 
 
 def stage_hybrid_prefix_for_write(
@@ -1216,8 +1129,9 @@ def stage_hybrid_prefix_for_write(
 ) -> tuple[dict[str, torch.Tensor], Any | None]:
     """Stage a hybrid prefix with one reusable per-layer GPU gather buffer.
 
-    The host side is one ``TransientHostPin`` region owned by the write job: page-locked
-    until the asynchronous copies finish and released once the entry is on disk.
+    The host side is pageable memory owned by the write job and released once the entry
+    is on disk (see ``stage_tensors_for_write``). Device-to-host copies into pageable
+    memory are synchronous, so the returned fence is always ``None`` on CUDA.
     """
     from freetoken.spec_decode import request_state_views
 
@@ -1237,35 +1151,7 @@ def stage_hybrid_prefix_for_write(
     locations = kv_indices.to(torch.long)
     flat = kv_cache._kv_buffer.flatten(2, 3)
     kv_shape = (flat.shape[0], flat.shape[1], locations.numel(), *flat.shape[3:])
-    cmp_buffer = getattr(kv_cache, "_cmp_k_buffer", None)
-    rows = None
-    if cmp_buffer is not None:
-        ratio = int(kv_cache.index_ratio)
-        if locations.numel() % ratio:
-            raise ValueError(
-                f"QSA disk prefix length {locations.numel()} is not group-aligned to {ratio}"
-            )
-        rows = locations[::ratio] // ratio
-    req = type("DiskSnapshotReq", (), {
-        "linear_slot_idx": linear_slot,
-        "table_idx": 0 if table_idx is None else table_idx,
-    })()
-    views = request_state_views(linear_pool, kv_cache if table_idx is not None else None, req)
-    state_sources: list[tuple[str, torch.Tensor]] = [
-        (name, views[name]) for name in ("conv", "recurrent", "qsa_pending") if name in views
-    ]
-    state_sources += [
-        (f"slot_state.{name}", value) for name, value in views.get("slot_states", {}).items()
-    ]
-    state_sources += list((extra_tensors or {}).items())
-
-    specs = [(kv_shape, flat.dtype)]
-    if rows is not None:
-        specs.append(((cmp_buffer.shape[0], rows.numel(), cmp_buffer.shape[2]), cmp_buffer.dtype))
-    specs += [(value.shape, value.dtype) for _, value in state_sources]
-    pin = TransientHostPin(_staging_nbytes(specs))
-
-    host_kv = pin.take(kv_shape, flat.dtype)
+    host_kv = _host_staging_empty(kv_shape, flat.dtype)
     scratch = torch.empty(
         (flat.shape[0], locations.numel(), *flat.shape[3:]),
         dtype=flat.dtype,
@@ -1274,7 +1160,7 @@ def stage_hybrid_prefix_for_write(
     for layer in range(flat.shape[1]):
         torch.index_select(flat[:, layer], 1, locations, out=scratch)
         for slab in range(flat.shape[0]):
-            host_kv[slab, layer].copy_(scratch[slab], non_blocking=pin.registered)
+            host_kv[slab, layer].copy_(scratch[slab])
     staged: dict[str, torch.Tensor] = {"qsa_kv": host_kv}
     page_size = getattr(kv_cache, "_page_size", None)
     if page_size is not None:
@@ -1282,8 +1168,15 @@ def stage_hybrid_prefix_for_write(
             int(locations.numel()), int(page_size)
         )
 
-    if rows is not None:
-        host_index = pin.take(
+    cmp_buffer = getattr(kv_cache, "_cmp_k_buffer", None)
+    if cmp_buffer is not None:
+        ratio = int(kv_cache.index_ratio)
+        if locations.numel() % ratio:
+            raise ValueError(
+                f"QSA disk prefix length {locations.numel()} is not group-aligned to {ratio}"
+            )
+        rows = locations[::ratio] // ratio
+        host_index = _host_staging_empty(
             (cmp_buffer.shape[0], rows.numel(), cmp_buffer.shape[2]), cmp_buffer.dtype
         )
         index_scratch = torch.empty(
@@ -1291,21 +1184,38 @@ def stage_hybrid_prefix_for_write(
         )
         for layer in range(cmp_buffer.shape[0]):
             torch.index_select(cmp_buffer[layer], 0, rows, out=index_scratch)
-            host_index[layer].copy_(index_scratch, non_blocking=pin.registered)
+            host_index[layer].copy_(index_scratch)
         staged["qsa_index"] = host_index
 
-    for name, value in state_sources:
-        staged[name] = pin.copy_into(value)
+    req = type("DiskSnapshotReq", (), {
+        "linear_slot_idx": linear_slot,
+        "table_idx": 0 if table_idx is None else table_idx,
+    })()
+    views = request_state_views(
+        linear_pool, kv_cache if table_idx is not None else None, req
+    )
+    for name in ("conv", "recurrent", "qsa_pending"):
+        if name in views:
+            host = _host_staging_empty(views[name].shape, views[name].dtype)
+            host.copy_(views[name])
+            staged[name] = host
+    for name, value in views.get("slot_states", {}).items():
+        host = _host_staging_empty(value.shape, value.dtype)
+        host.copy_(value)
+        staged[f"slot_state.{name}"] = host
 
-    pin.record()
+    for name, value in (extra_tensors or {}).items():
+        host = _host_staging_empty(value.shape, value.dtype)
+        host.copy_(value)
+        staged[name] = host
+
     logger.info(
-        "Disk prefix staged %d tokens (%.2f GiB, %s) in %.0f ms",
+        "Disk prefix staged %d tokens (%.2f GiB) to pageable host memory in %.0f ms",
         int(locations.numel()),
         tensor_nbytes(staged) / 2**30,
-        "transient pin" if pin.registered else "pageable",
         (time.perf_counter() - started) * 1000.0,
     )
-    return staged, pin
+    return staged, None
 
 
 __all__ = [
@@ -1314,7 +1224,6 @@ __all__ = [
     "DiskPrefixEntry",
     "DiskPrefixStore",
     "LazyKVRestore",
-    "TransientHostPin",
     "capture_hybrid_prefix_tensors",
     "make_block_index",
     "model_cache_identity",
