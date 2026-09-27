@@ -34,29 +34,6 @@ _TMP_MARKER = ".tmp-"
 BLOCK_INDEX_TENSOR = "qsa_block_index"
 
 
-def _drop_file_pages(path: Path | str) -> None:
-    """Advise the kernel to drop a cache entry's pages from the page cache.
-
-    Entries are written and restored through the page cache. On the disk tier
-    those pages compete with the streamed file-backed expert banks, and one
-    100k-token entry (about 1.4 GiB) was measured to evict enough bank pages
-    that later cold prefills read five times more from NVMe. Entries are read
-    at most once per restore, so nothing is lost by dropping them. Best effort.
-    """
-    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
-        return
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-
-
 def _stable_json_value(value: Any) -> Any:
     if dataclasses.is_dataclass(value):
         return {
@@ -453,7 +430,6 @@ class DiskPrefixStore:
                         os.close(dir_fd)
                 except OSError:
                     pass
-                _drop_file_pages(path)
                 key = token_chain_hash(self.identity, job.token_ids)
                 with self._lock:
                     self._entries[(job.token_ids.numel(), key)] = path
@@ -1021,7 +997,6 @@ class LazyKVRestore:
             if self._completed_callback:
                 return
             self._completed_callback = True
-        _drop_file_pages(self.entry.path)
         if self._on_complete is not None:
             self._on_complete()
 
