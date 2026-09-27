@@ -508,3 +508,22 @@ def test_fp8_disk_restore_round_trip_uses_uint8_views(cpu_byte_store):
     assert torch.equal(restored.view(torch.uint8), source.view(torch.uint8))
     assert len(cpu_byte_store) == 2
     assert all(call[0].dtype == call[3].dtype == torch.uint8 for call in cpu_byte_store)
+
+
+def test_drop_file_pages_is_best_effort(tmp_path, monkeypatch):
+    from freetoken.kvcache import disk_prefix_cache as module
+
+    calls = []
+    target = tmp_path / "entry.safetensors"
+    target.write_bytes(b"x" * 4096)
+
+    def fake_fadvise(fd, offset, length, advice):
+        calls.append((offset, length, advice))
+
+    monkeypatch.setattr(module.os, "posix_fadvise", fake_fadvise, raising=False)
+    monkeypatch.setattr(module.os, "POSIX_FADV_DONTNEED", 4, raising=False)
+    module._drop_file_pages(target)
+    assert calls == [(0, 0, 4)]
+    # A missing file never raises: the writer may have already replaced it.
+    module._drop_file_pages(tmp_path / "missing.safetensors")
+    assert len(calls) == 1
