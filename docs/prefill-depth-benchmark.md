@@ -423,3 +423,23 @@ Cold TTFT right after restart was 13.06 s at 8k and 57.54 s at 32k, the usual
 warm-up; repeat TTFT was 1.57 and 1.38 s. The three-session continuation
 workload then passed in 94.2, 84.6 and 79.7 s. The serving script's default
 chunk is now 8192, overridable with `FREETOKEN_PREFILL_CHUNK`.
+
+### Live-server depth checks
+
+Two distinct 100k prompts from the manifest were sent to the deployed server
+(disk prefix cache on, 15 and 19 minutes after restart). Both passed. Cold TTFT
+was 138.60 s and 165.92 s; the cached repeat of the first reused 99,904 tokens
+with a 2.96 s TTFT. The journal shows the difference from the 89.6 s arm is in
+the chunks themselves: 8192-token chunks took 11 to 17 s on the live server
+against 6.9 to 8.9 s in the arm, with no additional delay before the first
+chunk (the "Prefill batch" line is written at chunk completion, so its
+throughput figure for a request's first chunk is not a chunk timing).
+
+A second pass of the continuation workload on the live server, with the disk
+prefix cache holding the first pass, completed in 51.4, 46.2 and 46.5 s per
+session with identical outputs, reading 2,048 to 3,776 cached tokens per call.
+Decode is therefore unchanged; the slower cold sessions are uncached prefill.
+The remaining suspect for the slower live chunks is the prefix cache itself,
+whose 1.4 GiB per-100k-request writes go through the same page cache that
+holds the file-backed expert banks. That is measured next as `workspacecurve4-*`
+(8192, finalist tree, prefix cache on with a fresh directory, same manifest).
