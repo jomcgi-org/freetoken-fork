@@ -498,3 +498,75 @@ placement experiment, not a cache setting.
 Artifacts: `stagefix1-*`, `stagefix2-*` (reverted transient pinning) and
 `pagercache1-*`, with `node4-cachepressure-summary.py` for per-request TTFT,
 NVMe read, stall and parity, and `pagercache1-summary.txt`.
+
+## HOT adaptation across idle gaps, 2026-09-27
+
+With the prefix-cache leak fixed, the live server still ran cold 100k prefills
+in 106 to 115 s against about 92 s in the qualification arms. The steady
+8192-token chunks took about 7 s on both; the difference was the first two or
+three chunks after an idle gap (about 19, 15 and 9 s live against 9 to 10 s).
+Under `--moe-hot-adapt-aim phase` the idle ticks aim at the decode history
+alone. Every request starts with a prefill, so after each gap the next prefill
+began at a 26 to 27% decayed hot rate with a 1,148-swap plan and read 24 to 29
+GiB from NVMe instead of about 10. The arms hid this: their 8k and 32k rows
+triggered the adaptation's bandwidth back-off early, which spaced later ticks
+out, and no row followed a long idle.
+
+Two protocols reproduce live traffic, both on `a120203` with the prefix cache on
+and a fresh directory per arm, and all rows passed with exact parity:
+
+- `livelike*`: a freshly started server, the `node4-finalist-verify.py` warm-up,
+  then the three 100k manifest cases each after 90 s of idle
+  (`node4-livelike-driver.py`). Its baseline reproduced the live numbers.
+- `idlegap*`: the fixed continuation workload, then the 27 depth rows with 60 s
+  of idle before every cold request (`prefill-depth.py measure
+  --idle-before-cold 60`).
+
+Live-like 100k cold TTFT (runs 2 and 3; run 1 is page-cache warm-up after the
+restart in every arm) and NVMe read:
+
+| Sweep, arm order | Baseline | Idle ticks off | Idle off + post-prefill tick | Idle aimed at prefill |
+| --- | --- | --- | --- | --- |
+| livelike1 (baseline first) | 109.8 / 106.5 s, 27 / 24 GiB | 92.3 / 92.4 s, 10 / 11 GiB | | 92.6 / 92.0 s, 11 / 11 GiB |
+| livelike2 (idle off first) | 109.6 / 108.4 s, 28 / 29 GiB | 93.2 / 91.4 s, 12 / 10 GiB | | |
+| livelike3 (post-prefill first) | | 95.8 / 93.5 s, 12 / 11 GiB | 95.7 / 93.5 s, 14 / 12 GiB | |
+
+Idle-gap depth protocol, means of three runs:
+
+| Arm (sweep) | 8k cold TTFT / wall | 32k cold TTFT | 100k cold TTFT | 100k repeat wall | 100k post-prefill decode wall | Continuation walls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline (idlegap1) | 13.37 / 30.02 s | 37.86 s | 93.23 s | 3.88 s | 21.10 s | 99.5 / 72.8 / 79.3 s |
+| baseline (idlegap2) | 13.60 / 30.78 s | 39.59 s | 98.75 s | 3.99 s | 19.90 s | 104.2 / 77.6 / 78.9 s |
+| idle aimed at prefill (idlegap1) | 13.09 / 24.77 s | 36.78 s | 92.14 s | 7.44 s | 24.75 s | 93.2 / 73.1 / 73.4 s |
+| idle off (idlegap1) | 11.66 / 16.97 s | 33.45 s | 93.19 s | 4.91 s | 23.16 s | 96.1 / 72.0 / 69.9 s |
+| idle off (idlegap2) | 11.75 / 16.73 s | 34.22 s | 90.33 s | 5.40 s | 25.39 s | 96.9 / 71.8 / 75.4 s |
+| idle off (idlegap3) | 11.52 / 18.05 s | 33.36 s | 91.20 s | 5.59 s | 24.36 s | 102.1 / 72.0 / 76.0 s |
+| idle off + post-prefill tick (idlegap3) | 12.36 / 18.55 s | 30.28 s | 89.72 s | 4.22 s | 18.47 s | 100.0 / 74.1 / 66.9 s |
+
+Aiming idle ticks at the prefill blend (an opt-in flag, since reverted) fixed
+the prefill but slowed decode after cached restores. Turning idle ticks off
+improved every cold row and the continuation sessions, and in all three sweeps
+slowed decode right after a 100k prefill, because nothing re-aimed the set at
+decode before the next tokens. One bounded decode tick at the first decode
+boundary after each prefill (`--moe-hot-adapt-post-prefill-tick on`) recovers
+that. The 4090 serving script now passes `--moe-hot-adapt-idle-ms 0
+--moe-hot-adapt-post-prefill-tick on` (`9f9b5d2`); the engine defaults are
+unchanged. The idle ticks were added for short chat turns right after startup;
+on this profile the HOT set is seeded from the layer profile and reports its
+fill complete at the first decode tick, so they only ran after the fill.
+
+Deployed with `node4-finalist-deploy.sh 8192` on `9f9b5d2`; the startup log
+shows `idle=off`, the post-prefill tick on, 20 GPU prefill layers and 82 HOT
+experts, and `node4-finalist-verify.py` passed. The same live sequence as
+before (verify warm-up, then three fresh 100k prompts 90 s apart,
+`livetrace-idletick-20260927.jsonl`):
+
+| Live 100k cold request | Before (prefix fix only) | After (idle off + post-prefill tick) |
+| --- | ---: | ---: |
+| first after restart | 179.6 s, 96.1 GiB | 154.0 s, 69.8 GiB |
+| second | 114.5 s, 33.9 GiB | 97.3 s, 14.7 GiB |
+| third | 105.9 s, 25.5 GiB | 93.2 s, 12.7 GiB |
+
+The first request after a restart still pays the page-cache warm-up of the
+file-backed DISK banks. Later cold 100k requests on the live server now run
+within a few seconds of the qualification arms.
