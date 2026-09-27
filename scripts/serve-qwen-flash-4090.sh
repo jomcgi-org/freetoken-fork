@@ -6,6 +6,11 @@
 # 2026-09-22 matched curve on the deferred-workspace runtime cut 100k cold TTFT
 # from 222 s to 89 s with exact parity and no cached-repeat or continuation
 # regression. See docs/prefill-depth-benchmark.md for the data.
+# HOT adaptation runs no idle ticks and one bounded decode tick after each prefill.
+# Idle ticks re-aimed the HOT set at decode between requests, so the next prefill
+# (every request starts with one) began at a 26% hot rate: live 100k cold ~108 s
+# against ~92 s without them. The post-prefill tick keeps decode after a long
+# prefill at the idle-tick level (2026-09-27 idlegap/livelike sweeps).
 set -euo pipefail
 if (( $# < 2 )); then
   printf 'Usage: %s MODEL_PATH LAYER_PROFILE_JSON [extra ft serve arguments]\n' "$0" >&2
@@ -37,4 +42,5 @@ exec "${FREETOKEN_BIN:-ft}" serve \
   --kv-disk-cache-gib "${FREETOKEN_PREFIX_CACHE_GIB:-500}" --moe-hot-plan-persist off --cache-type radix \
   --kv-ladder off --kv-reserve-tokens 65536 --cuda-graph-max-bs 1 \
   --moe-disk-prefill-io buffered --moe-hot-staging-io mmap \
-  --moe-hot-host-cache reclaim "$@"
+  --moe-hot-host-cache reclaim \
+  --moe-hot-adapt-idle-ms 0 --moe-hot-adapt-post-prefill-tick on "$@"
