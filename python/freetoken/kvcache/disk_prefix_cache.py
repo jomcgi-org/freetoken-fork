@@ -10,7 +10,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import logging
 import math
 import os
 import queue
@@ -25,6 +24,8 @@ from typing import Any, Callable, Mapping, Sequence
 import torch
 from safetensors import safe_open
 
+from freetoken.utils import init_logger
+
 
 FORMAT = "freetoken_disk_prefix"
 VERSION = 3
@@ -33,7 +34,7 @@ _SUFFIX = ".safetensors"
 _TMP_MARKER = ".tmp-"
 BLOCK_INDEX_TENSOR = "qsa_block_index"
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 _SAFETENSORS_DTYPES: dict[torch.dtype, str] = {
     torch.bool: "BOOL",
