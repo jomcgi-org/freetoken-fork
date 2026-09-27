@@ -443,3 +443,58 @@ The remaining suspect for the slower live chunks is the prefix cache itself,
 whose 1.4 GiB per-100k-request writes go through the same page cache that
 holds the file-backed expert banks. That is measured next as `workspacecurve4-*`
 (8192, finalist tree, prefix cache on with a fresh directory, same manifest).
+
+## Prefix cache staging fix and host budget arms, 2026-09-27
+
+The live-server gap between cache-off arms (100k cold 89.6 s) and the deployed
+server (139 to 196 s) came from pinned host memory that the disk prefix cache
+retained after each entry write. The cause, the fix and the live traces are in
+`docs/prefix-cache-page-pressure-20260926.md`. With pageable staging (`f28f44b`)
+the cache-on protocol (`stagefix1-*`) passed all 27 rows with exact parity and
+ran 100k cold in 93.4, 90.0 and 88.3 s with 13.0, 10.0 and 7.9 GiB read from
+NVMe, matching the cache-off arm.
+
+### Host budget arms
+
+On the fixed tree (`368d9c4`, same tree as `8422299`) the `pagercache1-*`
+sweep tested whether a smaller host reserve or a larger pager share would leave
+more page cache to the file-backed DISK banks. Three arms ran the same
+protocol back to back, cache on, fresh directory each. The two non-baseline arms
+held the pin budget at 27.07 GiB with `FREETOKEN_PIN_BUDGET_GB` so placement
+could not change; every startup log showed 20 GPU prefill layers, 28 DISK
+layers and 82 protected HOT experts.
+
+| Arm | Budget table | 100k cold TTFT | NVMe per 100k cold | 32k cold TTFT | 32k repeat wall | 32k post-prefill decode wall | 100k post-prefill decode wall | Swap-out during run |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline | reserve 9.29, pin 27.07, pager 21.24 (derived) | 91.99 s | 11.8 GiB | 37.45 s | 3.98 s | 19.51 s | 25.23 s | 2.83 GiB |
+| `--host-cache-reserve-gib 6` | reserve 6.00, pin 27.07, pager 24.60 (derived) | 90.95 s | 9.8 GiB | 42.49 s | 4.45 s | 24.54 s | 24.15 s | 2.73 GiB |
+| reserve 4.5, `--moe-pager-budget-gib 25.3` | reserve 4.50, pin 27.07, pager 25.30 | 91.69 s | 9.7 GiB | 44.10 s | 5.93 s | 24.80 s | 25.38 s | 2.72 GiB |
+
+All 81 responses passed with exact parity against `workspacecurve1-0`. No arm
+won. The 100k cold differences are inside the run-to-run spread of the
+baseline itself (89.3 to 94.6 s), total NVMe reads over each arm were 118, 124
+and 126 GiB, and both non-baseline arms were slower on the 32k rows. The
+defaults in `engine/host_memory.py` are unchanged.
+
+The null result follows from what the two knobs control on this profile:
+
+- The reserve is an accounting input, not memory the process holds. It lowers
+  the governor's ceiling, and with a derived pin budget the pin share (28/50 of
+  the remainder) grows with it. At reserve 6 the derived pin budget would be
+  about 28.9 GiB, enough for a 21st GPU layer, which is why these arms fixed
+  the pin budget.
+- The served profile uses `moe_disk_pager='madvise'`, not `uffd`, so the DISK
+  banks are an ordinary file mapping and the kernel page cache decides residency. The pager budget
+  then only sets the CPU prefill populate ceiling (half the budget per layer:
+  10.64, 12.30 and 12.65 GiB), and every DISK layer already allows all 512
+  experts at the baseline value.
+
+Page cache for the DISK banks is what physical memory leaves after the pinned
+banks (26.44 GiB for 20 GPU layers plus 0.56 GiB HOT staging), the engine's
+anonymous memory and the rest of the host. Giving the banks more of it means
+pinning fewer layers, which trades GPU prefill layers for DISK layers and is a
+placement experiment, not a cache setting.
+
+Artifacts: `stagefix1-*`, `stagefix2-*` (reverted transient pinning) and
+`pagercache1-*`, with `node4-cachepressure-summary.py` for per-request TTFT,
+NVMe read, stall and parity, and `pagercache1-summary.txt`.
