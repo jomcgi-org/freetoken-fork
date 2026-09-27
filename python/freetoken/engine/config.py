@@ -103,6 +103,9 @@ class EngineConfig:
     moe_hot_adapt_prefill_weight: float = 1.0
     moe_hot_adapt_histories: str = "shared"
     moe_hot_adapt_aim: str = "blend"
+    # Under aim="phase", idle ticks aim at the decode history ("decode") or at the
+    # prefill blend a prefill tick uses ("prefill"); every request starts with a prefill.
+    moe_hot_adapt_idle_aim: str = "decode"
     moe_hot_adapt_prefill_blend: float = 0.25
     moe_hot_adapt_prefill_normalize: str = "off"
     moe_hot_adapt_prefill_run_cap_frac: float = 0.0
@@ -465,6 +468,11 @@ class EngineConfig:
             raise ValueError(
                 "--moe-hot-adapt-aim must be 'blend' or 'phase', got "
                 f"{self.moe_hot_adapt_aim!r}"
+            )
+        if self.moe_hot_adapt_idle_aim not in ("decode", "prefill"):
+            raise ValueError(
+                "--moe-hot-adapt-idle-aim must be 'decode' or 'prefill', got "
+                f"{self.moe_hot_adapt_idle_aim!r}"
             )
         if (
             isinstance(self.moe_hot_adapt_prefill_blend, bool)

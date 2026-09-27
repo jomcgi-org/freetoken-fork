@@ -1027,6 +1027,7 @@ class Engine:
                 ),
                 histories=getattr(config, "moe_hot_adapt_histories", "shared"),
                 aim=getattr(config, "moe_hot_adapt_aim", "blend"),
+                idle_aim=getattr(config, "moe_hot_adapt_idle_aim", "decode"),
                 prefill_blend=getattr(
                     config, "moe_hot_adapt_prefill_blend", 0.25
                 ),
@@ -2811,6 +2812,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_prefill_weight": 1.0,
     "moe_hot_adapt_histories": "shared",
     "moe_hot_adapt_aim": "blend",
+    "moe_hot_adapt_idle_aim": "decode",
     "moe_hot_adapt_prefill_blend": 0.25,
     "moe_hot_adapt_prefill_normalize": "off",
     "moe_hot_adapt_prefill_run_cap_frac": 0.0,

@@ -535,15 +535,19 @@ def test_split_blend_keeps_decode_heavy_experts_ranked_first():
 
 
 @pytest.mark.parametrize(
-    ("aim", "boundary", "expected"),
+    ("aim", "boundary", "expected", "idle_aim"),
     [
-        ("phase", "prefill", {0: (2.0, 20.0, 0.5, 4.0)}),
-        ("phase", "decode", {0: (8.0, 0.0, 2.0, 0.0)}),
-        ("blend", "prefill", {0: (8.0, 5.0, 2.0, 1.0)}),
+        ("phase", "prefill", {0: (2.0, 20.0, 0.5, 4.0)}, "decode"),
+        ("phase", "decode", {0: (8.0, 0.0, 2.0, 0.0)}, "decode"),
+        ("blend", "prefill", {0: (8.0, 5.0, 2.0, 1.0)}, "decode"),
+        ("phase", "idle", {0: (8.0, 0.0, 2.0, 0.0)}, "decode"),
+        ("phase", "idle", {0: (2.0, 20.0, 0.5, 4.0)}, "prefill"),
+        ("phase", "decode", {0: (8.0, 0.0, 2.0, 0.0)}, "prefill"),
+        ("blend", "idle", {0: (8.0, 5.0, 2.0, 1.0)}, "prefill"),
     ],
 )
 def test_split_history_aim_counts_follow_boundary(
-    monkeypatch, aim, boundary, expected,
+    monkeypatch, aim, boundary, expected, idle_aim,
 ):
     import torch
 
@@ -556,6 +560,7 @@ def test_split_history_aim_counts_follow_boundary(
     cache.hot_expert_capacity = {0: 1}
     cache.hot_adapt_histories = "split"
     cache.hot_adapt_aim = aim
+    cache.hot_adapt_idle_aim = idle_aim
     cache.hot_adapt_prefill_blend = 0.25
     cache.hot_adapt_expert_bytes = 1
     cache.num_experts = 4
@@ -583,14 +588,18 @@ def test_split_history_aim_counts_follow_boundary(
 
 
 @pytest.mark.parametrize(
-    ("aim", "boundary", "expected"),
+    ("aim", "boundary", "expected", "idle_aim"),
     [
-        ("blend", "prefill", 0.5),
-        ("phase", "prefill", 2.0 / 26.5),
-        ("phase", "decode", 0.8),
+        ("blend", "prefill", 0.5, "decode"),
+        ("phase", "prefill", 2.0 / 26.5, "decode"),
+        ("phase", "decode", 0.8, "decode"),
+        ("phase", "idle", 0.8, "decode"),
+        ("phase", "idle", 2.0 / 26.5, "prefill"),
     ],
 )
-def test_decayed_hot_pair_rate_follows_active_aim(monkeypatch, aim, boundary, expected):
+def test_decayed_hot_pair_rate_follows_active_aim(
+    monkeypatch, aim, boundary, expected, idle_aim,
+):
     import torch
 
     OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
@@ -598,6 +607,7 @@ def test_decayed_hot_pair_rate_follows_active_aim(monkeypatch, aim, boundary, ex
     cache.hot_adapt_enabled = True
     cache.num_layers = 1
     cache.hot_adapt_aim = aim
+    cache.hot_adapt_idle_aim = idle_aim
     cache.hot_adapt_prefill_blend = 0.25
     cache._hot_adapt_tick_boundary = boundary
     cache.decayed_decode_freq = torch.tensor([[8.0, 0.0, 2.0, 0.0]])
@@ -621,6 +631,27 @@ def test_engine_config_defaults_hot_adapt_aim_to_blend(monkeypatch):
     )
 
     assert config.moe_hot_adapt_aim == "blend"
+
+
+@pytest.mark.parametrize("idle_aim", ["blend", "", None])
+def test_engine_config_rejects_invalid_hot_adapt_idle_aim(monkeypatch, idle_aim):
+    import torch
+
+    _offload_cache_class_without_triton(monkeypatch)
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    default = EngineConfig(
+        model_path="/tmp/model", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16
+    )
+    assert default.moe_hot_adapt_idle_aim == "decode"
+    with pytest.raises(ValueError, match="--moe-hot-adapt-idle-aim"):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_hot_adapt_idle_aim=idle_aim,
+        )
 
 
 @pytest.mark.parametrize("aim", ["mixed", "", None])
