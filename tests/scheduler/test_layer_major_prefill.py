@@ -159,3 +159,22 @@ def test_group_drain_processes_chunks_in_order_and_exposes_the_last():
     items = [("a", 1), ("b", 1), ("c", 1)]
     Scheduler._process_last_data(sched, items)
     assert seen == items
+
+
+def test_long_prompts_use_the_group_chunk_and_short_ones_keep_one_chunk():
+    sched, pm, prepared = _scheduler(8 * CHUNK, prompt_len=CHUNK)
+    pm.long_chunk = CHUNK // 2
+    first = _first(sched, pm)
+    # A prompt that fits one chunk is not split.
+    assert prepared == [[(0, CHUNK)]] and sched._schedule_layer_major_group(first) is None
+
+    sched, pm, prepared = _scheduler(8 * CHUNK, prompt_len=2 * CHUNK + 5)
+    pm.long_chunk = CHUNK // 2
+    group = sched._schedule_layer_major_group(_first(sched, pm))
+    half = CHUNK // 2
+    # Split at the group chunk while more than one full chunk remains, then the
+    # remainder that fits one ordinary chunk goes in one piece.
+    assert [p[0] for p in prepared] == [
+        (0, half), (half, half), (CHUNK, half), (CHUNK + half, half), (2 * CHUNK, 5)
+    ]
+    assert len(group) == 5

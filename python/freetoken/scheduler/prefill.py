@@ -48,6 +48,9 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # Chunk size for requests that need more than one chunk (layer-major prefill);
+    # 0 keeps token_budget. A request whose remaining extend fits one chunk is unaffected.
+    long_chunk: int = 0
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -148,6 +151,8 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        if self.long_chunk > 0 and remain_len > self.token_budget:
+            chunk_size = min(chunk_size, self.long_chunk)
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -312,6 +317,7 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
     priority_aging_seconds: float = 30.0
     clock: Callable[[], float] = time.monotonic
+    long_chunk: int = 0
 
     def add_one_req(self, req: UserMsg) -> None:
         cache_anchor_len = None
@@ -370,6 +376,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            long_chunk=self.long_chunk,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

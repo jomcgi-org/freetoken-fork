@@ -175,6 +175,11 @@ class Scheduler(SchedulerIOMixin):
             self.table_manager,
             self.decode_manager,
             priority_aging_seconds=config.priority_aging_seconds,
+            long_chunk=(
+                int(getattr(config, "prefill_layer_major_chunk", 0))
+                if getattr(config, "prefill_layer_major_tokens", 0) > 0
+                else 0
+            ),
         )
 
         # some alias for easy access
@@ -1822,7 +1827,11 @@ class Scheduler(SchedulerIOMixin):
             if len(pending) != 1 or pending[0].chunked_req is not req:
                 break
             remaining = pending[0].input_len - (req.cached_len + req.extend_len)
-            if remaining <= 0 or tokens + min(self.prefill_budget, remaining) > budget:
+            next_chunk = min(self.prefill_budget, remaining)
+            long_chunk = getattr(self.prefill_manager, "long_chunk", 0)
+            if long_chunk > 0 and remaining > self.prefill_budget:
+                next_chunk = min(next_chunk, long_chunk)
+            if remaining <= 0 or tokens + next_chunk > budget:
                 break
             # The continuation is built from the advanced lengths, exactly as overlap
             # scheduling builds it after the previous forward launched. Restore them
