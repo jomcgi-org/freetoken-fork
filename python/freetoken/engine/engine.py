@@ -1703,6 +1703,20 @@ class Engine:
             by_kind.setdefault(kind, []).append(ms)
         copy_ms: dict[str, list[float]] = {}
         copy_host: dict[str, list[float]] = {}
+        disk = [entry for entry in copies if entry[0] == "disk"]
+        jobs = [entry for entry in copies if entry[0] == "diskjob"]
+        copies = [entry for entry in copies if entry[0] not in ("disk", "diskjob")]
+        disk_fragment = ""
+        if disk:
+            disk_fragment = (
+                f" disk_chunks={len(disk)} predicted_rows={sum(e[2] for e in disk)}"
+                f" routed_rows={sum(e[3] for e in disk)} missing_rows={sum(e[4] for e in disk)}"
+                f" job_wait_ms={sum(e[5] for e in disk) * 1000:.0f}"
+                f" route_sync_ms={sum(e[6] for e in disk) * 1000:.0f}"
+                f" miss_stage_ms={sum(e[7] for e in disk) * 1000:.0f}"
+                f" prefetch_jobs={len(jobs)} prefetch_rows={sum(e[2] for e in jobs)}"
+                f" prefetch_host_ms={sum(e[3] for e in jobs) * 1000:.0f}"
+            )
         for layer_id, started, ended, host in copies:
             kind = residency[layer_id] if layer_id < len(residency) else "?"
             copy_ms.setdefault(kind, []).append(started.elapsed_time(ended))
@@ -1721,6 +1735,7 @@ class Engine:
             + " ".join(f"copy_ms[{k}]({stats(v)})" for k, v in sorted(copy_ms.items()))
             + " "
             + " ".join(f"copy_host_ms[{k}]({stats(v)})" for k, v in sorted(copy_host.items()))
+            + disk_fragment
         )
 
     def _record_mtp_hidden(self, batch: Batch) -> None:

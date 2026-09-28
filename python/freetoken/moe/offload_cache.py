@@ -939,7 +939,10 @@ class OffloadMoeCache:
         staging = self._lm_bg_staging
         device = self.device
 
+        trace = getattr(self, "_layer_major_trace", None)
+
         def job() -> None:
+            started = time.perf_counter()
             if stream is None:  # CPU tests
                 self._lm_copy_rows(staging, layer_id, buffer_id, rows)
                 return
@@ -948,6 +951,8 @@ class OffloadMoeCache:
                     stream.wait_event(release)
                 self._lm_copy_rows(staging, layer_id, buffer_id, rows)
                 ready.record(stream)
+            if trace is not None:
+                trace.append(("diskjob", layer_id, len(rows), time.perf_counter() - started))
 
         self._lm_resident[layer_id] = set(rows)
         self._lm_jobs[layer_id] = self._lm_executor.submit(job)
@@ -957,22 +962,34 @@ class OffloadMoeCache:
     ) -> tuple[torch.Tensor, ...]:
         """Buffer views holding every row ``expert_ids`` routes to, for one chunk."""
         buffer_id = self._lm_claim_buffer(layer_id)
+        trace = getattr(self, "_layer_major_trace", None)
+        waited = time.perf_counter()
         job = self._lm_jobs.pop(layer_id, None)
+        predicted = len(self._lm_resident.get(layer_id, ())) if job is not None else 0
         if job is not None:
             job.result()
             if self._lm_copy_stream is not None:
                 torch.cuda.current_stream(self.device).wait_event(
                     self.prefill_ready_events[buffer_id]
                 )
+        waited = time.perf_counter() - waited
+        synced = time.perf_counter()
         rows = torch.unique(expert_ids).cpu().tolist()
+        synced = time.perf_counter() - synced
         self._lm_needed.setdefault(layer_id, set()).update(rows)
         resident = self._lm_resident.setdefault(layer_id, set())
         missing = [row for row in rows if row not in resident]
+        staged = time.perf_counter()
         if missing:
             # On the compute stream: ordered after the prediction's ready wait and
             # after the buffer's previous occupant.
             self._lm_copy_rows(self._disk_prefill_staging, layer_id, buffer_id, missing)
             resident.update(missing)
+        if trace is not None:
+            trace.append(
+                ("disk", layer_id, predicted, len(rows), len(missing), waited, synced,
+                 time.perf_counter() - staged)
+            )
         return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 
     def _layer_major_missing_rows(self, layer_id: int, rows: list[int]) -> list[int]:
