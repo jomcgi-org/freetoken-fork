@@ -163,11 +163,17 @@ class DiskPrefillStaging:
         if not pieces:
             return 0
         fd = os.open(bank._file_path, os.O_RDONLY)
+        # Inference mode is thread-local; workers copy into the caller's tensors.
+        inference = torch.is_inference_mode_enabled()
 
         def work(worker: int) -> int:
             copied = 0
             turn = 0
-            with torch.cuda.device(self.device), torch.cuda.stream(stream):
+            with (
+                torch.inference_mode(inference),
+                torch.cuda.device(self.device),
+                torch.cuda.stream(stream),
+            ):
                 for index in range(worker, len(pieces), self.workers):
                     start, count = pieces[index]
                     slot = 2 * worker + turn

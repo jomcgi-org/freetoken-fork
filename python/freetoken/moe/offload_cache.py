@@ -959,13 +959,19 @@ class OffloadMoeCache:
         device = self.device
 
         trace = getattr(self, "_layer_major_trace", None)
+        # Inference mode is thread-local; the job copies into the caller's tensors.
+        inference = torch.is_inference_mode_enabled()
 
         def job() -> None:
             started = time.perf_counter()
             if stream is None:  # CPU tests
                 self._lm_copy_rows(staging, layer_id, buffer_id, rows)
                 return
-            with torch.cuda.device(device), torch.cuda.stream(stream):
+            with (
+                torch.inference_mode(inference),
+                torch.cuda.device(device),
+                torch.cuda.stream(stream),
+            ):
                 if has_release:
                     stream.wait_event(release)
                 self._lm_copy_rows(staging, layer_id, buffer_id, rows)

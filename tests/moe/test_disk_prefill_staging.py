@@ -372,3 +372,19 @@ def test_parallel_staging_rejects_direct_io(tmp_path):
     device = torch.device("cuda", torch.cuda.current_device())
     with pytest.raises(ValueError, match="buffered reader"):
         DiskPrefillStaging(device, chunk_bytes=8192, direct_io=True, workers=2)
+
+
+def test_parallel_staging_writes_inference_tensors_from_worker_threads(tmp_path):
+    shape = (4, 64)
+    path = tmp_path / "weights.ftw"
+    path.write_bytes(bytes(range(256)))
+    bank = HostBank(shape, torch.uint8, backing="file", file_path=str(path))
+    device = torch.device("cuda", torch.cuda.current_device())
+    staging = DiskPrefillStaging(device, chunk_bytes=64, workers=2)
+    try:
+        with torch.inference_mode():
+            target = torch.zeros(shape, dtype=torch.uint8, device=device)
+            staging.copy_bank(bank.tensor, target, [0, 3])
+            assert torch.equal(target[[0, 3]].cpu(), bank.tensor[[0, 3]])
+    finally:
+        staging.synchronize()
