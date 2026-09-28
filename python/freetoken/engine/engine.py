@@ -1618,6 +1618,51 @@ class Engine:
                 req.sample_copy_done = copy_done_event
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
+    def forward_layer_major(
+        self, batches: list[Batch], args: BatchSamplingArgs
+    ) -> ForwardOutput:
+        """Run consecutive prefill chunks of one request layer by layer.
+
+        Equivalent to ``forward_batch`` on each chunk in order, except that each
+        layer runs for every chunk before the next layer, request bookkeeping was
+        advanced by the scheduler while it built the group, and only the last chunk's
+        logits are computed and sampled (intermediate chunk samples are discarded by
+        the scheduler in chunk-major order too). See ``Qwen4ExpModel.forward_layer_major``.
+        """
+        assert torch.cuda.current_stream() == self.stream
+        assert batches and all(batch.is_prefill for batch in batches)
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.reset_disk_lookahead()
+        cache = self.moe_offload_cache
+        if cache is not None:
+            cache.begin_layer_major_group()
+        try:
+            logits = self.model.forward_layer_major(batches, self.ctx.forward_batch)
+        finally:
+            if cache is not None:
+                cache.end_layer_major_group()
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.raise_if_unhealthy()
+        if cache is not None:
+            cache.hot_adapt_prefill_group_boundary(
+                sum(int(batch.input_ids.numel()) for batch in batches)
+            )
+        # The scheduler advanced every chunk's request (complete_one) while it
+        # built the group, so each next chunk could be scheduled before this runs.
+        last = batches[-1]
+        next_tokens_gpu = self.sampler.sample(logits[: last.size], args).to(torch.int32)
+        last.generated_tokens = len(last.reqs)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        if args.has_guided:
+            copy_done_event.synchronize()
+            last.mask_us = self.sampler.finish_guided(last, args, next_tokens_cpu)
+        for req, token in zip(last.reqs, next_tokens_cpu):
+            req.pending_token_cpu = token
+            req.sample_copy_done = copy_done_event
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
     def _record_mtp_hidden(self, batch: Batch) -> None:
         hidden = getattr(getattr(self.model, "model", None), "_last_hc_hidden", None)
         if hidden is None or self.config.speculative_mtp != "on":

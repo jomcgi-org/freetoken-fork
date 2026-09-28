@@ -280,6 +280,10 @@ class OffloadMoeCache:
             raise ValueError("cached file reads require staged DISK prefill")
         self._staged_prefill_active = False
         self._disk_prefill_staging = None
+        # Layer-major prefill group state (see begin_layer_major_group).
+        self._layer_major_group = False
+        self._layer_major_begun = False
+        self._layer_major_staged: tuple[int, set[int]] | None = None
         self.hot_expert_capacity: dict[int, int] = {}
         assert self.moe_prefill_coalesce in (
             "populate", "on", "off"
@@ -821,10 +825,45 @@ class OffloadMoeCache:
                 f"file_io={self.moe_disk_prefill_io}"
             )
 
+    def begin_layer_major_group(self) -> None:
+        """Run the following prefill chunks layer by layer as one group.
+
+        Every chunk of a layer executes before the next layer, so a layer's experts
+        need to reach the GPU once per group instead of once per chunk. Pinned
+        layers already stay in their double buffer while their chunks run back to
+        back; the group only has to keep ``begin_prefill`` from resetting that
+        bookkeeping on each chunk. DISK layers stage each expert row once per group.
+        """
+        self._layer_major_group = True
+        self._layer_major_begun = False
+        self._layer_major_staged = None
+
+    def end_layer_major_group(self) -> None:
+        self._layer_major_group = False
+        self._layer_major_begun = False
+        self._layer_major_staged = None
+
+    def _layer_major_missing_rows(self, layer_id: int, rows: list[int]) -> list[int]:
+        """Rows of ``layer_id`` not yet staged into scratch during this group."""
+        if not self._layer_major_group:
+            return rows
+        staged = self._layer_major_staged
+        if staged is None or staged[0] != layer_id:
+            staged = (layer_id, set())
+            self._layer_major_staged = staged
+        missing = [row for row in rows if row not in staged[1]]
+        staged[1].update(missing)
+        return missing
+
     def stage_disk_prefill_layer(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         assert self._disk_prefill_staging is not None, "staging must be initialized before serving"
         assert self.layer_residency[layer_id] == "disk"
         rows = torch.unique(expert_ids).cpu().tolist()
+        rows = self._layer_major_missing_rows(layer_id, rows)
+        if not rows:
+            # Every routed row of this chunk is already in scratch from an earlier
+            # chunk of the same layer in this group.
+            return
         # Sparse copies cannot advertise uncopied experts as cache hits. This
         # applies to layers without protected HOT slots as well as HOT layers.
         self.materialize_layer(layer_id, temporary=True)
@@ -2695,6 +2734,17 @@ class OffloadMoeCache:
         self._hot_adapt_prefill_tokens_counted = 0
         self._hot_adapt_token_boundary(routed_tokens, "prefill")
 
+    def hot_adapt_prefill_group_boundary(self, group_tokens: int) -> None:
+        """One prefill boundary for a layer-major group of chunks.
+
+        Each chunk counts its tokens as the maximum over layers, which a group would
+        collapse to one chunk; credit the group's routed tokens instead whenever any
+        were observed.
+        """
+        observed = self._hot_adapt_prefill_tokens_counted
+        self._hot_adapt_prefill_tokens_counted = 0
+        self._hot_adapt_token_boundary(int(group_tokens) if observed else 0, "prefill")
+
     def hot_adapt_step_boundary(self, batch_size: int = 1) -> None:
         """Account one decode batch and start any due tick."""
         if batch_size < 0:
@@ -3314,6 +3364,9 @@ class OffloadMoeCache:
             self._prefill_hit_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
 
     def _invalidate_prefill_buffer(self, buffer_id: int) -> None:
+        if buffer_id == 0:
+            # Buffer 0 aliases the DISK staging scratch rows.
+            self._layer_major_staged = None
         slot_start = buffer_id * self.num_experts
         slot_end = slot_start + self.num_experts
         old_ids = self.id_of_slot[slot_start:slot_end]
@@ -3324,6 +3377,12 @@ class OffloadMoeCache:
         self.usage[slot_start:slot_end].zero_()
 
     def begin_prefill(self, num_tokens: int | None = None) -> None:
+        if self._layer_major_group:
+            # A group sets up its prefill once. Repeating it per chunk would drop the
+            # double-buffer bookkeeping and could flip the staged mode on a short tail.
+            if self._layer_major_begun:
+                return
+            self._layer_major_begun = True
         staged = bool(
             self.moe_disk_prefill == "staged" and num_tokens is not None
             and num_tokens >= self.moe_disk_prefill_min_tokens

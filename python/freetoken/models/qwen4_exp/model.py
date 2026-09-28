@@ -127,6 +127,49 @@ class Qwen4ExpModel(BaseOP):
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
         return self.hyper_connection_mixer.mix(hidden)[0]
 
+    def forward_layer_major(self, batches, enter, prepare_ple) -> torch.Tensor:
+        """Run consecutive prefill chunks of one request layer by layer.
+
+        ``batches`` are the chunks in token order, each with its own metadata.
+        ``enter(batch)`` is the context manager that makes a chunk the active batch;
+        ``prepare_ple(batch)`` stages a chunk's host PLE rows. Every chunk passes
+        layer L before any chunk reaches layer L+1, so a layer's routed experts reach
+        the GPU once per group. Per chunk and per layer the operations, shapes and
+        order are those of ``forward``: attention and GDN state carry from chunk to
+        chunk inside each layer exactly as they do between chunk-major forwards.
+
+        Returns the collapsed hidden state of the last chunk.
+        """
+        if len(self._ple) > 1:
+            raise RuntimeError("layer-major prefill supports at most one PLE layer")
+        hiddens = []
+        for batch in batches:
+            with enter(batch):
+                hiddens.append(
+                    self.embed_tokens.forward(batch.input_ids).repeat(1, self.hc_count)
+                )
+        for layer in self.layers.op_list:
+            for index, batch in enumerate(batches):
+                with enter(batch):
+                    meta = None
+                    if layer.ple is not None:
+                        # PLE runs per chunk: a chunk's n-gram context is the previous
+                        # chunk's committed window, and the host staging holds one chunk.
+                        from .ple import build_ple_metadata
+
+                        prepare_ple(batch)
+                        meta = build_ple_metadata(batch, layer.ple.args, batch.input_ids.device)
+                        layer.ple.start_prefetch(batch, meta)
+                    hiddens[index] = layer.forward(hiddens[index], batch)
+                    if meta is not None:
+                        from .ple import commit_ngram_context
+
+                        commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+        last = hiddens[-1]
+        del hiddens
+        with enter(batches[-1]):
+            return self.hyper_connection_mixer.mix(last)[0]
+
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
@@ -628,6 +671,18 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         """Fence fixed host-buffer reuse after a submitted graph or eager warmup."""
         for backend in getattr(self, "_ple_disk_backends", ()):
             backend.finish_decode(record_event=record_event)
+
+    @property
+    def supports_layer_major_prefill(self) -> bool:
+        return len(self.model.ple_layers) <= 1
+
+    def forward_layer_major(self, batches, enter) -> torch.Tensor:
+        """Layer-major prefill over ``batches``; logits for the last chunk only."""
+        if getattr(self.model, "_capture_mtp_hidden", False):
+            raise RuntimeError("layer-major prefill does not capture MTP hidden states")
+        hidden = self.model.forward_layer_major(batches, enter, self.prepare_prefill_ple)
+        with enter(batches[-1]):
+            return self.lm_head.forward(hidden, select_last=True)
 
     def forward(self, *, select_last: bool = True) -> torch.Tensor:
         batch = get_global_ctx().batch

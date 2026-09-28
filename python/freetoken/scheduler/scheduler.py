@@ -585,7 +585,9 @@ class Scheduler(SchedulerIOMixin):
         # Expose the un-drained batch to _process_one_msg (abort in-flight check). Assigning
         # before the message loop is what makes the check airtight: the batch launched later
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
-        self._last_data = last_data
+        # A layer-major group drains chunk by chunk; its last chunk is the one an abort
+        # can find in flight (earlier chunks' request objects are superseded).
+        self._last_data = last_data[-1] if isinstance(last_data, list) else last_data
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
@@ -617,8 +619,17 @@ class Scheduler(SchedulerIOMixin):
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
         forward_input = self._schedule_next_batch()
+        group = (
+            self._schedule_layer_major_group(forward_input)
+            if forward_input is not None
+            else None
+        )
         ongoing_data = None
-        if forward_input is not None:
+        if group is not None:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                ongoing_data = self._run_layer_major_group(group)
+        elif forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
                 # COW-restore GDN snapshots for prefix hits ON THE ENGINE STREAM, after the
@@ -665,8 +676,15 @@ class Scheduler(SchedulerIOMixin):
             self._drain_kv_ladder_waiting()
 
         forward_input = self._schedule_next_batch()
+        group = (
+            self._schedule_layer_major_group(forward_input)
+            if forward_input is not None
+            else None
+        )
         ongoing_data = None
-        if forward_input is not None:
+        if group is not None:
+            ongoing_data = self._run_layer_major_group(group)
+        elif forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
             self._restore_linear_states(forward_input.batch)
             try:
@@ -707,6 +725,11 @@ class Scheduler(SchedulerIOMixin):
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
+            return
+        if isinstance(last_data, list):
+            # A layer-major group drains in chunk order, as chunk-major forwards would.
+            for item in last_data:
+                self._process_last_data(item)
             return
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
@@ -1753,6 +1776,105 @@ class Scheduler(SchedulerIOMixin):
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
+
+    def _layer_major_eligible(self, batch: Batch) -> bool:
+        budget = getattr(getattr(self, "config", None), "prefill_layer_major_tokens", 0)
+        if not budget or budget <= 0 or not batch.is_prefill or len(batch.reqs) != 1:
+            return False
+        req = batch.reqs[0]
+        if not isinstance(req, ChunkedReq) or req.extend_len >= budget:
+            return False
+        if req.mm_embeds is not None or req.sampling_params.guided_decoding is not None:
+            return False
+        if getattr(self.config, "speculative_mtp", "off") == "on":
+            return False
+        model = getattr(self.engine, "model", None)
+        if not getattr(model, "supports_layer_major_prefill", False):
+            return False
+        # A group holds the GPU for all its chunks; never delay running decodes.
+        return not self.decode_manager.runnable
+
+    def _schedule_layer_major_group(
+        self, first: ForwardInput
+    ) -> list[ForwardInput] | None:
+        """Extend a first chunk into a group of consecutive chunks of the same request.
+
+        Each chunk is scheduled and prepared exactly as chunk-major serving would
+        (page allocation, attention, GDN and track metadata), after advancing the
+        previous chunk's host bookkeeping the way its forward launch would. The group
+        stops at the token budget, at the prompt's final chunk, and at a chunk that
+        persists an intermediate harness root: that snapshot's ping-pong slot is
+        rewritten two chunks later, so it must drain before the group continues.
+        Returns None when no second chunk joins, leaving the ordinary path unchanged.
+        """
+        if not self._layer_major_eligible(first.batch):
+            return None
+        budget = int(self.config.prefill_layer_major_tokens)
+        group = [first]
+        tokens = first.batch.reqs[0].extend_len
+        while True:
+            req = group[-1].batch.reqs[0]
+            if not isinstance(req, ChunkedReq) or getattr(req, "cache_anchor_persistable", False):
+                break
+            pending = self.prefill_manager.pending_list
+            if len(pending) != 1 or pending[0].chunked_req is not req:
+                break
+            remaining = pending[0].input_len - (req.cached_len + req.extend_len)
+            if remaining <= 0 or tokens + min(self.prefill_budget, remaining) > budget:
+                break
+            req.complete_one()
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            assert batch is not None and len(batch.reqs) == 1
+            assert batch.reqs[0].uid == req.uid
+            forward_input = self._prepare_batch(batch)
+            self._report_prompt_admissions(batch)
+            group.append(forward_input)
+            tokens += batch.reqs[0].extend_len
+        if len(group) == 1:
+            return None
+        for req in group[-1].batch.reqs:
+            req.complete_one()
+        return group
+
+    def _run_layer_major_group(self, group: list[ForwardInput]) -> list | None:
+        for forward_input in group:
+            self._restore_linear_states(forward_input.batch)
+        try:
+            return self._forward_layer_major(group)
+        except _OOM_ERRORS as oom:
+            last = group[-1]
+            logger.warning_rank0(
+                "Scheduler layer-major prefill OOM for request %s (%d chunks); aborting: %r",
+                last.batch.reqs[0].uid,
+                len(group),
+                oom,
+            )
+            self._synchronize_failed_forward(oom)
+            try:
+                self._restore_failed_request_lengths(last)
+            except Exception as context_error:  # noqa: BLE001
+                self._fatal_cuda_context(oom, context_error)
+            self._abort_oom_requests(last.batch.reqs)
+            self._clear_cache_and_probe_cuda(oom)
+            return None
+
+    def _forward_layer_major(self, group: list[ForwardInput]) -> list:
+        for forward_input in group:
+            forward_input.batch.input_ids = self.token_pool[forward_input.input_tuple]
+        last = group[-1]
+        forward_output = self.engine.forward_layer_major(
+            [forward_input.batch for forward_input in group], last.sample_args
+        )
+        # Intermediate chunks sample nothing that is kept; only the last chunk's token
+        # is written, as its chunk-major forward would.
+        self.token_pool[last.write_tuple] = forward_output.next_tokens_gpu
+        admit_reqs = getattr(self.decode_manager, "admit_reqs", None)
+        for forward_input in group:
+            if admit_reqs is not None:
+                admit_reqs(forward_input.batch.reqs)
+            else:
+                self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        return [(forward_input, forward_output) for forward_input in group]
 
     def _report_prompt_admissions(self, batch: Batch) -> None:
         """Publish first-prefill accounting only after batch preparation succeeded.
