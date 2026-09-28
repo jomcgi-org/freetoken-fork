@@ -844,7 +844,8 @@ class OffloadMoeCache:
         # file through the staging ring on the copy stream, so no per-chunk routing
         # readback stalls the host.
         self._layer_major_full = bool(
-            self.moe_disk_prefill == "staged"
+            os.environ.get("FREETOKEN_LAYER_MAJOR_STREAM", "1") != "0"
+            and self.moe_disk_prefill == "staged"
             and self._disk_prefill_staging is not None
             and self.prefill_overlap
             and self.prefill_copy_stream is not None
@@ -3491,6 +3492,7 @@ class OffloadMoeCache:
                         per_layer[layer_id].numel() * per_layer[layer_id].element_size()
                     )
 
+        trace = getattr(self, "_layer_major_trace", None)
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
@@ -3499,7 +3501,17 @@ class OffloadMoeCache:
             with torch.cuda.stream(self.prefill_copy_stream):
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+                if trace is not None:
+                    started = torch.cuda.Event(enable_timing=True)
+                    started.record(self.prefill_copy_stream)
+                host_started = time.perf_counter()
                 copy()
+                if trace is not None:
+                    ended = torch.cuda.Event(enable_timing=True)
+                    ended.record(self.prefill_copy_stream)
+                    trace.append(
+                        (layer_id, started, ended, time.perf_counter() - host_started)
+                    )
                 self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
         self._prefill_buffer_layer[buffer_id] = layer_id

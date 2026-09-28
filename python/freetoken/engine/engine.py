@@ -1635,15 +1635,37 @@ class Engine:
         cache = self.moe_offload_cache
         if cache is not None:
             cache.begin_layer_major_group()
+        trace = os.environ.get("FREETOKEN_LAYER_MAJOR_TRACE", "0") == "1"
+        layer_events = []
+        host_started = time.perf_counter()
+        if trace:
+            begin = torch.cuda.Event(enable_timing=True)
+            begin.record(self.stream)
+            if cache is not None:
+                cache._layer_major_trace = []
+
+        def after_layer(layer_index: int) -> None:
+            if trace:
+                event = torch.cuda.Event(enable_timing=True)
+                event.record(self.stream)
+                layer_events.append(event)
+            if cache is not None:
+                cache.layer_major_layer_done(layer_index)
+
         try:
             logits = self.model.forward_layer_major(
-                batches,
-                self.ctx.forward_batch,
-                cache.layer_major_layer_done if cache is not None else None,
+                batches, self.ctx.forward_batch, after_layer
             )
         finally:
             if cache is not None:
+                copies = getattr(cache, "_layer_major_trace", None)
+                cache._layer_major_trace = None
                 cache.end_layer_major_group()
+        if trace:
+            self._log_layer_major_trace(
+                batches, begin, layer_events, copies or [],
+                time.perf_counter() - host_started,
+            )
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
         if cache is not None:
@@ -1666,6 +1688,42 @@ class Engine:
             req.pending_token_cpu = token
             req.sample_copy_done = copy_done_event
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _log_layer_major_trace(self, batches, begin, layer_events, copies, host_s):
+        """Diagnostic: per-layer GPU time and copy-stream time for one group (syncs)."""
+        torch.cuda.synchronize(self.device)
+        cache = self.moe_offload_cache
+        residency = getattr(cache, "layer_residency", ())
+        layer_ms = []
+        previous = begin
+        for event in layer_events:
+            layer_ms.append(previous.elapsed_time(event))
+            previous = event
+        by_kind: dict[str, list[float]] = {}
+        for index, ms in enumerate(layer_ms):
+            kind = residency[index] if index < len(residency) else "?"
+            by_kind.setdefault(kind, []).append(ms)
+        copy_ms: dict[str, list[float]] = {}
+        copy_host: dict[str, list[float]] = {}
+        for layer_id, started, ended, host in copies:
+            kind = residency[layer_id] if layer_id < len(residency) else "?"
+            copy_ms.setdefault(kind, []).append(started.elapsed_time(ended))
+            copy_host.setdefault(kind, []).append(host * 1000.0)
+        tokens = sum(int(batch.input_ids.numel()) for batch in batches)
+
+        def stats(values):
+            return f"n={len(values)} sum={sum(values):.0f} max={max(values):.0f}" if values else "n=0"
+
+        logger.info_rank0(
+            f"Layer-major trace: chunks={len(batches)} tokens={tokens} "
+            f"gpu_ms={begin.elapsed_time(layer_events[-1]) if layer_events else 0:.0f} "
+            f"host_enqueue_ms={host_s * 1000:.0f} "
+            + " ".join(f"layer_ms[{k}]({stats(v)})" for k, v in sorted(by_kind.items()))
+            + " "
+            + " ".join(f"copy_ms[{k}]({stats(v)})" for k, v in sorted(copy_ms.items()))
+            + " "
+            + " ".join(f"copy_host_ms[{k}]({stats(v)})" for k, v in sorted(copy_host.items()))
+        )
 
     def _record_mtp_hidden(self, batch: Batch) -> None:
         hidden = getattr(getattr(self.model, "model", None), "_last_hc_hidden", None)

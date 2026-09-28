@@ -570,3 +570,68 @@ before (verify warm-up, then three fresh 100k prompts 90 s apart,
 The first request after a restart still pays the page-cache warm-up of the
 file-backed DISK banks. Later cold 100k requests on the live server now run
 within a few seconds of the qualification arms.
+
+## Layer-major prefill, 2026-09-28
+
+Chunked prefill runs all 48 layers for each chunk, so every layer's experts
+cross PCIe once per chunk: at 100k with 8192-token chunks, 13 passes over the
+26.4 GiB of pinned banks and 13 routed-union stagings of the 37 GiB of DISK
+banks, the fixed 3.3 to 4.5 s of every chunk. Layer-major prefill groups
+consecutive chunks of one request and runs them layer by layer: every chunk of
+a group passes layer L before any reaches layer L+1, so a layer's experts move
+once per group.
+
+Scheduler (`--prefill-layer-major-tokens N`): after the first chunk, the next
+chunks are scheduled and prepared exactly as chunk-major serving would
+(pages, QSA metadata, GDN metadata and snapshot tracking), from the lengths
+the previous chunk's forward launch leaves behind. A group stops at N tokens,
+at the prompt's final chunk, and at a chunk that persists an intermediate
+harness root (its ping-pong snapshot slot is rewritten two chunks later, so it
+drains first). Only a lone request with no running decode is grouped. The group
+drains chunk by chunk; its last chunk is the in-flight batch for aborts, and a
+CUDA OOM aborts the request cleanly (seen with 4 x 8192-token groups on the
+4090, which then served the next request normally).
+
+Model (`qwen4_exp`): per layer and per chunk the same operations and shapes as
+the chunk-major forward. GDN state and QSA KV carry between chunks inside each
+layer; each ping-pong slot's last writer per layer is the same chunk as before,
+so the final radix snapshot is identical. PLE runs per chunk at its layer
+(layer 2), because a chunk's n-gram context is the previous chunk's committed
+window. Only the last chunk's logits are sampled.
+
+Expert movement: pinned layers stay in their double buffer while their chunks
+run back to back (prefill setup runs once per group). DISK layers first staged
+each expert row once per group (`e0c4ee8`); the dev branch streams whole
+layers instead (every layer alternates between the two existing double
+buffers, DISK layers read their file through the staging ring on the copy
+stream, and the next layer streams once every chunk of the current layer is
+enqueued), which removes the per-chunk routing readback.
+
+The group's hyper-connection residual stays on the GPU (20 KiB per token for
+this model), so N is set by free GPU memory: 4 x 8192 tokens ran out of memory
+on the 24 GiB 4090, 32k groups fit with 4096-token chunks. On a 96 GB GPU the
+whole prompt fits in one group. `--prefill-layer-major-chunk` sets the chunk
+size only for prompts that need more than one `--max-extend-length` chunk, so
+prompts up to 8192 tokens keep a single chunk.
+
+Exact parity held on every row of every arm (request hash, text, reasoning,
+finish reason and usage against `workspacecurve1-0`, continuation sessions
+against `workspacecurve3-1`).
+
+Idle-gap protocol, 32k groups of 4096-token chunks (`e0c4ee8`), both arm
+orders:
+
+| Sweep, order | Arm | 8k cold TTFT / wall | 32k cold TTFT | 100k cold TTFT | 100k cold wall | 100k repeat wall | Continuation walls |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| idlegap4, layer-major first | layer-major | 12.02 / 21.83 s | 23.18 s | 69.82 s | 78.30 s | 4.78 s | 111.1 / 74.6 / 67.3 s |
+| | baseline | 12.01 / 18.08 s | 34.93 s | 89.25 s | 96.14 s | 5.12 s | 119.9 / 74.2 / 66.1 s |
+| idlegap5, baseline first | layer-major | 15.32 / 22.09 s | 24.04 s | 68.01 s | 75.05 s | 4.01 s | 114.2 / 74.5 / 73.8 s |
+| | baseline | 12.83 / 18.01 s | 30.92 s | 91.06 s | 96.76 s | 3.99 s | 122.6 / 79.1 / 73.3 s |
+
+Live-like sequence (`livelike4`, baseline first): 100k cold 96.1 / 87.9 /
+80.8 s against 110.2 / 93.5 / 93.2 s.
+
+Cold 100k TTFT fell by 21 to 23 s and 32k by 7 to 12 s. With every prompt split
+into 4096-token chunks, the 8k cold wall rose 3.7 to 4.1 s, mostly slower
+decode right after the prefill; `--prefill-layer-major-chunk` keeps such
+prompts in one chunk.
