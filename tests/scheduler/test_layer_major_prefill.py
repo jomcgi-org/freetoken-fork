@@ -83,8 +83,11 @@ def test_group_prepares_consecutive_chunks_up_to_the_budget():
     assert prepared == [[(0, CHUNK)], [(CHUNK, CHUNK)], [(2 * CHUNK, CHUNK)]]
     reqs = [fi.batch.reqs[0] for fi in group]
     assert all(isinstance(r, ChunkedReq) for r in reqs)
-    # Host bookkeeping advanced as each chunk's forward launch would.
-    assert [r.cached_len for r in reqs] == [CHUNK, 2 * CHUNK, 3 * CHUNK]
+    # Each chunk keeps its forward-time lengths; the engine advances them after the
+    # group forward, as forward_batch does.
+    assert [(r.cached_len, r.extend_len) for r in reqs] == [
+        (0, CHUNK), (CHUNK, CHUNK), (2 * CHUNK, CHUNK)
+    ]
     # The continuation stays pending for the next group.
     assert pm.pending_list[0].chunked_req is reqs[-1]
 
@@ -98,7 +101,9 @@ def test_group_ends_at_the_final_chunk():
     assert prepared[-1] == [(3 * CHUNK, 3)]
     final = group[-1].batch.reqs[0]
     assert not isinstance(final, ChunkedReq)
-    assert final.can_decode and not pm.runnable
+    assert (final.cached_len, final.extend_len) == (3 * CHUNK, 3) and not pm.runnable
+    final.complete_one()
+    assert final.can_decode
 
 
 def test_no_group_leaves_the_first_chunk_untouched():

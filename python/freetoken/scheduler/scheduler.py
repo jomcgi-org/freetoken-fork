@@ -1800,8 +1800,8 @@ class Scheduler(SchedulerIOMixin):
         """Extend a first chunk into a group of consecutive chunks of the same request.
 
         Each chunk is scheduled and prepared exactly as chunk-major serving would
-        (page allocation, attention, GDN and track metadata), after advancing the
-        previous chunk's host bookkeeping the way its forward launch would. The group
+        (page allocation, attention, GDN and track metadata), from the lengths the
+        previous chunk's forward launch would leave behind. The group
         stops at the token budget, at the prompt's final chunk, and at a chunk that
         persists an intermediate harness root: that snapshot's ping-pong slot is
         rewritten two chunks later, so it must drain before the group continues.
@@ -1822,8 +1822,16 @@ class Scheduler(SchedulerIOMixin):
             remaining = pending[0].input_len - (req.cached_len + req.extend_len)
             if remaining <= 0 or tokens + min(self.prefill_budget, remaining) > budget:
                 break
+            # The continuation is built from the advanced lengths, exactly as overlap
+            # scheduling builds it after the previous forward launched. Restore them
+            # afterwards: model code reads each chunk's extend length while it runs,
+            # and the engine advances every chunk after the group, as forward_batch does.
+            lengths = (req.cached_len, req.device_len)
             req.complete_one()
-            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            try:
+                batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            finally:
+                req.cached_len, req.device_len = lengths
             assert batch is not None and len(batch.reqs) == 1
             assert batch.reqs[0].uid == req.uid
             forward_input = self._prepare_batch(batch)
@@ -1832,8 +1840,6 @@ class Scheduler(SchedulerIOMixin):
             tokens += batch.reqs[0].extend_len
         if len(group) == 1:
             return None
-        for req in group[-1].batch.reqs:
-            req.complete_one()
         return group
 
     def _run_layer_major_group(self, group: list[ForwardInput]) -> list | None:

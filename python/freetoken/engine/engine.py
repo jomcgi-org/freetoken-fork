@@ -1624,8 +1624,7 @@ class Engine:
         """Run consecutive prefill chunks of one request layer by layer.
 
         Equivalent to ``forward_batch`` on each chunk in order, except that each
-        layer runs for every chunk before the next layer, request bookkeeping was
-        advanced by the scheduler while it built the group, and only the last chunk's
+        layer runs for every chunk before the next layer, and only the last chunk's
         logits are computed and sampled (intermediate chunk samples are discarded by
         the scheduler in chunk-major order too). See ``Qwen4ExpModel.forward_layer_major``.
         """
@@ -1647,8 +1646,9 @@ class Engine:
             cache.hot_adapt_prefill_group_boundary(
                 sum(int(batch.input_ids.numel()) for batch in batches)
             )
-        # The scheduler advanced every chunk's request (complete_one) while it
-        # built the group, so each next chunk could be scheduled before this runs.
+        for batch in batches:
+            for req in batch.reqs:
+                req.complete_one()
         last = batches[-1]
         next_tokens_gpu = self.sampler.sample(logits[: last.size], args).to(torch.int32)
         last.generated_tokens = len(last.reqs)
