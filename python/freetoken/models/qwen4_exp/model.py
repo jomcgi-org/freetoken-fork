@@ -75,6 +75,19 @@ class Qwen4ExpDecoderLayer(BaseOP):
             PLELayer(config, layer_id) if layer_id in config.qwen4_args.ple_layer_ids else None
         )
 
+    def forward_attention(self, hidden: torch.Tensor, batch: Batch):
+        """``forward`` up to the MLP input: (residual, MLP block input, MLP inject)."""
+        if self.ple is not None:
+            hidden = hidden + self.ple.forward(hidden, batch)
+        block_input, inject = self.attn_hyper_connection.mix(hidden)
+        if self._is_linear:
+            block_output = self.linear_attn.forward(block_input)
+        else:
+            block_output = self.self_attn.forward(block_input, batch)
+        hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        block_input, inject = self.mlp_hyper_connection.mix(hidden)
+        return hidden, block_input, inject
+
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
         if self.ple is not None:
@@ -151,23 +164,63 @@ class Qwen4ExpModel(BaseOP):
                 hiddens.append(
                     self.embed_tokens.forward(batch.input_ids).repeat(1, self.hc_count)
                 )
+        def run_ple(layer, batch):
+            if layer.ple is None:
+                return None
+            # PLE runs per chunk: a chunk's n-gram context is the previous chunk's
+            # committed window, and the host staging holds one chunk.
+            from .ple import build_ple_metadata
+
+            prepare_ple(batch)
+            meta = build_ple_metadata(batch, layer.ple.args, batch.input_ids.device)
+            layer.ple.start_prefetch(batch, meta)
+            return meta
+
+        def commit_ple(meta, batch):
+            if meta is not None:
+                from .ple import commit_ngram_context
+
+                commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+
         for layer_index, layer in enumerate(self.layers.op_list):
-            for index, batch in enumerate(batches):
-                with enter(batch):
-                    meta = None
-                    if layer.ple is not None:
-                        # PLE runs per chunk: a chunk's n-gram context is the previous
-                        # chunk's committed window, and the host staging holds one chunk.
-                        from .ple import build_ple_metadata
+            if getattr(layer.mlp, "supports_layer_major_split", False):
+                # Pipeline within the layer: chunk c+1's attention and routing are
+                # enqueued before chunk c's experts, so waiting for c's routed rows
+                # (to stage any the prediction missed) leaves the GPU busy. Chunk c+1's
+                # attention reads only attention state that chunk c's attention wrote;
+                # each chunk runs exactly the operations of ``forward``.
+                pending = {}
 
-                        prepare_ple(batch)
-                        meta = build_ple_metadata(batch, layer.ple.args, batch.input_ids.device)
-                        layer.ple.start_prefetch(batch, meta)
-                    hiddens[index] = layer.forward(hiddens[index], batch)
-                    if meta is not None:
-                        from .ple import commit_ngram_context
+                def attention(index: int) -> None:
+                    batch = batches[index]
+                    with enter(batch):
+                        meta = run_ple(layer, batch)
+                        hidden, block_input, inject = layer.forward_attention(
+                            hiddens[index], batch
+                        )
+                        commit_ple(meta, batch)
+                        pending[index] = (
+                            hidden, inject, layer.mlp.prepare_layer_major(block_input)
+                        )
 
-                        commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+                def experts(index: int) -> None:
+                    with enter(batches[index]):
+                        hidden, inject, prepared = pending.pop(index)
+                        hiddens[index] = layer.mlp_hyper_connection.combine(
+                            hidden, layer.mlp.finish_layer_major(prepared), inject
+                        )
+
+                attention(0)
+                for index in range(len(batches)):
+                    if index + 1 < len(batches):
+                        attention(index + 1)
+                    experts(index)
+            else:
+                for index, batch in enumerate(batches):
+                    with enter(batch):
+                        meta = run_ple(layer, batch)
+                        hiddens[index] = layer.forward(hiddens[index], batch)
+                        commit_ple(meta, batch)
             if after_layer is not None:
                 after_layer(layer_index)
         last = hiddens[-1]

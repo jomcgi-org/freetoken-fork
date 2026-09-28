@@ -362,6 +362,29 @@ class OffloadMoELayer(MoELayer):
         )
         return self._decode_routed(hidden_states, topk_weights, topk_ids)
 
+    def prefill_prepare(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        """First half of ``prefill_forward``: the routing decision, plus (in a
+        layer-major group) an asynchronous readback of the routed rows, so the host
+        can wait for exactly this chunk's router while later work stays queued."""
+        topk_weights, topk_ids = fused_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+        )
+        cache = self.offload_cache
+        ticket = None
+        if cache is not None and getattr(cache, "_lm_predictive", False):
+            ticket = cache.layer_major_route_ticket(self.layer_id, topk_ids)
+        return topk_weights, topk_ids, ticket
+
+    def prefill_finish(
+        self, hidden_states: torch.Tensor, topk_weights, topk_ids, ticket
+    ) -> torch.Tensor:
+        """Second half of ``prefill_forward``."""
+        out = self._prefill_routed(hidden_states, topk_weights, topk_ids, ticket=ticket)
+        return self._maybe_all_reduce(out)
+
     def prefill_forward(
         self,
         hidden_states: torch.Tensor,
@@ -537,6 +560,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        ticket=None,
     ) -> torch.Tensor:
         """Run routed CPU prefill or stage exact DISK rows for the GPU GEMM.
 
@@ -586,7 +610,7 @@ class OffloadMoELayer(MoELayer):
             # Layer-major group: this DISK layer's rows are staged into its group
             # buffer, mostly ahead of time; start the next layer's movement first.
             self._prefetch_next_overlap_layer(cache)
-            views = cache.layer_major_disk_views(self.layer_id, topk_ids)
+            views = cache.layer_major_disk_views(self.layer_id, topk_ids, ticket)
             out = self._expert_gemm(
                 cache,
                 hidden_states,

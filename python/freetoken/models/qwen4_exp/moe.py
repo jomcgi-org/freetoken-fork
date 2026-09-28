@@ -33,6 +33,26 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             weight_format="fp8_block",
         )
 
+    @property
+    def supports_layer_major_split(self) -> bool:
+        return hasattr(self.experts, "prefill_prepare")
+
+    def prepare_layer_major(self, hidden_states: torch.Tensor):
+        """``forward`` up to the routed experts: router, shared expert, gate, top-k."""
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        router_logits = self.gate.forward(hidden_states)
+        shared = self.shared_expert.forward(hidden_states)
+        gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
+        routing = self.experts.prefill_prepare(hidden_states, router_logits)
+        return hidden_states, num_tokens, hidden_dim, shared, gate, routing
+
+    def finish_layer_major(self, prepared) -> torch.Tensor:
+        """The rest of ``forward``: routed experts and the shared-gate combine."""
+        hidden_states, num_tokens, hidden_dim, shared, gate, routing = prepared
+        routed = self.experts.prefill_finish(hidden_states, *routing)
+        return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)

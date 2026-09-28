@@ -982,8 +982,25 @@ class OffloadMoeCache:
         self._lm_resident[layer_id] = set(rows)
         self._lm_jobs[layer_id] = self._lm_executor.submit(job)
 
+    def layer_major_route_ticket(self, layer_id: int, expert_ids: torch.Tensor):
+        """Start reading back which rows a chunk routes to, without a stream sync.
+
+        A fixed-size presence mask is copied to pinned memory and fenced by an event
+        recorded right after the copy, so waiting on it waits for this chunk's router
+        only, not for work enqueued after it (the next chunk's attention).
+        """
+        if not self._lm_predictive or self.layer_residency[layer_id] != "disk":
+            return None
+        mask = torch.zeros(self.num_experts, dtype=torch.bool, device=expert_ids.device)
+        mask[expert_ids.reshape(-1).long()] = True
+        host = torch.empty(self.num_experts, dtype=torch.bool, pin_memory=True)
+        host.copy_(mask, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record(torch.cuda.current_stream(expert_ids.device))
+        return host, done
+
     def layer_major_disk_views(
-        self, layer_id: int, expert_ids: torch.Tensor
+        self, layer_id: int, expert_ids: torch.Tensor, ticket=None
     ) -> tuple[torch.Tensor, ...]:
         """Buffer views holding every row ``expert_ids`` routes to, for one chunk."""
         buffer_id = self._lm_claim_buffer(layer_id)
@@ -999,7 +1016,12 @@ class OffloadMoeCache:
                 )
         waited = time.perf_counter() - waited
         synced = time.perf_counter()
-        rows = torch.unique(expert_ids).cpu().tolist()
+        if ticket is not None:
+            host, done = ticket
+            done.synchronize()
+            rows = torch.nonzero(host).view(-1).tolist()
+        else:
+            rows = torch.unique(expert_ids).cpu().tolist()
         synced = time.perf_counter() - synced
         self._lm_needed.setdefault(layer_id, set()).update(rows)
         resident = self._lm_resident.setdefault(layer_id, set())
