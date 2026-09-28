@@ -842,7 +842,7 @@ class OffloadMoeCache:
             cached = self.moe_disk_prefill_io == "cached"
             self._disk_prefill_staging = DiskPrefillStaging(
                 self.device, direct_io=cached, reuse_cached_rows=cached,
-                **_disk_staging_geometry(1 if cached else _disk_staging_workers()),
+                **_disk_staging_geometry(_disk_staging_workers()),
             )
             logger.info_rank0(
                 f"DISK staged prefill: ring={self._disk_prefill_staging.pinned_bytes / 2**20:.0f} MiB, "
@@ -947,8 +947,12 @@ class OffloadMoeCache:
             self._lm_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="ft-lm-prefetch"
             )
+            cached = self.moe_disk_prefill_io == "cached"
             self._lm_bg_staging = DiskPrefillStaging(
-                self.device, **_disk_staging_geometry(_disk_staging_workers())
+                self.device,
+                direct_io=cached,
+                reuse_cached_rows=cached,
+                **_disk_staging_geometry(_disk_staging_workers()),
             )
             self._lm_copy_stream = torch.cuda.Stream(device=self.device)
         has_release = self._prefill_buffer_has_release_event[buffer_id]

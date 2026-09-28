@@ -368,10 +368,34 @@ def test_parallel_staging_matches_the_single_reader(tmp_path, workers, rows):
         staging.synchronize()
 
 
-def test_parallel_staging_rejects_direct_io(tmp_path):
+@pytest.mark.parametrize("workers", [2, 3])
+@pytest.mark.parametrize("reuse_cached_rows", [False, True])
+@pytest.mark.parametrize("rows", [None, [7, 2, 3, 2, -1, 5], []])
+def test_parallel_direct_staging_matches_the_single_reader(tmp_path, workers, reuse_cached_rows, rows):
+    shape = (8, 64, 64)
+    nbytes = 8 * 64 * 64
+    payload = bytes((i * 13 + i // 5) % 256 for i in range(nbytes))
+    path = tmp_path / "weights.ftw"
+    # An unaligned file offset exercises the block-aligned head of each piece.
+    path.write_bytes(b"prefix" + payload)
+    bank = HostBank(shape, torch.uint8, backing="file", file_path=str(path), file_offset=6)
     device = torch.device("cuda", torch.cuda.current_device())
-    with pytest.raises(ValueError, match="buffered reader"):
-        DiskPrefillStaging(device, chunk_bytes=8192, direct_io=True, workers=2)
+    staging = DiskPrefillStaging(
+        device, chunk_bytes=3 * 4096, direct_io=True,
+        reuse_cached_rows=reuse_cached_rows, workers=workers,
+    )
+    try:
+        for _ in range(3):
+            target = torch.full(shape, 211, dtype=torch.uint8, device=device)
+            expected = torch.full_like(bank.tensor, 211)
+            selected = list(range(8)) if rows is None else [2, 3, 5, 7] if rows else []
+            expected[selected] = bank.tensor[selected]
+            torch.cuda._sleep(1_000_000)
+            copied = staging.copy_bank(bank.tensor, target, rows)
+            assert torch.equal(target.cpu(), expected)
+            assert copied == len(selected) * nbytes // 8
+    finally:
+        staging.synchronize()
 
 
 def test_parallel_staging_writes_inference_tensors_from_worker_threads(tmp_path):

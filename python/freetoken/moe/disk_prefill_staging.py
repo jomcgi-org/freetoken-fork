@@ -55,8 +55,6 @@ class DiskPrefillStaging:
             self._mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
             self._mincore.restype = ctypes.c_int
         self.workers = max(1, int(workers))
-        if self.workers > 1 and (direct_io or reuse_cached_rows):
-            raise ValueError("parallel staging supports the buffered reader only")
         # Two slots per worker: each worker reads its next piece while the copy of
         # its previous piece drains.
         self._allocations = [
@@ -148,61 +146,94 @@ class DiskPrefillStaging:
         if pending is not None:
             yield pending
 
-    def _copy_parallel(self, bank, file_offset, ranges, target, stream) -> int:
-        """Buffered reads split across workers, each with its own two slots.
+    def _copy_parallel(self, bank, file_offset, ranges, target, stream, source) -> int:
+        """Reads split across workers, each with its own two slots.
 
         Pieces are at most one slot and are dealt round-robin, so page-cache copies
-        use several cores and NVMe misses see a deeper queue. Every copy is enqueued
-        on ``stream`` before this returns; workers own disjoint slots and destination
-        byte ranges, so their order on the stream does not matter.
+        use several cores and NVMe reads see a deeper queue. With direct I/O each
+        piece is read block-aligned (its unaligned head included in the slot), so
+        cold rows do not enter the page cache; with cached-row reuse, rows already
+        resident are read through the page cache instead. The residency plan is made
+        here, on the calling thread, because its probe buffer is shared. Every copy is
+        enqueued on ``stream`` before this returns; workers own disjoint slots and
+        destination byte ranges, so their order on the stream does not matter.
         """
-        pieces = []
-        for start, length in ranges:
-            for done in range(0, length, self.chunk_bytes):
-                pieces.append((start + done, min(self.chunk_bytes, length - done)))
-        if not pieces:
-            return 0
-        fd = os.open(bank._file_path, os.O_RDONLY)
-        # Inference mode is thread-local; workers copy into the caller's tensors.
-        inference = torch.is_inference_mode_enabled()
-
-        def work(worker: int) -> int:
-            copied = 0
-            turn = 0
-            with (
-                torch.inference_mode(inference),
-                torch.cuda.device(self.device),
-                torch.cuda.stream(stream),
-            ):
-                for index in range(worker, len(pieces), self.workers):
-                    start, count = pieces[index]
-                    slot = 2 * worker + turn
-                    turn ^= 1
-                    if self._pending[slot]:
-                        self._events[slot].synchronize()
-                        self._pending[slot] = False
-                    view = self._views[slot]
-                    filled = 0
-                    while filled < count:
-                        got = os.preadv(fd, [view[filled:count]], file_offset + start + filled)
-                        if got <= 0:
-                            raise OSError("short file read while staging prefill weights")
-                        filled += got
-                    target[start:start + count].copy_(
-                        self.buffers[slot][:count], non_blocking=True,
-                    )
-                    self._events[slot].record(stream)
-                    self._pending[slot] = True
-                    copied += count
-            return copied
-
+        flags = os.O_RDONLY | (os.O_DIRECT if self.direct_io else 0)
+        fd = os.open(bank._file_path, flags)
+        cached_fd = None
         try:
+            reuse = self.reuse_cached_rows and os.fstat(fd).st_uid == os.geteuid()
+            planned = (
+                list(self._cached_row_ranges(source, ranges)) if reuse else
+                [(start, length, False) for start, length in ranges]
+            )
+            usable = min(buffer.numel() for buffer in self.buffers)
+            pieces = []
+            for start, length, cached in planned:
+                direct = self.direct_io and not cached
+                done = 0
+                while done < length:
+                    head = (file_offset + start + done) % _BLK if direct else 0
+                    count = min(usable - head, length - done)
+                    pieces.append((start + done, count, cached, direct))
+                    done += count
+            if not pieces:
+                return 0
+            if any(cached for _, _, cached, _ in pieces):
+                cached_fd = os.open(bank._file_path, os.O_RDONLY)
+                os.posix_fadvise(cached_fd, 0, 0, os.POSIX_FADV_RANDOM)
+            buffered_fd = cached_fd if not self.direct_io else None
+            # Inference mode is thread-local; workers copy into the caller's tensors.
+            inference = torch.is_inference_mode_enabled()
+
+            def work(worker: int) -> int:
+                copied = 0
+                turn = 0
+                with (
+                    torch.inference_mode(inference),
+                    torch.cuda.device(self.device),
+                    torch.cuda.stream(stream),
+                ):
+                    for index in range(worker, len(pieces), self.workers):
+                        start, count, cached, direct = pieces[index]
+                        slot = 2 * worker + turn
+                        turn ^= 1
+                        if self._pending[slot]:
+                            self._events[slot].synchronize()
+                            self._pending[slot] = False
+                        view = self._views[slot]
+                        offset = file_offset + start
+                        if direct:
+                            head = offset % _BLK
+                            span = (head + count + _BLK - 1) // _BLK * _BLK
+                            _preadv_all(fd, view[:span], offset - head, head + count)
+                        else:
+                            head = 0
+                            read_fd = cached_fd if cached else (buffered_fd or fd)
+                            filled = 0
+                            while filled < count:
+                                got = os.preadv(read_fd, [view[filled:count]], offset + filled)
+                                if got <= 0:
+                                    raise OSError(
+                                        "short file read while staging prefill weights"
+                                    )
+                                filled += got
+                        target[start:start + count].copy_(
+                            self.buffers[slot][head:head + count], non_blocking=True,
+                        )
+                        self._events[slot].record(stream)
+                        self._pending[slot] = True
+                        copied += count
+                return copied
+
             futures = [
                 self._pool.submit(work, worker)
                 for worker in range(min(self.workers, len(pieces)))
             ]
             return sum(future.result() for future in futures)
         finally:
+            if cached_fd is not None:
+                os.close(cached_fd)
             os.close(fd)
 
     def copy_bank(self, source: torch.Tensor, destination: torch.Tensor, rows=None) -> int:
@@ -242,7 +273,7 @@ class DiskPrefillStaging:
         target = destination.view(torch.uint8).view(-1)
         stream = torch.cuda.current_stream(self.device)
         if self._pool is not None:
-            return self._copy_parallel(bank, file_offset, ranges, target, stream)
+            return self._copy_parallel(bank, file_offset, ranges, target, stream, source)
         copied = 0
         flags = os.O_RDONLY | (os.O_DIRECT if self.direct_io else 0)
         fd = os.open(bank._file_path, flags)
