@@ -284,6 +284,15 @@ class OffloadMoeCache:
         self._layer_major_group = False
         self._layer_major_begun = False
         self._layer_major_staged: tuple[int, set[int]] | None = None
+        # Predicted DISK staging inside layer-major groups (see begin_layer_major_group).
+        self._lm_predictive = False
+        self._lm_resident: dict[int, set[int]] = {}
+        self._lm_needed: dict[int, set[int]] = {}
+        self._lm_predict: dict[int, set[int]] = {}
+        self._lm_jobs: dict = {}
+        self._lm_executor = None
+        self._lm_bg_staging = None
+        self._lm_copy_stream = None
         self.hot_expert_capacity: dict[int, int] = {}
         assert self.moe_prefill_coalesce in (
             "populate", "on", "off"
@@ -837,11 +846,134 @@ class OffloadMoeCache:
         self._layer_major_group = True
         self._layer_major_begun = False
         self._layer_major_staged = None
+        # Predicted DISK staging: every layer alternates between the two prefill
+        # double buffers, so a DISK layer's rows can be staged into its buffer while
+        # the previous layer computes from the other one. A background thread reads
+        # the rows this DISK layer routed in the previous group (the prediction) and
+        # copies them on a dedicated stream; at use time only rows the prediction
+        # missed are staged synchronously, so every routed row is always present.
+        self._lm_predictive = bool(
+            os.environ.get("FREETOKEN_LAYER_MAJOR_PREDICT", "1") != "0"
+            and self.moe_disk_prefill == "staged"
+            and self._disk_prefill_staging is not None
+            and self.prefill_overlap
+            and self.prefill_copy_stream is not None
+            and not self.prefill_hit_d2d
+            and "disk" in self.layer_residency
+        )
+        self._lm_resident = {}
+        self._lm_needed = {}
+        self._lm_jobs = {}
 
     def end_layer_major_group(self) -> None:
+        predictive = self._lm_predictive
         self._layer_major_group = False
         self._layer_major_begun = False
         self._layer_major_staged = None
+        self._lm_predictive = False
+        if predictive:
+            # A job can only be pending for a layer the group never reached (an
+            # aborted forward); finish it before the buffers change hands.
+            for job in self._lm_jobs.values():
+                job.result()
+            self._lm_jobs = {}
+            for layer_id, rows in self._lm_needed.items():
+                if rows:
+                    self._lm_predict[layer_id] = rows
+            self._lm_needed = {}
+            self._lm_resident = {}
+            self._configure_prefill_overlap_layers()
+            self._prefill_buffer_layer = [None, None]
+            self._prefill_buffer_released = [True, True]
+
+    def _lm_claim_buffer(self, layer_id: int) -> int:
+        """Assign ``layer_id``'s group buffer to it (main thread)."""
+        buffer_id = self._prefill_overlap_buffer_ids[layer_id]
+        if self._prefill_buffer_layer[buffer_id] == layer_id:
+            return buffer_id
+        if self._prefill_buffer_layer[buffer_id] is not None:
+            assert self._prefill_buffer_released[buffer_id], (
+                "Prefill overlap buffer is being reused before release"
+            )
+        self._invalidate_prefill_buffer(buffer_id)
+        self._prefill_buffer_layer[buffer_id] = layer_id
+        self._prefill_buffer_released[buffer_id] = False
+        self._lm_resident[layer_id] = set()
+        return buffer_id
+
+    def _lm_copy_rows(self, staging, layer_id: int, buffer_id: int, rows) -> None:
+        for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+            copied = staging.copy_bank(per_layer[layer_id], buffer[buffer_id], rows)
+            if self.collect_stats:
+                self.disk_prefill_staged_h2d_bytes += copied
+
+    def layer_major_prefetch_disk(self, layer_id: int) -> None:
+        """Start staging a DISK layer's predicted rows into its group buffer."""
+        if (
+            not self._lm_predictive
+            or layer_id >= self.num_layers
+            or self.layer_residency[layer_id] != "disk"
+            or layer_id in self._lm_jobs
+            or self._prefill_buffer_layer[self._prefill_overlap_buffer_ids[layer_id]]
+            == layer_id
+        ):
+            return
+        buffer_id = self._lm_claim_buffer(layer_id)
+        rows = sorted(self._lm_predict.get(layer_id, ()))
+        if not rows:
+            return
+        if self._lm_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            from freetoken.moe.disk_prefill_staging import DiskPrefillStaging
+
+            self._lm_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ft-lm-prefetch"
+            )
+            self._lm_bg_staging = DiskPrefillStaging(self.device)
+            self._lm_copy_stream = torch.cuda.Stream(device=self.device)
+        has_release = self._prefill_buffer_has_release_event[buffer_id]
+        release = self.prefill_release_events[buffer_id] if self.prefill_release_events else None
+        ready = self.prefill_ready_events[buffer_id] if self.prefill_ready_events else None
+        stream = self._lm_copy_stream
+        staging = self._lm_bg_staging
+        device = self.device
+
+        def job() -> None:
+            if stream is None:  # CPU tests
+                self._lm_copy_rows(staging, layer_id, buffer_id, rows)
+                return
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                if has_release:
+                    stream.wait_event(release)
+                self._lm_copy_rows(staging, layer_id, buffer_id, rows)
+                ready.record(stream)
+
+        self._lm_resident[layer_id] = set(rows)
+        self._lm_jobs[layer_id] = self._lm_executor.submit(job)
+
+    def layer_major_disk_views(
+        self, layer_id: int, expert_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        """Buffer views holding every row ``expert_ids`` routes to, for one chunk."""
+        buffer_id = self._lm_claim_buffer(layer_id)
+        job = self._lm_jobs.pop(layer_id, None)
+        if job is not None:
+            job.result()
+            if self._lm_copy_stream is not None:
+                torch.cuda.current_stream(self.device).wait_event(
+                    self.prefill_ready_events[buffer_id]
+                )
+        rows = torch.unique(expert_ids).cpu().tolist()
+        self._lm_needed.setdefault(layer_id, set()).update(rows)
+        resident = self._lm_resident.setdefault(layer_id, set())
+        missing = [row for row in rows if row not in resident]
+        if missing:
+            # On the compute stream: ordered after the prediction's ready wait and
+            # after the buffer's previous occupant.
+            self._lm_copy_rows(self._disk_prefill_staging, layer_id, buffer_id, missing)
+            resident.update(missing)
+        return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
 
     def _layer_major_missing_rows(self, layer_id: int, rows: list[int]) -> list[int]:
         """Rows of ``layer_id`` not yet staged into scratch during this group."""
@@ -3390,6 +3522,11 @@ class OffloadMoeCache:
         if staged != getattr(self, "_staged_prefill_active", False):
             self._staged_prefill_active = staged
             self._configure_prefill_overlap_layers()
+        if self._lm_predictive:
+            # Every layer alternates between the two buffers for this group.
+            self._prefill_overlap_buffer_ids = [
+                layer_id & 1 for layer_id in range(self.num_layers)
+            ]
         self.prefill_selective_active = bool(
             num_tokens is not None
             and 0 < num_tokens <= self.prefill_selective_max_tokens
@@ -3431,6 +3568,9 @@ class OffloadMoeCache:
             )
 
         assert self.banks and self.prefill_bank_buffers
+        if self._lm_predictive and self.layer_residency[layer_id] == "disk":
+            self.layer_major_prefetch_disk(layer_id)
+            return
 
         buffer_id = self._prefill_overlap_buffer_ids[layer_id]
         if self._prefill_buffer_layer[buffer_id] == layer_id:

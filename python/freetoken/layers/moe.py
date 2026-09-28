@@ -582,6 +582,23 @@ class OffloadMoELayer(MoELayer):
             else:
                 # Preserve the existing advisory sweep for the full-layer copy benchmark.
                 cache.prefetch_disk_experts(self.layer_id, topk_ids)
+        if disk_mode == "staged" and getattr(cache, "_lm_predictive", False):
+            # Layer-major group: this DISK layer's rows are staged into its group
+            # buffer, mostly ahead of time; start the next layer's movement first.
+            self._prefetch_next_overlap_layer(cache)
+            views = cache.layer_major_disk_views(self.layer_id, topk_ids)
+            out = self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=views,
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
+            cache.release_prefill_layer(self.layer_id)
+            return out
         if cache.prefill_overlap and cache.prefill_overlap_for_layer(self.layer_id):
             if cache.prefill_selective_active:
                 cache.prefetch_routed_prefill_layer(self.layer_id, topk_ids)
