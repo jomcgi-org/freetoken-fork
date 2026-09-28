@@ -22,7 +22,7 @@ import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.utils import init_logger, nvtx_annotate
+from freetoken.utils import init_logger, nvtx_annotate, stage_timer
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
@@ -191,24 +191,31 @@ class Qwen4ExpModel(BaseOP):
                 # each chunk runs exactly the operations of ``forward``.
                 pending = {}
 
+                attn_kind = "attn_linear" if layer._is_linear else "attn_full"
+
                 def attention(index: int) -> None:
                     batch = batches[index]
                     with enter(batch):
-                        meta = run_ple(layer, batch)
-                        hidden, block_input, inject = layer.forward_attention(
-                            hiddens[index], batch
-                        )
+                        with stage_timer.span("ple"):
+                            meta = run_ple(layer, batch)
+                        with stage_timer.span(attn_kind):
+                            hidden, block_input, inject = layer.forward_attention(
+                                hiddens[index], batch
+                            )
                         commit_ple(meta, batch)
-                        pending[index] = (
-                            hidden, inject, layer.mlp.prepare_layer_major(block_input)
-                        )
+                        with stage_timer.span("moe_prepare"):
+                            prepared = layer.mlp.prepare_layer_major(block_input)
+                        pending[index] = (hidden, inject, prepared)
 
                 def experts(index: int) -> None:
                     with enter(batches[index]):
                         hidden, inject, prepared = pending.pop(index)
-                        hiddens[index] = layer.mlp_hyper_connection.combine(
-                            hidden, layer.mlp.finish_layer_major(prepared), inject
-                        )
+                        with stage_timer.span("moe_finish"):
+                            out = layer.mlp.finish_layer_major(prepared)
+                        with stage_timer.span("mlp_combine"):
+                            hiddens[index] = layer.mlp_hyper_connection.combine(
+                                hidden, out, inject
+                            )
 
                 attention(0)
                 for index in range(len(batches)):

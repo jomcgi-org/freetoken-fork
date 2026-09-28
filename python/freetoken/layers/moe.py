@@ -8,6 +8,7 @@ from freetoken.moe import is_offload_moe_backend
 from freetoken.moe.fused import fused_experts_decode_impl, fused_experts_impl, fused_topk
 from freetoken.moe.offload_cache import OffloadMoeCache
 from freetoken.utils import div_even, init_logger
+from freetoken.utils import stage_timer
 
 from .base import BaseOP
 
@@ -610,17 +611,19 @@ class OffloadMoELayer(MoELayer):
             # Layer-major group: this DISK layer's rows are staged into its group
             # buffer, mostly ahead of time; start the next layer's movement first.
             self._prefetch_next_overlap_layer(cache)
-            views = cache.layer_major_disk_views(self.layer_id, topk_ids, ticket)
-            out = self._expert_gemm(
-                cache,
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                views=views,
-                n=self.num_experts,
-                alphas=cache.alphas_for_layer(self.layer_id),
-                is_prefill=True,
-            )
+            with stage_timer.span("disk_rows"):
+                views = cache.layer_major_disk_views(self.layer_id, topk_ids, ticket)
+            with stage_timer.span("expert_gemm_disk"):
+                out = self._expert_gemm(
+                    cache,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    views=views,
+                    n=self.num_experts,
+                    alphas=cache.alphas_for_layer(self.layer_id),
+                    is_prefill=True,
+                )
             cache.release_prefill_layer(self.layer_id)
             return out
         if cache.prefill_overlap and cache.prefill_overlap_for_layer(self.layer_id):
@@ -628,17 +631,19 @@ class OffloadMoELayer(MoELayer):
                 cache.prefetch_routed_prefill_layer(self.layer_id, topk_ids)
                 views = cache.wait_prefill_layer(self.layer_id)
             else:
-                views = self._wait_prefill_overlap(cache)
-            out = self._expert_gemm(
-                cache,
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                views=views,
-                n=self.num_experts,
-                alphas=cache.alphas_for_layer(self.layer_id),
-                is_prefill=True,
-            )
+                with stage_timer.span("pinned_wait"):
+                    views = self._wait_prefill_overlap(cache)
+            with stage_timer.span("expert_gemm_pinned"):
+                out = self._expert_gemm(
+                    cache,
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    views=views,
+                    n=self.num_experts,
+                    alphas=cache.alphas_for_layer(self.layer_id),
+                    is_prefill=True,
+                )
             cache.release_prefill_layer(self.layer_id)
             return out
         if disk_mode == "staged":

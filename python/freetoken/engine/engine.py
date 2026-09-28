@@ -1643,6 +1643,23 @@ class Engine:
             begin.record(self.stream)
             if cache is not None:
                 cache._layer_major_trace = []
+            from freetoken.utils import stage_timer
+
+            stage_timer.enable()
+        self._layer_major_groups = getattr(self, "_layer_major_groups", 0) + 1
+        profile_dir = os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE", "")
+        profile_group = int(os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE_GROUP", "3"))
+        profiler = None
+        if profile_dir and self._layer_major_groups == profile_group:
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+            )
+            profiler.__enter__()
+            profile_begin = torch.cuda.Event(enable_timing=True)
+            profile_begin.record(self.stream)
 
         def after_layer(layer_index: int) -> None:
             if trace:
@@ -1659,10 +1676,21 @@ class Engine:
                 copies = getattr(cache, "_layer_major_trace", None)
                 cache._layer_major_trace = None
                 cache.end_layer_major_group()
+        if profiler is not None:
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_end.record(self.stream)
+            torch.cuda.synchronize(self.device)
+            profiler.__exit__(None, None, None)
+            self._write_layer_major_profile(
+                profiler, profile_begin.elapsed_time(profile_end), batches, profile_dir
+            )
         if trace:
+            from freetoken.utils import stage_timer
+
+            spans = stage_timer.collect()
             self._log_layer_major_trace(
                 batches, begin, layer_events, copies or [],
-                time.perf_counter() - host_started,
+                time.perf_counter() - host_started, spans,
             )
         if self.cpu_moe_executor is not None:
             self.cpu_moe_executor.raise_if_unhealthy()
@@ -1687,7 +1715,43 @@ class Engine:
             req.sample_copy_done = copy_done_event
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
-    def _log_layer_major_trace(self, batches, begin, layer_events, copies, host_s):
+    def _write_layer_major_profile(self, profiler, wall_ms, batches, directory):
+        """Diagnostic: kernel time by name and GPU busy time for one group."""
+        from pathlib import Path
+
+        kernels = [
+            event for event in profiler.events()
+            if getattr(event, "device_type", None) == torch.autograd.DeviceType.CUDA
+        ]
+        intervals = sorted(
+            (event.time_range.start, event.time_range.end) for event in kernels
+        )
+        busy = 0.0
+        cursor = None
+        for start, end in intervals:
+            if cursor is None or start > cursor:
+                busy += end - start
+                cursor = end
+            elif end > cursor:
+                busy += end - cursor
+                cursor = end
+        tokens = sum(int(batch.input_ids.numel()) for batch in batches)
+        path = Path(directory) / f"layer-major-profile-{os.getpid()}-{self._layer_major_groups}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        table = profiler.key_averages().table(sort_by="cuda_time_total", row_limit=60)
+        path.write_text(
+            f"chunks={len(batches)} tokens={tokens} group_wall_ms={wall_ms:.0f} "
+            f"kernel_busy_ms={busy / 1000:.0f} kernels={len(kernels)}\n\n" + table
+        )
+        logger.info_rank0(
+            f"Layer-major profile: chunks={len(batches)} tokens={tokens} "
+            f"group_wall_ms={wall_ms:.0f} kernel_busy_ms={busy / 1000:.0f} "
+            f"kernels={len(kernels)} written to {path}"
+        )
+
+    def _log_layer_major_trace(
+        self, batches, begin, layer_events, copies, host_s, spans=()
+    ):
         """Diagnostic: per-layer GPU time and copy-stream time for one group (syncs)."""
         torch.cuda.synchronize(self.device)
         cache = self.moe_offload_cache
@@ -1726,6 +1790,12 @@ class Engine:
         def stats(values):
             return f"n={len(values)} sum={sum(values):.0f} max={max(values):.0f}" if values else "n=0"
 
+        stage_ms: dict[str, float] = {}
+        for name, started, ended in spans:
+            stage_ms[name] = stage_ms.get(name, 0.0) + started.elapsed_time(ended)
+        stage_fragment = " stages_ms[" + " ".join(
+            f"{name}={ms:.0f}" for name, ms in sorted(stage_ms.items())
+        ) + "]" if stage_ms else ""
         logger.info_rank0(
             f"Layer-major trace: chunks={len(batches)} tokens={tokens} "
             f"gpu_ms={begin.elapsed_time(layer_events[-1]) if layer_events else 0:.0f} "
@@ -1736,6 +1806,7 @@ class Engine:
             + " "
             + " ".join(f"copy_host_ms[{k}]({stats(v)})" for k, v in sorted(copy_host.items()))
             + disk_fragment
+            + stage_fragment
         )
 
     def _record_mtp_hidden(self, batch: Batch) -> None:
