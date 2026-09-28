@@ -717,7 +717,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
         reqs = getattr(batch, "padded_reqs", None)
         if reqs is None:
             reqs = batch.reqs
+        import time as _time
+
         for ple, backend in gather_layers:
+            hashed = _time.perf_counter()
             try:
                 row_ids = ple.ple_embedding.host_prefill_row_ids(
                     reqs,
@@ -734,7 +737,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 if degrade is not None:
                     degrade(f"host row-id allocation failed: {exc}")
                 continue
+            staged = _time.perf_counter()
             backend.prepare_prefill(row_ids)
+            done = _time.perf_counter()
+            stats = getattr(self, "_ple_prefill_host_ms", None)
+            if stats is not None:
+                stats[0] += (staged - hashed) * 1000.0
+                stats[1] += (done - staged) * 1000.0
 
     def cancel_prefill_ple(self) -> None:
         for _ple, backend in getattr(self, "_ple_prefill_gather", ()):

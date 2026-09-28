@@ -1544,6 +1544,7 @@ class PrefillGatherTable:
         try:
             if self._host_copy_done is not None:
                 self._host_copy_done.synchronize()
+            self._copy_wait_ns = getattr(self, "_copy_wait_ns", 0) + time.perf_counter_ns() - started
             unique_count = reader.stage_prefill_rows(ids)
             if self._device.type == "cuda":
                 assert self._device_data is not None

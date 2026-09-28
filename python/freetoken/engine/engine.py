@@ -1646,6 +1646,7 @@ class Engine:
             from freetoken.utils import stage_timer
 
             stage_timer.enable()
+            self.model._ple_prefill_host_ms = [0.0, 0.0]
         self._layer_major_groups = getattr(self, "_layer_major_groups", 0) + 1
         profile_dir = os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE", "")
         profile_group = int(os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE_GROUP", "3"))
@@ -1688,6 +1689,12 @@ class Engine:
             from freetoken.utils import stage_timer
 
             spans = stage_timer.collect()
+            host_ms = getattr(self.model, "_ple_prefill_host_ms", None)
+            self.model._ple_prefill_host_ms = None
+            if host_ms is not None:
+                logger.info_rank0(
+                    f"Layer-major PLE host: hash_ms={host_ms[0]:.0f} stage_ms={host_ms[1]:.0f}"
+                )
             self._log_layer_major_trace(
                 batches, begin, layer_events, copies or [],
                 time.perf_counter() - host_started, spans,
