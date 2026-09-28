@@ -1636,7 +1636,11 @@ class Engine:
         if cache is not None:
             cache.begin_layer_major_group()
         try:
-            logits = self.model.forward_layer_major(batches, self.ctx.forward_batch)
+            logits = self.model.forward_layer_major(
+                batches,
+                self.ctx.forward_batch,
+                cache.layer_major_layer_done if cache is not None else None,
+            )
         finally:
             if cache is not None:
                 cache.end_layer_major_group()

@@ -284,6 +284,7 @@ class OffloadMoeCache:
         self._layer_major_group = False
         self._layer_major_begun = False
         self._layer_major_staged: tuple[int, set[int]] | None = None
+        self._layer_major_full = False
         self.hot_expert_capacity: dict[int, int] = {}
         assert self.moe_prefill_coalesce in (
             "populate", "on", "off"
@@ -837,11 +838,36 @@ class OffloadMoeCache:
         self._layer_major_group = True
         self._layer_major_begun = False
         self._layer_major_staged = None
+        # Whole-layer streaming: at group lengths every expert of a layer is routed, so
+        # each layer (pinned or DISK) moves once into alternating double buffers and the
+        # next layer streams while the current one computes. DISK layers read their
+        # file through the staging ring on the copy stream, so no per-chunk routing
+        # readback stalls the host.
+        self._layer_major_full = bool(
+            self.moe_disk_prefill == "staged"
+            and self._disk_prefill_staging is not None
+            and self.prefill_overlap
+            and self.prefill_copy_stream is not None
+            and not self.prefill_hit_d2d
+        )
 
     def end_layer_major_group(self) -> None:
+        full = self._layer_major_full
         self._layer_major_group = False
         self._layer_major_begun = False
         self._layer_major_staged = None
+        self._layer_major_full = False
+        if full:
+            # Return to the chunk-major schedule; the next prefill's begin_prefill
+            # starts from empty buffer bookkeeping.
+            self._configure_prefill_overlap_layers()
+            self._prefill_buffer_layer = [None, None]
+            self._prefill_buffer_released = [True, True]
+
+    def layer_major_layer_done(self, layer_id: int) -> None:
+        """Every chunk of ``layer_id`` is enqueued; start streaming the next layer."""
+        if self._layer_major_full and self.prefill_overlap_for_layer(layer_id + 1):
+            self.prefetch_prefill_layer(layer_id + 1)
 
     def _layer_major_missing_rows(self, layer_id: int, rows: list[int]) -> list[int]:
         """Rows of ``layer_id`` not yet staged into scratch during this group."""
@@ -3390,6 +3416,11 @@ class OffloadMoeCache:
         if staged != getattr(self, "_staged_prefill_active", False):
             self._staged_prefill_active = staged
             self._configure_prefill_overlap_layers()
+        if self._layer_major_full:
+            # Every layer alternates between the two buffers for this group.
+            self._prefill_overlap_buffer_ids = [
+                layer_id & 1 for layer_id in range(self.num_layers)
+            ]
         self.prefill_selective_active = bool(
             num_tokens is not None
             and 0 < num_tokens <= self.prefill_selective_max_tokens
@@ -3440,9 +3471,20 @@ class OffloadMoeCache:
                 "Prefill overlap buffer is being reused before release"
             )
 
+        from_file = (
+            self._layer_major_full and self.layer_residency[layer_id] == "disk"
+        )
+
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+                if from_file:
+                    copied = self._disk_prefill_staging.copy_bank(
+                        per_layer[layer_id], buffer[buffer_id]
+                    )
+                    if self.collect_stats:
+                        self.disk_prefill_staged_h2d_bytes += copied
+                    continue
                 buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
                 if self.collect_stats:
                     self.prefill_h2d_bytes += (

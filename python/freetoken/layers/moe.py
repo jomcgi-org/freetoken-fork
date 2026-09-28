@@ -810,6 +810,10 @@ class OffloadMoELayer(MoELayer):
         """Start the next physical layer's copy when it has pinned banks."""
         if not cache.prefill_overlap or cache.prefill_selective_active:
             return
+        if getattr(cache, "_layer_major_full", False):
+            # A layer-major group streams the next layer once all chunks of this
+            # layer are enqueued (layer_major_layer_done), not after the first chunk.
+            return
         next_layer_id = self.layer_id + 1
         if cache.prefill_overlap_for_layer(next_layer_id):
             cache.prefetch_prefill_layer(next_layer_id)

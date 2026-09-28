@@ -127,12 +127,15 @@ class Qwen4ExpModel(BaseOP):
             commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
         return self.hyper_connection_mixer.mix(hidden)[0]
 
-    def forward_layer_major(self, batches, enter, prepare_ple) -> torch.Tensor:
+    def forward_layer_major(
+        self, batches, enter, prepare_ple, after_layer=None
+    ) -> torch.Tensor:
         """Run consecutive prefill chunks of one request layer by layer.
 
         ``batches`` are the chunks in token order, each with its own metadata.
         ``enter(batch)`` is the context manager that makes a chunk the active batch;
-        ``prepare_ple(batch)`` stages a chunk's host PLE rows. Every chunk passes
+        ``prepare_ple(batch)`` stages a chunk's host PLE rows; ``after_layer(i)`` runs
+        once every chunk of layer ``i`` is enqueued. Every chunk passes
         layer L before any chunk reaches layer L+1, so a layer's routed experts reach
         the GPU once per group. Per chunk and per layer the operations, shapes and
         order are those of ``forward``: attention and GDN state carry from chunk to
@@ -148,7 +151,7 @@ class Qwen4ExpModel(BaseOP):
                 hiddens.append(
                     self.embed_tokens.forward(batch.input_ids).repeat(1, self.hc_count)
                 )
-        for layer in self.layers.op_list:
+        for layer_index, layer in enumerate(self.layers.op_list):
             for index, batch in enumerate(batches):
                 with enter(batch):
                     meta = None
@@ -165,6 +168,8 @@ class Qwen4ExpModel(BaseOP):
                         from .ple import commit_ngram_context
 
                         commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
+            if after_layer is not None:
+                after_layer(layer_index)
         last = hiddens[-1]
         del hiddens
         with enter(batches[-1]):
@@ -676,11 +681,13 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
     def supports_layer_major_prefill(self) -> bool:
         return len(self.model.ple_layers) <= 1
 
-    def forward_layer_major(self, batches, enter) -> torch.Tensor:
+    def forward_layer_major(self, batches, enter, after_layer=None) -> torch.Tensor:
         """Layer-major prefill over ``batches``; logits for the last chunk only."""
         if getattr(self.model, "_capture_mtp_hidden", False):
             raise RuntimeError("layer-major prefill does not capture MTP hidden states")
-        hidden = self.model.forward_layer_major(batches, enter, self.prepare_prefill_ple)
+        hidden = self.model.forward_layer_major(
+            batches, enter, self.prepare_prefill_ple, after_layer
+        )
         with enter(batches[-1]):
             return self.lm_head.forward(hidden, select_last=True)
 
