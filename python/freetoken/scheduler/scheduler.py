@@ -1784,7 +1784,9 @@ class Scheduler(SchedulerIOMixin):
         req = batch.reqs[0]
         if not isinstance(req, ChunkedReq) or req.extend_len >= budget:
             return False
-        if req.mm_embeds is not None or req.sampling_params.guided_decoding is not None:
+        # Guided decoding only constrains requests that can decode, i.e. the last
+        # chunk, whose sampling arguments are prepared as in chunk-major serving.
+        if req.mm_embeds is not None:
             return False
         if getattr(self.config, "speculative_mtp", "off") == "on":
             return False
