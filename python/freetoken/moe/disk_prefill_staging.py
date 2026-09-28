@@ -30,7 +30,7 @@ class DiskPrefillStaging:
 
     def __init__(
         self, device: torch.device, *, chunk_bytes: int = 32 << 20,
-        direct_io: bool = False, reuse_cached_rows: bool = False,
+        direct_io: bool = False, reuse_cached_rows: bool = False, workers: int = 1,
     ):
         self.device = torch.device(device)
         chunk_bytes = int(chunk_bytes)
@@ -54,9 +54,22 @@ class DiskPrefillStaging:
             self._mincore = ctypes.CDLL(None, use_errno=True).mincore
             self._mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
             self._mincore.restype = ctypes.c_int
+        self.workers = max(1, int(workers))
+        if self.workers > 1 and (direct_io or reuse_cached_rows):
+            raise ValueError("parallel staging supports the buffered reader only")
+        # Two slots per worker: each worker reads its next piece while the copy of
+        # its previous piece drains.
         self._allocations = [
-            alloc_pinned_tensor(self.chunk_bytes, dtype=torch.uint8) for _ in range(2)
+            alloc_pinned_tensor(self.chunk_bytes, dtype=torch.uint8)
+            for _ in range(2 * self.workers)
         ]
+        self._pool = None
+        if self.workers > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(
+                max_workers=self.workers, thread_name_prefix="ft-disk-staging"
+            )
         self.buffers = self._allocations
         if direct_io:
             # Align within the existing allocation. This spends a little usable
@@ -135,6 +148,57 @@ class DiskPrefillStaging:
         if pending is not None:
             yield pending
 
+    def _copy_parallel(self, bank, file_offset, ranges, target, stream) -> int:
+        """Buffered reads split across workers, each with its own two slots.
+
+        Pieces are at most one slot and are dealt round-robin, so page-cache copies
+        use several cores and NVMe misses see a deeper queue. Every copy is enqueued
+        on ``stream`` before this returns; workers own disjoint slots and destination
+        byte ranges, so their order on the stream does not matter.
+        """
+        pieces = []
+        for start, length in ranges:
+            for done in range(0, length, self.chunk_bytes):
+                pieces.append((start + done, min(self.chunk_bytes, length - done)))
+        if not pieces:
+            return 0
+        fd = os.open(bank._file_path, os.O_RDONLY)
+
+        def work(worker: int) -> int:
+            copied = 0
+            turn = 0
+            with torch.cuda.device(self.device), torch.cuda.stream(stream):
+                for index in range(worker, len(pieces), self.workers):
+                    start, count = pieces[index]
+                    slot = 2 * worker + turn
+                    turn ^= 1
+                    if self._pending[slot]:
+                        self._events[slot].synchronize()
+                        self._pending[slot] = False
+                    view = self._views[slot]
+                    filled = 0
+                    while filled < count:
+                        got = os.preadv(fd, [view[filled:count]], file_offset + start + filled)
+                        if got <= 0:
+                            raise OSError("short file read while staging prefill weights")
+                        filled += got
+                    target[start:start + count].copy_(
+                        self.buffers[slot][:count], non_blocking=True,
+                    )
+                    self._events[slot].record(stream)
+                    self._pending[slot] = True
+                    copied += count
+            return copied
+
+        try:
+            futures = [
+                self._pool.submit(work, worker)
+                for worker in range(min(self.workers, len(pieces)))
+            ]
+            return sum(future.result() for future in futures)
+        finally:
+            os.close(fd)
+
     def copy_bank(self, source: torch.Tensor, destination: torch.Tensor, rows=None) -> int:
         """Copy all rows, or the exact valid row union, to original row positions.
 
@@ -171,6 +235,8 @@ class DiskPrefillStaging:
             return 0
         target = destination.view(torch.uint8).view(-1)
         stream = torch.cuda.current_stream(self.device)
+        if self._pool is not None:
+            return self._copy_parallel(bank, file_offset, ranges, target, stream)
         copied = 0
         flags = os.O_RDONLY | (os.O_DIRECT if self.direct_io else 0)
         fd = os.open(bank._file_path, flags)

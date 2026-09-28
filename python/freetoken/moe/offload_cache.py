@@ -202,6 +202,21 @@ _BANK_BYTES_PER_EXPERT = {
 MARLIN_MAX_CACHE_SIZE = 992
 
 
+def _disk_staging_workers() -> int:
+    """Reader threads for buffered DISK prefill staging (FREETOKEN_DISK_STAGING_WORKERS)."""
+    try:
+        return max(1, int(os.environ.get("FREETOKEN_DISK_STAGING_WORKERS", "1")))
+    except ValueError:
+        return 1
+
+
+def _disk_staging_geometry(workers: int) -> dict:
+    """Two slots per worker, with the pinned total near the 64 MiB single ring."""
+    if workers <= 1:
+        return {"workers": 1}
+    return {"workers": workers, "chunk_bytes": max(4 << 20, (64 << 20) // workers)}
+
+
 @dataclass
 class OffloadMoeCache:
     num_layers: int
@@ -827,11 +842,13 @@ class OffloadMoeCache:
             cached = self.moe_disk_prefill_io == "cached"
             self._disk_prefill_staging = DiskPrefillStaging(
                 self.device, direct_io=cached, reuse_cached_rows=cached,
+                **_disk_staging_geometry(1 if cached else _disk_staging_workers()),
             )
             logger.info_rank0(
                 f"DISK staged prefill: ring={self._disk_prefill_staging.pinned_bytes / 2**20:.0f} MiB, "
                 f"minimum_chunk={self.moe_disk_prefill_min_tokens} tokens, "
-                f"file_io={self.moe_disk_prefill_io}"
+                f"file_io={self.moe_disk_prefill_io}, "
+                f"workers={self._disk_prefill_staging.workers}"
             )
 
     def begin_layer_major_group(self) -> None:
@@ -930,7 +947,9 @@ class OffloadMoeCache:
             self._lm_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="ft-lm-prefetch"
             )
-            self._lm_bg_staging = DiskPrefillStaging(self.device)
+            self._lm_bg_staging = DiskPrefillStaging(
+                self.device, **_disk_staging_geometry(_disk_staging_workers())
+            )
             self._lm_copy_stream = torch.cuda.Stream(device=self.device)
         has_release = self._prefill_buffer_has_release_event[buffer_id]
         release = self.prefill_release_events[buffer_id] if self.prefill_release_events else None
