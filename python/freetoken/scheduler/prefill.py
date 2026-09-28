@@ -48,8 +48,8 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
-    # Chunk size for requests that need more than one chunk (layer-major prefill);
-    # 0 keeps token_budget. A request whose remaining extend fits one chunk is unaffected.
+    # Chunk size for every chunk of a request that needs more than one chunk
+    # (layer-major prefill); 0 keeps token_budget. A prompt that fits one chunk is whole.
     long_chunk: int = 0
 
     def _try_allocate_one(self, req: PendingReq):
@@ -151,7 +151,12 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
-        if self.long_chunk > 0 and remain_len > self.token_budget:
+        if self.long_chunk > 0 and (
+            remain_len > self.token_budget or pending_req.chunked_req is not None
+        ):
+            # Every chunk of a multi-chunk prompt, the final remainder included, uses
+            # the group chunk: a group's peak GPU memory is its residual plus one
+            # chunk's transient, so a larger tail chunk could exceed it.
             chunk_size = min(chunk_size, self.long_chunk)
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in

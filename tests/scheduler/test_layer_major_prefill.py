@@ -172,9 +172,14 @@ def test_long_prompts_use_the_group_chunk_and_short_ones_keep_one_chunk():
     pm.long_chunk = CHUNK // 2
     group = sched._schedule_layer_major_group(_first(sched, pm))
     half = CHUNK // 2
-    # Split at the group chunk while more than one full chunk remains, then the
-    # remainder that fits one ordinary chunk goes in one piece.
+    # Every chunk of a multi-chunk prompt uses the group chunk, the tail included.
     assert [p[0] for p in prepared] == [
-        (0, half), (half, half), (CHUNK, half), (CHUNK + half, half), (2 * CHUNK, 5)
+        (0, half), (half, half), (CHUNK, half), (CHUNK + half, half),
+        (2 * CHUNK, half), (2 * CHUNK + half, 1),
     ]
-    assert len(group) == 5
+    assert len(group) == 6
+
+    sched, pm, prepared = _scheduler(8 * CHUNK, prompt_len=CHUNK + 7)
+    pm.long_chunk = CHUNK // 2
+    sched._schedule_layer_major_group(_first(sched, pm))
+    assert [p[0] for p in prepared] == [(0, half), (half, half), (CHUNK, half), (CHUNK + half, 3)]

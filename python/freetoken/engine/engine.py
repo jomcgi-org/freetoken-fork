@@ -1649,8 +1649,6 @@ class Engine:
                 event = torch.cuda.Event(enable_timing=True)
                 event.record(self.stream)
                 layer_events.append(event)
-            if cache is not None:
-                cache.layer_major_layer_done(layer_index)
 
         try:
             logits = self.model.forward_layer_major(

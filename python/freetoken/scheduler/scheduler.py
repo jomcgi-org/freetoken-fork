@@ -1829,7 +1829,7 @@ class Scheduler(SchedulerIOMixin):
             remaining = pending[0].input_len - (req.cached_len + req.extend_len)
             next_chunk = min(self.prefill_budget, remaining)
             long_chunk = getattr(self.prefill_manager, "long_chunk", 0)
-            if long_chunk > 0 and remaining > self.prefill_budget:
+            if long_chunk > 0:
                 next_chunk = min(next_chunk, long_chunk)
             if remaining <= 0 or tokens + next_chunk > budget:
                 break
