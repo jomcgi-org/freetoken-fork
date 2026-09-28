@@ -265,7 +265,21 @@ def fused_experts_decode_nvfp4_serial(
     )
 
 
-def _prefill_config(M: int) -> Dict[str, int]:
+# (N, K) of both expert GEMMs of the 2560-hidden / 640-intermediate Qwen3.8-Flash
+# experts (gate_up, down). Offline sweep on the RTX 4090 (results/.../moebench,
+# 512 experts, skewed top-10): 128 x 256 tiles, 8 warps, 2 stages run the prefill at
+# 15.8 ms per 4096 tokens against 25.3 ms for the default tiles, and faster still
+# for larger M. BLOCK_SIZE_KB stays 32: the K step sets the order of the fp32
+# accumulation, and only M/N tiling, warps and stages change here, so every output
+# row is bit-identical to the default tiles (checked on all 90 swept configs).
+_QWEN38_FLASH_PREFILL_SHAPES = frozenset({(1280, 2560), (2560, 640)})
+_LARGE_TILE_MIN_M = 2048
+
+
+def _prefill_config(M: int, N: int | None = None, K: int | None = None) -> Dict[str, int]:
+    if M >= _LARGE_TILE_MIN_M and (N, K) in _QWEN38_FLASH_PREFILL_SHAPES:
+        return dict(BLOCK_SIZE_M=128, BLOCK_SIZE_N=256, BLOCK_SIZE_KB=32,
+                    GROUP_SIZE_M=8, num_warps=8, num_stages=2)
     # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
     # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
     # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
@@ -396,7 +410,9 @@ def fused_experts_nvfp4(
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = _prefill_config(M)
+    # One config serves both GEMMs (BLOCK_SIZE_M is baked into the token alignment);
+    # key it on the gate/up shape.
+    cfg = _prefill_config(M, two_i, H)
 
     if num_experts <= _SGL_ALIGN_MAX_ACTIVE_SLOTS:
         sorted_ids, expert_ids, ntpp = moe_align_block_size(
