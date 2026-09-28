@@ -661,3 +661,14 @@ already exist. With more GPU memory a group covers the whole prompt (one expert
 pass per prompt) and more layers stay GPU-resident; a larger model with more of
 its experts on DISK is bound by the same staging path, which now reads in
 parallel, predicts a group's rows, and keeps cold rows out of the page cache.
+
+### Deployment
+
+Deployed with `node4-finalist-deploy.sh 8192` on `c841a64`: the startup log
+shows `file_io=cached, workers=8`, 20 GPU prefill layers, 28 DISK layers and 82
+HOT experts; `node4-finalist-verify.py` passed. The live sequence (verify
+warm-up, then three fresh 100k prompts 90 s apart,
+`livetrace-layermajor-20260928.jsonl`) ran in 57.3, 53.6 and 53.3 s TTFT, against
+154.0, 97.3 and 93.2 s for the same sequence on the previous deployment. Shmem
+stayed at 27.26 GiB with no swap; prefill read about 60 GiB from NVMe per 100k
+request, most of it cold rows by direct I/O.
