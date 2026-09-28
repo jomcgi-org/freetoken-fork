@@ -571,67 +571,93 @@ The first request after a restart still pays the page-cache warm-up of the
 file-backed DISK banks. Later cold 100k requests on the live server now run
 within a few seconds of the qualification arms.
 
-## Layer-major prefill, 2026-09-28
+## Layer-major prefill and DISK staging, 2026-09-28
 
 Chunked prefill runs all 48 layers for each chunk, so every layer's experts
 cross PCIe once per chunk: at 100k with 8192-token chunks, 13 passes over the
 26.4 GiB of pinned banks and 13 routed-union stagings of the 37 GiB of DISK
-banks, the fixed 3.3 to 4.5 s of every chunk. Layer-major prefill groups
-consecutive chunks of one request and runs them layer by layer: every chunk of
-a group passes layer L before any reaches layer L+1, so a layer's experts move
-once per group.
+banks. Four changes, each measured on its own, cut cold 100k TTFT from about
+92 s to 53 s on the 4090 with exact parity on every row.
 
-Scheduler (`--prefill-layer-major-tokens N`): after the first chunk, the next
-chunks are scheduled and prepared exactly as chunk-major serving would
-(pages, QSA metadata, GDN metadata and snapshot tracking), from the lengths
-the previous chunk's forward launch leaves behind. A group stops at N tokens,
-at the prompt's final chunk, and at a chunk that persists an intermediate
-harness root (its ping-pong snapshot slot is rewritten two chunks later, so it
-drains first). Only a lone request with no running decode is grouped. The group
-drains chunk by chunk; its last chunk is the in-flight batch for aborts, and a
-CUDA OOM aborts the request cleanly (seen with 4 x 8192-token groups on the
-4090, which then served the next request normally).
+### What changed
 
-Model (`qwen4_exp`): per layer and per chunk the same operations and shapes as
-the chunk-major forward. GDN state and QSA KV carry between chunks inside each
-layer; each ping-pong slot's last writer per layer is the same chunk as before,
-so the final radix snapshot is identical. PLE runs per chunk at its layer
-(layer 2), because a chunk's n-gram context is the previous chunk's committed
-window. Only the last chunk's logits are sampled.
+1. **Layer-major groups** (`--prefill-layer-major-tokens N`). Consecutive
+   chunks of one request run layer by layer: every chunk of a group passes
+   layer L before any reaches layer L+1, so a layer's experts move once per
+   group. The scheduler prepares each chunk exactly as chunk-major serving
+   would (pages, QSA and GDN metadata, snapshot tracking) from the lengths the
+   previous chunk's launch leaves behind. A group stops at N tokens, at the
+   prompt's final chunk, and at a chunk persisting an intermediate harness root
+   (its ping-pong snapshot slot is rewritten two chunks later). Only a lone
+   request with no running decode is grouped; the group drains chunk by chunk;
+   an OOM aborts the request cleanly. The model runs the same operations and
+   shapes per chunk as the chunk-major forward; PLE runs per chunk at its layer.
+   The group's hyper-connection residual (20 KiB per token here) stays on the
+   GPU, so N follows free GPU memory: 4 x 8192-token chunks ran out of memory on
+   the 4090 and 32k groups fit with 4096-token chunks
+   (`--prefill-layer-major-chunk 4096`, applied only to prompts that need more
+   than one `--max-extend-length` chunk). On a 96 GB GPU a whole prompt fits in
+   one group.
+2. **Parallel DISK staging reads** (`FREETOKEN_DISK_STAGING_WORKERS`). The
+   staging ring read one 32 MiB piece at a time on one thread (~1.9 GB/s in the
+   trace). Reads are now dealt to N workers with two pinned slots each (pinned
+   total ~64 MiB per reader); a single reader gets ~10.6 GB/s from page cache and
+   ~1.4 GB/s from NVMe on node-4, eight get several GB/s on cold data.
+3. **Predicted DISK staging** inside a group: every layer alternates between the
+   two prefill double buffers, a background reader stages the rows each DISK
+   layer routed in its previous group while the previous layer computes, and
+   only the rows the prediction missed (~550 of ~14,000 per group) are staged
+   on demand. Chunk c+1's attention and routing are enqueued before chunk c's
+   experts, and the routed rows are read back through a fixed-size mask fenced
+   by an event, so the host never waits on the whole stream.
+4. **Cached DISK reads** (`--moe-disk-prefill-io cached`, now parallel): rows
+   already in the page cache are read through it and cold rows with O_DIRECT.
+   The DISK banks (37 GiB) exceed the page cache left for them (~31 GiB).
+   Chunk-major touches popular experts every chunk, so LRU keeps them; a group
+   touches each routed row about once, so buffered group reads became a 36 GiB
+   sweep that evicted the next group's rows and decode's hot rows alike (32k
+   cold reads 16.7-21.4 GiB against 3-13 GiB, decode after prefill 2-5 s
+   slower). Direct reads leave the page cache to the rows decode uses.
 
-Expert movement: pinned layers stay in their double buffer while their chunks
-run back to back (prefill setup runs once per group). DISK layers first staged
-each expert row once per group (`e0c4ee8`); the dev branch streams whole
-layers instead (every layer alternates between the two existing double
-buffers, DISK layers read their file through the staging ring on the copy
-stream, and the next layer streams once every chunk of the current layer is
-enqueued), which removes the per-chunk routing readback.
+Tried and reverted on the way: streaming whole DISK layers ahead (routing is
+skewed, so it read the rarely used experts, the pages never in the page cache:
+22-29 GiB from NVMe per 32k request and no gain), and aiming idle ticks at
+prefill.
 
-The group's hyper-connection residual stays on the GPU (20 KiB per token for
-this model), so N is set by free GPU memory: 4 x 8192 tokens ran out of memory
-on the 24 GiB 4090, 32k groups fit with 4096-token chunks. On a 96 GB GPU the
-whole prompt fits in one group. `--prefill-layer-major-chunk` sets the chunk
-size only for prompts that need more than one `--max-extend-length` chunk, so
-prompts up to 8192 tokens keep a single chunk.
+### Group trace
 
-Exact parity held on every row of every arm (request hash, text, reasoning,
-finish reason and usage against `workspacecurve1-0`, continuation sessions
-against `workspacecurve3-1`).
+`FREETOKEN_LAYER_MAJOR_TRACE=1` logs per-layer GPU time and staging counters
+for each group. One 32k group (8 chunks of 4096 tokens):
 
-Idle-gap protocol, 32k groups of 4096-token chunks (`e0c4ee8`), both arm
-orders:
+| Build | Group GPU time | DISK layers | Pinned layers | DISK staging on demand |
+| --- | ---: | ---: | ---: | ---: |
+| per-row staging, one reader | 22-27 s | 16-22 s | 5.3-5.5 s | 19.4 s (first group) |
+| + predicted staging | 26.7-28.0 s | 21-22.5 s | 5.3-5.5 s | 0.8-1.4 s, 19-20.5 s background reads |
+| + 8 readers | 15.7 s | 10.3 s | 5.4 s | 0.35 s, 3.9-4.2 s background reads (hidden) |
 
-| Sweep, order | Arm | 8k cold TTFT / wall | 32k cold TTFT | 100k cold TTFT | 100k cold wall | 100k repeat wall | Continuation walls |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| idlegap4, layer-major first | layer-major | 12.02 / 21.83 s | 23.18 s | 69.82 s | 78.30 s | 4.78 s | 111.1 / 74.6 / 67.3 s |
-| | baseline | 12.01 / 18.08 s | 34.93 s | 89.25 s | 96.14 s | 5.12 s | 119.9 / 74.2 / 66.1 s |
-| idlegap5, baseline first | layer-major | 15.32 / 22.09 s | 24.04 s | 68.01 s | 75.05 s | 4.01 s | 114.2 / 74.5 / 73.8 s |
-| | baseline | 12.83 / 18.01 s | 30.92 s | 91.06 s | 96.76 s | 3.99 s | 122.6 / 79.1 / 73.3 s |
+### Idle-gap protocol, final configuration
 
-Live-like sequence (`livelike4`, baseline first): 100k cold 96.1 / 87.9 /
-80.8 s against 110.2 / 93.5 / 93.2 s.
+`idlegap9` (final configuration first, then buffered reads, then baseline;
+continuation workload plus 27 depth rows with 60 s idle before each cold
+request). All 81 depth rows and 9 continuation sessions passed with exact
+parity.
 
-Cold 100k TTFT fell by 21 to 23 s and 32k by 7 to 12 s. With every prompt split
-into 4096-token chunks, the 8k cold wall rose 3.7 to 4.1 s, mostly slower
-decode right after the prefill; `--prefill-layer-major-chunk` keeps such
-prompts in one chunk.
+| Arm | 8k cold TTFT / wall | 32k cold TTFT / wall | 100k cold TTFT / wall | 32k repeat wall | 100k post-prefill decode wall | Continuation walls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| final (cached reads) | 5.97 / 10.81 s | 16.94 / 21.77 s | 53.16 / 60.36 s | 3.92 s | 17.52 s | 100.9 / 73.2 / 65.0 s |
+| buffered reads | 6.73 / 13.23 s | 17.69 / 24.62 s | 54.80 / 62.47 s | 4.22 s | 20.11 s | 93.2 / 79.1 / 78.8 s |
+| baseline | 12.11 / 17.23 s | 33.77 / 37.48 s | 93.69 / 98.31 s | 4.19 s | 18.04 s | 94.5 / 72.8 / 69.0 s |
+
+Earlier steps on the same protocol: layer-major alone (32k groups) 100k cold
+68.0-69.8 s against 89.3-91.1 s baseline in both arm orders (`idlegap4`,
+`idlegap5`, `idlegap7`); 8 readers alone, chunk-major, 69.7 s (`idlegap8`).
+
+### Scaling
+
+The pieces are sized by the machine rather than the model: the group budget by
+free GPU memory (the residual is `hc_count x hidden x 2` bytes per token), the
+staging readers by storage and page-cache bandwidth, and the double buffers
+already exist. With more GPU memory a group covers the whole prompt (one expert
+pass per prompt) and more layers stay GPU-resident; a larger model with more of
+its experts on DISK is bound by the same staging path, which now reads in
+parallel, predicts a group's rows, and keeps cold rows out of the page cache.
