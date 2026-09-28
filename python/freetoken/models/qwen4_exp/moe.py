@@ -53,6 +53,17 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         routed = self.experts.prefill_finish(hidden_states, *routing)
         return shared_gate_mul_add(routed, shared, gate).view(num_tokens, hidden_dim)
 
+    def finish_layer_major_batch(self, prepared_list) -> list[torch.Tensor]:
+        """``finish_layer_major`` for several chunks with one routed-expert GEMM."""
+        routed = self.experts.prefill_finish_batch(
+            [prepared[0] for prepared in prepared_list],
+            [prepared[5] for prepared in prepared_list],
+        )
+        return [
+            shared_gate_mul_add(out, prepared[3], prepared[4]).view(prepared[1], prepared[2])
+            for out, prepared in zip(routed, prepared_list)
+        ]
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)

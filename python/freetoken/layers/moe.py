@@ -386,6 +386,69 @@ class OffloadMoELayer(MoELayer):
         out = self._prefill_routed(hidden_states, topk_weights, topk_ids, ticket=ticket)
         return self._maybe_all_reduce(out)
 
+    def prefill_finish_batch(self, hidden_list, routings) -> list[torch.Tensor]:
+        """Routed experts for several chunks of a layer-major group in one GEMM.
+
+        HOT observation and DISK row staging stay per chunk; the grouped GEMM runs
+        once over the concatenated tokens, so each expert sees more rows per weight
+        tile. The GEMM computes every row independently (BLOCK_SIZE_KB fixes the
+        accumulation order), so each chunk's rows are unchanged. Paths other than
+        the pinned double buffer and predicted DISK staging run per chunk.
+        """
+        cache = self.offload_cache
+        if len(hidden_list) == 1 or cache is None:
+            return [self.prefill_finish(h, *r) for h, r in zip(hidden_list, routings)]
+        residency = getattr(cache, "layer_residency", ())
+        disk = self.layer_id < len(residency) and residency[self.layer_id] == "disk"
+        disk_mode = (
+            getattr(cache, "effective_disk_prefill", cache.moe_disk_prefill) if disk else None
+        )
+        predictive = disk and disk_mode == "staged" and getattr(cache, "_lm_predictive", False)
+        pinned = (
+            not disk
+            and cache.prefill_overlap
+            and cache.prefill_overlap_for_layer(self.layer_id)
+            and not cache.prefill_selective_active
+        )
+        if not (predictive or pinned):
+            return [self.prefill_finish(h, *r) for h, r in zip(hidden_list, routings)]
+        if self.layer_id == 0:
+            cache.begin_prefill(hidden_list[0].shape[0])
+        if predictive:
+            for _weights, ids, _ticket in routings:
+                if self.layer_id in cache.hot_expert_capacity and (
+                    cache.hot_adapt_enabled or cache.collect_stats or cache.collect_decode_freq
+                ):
+                    self._observe_hot_prefill(cache, ids.clone())
+                elif cache.collect_stats or cache.collect_decode_freq:
+                    cache.record_decode_frequency(self.layer_id, ids)
+            self._prefetch_next_overlap_layer(cache)
+            with stage_timer.span("disk_rows"):
+                for _weights, ids, ticket in routings:
+                    views = cache.layer_major_disk_views(self.layer_id, ids, ticket)
+            span = "expert_gemm_disk"
+        else:
+            with stage_timer.span("pinned_wait"):
+                views = self._wait_prefill_overlap(cache)
+            span = "expert_gemm_pinned"
+        hidden = torch.cat(hidden_list)
+        weights = torch.cat([routing[0] for routing in routings])
+        ids = torch.cat([routing[1] for routing in routings])
+        with stage_timer.span(span):
+            out = self._expert_gemm(
+                cache,
+                hidden,
+                weights,
+                ids,
+                views=views,
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
+        cache.release_prefill_layer(self.layer_id)
+        out = self._maybe_all_reduce(out)
+        return list(torch.split(out, [h.shape[0] for h in hidden_list]))
+
     def prefill_forward(
         self,
         hidden_states: torch.Tensor,

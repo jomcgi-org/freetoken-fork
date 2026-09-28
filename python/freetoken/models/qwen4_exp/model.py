@@ -182,6 +182,9 @@ class Qwen4ExpModel(BaseOP):
 
                 commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
 
+        import os
+
+        moe_tokens = int(os.environ.get("FREETOKEN_LAYER_MAJOR_MOE_TOKENS", "0") or 0)
         for layer_index, layer in enumerate(self.layers.op_list):
             if getattr(layer.mlp, "supports_layer_major_split", False):
                 # Pipeline within the layer: chunk c+1's attention and routing are
@@ -217,11 +220,45 @@ class Qwen4ExpModel(BaseOP):
                                 hidden, out, inject
                             )
 
-                attention(0)
-                for index in range(len(batches)):
-                    if index + 1 < len(batches):
-                        attention(index + 1)
-                    experts(index)
+                if moe_tokens > 0 and hasattr(layer.mlp, "finish_layer_major_batch"):
+                    # Expert batches: consecutive chunks up to moe_tokens share one
+                    # routed-expert GEMM. The next batch's attention is enqueued first.
+                    groups, current, size = [], [], 0
+                    for index, batch in enumerate(batches):
+                        tokens = int(batch.input_ids.numel())
+                        if current and size + tokens > moe_tokens:
+                            groups.append(current)
+                            current, size = [], 0
+                        current.append(index)
+                        size += tokens
+                    groups.append(current)
+
+                    def experts_batch(indices) -> None:
+                        with enter(batches[indices[-1]]):
+                            states = [pending.pop(index) for index in indices]
+                            with stage_timer.span("moe_finish"):
+                                outs = layer.mlp.finish_layer_major_batch(
+                                    [state[2] for state in states]
+                                )
+                            with stage_timer.span("mlp_combine"):
+                                for index, state, out in zip(indices, states, outs):
+                                    hiddens[index] = layer.mlp_hyper_connection.combine(
+                                        state[0], out, state[1]
+                                    )
+
+                    for index in groups[0]:
+                        attention(index)
+                    for position, indices in enumerate(groups):
+                        if position + 1 < len(groups):
+                            for index in groups[position + 1]:
+                                attention(index)
+                        experts_batch(indices)
+                else:
+                    attention(0)
+                    for index in range(len(batches)):
+                        if index + 1 < len(batches):
+                            attention(index + 1)
+                        experts(index)
             else:
                 for index, batch in enumerate(batches):
                     with enter(batch):
