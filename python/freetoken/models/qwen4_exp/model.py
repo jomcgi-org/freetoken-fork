@@ -237,9 +237,11 @@ class Qwen4ExpModel(BaseOP):
                         with enter(batches[indices[-1]]):
                             states = [pending.pop(index) for index in indices]
                             with stage_timer.span("moe_finish"):
-                                outs = layer.mlp.finish_layer_major_batch(
-                                    [state[2] for state in states]
-                                )
+                                outs = []
+                                for part in _fit_expert_batch(
+                                    layer.mlp, [state[2] for state in states]
+                                ):
+                                    outs.extend(layer.mlp.finish_layer_major_batch(part))
                             with stage_timer.span("mlp_combine"):
                                 for index, state, out in zip(indices, states, outs):
                                     hiddens[index] = layer.mlp_hyper_connection.combine(
@@ -271,6 +273,43 @@ class Qwen4ExpModel(BaseOP):
         del hiddens
         with enter(batches[-1]):
             return self.hyper_connection_mixer.mix(last)[0]
+
+
+_EXPERT_BATCH_MARGIN_BYTES = 768 << 20
+
+
+def _fit_expert_batch(mlp, prepared_list):
+    """Split an expert batch so its GEMM scratch fits the free GPU memory.
+
+    The routed-expert GEMM allocates top_k x (2I + I + H) activations per token plus
+    the concatenated input and output (H each), bf16. Free memory counts the CUDA
+    allocator's cached-but-unused blocks, which the GEMM reuses. A batch that does
+    not fit is halved until it does; a single chunk always runs as before.
+    """
+    if len(prepared_list) <= 1:
+        return [prepared_list]
+    experts = mlp.experts
+    hidden = prepared_list[0][2]
+    inter = getattr(experts, "intermediate_size_per_partition", None) or getattr(
+        experts, "intermediate_size", 0
+    )
+    per_token = 2 * (experts.top_k * (3 * inter + hidden) + 2 * hidden)
+    free, _total = torch.cuda.mem_get_info()
+    free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    budget = max(0, free - _EXPERT_BATCH_MARGIN_BYTES)
+
+    def fits(part) -> bool:
+        return sum(prepared[1] for prepared in part) * per_token <= budget
+
+    parts, stack = [], [prepared_list]
+    while stack:
+        part = stack.pop(0)
+        if len(part) > 1 and not fits(part):
+            middle = len(part) // 2
+            stack[:0] = [part[:middle], part[middle:]]
+        else:
+            parts.append(part)
+    return parts
 
 
 class Qwen4ExpForCausalLM(BaseLLMModel):
