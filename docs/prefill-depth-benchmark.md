@@ -672,3 +672,100 @@ warm-up, then three fresh 100k prompts 90 s apart,
 154.0, 97.3 and 93.2 s for the same sequence on the previous deployment. Shmem
 stayed at 27.26 GiB with no swap; prefill read about 60 GiB from NVMe per 100k
 request, most of it cold rows by direct I/O.
+
+## Prefill MoE kernel, tail chunk and PLE staging, 2026-09-29
+
+Three more changes on the layer-major build, each with exact parity on every
+depth row and continuation session. Cold 100k TTFT on the idle-gap protocol
+went from 45.5 s to about 24 s.
+
+### What changed
+
+1. **v2 prefill NVFP4 MoE kernel** (`1f2619e`, deployed). The v1 kernel loaded
+   the even and odd K columns of the activations as two stride-2 gathers and
+   decoded every e2m1 weight through a lookup-table load. v2 loads the
+   activations contiguously, splits the two nibble planes in registers, and
+   decodes e2m1 arithmetically (the magnitude bits form an fp16 pattern worth
+   value x 2^-14). The values and the order of both dots are unchanged, so the
+   output is bit-identical to v1. At the Qwen3.8-Flash expert shapes (512
+   experts, top-10) a 4096-token chunk takes 5.45 ms with 64x128 tiles, 4 warps
+   and 2 stages, against 16.1 ms for v1 at its best tiles. Batching the expert
+   GEMM across chunks (`FREETOKEN_LAYER_MAJOR_MOE_TOKENS`, `6631a9d`, off by
+   default) left the expert GEMM time unchanged with v2 (`lmkernel1`).
+2. **The final chunk joins the last group** (`d1b6e7a`). A 100k prompt split
+   into three 32,768-token groups and a 1,655-token tail. The tail ran
+   chunk-major and streamed every DISK layer's experts again: about 4-5 s for
+   2% of the tokens. The group budget may now be overrun by the prompt's final
+   chunk (at most one chunk); that group costs 0.5-0.8 s more.
+3. **PLE rows staged on a host thread** (`6839780`, then `06079df`). The uring
+   PLE backend hashed each chunk's n-grams on the GPU and read the row ids back
+   (`row_ids.cpu()`), which drained every queued kernel of the group once per
+   chunk while the host deduplicated and read the rows (16 row ids per token,
+   two small O_DIRECT reads per unique row). Each chunk is now hashed from the
+   host prompt (the tested host hash) and its rows read into a ring of slots in
+   the staging bank, above the rows ordinary fills use. The first version
+   staged one group at a time and only gained layers 0-1 of head start; the
+   request-level version plans every remaining chunk of the prompt, so the
+   next group's rows are read while the current group runs.
+
+### Group profile
+
+One 32k group with v2 (`lmple1`, torch profiler): 8.5 s wall, GPU kernels busy
+6.0 s. The prefill MoE kernel took 2.0 s (about 78 TFLOPS on the rows it
+computes), host-to-device copies 2.6 s (partly overlapped), dense bf16 GEMMs
+1.5 s, attention 0.4 s and GDN 0.3 s. PLE spans per group:
+
+| Build | PLE span, first group | PLE span, later groups | Group GPU time, later groups |
+| --- | ---: | ---: | ---: |
+| v2 (`lmple1`) | 1.8-2.3 s | 1.8-2.3 s | 9.0-9.6 s |
+| + tail join, group stager (`lmtrace7`) | 1.5-1.8 s | 1.5-1.8 s | 8.5-9.9 s |
+| + request stager (`lmtrace10`) | 1.5-1.8 s | 0.14-0.24 s | 7.1-7.9 s |
+
+The first group of a request still waits for its PLE rows: the reads are bound
+by IOPS, and the thread starts with the request. `fb1b1b6` reads the data and
+scale stores concurrently for large fills (`lmtrace11`, pending).
+
+### Idle-gap protocol
+
+Each pair runs in both orders. Cold 100k TTFT, mean of 3:
+
+| Run | First arm | Second arm |
+| --- | --- | --- |
+| `idlegap10` | v2 29.44 s | v1 45.60 s |
+| `idlegap11` | v1 45.50 s | v2 30.17 s |
+| `lmstage2` | tail + group stager 25.90 s | v2 29.64 s |
+| `lmstage3` | v2 29.54 s | tail + group stager 25.98 s |
+| `lmstage4` | tail + group stager 26.68 s | + request stager 23.93 s |
+
+The v1 arms run the v2 build with `FREETOKEN_NVFP4_PREFILL_KERNEL=v1` (v2's
+tiles). 32k cold TTFT: v1 14.4 s, v2 9.4-9.5 s, later builds 9.0-9.2 s. On the
+live-like driver (verify warm-up, then three fresh 100k prompts 90 s apart) v2
+ran 30.4 s against 45.8 s for v1 (`livelike9`).
+
+Continuation walls follow arm order: the first arm pays 105-120 s for session 1
+and the second 91-97 s, whatever the build. The tail and group-stager build
+also paid about 107-109 s as the second arm in `lmstage3`; its code does not
+run for the continuation prompts (about 2k tokens, one chunk), and `contab1`
+(alternating fresh servers, two passes each) is pending to settle it.
+
+### Tried: SwiGLU in the gate/up GEMM epilogue
+
+`562458a` (branch `dev/moe-swiglu-fusion`, not on this branch) computes the gate and up halves of the same columns in one program,
+rounds both to bf16 as the unfused kernel stores them, and applies flashinfer's
+act_and_mul instruction sequence (sm_89 fast-math SASS: FMUL.FTZ, MUFU.EX2,
+FADD.FTZ, MUFU.RCP, FMUL.FTZ) in inline PTX. It is bit-identical (all 65,536
+bf16 gate values against flashinfer, and whole MoE layers) but 1.5-2.3% slower
+than the separate pass (6.15 against 6.05 ms per 4096-token chunk), so it was
+left out. The expert GEMMs are
+compute-bound; a fused MoE megakernel could remove at most the activation,
+align and top-k sum kernels (about 0.15-0.25 s per 32k group), and the top-k
+sum cannot be fused without changing its summation order.
+
+### Deployment
+
+`1f2619e` (v2) is on the serving branch. The tail and PLE staging changes
+deploy after `contab1` and `lmstage5`.
+
+A node-4 hard hang at 15:40 UTC on 2026-09-28 (no panic record, journals
+closed uncleanly, idle between benchmark requests) interrupted the first run
+of these benchmarks; they were rerun after the reboot.
