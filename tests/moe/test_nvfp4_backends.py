@@ -561,6 +561,7 @@ def test_nvfp4_full_layer_prefill_keeps_direct_alignment_path(monkeypatch):
         lambda *_args: pytest.fail("full-layer prefill synchronized table bounds"),
     )
     monkeypatch.setattr(fused_nvfp4, "_prefill_gemm", lambda *_args: None)
+    monkeypatch.setattr(fused_nvfp4, "_prefill_gemm_swiglu", lambda *_args: None)
     monkeypatch.setattr(fused_nvfp4, "_run_act", lambda *_args: None)
     monkeypatch.setattr(
         fused_nvfp4, "moe_sum_reduce_triton", lambda _source, out: out.zero_()
