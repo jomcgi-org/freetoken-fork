@@ -398,10 +398,13 @@ def _swiglu_fused(activation: str, apply_router_weight_on_input: bool) -> bool:
 
     The epilogue reproduces flashinfer's act_and_mul instruction for instruction, so
     it only replaces that kernel; other activation backends keep the separate pass.
+    Opt-in (FREETOKEN_NVFP4_PREFILL_SWIGLU=fused): bit-identical, but on the 4090
+    at Qwen3.8-Flash shapes the two-accumulator tile measured 1.5-2.3% slower than
+    the separate GEMM and activation (6.15 vs 6.05 ms per 4096-token chunk).
     """
     if activation != "silu" or apply_router_weight_on_input:
         return False
-    if os.environ.get("FREETOKEN_NVFP4_PREFILL_SWIGLU", "fused") != "fused":
+    if os.environ.get("FREETOKEN_NVFP4_PREFILL_SWIGLU", "separate") != "fused":
         return False
     from freetoken.kernel.backend import is_flashinfer_installed
 

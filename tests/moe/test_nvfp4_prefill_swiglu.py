@@ -18,12 +18,14 @@ def test_fusion_is_limited_to_silu_without_input_weighting(monkeypatch):
     from freetoken.moe import fused_nvfp4 as F
 
     monkeypatch.setattr("freetoken.kernel.backend.is_flashinfer_installed", lambda: True)
+    assert not F._swiglu_fused("silu", False)  # opt-in
+    monkeypatch.setenv("FREETOKEN_NVFP4_PREFILL_SWIGLU", "fused")
     assert F._swiglu_fused("silu", False)
     assert not F._swiglu_fused("silu", True)
     assert not F._swiglu_fused("swigluoai", False)
     monkeypatch.setenv("FREETOKEN_NVFP4_PREFILL_SWIGLU", "separate")
     assert not F._swiglu_fused("silu", False)
-    monkeypatch.delenv("FREETOKEN_NVFP4_PREFILL_SWIGLU")
+    monkeypatch.setenv("FREETOKEN_NVFP4_PREFILL_SWIGLU", "fused")
     monkeypatch.setattr("freetoken.kernel.backend.is_flashinfer_installed", lambda: False)
     assert not F._swiglu_fused("silu", False)
 
