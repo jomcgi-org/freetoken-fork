@@ -113,3 +113,32 @@ phases. Re-chunking can change floating-point results; these JSON-copy answers
 matched exactly, but that is not broad quality equivalence. See the
 [full protocol, depth results and continuation checks](prefill-depth-benchmark.md)
 for configuration details, fidelity checks and remaining qualification work.
+
+## CPU MoE decode workers, 2026-09-29
+
+The DISK layers' cold experts run on the CPU (W4A8). In isolation the kernel
+streams about 55 GB/s on the 7800X3D (one CCD, so the Infinity Fabric link caps
+reads near 60 GB/s), the same at 8, 14 or 16 workers and with 4 KB or 2 MB
+pages. In serving, 14 workers (8 cores plus 6 SMT siblings) reached only about
+13.5 GB/s. `perf` on the worker CPUs showed about 40% of cycles spinning in the
+pass barrier, waiting for workers stalled on DISK-bank page faults (about 450
+major faults per token). With 8 workers, one per physical core, the kernel ran at
+about 21 GB/s and the decode step fell from about 55 to 44 ms.
+
+Outputs are bit-identical across worker counts (1, 2, 8, 14 and 16 at batch 1
+and 2). The `threads8q` qualification ran the continuation workload and the
+live-like depth rows in ABBA order (14, 8, 8, 14 workers); every arm matched
+the parity references.
+
+| Workers | Continuation sessions (s) | 100k cold TTFT | 100k-row decode | Warm decode |
+| --- | --- | ---: | ---: | ---: |
+| 14 (1st) | 112.1 / 83.2 / 80.5 | 21.69 s | 15.1 tok/s | 22.8 tok/s |
+| 8 (2nd) | 95.1 / 64.8 / 62.2 | 21.84 s | 15.6 tok/s | 25.1 tok/s |
+| 8 (3rd) | 113.0 / 66.2 / 57.8 | 21.65 s | 18.1 tok/s | 25.9 tok/s |
+| 14 (4th) | 103.2 / 70.6 / 66.6 | 21.97 s | 13.6 tok/s | 23.6 tok/s |
+
+Across the bracket, 8 workers cut continuation wall by about 11% (17% on the
+warm second and third sessions) and raised decode 10-17%, with prefill
+unchanged. The serve script now passes `--moe-cpu-threads 8`. The remaining
+CPU-side cost is the page-fault stalls and about 6 ms per step of worker wake
+and GIL-bound WILLNEED callback.
