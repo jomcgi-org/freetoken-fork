@@ -285,6 +285,9 @@ class UringTable:
         self.format = source.format
         self.scale = source.weight_scale
         self._capacity = capacity
+        # Rows [0, required) serve ordinary chunk and decode fills; the rest of the
+        # bank holds layer-major prefill slots staged ahead of their forward.
+        self._required_rows = int(required_capacity_rows)
         self._bounce_nbytes = bounce_nbytes
         self._rows_per_shard = source.data.rows_per_extent
         self._device = device or (
@@ -545,19 +548,21 @@ class UringTable:
         return inverse.to(row_ids.device)
 
     def prefill_slots(self, rows: int) -> int:
-        """How many prefill chunks of ``rows`` row ids fit side by side in the bank."""
-        return self._capacity // rows if rows > 0 else 0
+        """How many prefill chunks of ``rows`` row ids fit in the slot region, the
+        rows above those ordinary chunk and decode fills use."""
+        return (self._capacity - self._required_rows) // rows if rows > 0 else 0
 
     def stage_prefill_slot(
         self, row_ids: torch.Tensor, slot: int, slot_rows: int, out: torch.Tensor
     ) -> torch.Tensor:
-        """Read one prefill chunk's unique rows into bank slot ``slot`` from host ids.
+        """Read one prefill chunk's unique rows into slot ``slot`` from host ids.
 
-        Writes the chunk's bank-local ids into ``out`` (host, row_ids' shape) and
+        Slots lie above the rows ordinary fills use, so they may be staged while
+        other forwards run. Writes the chunk's bank-local ids into ``out`` (host, row_ids' shape) and
         returns that view. Staging a slot while a gather still reads it is the
         caller's to prevent; other slots are untouched.
         """
-        base = int(slot) * int(slot_rows)
+        base = self._required_rows + int(slot) * int(slot_rows)
         if base + slot_rows > self._capacity:
             raise ValueError(f"PLE uring slot {slot} x {slot_rows} exceeds {self._capacity} rows")
         _unique, inverse = self._stage_rows(row_ids, phase="prefill", base=base, limit=slot_rows)

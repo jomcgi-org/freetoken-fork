@@ -164,10 +164,24 @@ class Qwen4ExpModel(BaseOP):
                 hiddens.append(
                     self.embed_tokens.forward(batch.input_ids).repeat(1, self.hc_count)
                 )
-        stager = _PleGroupStager.create(self._ple[0], batches) if self._ple else None
+        # The request's PLE stager outlives the group: it stages later groups' chunks
+        # while this group runs. A new request (or an unplanned chunk) replaces it.
+        stager = getattr(self, "_ple_stager", None)
+        if stager is not None and stager.index_of(batches[0]) is None:
+            stager.close()
+            stager = None
+        if stager is None and self._ple:
+            stager = _PleRequestStager.create(self._ple[0], batches)
+        self._ple_stager = stager
+        staged = {}
+
+        def drop_stager():
+            nonlocal stager
+            if stager is not None:
+                stager.close()
+            stager = self._ple_stager = None
 
         def run_ple(layer, batch, index):
-            nonlocal stager
             if layer.ple is None:
                 return None
             # PLE runs per chunk: a chunk's n-gram context is the previous chunk's
@@ -178,14 +192,16 @@ class Qwen4ExpModel(BaseOP):
             meta = build_ple_metadata(batch, layer.ple.args, batch.input_ids.device)
             if stager is not None:
                 try:
-                    token, local_ids = stager.take(index)
+                    planned, token, local_ids = stager.take(batch)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning_rank0(
-                        "Layer-major PLE staging failed (%r); staging on the forward path", exc
-                    )
-                    stager.close()
-                    stager = None
+                    if not isinstance(exc, _PleStageMismatch):
+                        logger.warning_rank0(
+                            "Layer-major PLE staging failed (%r); staging on the forward path",
+                            exc,
+                        )
+                    drop_stager()
                 else:
+                    staged[index] = planned
                     layer.ple._pending = (meta, token)
                     layer.ple.ple_embedding.table.use_prefill_ids(token, local_ids)
                     return meta
@@ -196,8 +212,8 @@ class Qwen4ExpModel(BaseOP):
             if meta is not None:
                 from .ple import commit_ngram_context
 
-                if stager is not None:
-                    stager.release(index)
+                if stager is not None and index in staged:
+                    stager.release(staged.pop(index))
                 commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
 
         import os
@@ -288,9 +304,11 @@ class Qwen4ExpModel(BaseOP):
                             commit_ple(meta, batch, index)
                 if after_layer is not None:
                     after_layer(layer_index)
-        finally:
-            if stager is not None:
-                stager.close()
+        except BaseException:
+            drop_stager()
+            raise
+        if stager is not None and stager.finished:
+            drop_stager()
         last = hiddens[-1]
         del hiddens
         with enter(batches[-1]):
@@ -304,71 +322,110 @@ class _Ran:
         return None
 
 
-class _PleGroupStager:
-    """Stage a layer-major group's PLE rows on a host thread, ahead of the GPU.
+class _PleStageMismatch(RuntimeError):
+    """A chunk is not one the request stager planned (its range differs)."""
+
+
+class _PleRequestStager:
+    """Stage a request's layer-major PLE rows on a host thread, ahead of the GPU.
 
     The forward path hashes a chunk's n-grams on the GPU and reads the row ids back,
     which drains every queued kernel of the group each chunk. Here a thread hashes
-    each chunk from its host tokens (the same hash, ``host_prefill_row_ids``) and
-    reads its unique rows into one of up to ``MAX_SLOTS`` bank slots while earlier
-    layers run. Chunk i's slot is restaged for chunk i + slots only after the event
-    recorded behind chunk i's gather, so a gather never reads a slot being rewritten.
+    each chunk from the host prompt (the same hash, ``host_prefill_row_ids``) and
+    reads its unique rows into a ring of bank slots. The thread plans every
+    remaining chunk of the request, so a later group's rows are read while earlier
+    groups run. Chunk j's slot is restaged for chunk j + slots only after the event
+    recorded behind chunk j's gather, so a gather never reads a slot being
+    rewritten; the slots lie above the rows other forwards fill.
     """
 
-    MAX_SLOTS = 4
+    MAX_SLOTS = 16
 
     @classmethod
-    def create(cls, ple, batches) -> "_PleGroupStager | None":
+    def create(cls, ple, batches) -> "_PleRequestStager | None":
         import os
 
         if os.environ.get("FREETOKEN_LAYER_MAJOR_PLE_STAGE", "1") == "0":
             return None
         embedding = ple.ple_embedding
         table = getattr(embedding, "_table", None)
+        prompt = getattr(batches[0], "prompt_ids", None)
         if (
-            not torch.cuda.is_available()
+            prompt is None
+            or not torch.cuda.is_available()
             or not hasattr(table, "stage_prefill_slot")
             or getattr(embedding, "_host_hash_constants", None) is None
-            or len(batches) < 2
+            or any(len(batch.reqs) != 1 for batch in batches)
         ):
             return None
-        tokens = max(int(batch.input_ids.numel()) for batch in batches)
+        step = max(int(batch.reqs[0].extend_len) for batch in batches)
         heads = int(table.local_ids.shape[1])
-        slots = min(cls.MAX_SLOTS, table.prefill_slots(tokens * heads))
+        slots = min(cls.MAX_SLOTS, table.prefill_slots(step * heads))
         if slots < 2:
             return None
-        return cls(embedding, table, batches, tokens, heads, slots)
+        first = batches[0].reqs[0]
+        return cls(
+            embedding, table, prompt, first.uid, int(first.cached_len), step, heads,
+            slots, batches[0].input_ids.device,
+        )
 
     def __init__(
-        self, embedding, table, batches, tokens: int, heads: int, slots: int
+        self, embedding, table, prompt, uid, start: int, step: int, heads: int,
+        slots: int, device,
     ) -> None:
         import threading
 
         self._embedding = embedding
         self._table = table
-        self._reqs = [getattr(b, "padded_reqs", None) or b.reqs for b in batches]
-        self._tokens = tokens
-        self._slot_rows = tokens * heads
+        self._prompt = torch.as_tensor(prompt, device="cpu")
+        self._uid = uid
+        self._start = start
+        self._step = step
+        self._slot_rows = step * heads
         self._slots = slots
-        self._device = batches[0].input_ids.device
+        self._device = torch.device(device)
+        total = int(self._prompt.numel())
+        self._ranges = [(b, min(b + step, total)) for b in range(start, total, step)]
         cuda = self._device.type == "cuda"
         self._out = [
-            torch.empty((tokens, heads), dtype=torch.int64, pin_memory=cuda)
+            torch.empty((step, heads), dtype=torch.int64, pin_memory=cuda)
             for _ in range(slots)
         ]
-        count = len(batches)
+        count = len(self._ranges)
         self._results: list = [None] * count
         self._ready = [threading.Event() for _ in range(count)]
         self._released = [threading.Event() for _ in range(count)]
         self._done: list = [None] * count
+        self._taken = 0
         self._stop = False
         self._inference = torch.is_inference_mode_enabled()
-        self._thread = threading.Thread(target=self._run, name="ple-group-stager", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="ple-request-stager", daemon=True)
         self._thread.start()
 
+    def index_of(self, batch) -> int | None:
+        """The planned chunk index of ``batch``, or None if it is not a planned chunk."""
+        (req,) = batch.reqs
+        if req.uid != self._uid:
+            return None
+        begin, end = int(req.cached_len), int(req.device_len)
+        offset = begin - self._start
+        if offset < 0 or offset % self._step:
+            return None
+        index = offset // self._step
+        if index >= len(self._ranges) or self._ranges[index] != (begin, end):
+            return None
+        return index
+
+    @property
+    def finished(self) -> bool:
+        """Every planned chunk's gather has been enqueued."""
+        return self._released[-1].is_set() if self._released else True
+
     def _run(self) -> None:
+        from types import SimpleNamespace
+
         with torch.inference_mode(self._inference):
-            for index, reqs in enumerate(self._reqs):
+            for index, (begin, end) in enumerate(self._ranges):
                 previous = index - self._slots
                 if previous >= 0:
                     self._released[previous].wait()
@@ -378,7 +435,10 @@ class _PleGroupStager:
                 if self._stop:
                     return
                 try:
-                    ids = self._embedding.host_prefill_row_ids(reqs, self._tokens)
+                    chunk = SimpleNamespace(
+                        input_ids=self._prompt[:end], cached_len=begin, device_len=end
+                    )
+                    ids = self._embedding.host_prefill_row_ids([chunk], self._step)
                     slot = index % self._slots
                     self._results[index] = self._table.stage_prefill_slot(
                         ids, slot, self._slot_rows, self._out[slot]
@@ -393,13 +453,22 @@ class _PleGroupStager:
             self._results[later] = exc
             self._ready[later].set()
 
-    def take(self, index: int):
-        """The chunk's lookup token and bank-local ids, copied to the device."""
+    def take(self, batch):
+        """The chunk's index, lookup token and bank-local ids (copied to the device)."""
+        index = self.index_of(batch)
+        if index is None:
+            raise _PleStageMismatch(f"chunk {batch.reqs[0]} was not planned")
+        # Planned chunks that ran outside a group never gather from their slot.
+        for skipped in range(self._taken, index):
+            if not self._released[skipped].is_set():
+                self._done[skipped] = _Ran()
+                self._released[skipped].set()
+        self._taken = max(self._taken, index + 1)
         self._ready[index].wait()
         result = self._results[index]
         if isinstance(result, BaseException):
             raise result
-        return object(), result.to(self._device, non_blocking=True)
+        return index, object(), result.to(self._device, non_blocking=True)
 
     def release(self, index: int) -> None:
         """Mark chunk ``index``'s gather enqueued; its slot frees once it has run."""
@@ -412,8 +481,7 @@ class _PleGroupStager:
         self._released[index].set()
 
     def close(self) -> None:
-        """Stop the thread and wait for every enqueued gather, so later forwards
-        (decode stages its rows at the bank's start) may reuse the slots."""
+        """Stop the thread and wait for every enqueued gather."""
         self._stop = True
         for event in self._released:
             event.set()

@@ -1820,6 +1820,14 @@ class Scheduler(SchedulerIOMixin):
         budget = int(self.config.prefill_layer_major_tokens)
         group = [first]
         tokens = first.batch.reqs[0].extend_len
+        # The whole prompt, so the model can stage per-chunk host work (PLE rows)
+        # for this group's and later groups' chunks ahead of their forwards.
+        pending = self.prefill_manager.pending_list
+        prompt_ids = (
+            pending[0].input_ids
+            if len(pending) == 1 and pending[0].chunked_req is first.batch.reqs[0]
+            else first.batch.reqs[0].input_ids
+        )
         while True:
             req = group[-1].batch.reqs[0]
             if not isinstance(req, ChunkedReq) or getattr(req, "cache_anchor_persistable", False):
@@ -1856,6 +1864,8 @@ class Scheduler(SchedulerIOMixin):
             tokens += batch.reqs[0].extend_len
         if len(group) == 1:
             return None
+        for forward_input in group:
+            forward_input.batch.prompt_ids = prompt_ids
         return group
 
     def _run_layer_major_group(self, group: list[ForwardInput]) -> list | None:
