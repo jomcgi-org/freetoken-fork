@@ -1809,7 +1809,8 @@ class Scheduler(SchedulerIOMixin):
         Each chunk is scheduled and prepared exactly as chunk-major serving would
         (page allocation, attention, GDN and track metadata), from the lengths the
         previous chunk's forward launch would leave behind. The group
-        stops at the token budget, at the prompt's final chunk, and at a chunk that
+        stops at the token budget (which the prompt's final chunk may overrun by one
+        chunk), at the prompt's final chunk, and at a chunk that
         persists an intermediate harness root: that snapshot's ping-pong slot is
         rewritten two chunks later, so it must drain before the group continues.
         Returns None when no second chunk joins, leaving the ordinary path unchanged.
@@ -1831,7 +1832,11 @@ class Scheduler(SchedulerIOMixin):
             long_chunk = getattr(self.prefill_manager, "long_chunk", 0)
             if long_chunk > 0:
                 next_chunk = min(next_chunk, long_chunk)
-            if remaining <= 0 or tokens + next_chunk > budget:
+            # The prompt's final chunk may overrun the budget by up to one chunk:
+            # left for a group of its own it would stream every DISK layer's experts
+            # again for a few thousand tokens.
+            final = next_chunk == remaining
+            if remaining <= 0 or (tokens + next_chunk > budget and not final):
                 break
             # The continuation is built from the advanced lengths, exactly as overlap
             # scheduling builds it after the previous forward launched. Restore them
