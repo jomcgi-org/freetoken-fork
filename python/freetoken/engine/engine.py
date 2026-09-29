@@ -1652,11 +1652,14 @@ class Engine:
         profile_group = int(os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE_GROUP", "3"))
         profiler = None
         if profile_dir and self._layer_major_groups == profile_group:
+            stacks = os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE_STACK", "0") == "1"
             profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                     torch.profiler.ProfilerActivity.CUDA,
-                ]
+                ],
+                record_shapes=stacks,
+                with_stack=stacks,
             )
             profiler.__enter__()
             profile_begin = torch.cuda.Event(enable_timing=True)
@@ -1746,6 +1749,13 @@ class Engine:
         path = Path(directory) / f"layer-major-profile-{os.getpid()}-{self._layer_major_groups}.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
         table = profiler.key_averages().table(sort_by="cuda_time_total", row_limit=60)
+        if os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE_STACK", "0") == "1":
+            table += "\n\nBy input shape:\n" + profiler.key_averages(
+                group_by_input_shape=True
+            ).table(sort_by="self_cuda_time_total", row_limit=60)
+            table += "\n\nBy stack:\n" + profiler.key_averages(
+                group_by_stack_n=8
+            ).table(sort_by="self_cuda_time_total", row_limit=80)
         path.write_text(
             f"chunks={len(batches)} tokens={tokens} group_wall_ms={wall_ms:.0f} "
             f"kernel_busy_ms={busy / 1000:.0f} kernels={len(kernels)}\n\n" + table
