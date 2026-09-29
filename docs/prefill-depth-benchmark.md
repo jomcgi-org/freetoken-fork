@@ -818,6 +818,26 @@ to the GPU a layer ahead would remove most of that wait, but it changes which
 experts run on the GPU (W4A16) and the CPU (W4A8), so it needs a new parity
 reference.
 
+### Predicting cold experts
+
+`FREETOKEN_ROUTE_DUMP` (eager decode, `--cuda-graph-max-bs 0`) recorded each
+layer's router input and logits for about 3,800 decode steps of the
+continuation workload (`routedump1`); `scripts/routedump-analyze.py` measures
+how many of a DISK layer's cold routes (experts not HOT) a fetch of F predicted
+experts would cover. There are 3.2 cold routes per DISK layer per token.
+
+| Predictor | F=1 | F=2 | F=4 | F=8 | F=16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| next layer's router on the previous layer's router input | 9.8% | 17.3% | 28.5% | 42.8% | 58.9% |
+| previous token's cold experts at the layer | 3.1% | 5.2% | 7.6% | 8.9% | 9.0% |
+
+Fetching predicted cold experts to the GPU does not pay here: half the cold
+routes need about 10 experts (about 28 MB per layer over PCIe, slower than the
+layer's 0.9 ms today), and a layer still waits on the CPU while any cold route is
+uncovered. The lever that remains is the CPU round trip itself: a DISK layer
+takes 0.9 ms against 0.16 ms for a GPU-resident layer, of which the CPU expert
+compute is 0.29 ms.
+
 ### Kernel probes
 
 - Tile sweep of the v2 prefill MoE kernel (`moebench/bench_tiles2.py`, 105

@@ -11,6 +11,11 @@ from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
 if TYPE_CHECKING:
     from freetoken.models.config import ModelConfig
 
+from .route_dump import _RECORDER as _ROUTE_RECORDER
+from .route_dump import maybe_record
+
+_route_dump = maybe_record if _ROUTE_RECORDER is not None else None
+
 
 class Qwen4ExpMoE(Qwen3_5MoE):
     """Qwen3_5MoE with the shared-expert gate on triton instead of gemv + sigmoid + mul + add.
@@ -68,6 +73,8 @@ class Qwen4ExpMoE(Qwen3_5MoE):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         router_logits = self.gate.forward(hidden_states)
+        if _route_dump is not None:
+            _route_dump(getattr(self.experts, "layer_id", None), self, hidden_states, router_logits)
         shared = self.shared_expert.forward(hidden_states)
         gate = shared_gate_sigmoid(hidden_states, self.shared_expert_gate.weight.view(-1))
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
