@@ -24,6 +24,7 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
     _e2m1_lut,
     _prefill_nvfp4_moe_kernel,
     _prefill_nvfp4_moe_kernel_v2,
+    _prefill_nvfp4_moe_swiglu_kernel,
 )
 from freetoken.layers import (
     gelu_and_mul,
@@ -392,6 +393,59 @@ def _prefill_gemm(
     )
 
 
+def _swiglu_fused(activation: str, apply_router_weight_on_input: bool) -> bool:
+    """Whether the gate/up GEMM applies the SwiGLU in its epilogue.
+
+    The epilogue reproduces flashinfer's act_and_mul instruction for instruction, so
+    it only replaces that kernel; other activation backends keep the separate pass.
+    """
+    if activation != "silu" or apply_router_weight_on_input:
+        return False
+    if os.environ.get("FREETOKEN_NVFP4_PREFILL_SWIGLU", "fused") != "fused":
+        return False
+    from freetoken.kernel.backend import is_flashinfer_installed
+
+    return is_flashinfer_installed()
+
+
+def _prefill_gemm_swiglu(
+    a: torch.Tensor,
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    glob: torch.Tensor,
+    c: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    num_valid_tokens: int,
+    top_k: int,
+    cfg: Dict[str, Any],
+) -> None:
+    inter = packed.shape[1] // 2
+    K = packed.shape[2] * 2
+    EM = sorted_ids.shape[0]
+    scale = e4m3_kernel_view(scale)
+    # Two accumulators per program: half the N tile keeps the register footprint of
+    # the unfused GEMM. BLOCK_SIZE_M (token alignment) and BLOCK_SIZE_KB (summation
+    # order) are the unfused GEMM's, so every output bit is the same.
+    fused = dict(cfg, BLOCK_SIZE_N=max(16, cfg["BLOCK_SIZE_N"] // 2))
+    grid = lambda META: (  # noqa: E731
+        triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(inter, META["BLOCK_SIZE_N"]),
+    )
+    _prefill_nvfp4_moe_swiglu_kernel[grid](
+        a, packed, scale, glob, c, sorted_ids, expert_ids, num_tokens_post_padded,
+        inter, K, EM, num_valid_tokens,
+        a.stride(0), a.stride(1),
+        packed.stride(0), packed.stride(1), packed.stride(2),
+        scale.stride(0), scale.stride(1), scale.stride(2),
+        glob.stride(0), glob.stride(1),
+        c.stride(0), c.stride(1),
+        top_k=top_k,
+        compute_type=_tl_dtype(c.dtype),
+        **fused,
+    )
+
+
 def fused_experts_nvfp4(
     hidden_states: torch.Tensor,
     gate_up_packed: torch.Tensor,
@@ -443,14 +497,20 @@ def fused_experts_nvfp4(
     tw = topk_weights.reshape(-1).contiguous()
     num_valid = topk_ids.numel()
 
-    ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
-    _prefill_gemm(
-        hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1,
-        tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
-        apply_router_weight_on_input, cfg,
-    )
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    _run_act(activation, ic1.view(-1, two_i), ic2, act_alpha, act_limit)
+    if _swiglu_fused(activation, apply_router_weight_on_input):
+        _prefill_gemm_swiglu(
+            hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic2,
+            sorted_ids, expert_ids, ntpp, num_valid, top_k, cfg,
+        )
+    else:
+        ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
+        _prefill_gemm(
+            hidden_states, gate_up_packed, gate_up_scale, gate_up_global, ic1,
+            tw, sorted_ids, expert_ids, ntpp, num_valid, top_k,
+            apply_router_weight_on_input, cfg,
+        )
+        _run_act(activation, ic1.view(-1, two_i), ic2, act_alpha, act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(
         ic2, down_packed, down_scale, down_global, ic3,
