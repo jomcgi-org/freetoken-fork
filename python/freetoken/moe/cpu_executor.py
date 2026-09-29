@@ -17,6 +17,7 @@ the subsequent capture embeds in its host/memcpy nodes.
 
 from __future__ import annotations
 
+import ctypes
 import mmap
 import os
 import queue
@@ -61,6 +62,8 @@ _WILLNEED_FAULT_WINDOW_STEPS = 64
 _WILLNEED_GUARD_HOLD_STEPS = 256
 # Decode steps between pre-gating stat log lines (--moe-disk-pregate-experts).
 _PREGATE_LOG_STEPS = 512
+# Evenly spaced pages sampled per bank row before a full-row mincore (0 = always full).
+_PREGATE_PROBE_PAGES = int(os.environ.get("FREETOKEN_PREGATE_PROBE_PAGES", "4"))
 
 # MoeTask::num_tokens and CpuMoeExecutor::create_task use a signed C++ int.
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
@@ -499,6 +502,7 @@ class CpuMoeExecutor:
         self._pregate_stop = False
         self._pregate_warned = False
         self._pregate_steps = 0
+        self._pregate_vec = None
         self._reset_pregate_stats()
         for layer_id, banks in self._disk_banks.items():
             pagers = {getattr(bank, "_pager", None) for bank in banks}
@@ -1488,23 +1492,44 @@ class CpuMoeExecutor:
             self._pregate_stale_hits += sum(1 for e in stale if e in predicted)
 
     def _pregate_advise(self, layer_id: int, ids: list[int], seq: int) -> None:
-        """Background-thread body for one prediction: filter, then WILLNEED."""
+        """Background-thread body for one prediction: WILLNEED its uncached pages.
+
+        Residency is checked with ``mincore`` rather than the recency heuristic of
+        ``--moe-cpu-willneed recent``: recently used rows are evicted often enough
+        under page-cache pressure that they dominate decode major faults.
+        """
         if seq != self._pregate_seq[layer_id]:
             self._pregate_late += 1
             return
-        if getattr(self, "_moe_cpu_willneed", "always") == "recent":
-            step = self._willneed_layer_steps[layer_id]
-            last = self._willneed_last_touch[layer_id]
-            window = self._willneed_recent_steps
-            keep = [e for e in ids if step - last[e] >= window]
-            self._pregate_recent_skips += len(ids) - len(keep)
-            ids = keep
         if not ids:
             return
+        banks = self._disk_banks[layer_id]
         started = time.perf_counter_ns()
-        pages = self._advise_rows(self._disk_banks[layer_id], ids)
+        pages = 0
+        missing: set[int] = set()
+        by_pager: dict[object, list] = {}
+        for bank in banks:
+            pager = getattr(bank, "_pager", None)
+            if pager is not None:
+                by_pager.setdefault(pager, []).append(bank)
+                continue
+            probe = getattr(bank, "prefetch_nonresident_rows", None)
+            if probe is None:
+                pages += bank.prefetch_experts(ids)
+                missing.update(ids)
+                continue
+            need = bank.tensor.stride(0) * bank.tensor.element_size() // 4096 + 2
+            if self._pregate_vec is None or len(self._pregate_vec) < need:
+                self._pregate_vec = (ctypes.c_char * need)()
+            bank_pages, bank_missing = probe(ids, self._pregate_vec, _PREGATE_PROBE_PAGES)
+            pages += bank_pages
+            missing.update(bank_missing)
+        for pager, pager_banks in by_pager.items():
+            pages += pager.prefetch(pager_banks, ids)
+            missing.update(ids)
         self._pregate_advise_ns += time.perf_counter_ns() - started
-        self._pregate_advised += len(ids)
+        self._pregate_checked += len(ids)
+        self._pregate_advised += len(missing)
         self._pregate_pages += pages
         if seq != self._pregate_seq[layer_id]:
             self._pregate_finished_late += 1
@@ -1515,9 +1540,9 @@ class CpuMoeExecutor:
         self._pregate_stale_routes = 0
         self._pregate_stale_hits = 0
         self._pregate_advised = 0
+        self._pregate_checked = 0
         self._pregate_pages = 0
         self._pregate_advise_ns = 0
-        self._pregate_recent_skips = 0
         self._pregate_late = 0
         self._pregate_finished_late = 0
         self._pregate_window_steps = 0
@@ -1536,9 +1561,9 @@ class CpuMoeExecutor:
                 if self._pregate_stale_routes else 0.0
             ),
             "nonrecent_experts_per_step": self._pregate_stale_routes / steps,
-            "advised_experts_per_step": self._pregate_advised / steps,
+            "checked_experts_per_step": self._pregate_checked / steps,
+            "missing_experts_per_step": self._pregate_advised / steps,
             "advised_mib_per_step": self._pregate_pages * 4096 / 2**20 / steps,
-            "recent_skips_per_step": self._pregate_recent_skips / steps,
             "advise_us_per_step": self._pregate_advise_ns / 1000 / steps,
             "late_drops": self._pregate_late,
             "finished_late": self._pregate_finished_late,

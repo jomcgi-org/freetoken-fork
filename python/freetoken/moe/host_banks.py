@@ -179,6 +179,48 @@ def _aligned_anonymous_mapping(length: int) -> tuple[mmap.mmap, memoryview, int]
     return raw, memoryview(raw)[offset:offset + length], address
 
 
+_LIBC_CACHED = None
+
+
+def _libc():
+    global _LIBC_CACHED
+    if _LIBC_CACHED is None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mincore.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
+        libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+        _LIBC_CACHED = libc
+    return _LIBC_CACHED
+
+
+def _nonresident_page_runs(address: int, npages: int, vec) -> list[tuple[int, int]]:
+    """``mincore`` one page-aligned span; return (first_page, count) runs not cached."""
+    if _libc().mincore(address, npages * _BLK, vec):
+        err = ctypes.get_errno()
+        raise OSError(err, f"mincore({npages} pages): {os.strerror(err)}")
+    state = bytes(vec[:npages])
+    runs: list[tuple[int, int]] = []
+    pos = state.find(b"\x00")
+    while pos >= 0:
+        end = pos
+        while end < npages and not state[end] & 1:
+            end += 1
+        runs.append((pos, end - pos))
+        pos = state.find(b"\x00", end)
+    return runs
+
+
+def _sampled_pages_resident(address: int, npages: int, samples: int, vec) -> bool:
+    """True when ``samples`` evenly spaced pages of a span are all in the page cache."""
+    libc = _libc()
+    for i in range(samples):
+        page = (i * (npages - 1)) // max(1, samples - 1)
+        if libc.mincore(address + page * _BLK, _BLK, vec):
+            return False
+        if not bytes(vec[:1])[0] & 1:
+            return False
+    return True
+
+
 def _madvise(address: int, length: int, advice: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.madvise(
@@ -1029,6 +1071,47 @@ class HostBank:
             )
             pages += (advise_end - advise_start + _BLK - 1) // _BLK
         return pages
+
+    def prefetch_nonresident_rows(
+        self, row_ids, vec, probe_pages: int = 0
+    ) -> tuple[int, list[int]]:
+        """``MADV_WILLNEED`` only the uncached pages of selected rows.
+
+        Checks page-cache residency with ``mincore`` first, so fully cached rows cost
+        one cheap syscall and no readahead walk. ``vec`` is a reusable byte buffer of
+        at least one row's page count (+2). ``probe_pages`` > 0 first samples that
+        many evenly spaced pages per row and skips rows whose samples are all cached
+        (page-cache eviction of an expert row is rarely partial; a full-row mincore
+        costs ~60 ns per page). Returns (pages advised, rows with a miss).
+        Non-DISK and UFFD banks are skipped (their residency is managed elsewhere).
+        """
+        if not self._disk or self._uffd:
+            return 0, []
+        stride = self.tensor.stride(0) * self.tensor.element_size()
+        pages = 0
+        rows: list[int] = []
+        for raw in row_ids:
+            row = int(raw)
+            if row < 0 or (row + 1) * stride > self.nbytes:
+                continue
+            lo = self._view_offset + row * stride
+            first = lo // _BLK
+            npages = (lo + stride + _BLK - 1) // _BLK - first
+            base = self._mapping_addr + first * _BLK
+            if probe_pages and npages > probe_pages and _sampled_pages_resident(
+                base, npages, probe_pages, vec
+            ):
+                continue
+            runs = _nonresident_page_runs(base, npages, vec)
+            if not runs:
+                continue
+            rows.append(row)
+            for start, count in runs:
+                if _libc().madvise(base + start * _BLK, count * _BLK, mmap.MADV_WILLNEED):
+                    err = ctypes.get_errno()
+                    raise OSError(err, f"madvise({count} pages): {os.strerror(err)}")
+                pages += count
+        return pages, rows
 
     def prefetch_experts(self, expert_ids) -> int:
         """Compatibility name for expert-bank row prefetching."""

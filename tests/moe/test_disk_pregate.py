@@ -48,6 +48,7 @@ def _executor(disk_layers=(0, 2, 5), *, experts=8, hidden=4, fetch=2, max_tokens
     executor._pregate_stop = False
     executor._pregate_warned = False
     executor._pregate_steps = 0
+    executor._pregate_vec = None
     executor._reset_pregate_stats()
     return executor
 
@@ -128,7 +129,7 @@ def test_callback_forwards_prediction_and_scores_it_at_the_target_layer():
     assert executor._disk_banks[2][0].calls == [[3, 6], [3, 4]]
 
 
-def test_recent_mode_skips_recently_touched_predictions_and_scores_nonrecent():
+def test_recent_mode_scores_nonrecent_and_advises_by_residency_not_recency():
     executor = _executor()
     executor._pregate_next = {0: 2}
     executor._pregate_host = torch.full((6, 1, 2), -1, dtype=torch.int32)
@@ -143,11 +144,22 @@ def test_recent_mode_skips_recently_touched_predictions_and_scores_nonrecent():
     executor._willneed_advised_experts = 0
     executor._willneed_last_touch[2][3] = 9  # recently used at layer 2
 
+    class ProbeBank(_Bank):
+        tensor = torch.zeros(8, 1024, dtype=torch.uint8)
+
+        def prefetch_nonresident_rows(self, row_ids, vec, probe_pages=0):
+            self.calls.append(list(row_ids))
+            return 5, [6]  # expert 6 had uncached pages
+
+    executor._disk_banks[2] = [ProbeBank()]
     executor._pregate_host[0, 0] = torch.tensor([3, 6], dtype=torch.int32)
     executor.prefetch_experts(0, torch.tensor([[1, -1]], dtype=torch.int32))
     executor._pregate_advise(*executor._pregate_queue.get_nowait())
-    assert executor._disk_banks[2][0].calls[0] == [6]
-    assert executor._pregate_recent_skips == 1
+    # Recently used expert 3 is still checked: eviction ignores recency.
+    assert executor._disk_banks[2][0].calls[0] == [3, 6]
+    assert executor._pregate_checked == 2
+    assert executor._pregate_advised == 1
+    assert executor._pregate_pages == 5
 
     executor.prefetch_experts(2, torch.tensor([[3, 6]], dtype=torch.int32))
     stats = executor.pregate_stats()
@@ -155,6 +167,25 @@ def test_recent_mode_skips_recently_touched_predictions_and_scores_nonrecent():
     # Only expert 6 was non-recent, and it was predicted.
     assert stats["coverage_nonrecent"] == 1.0
     assert executor._pregate_stale_routes == 1
+
+
+def test_nonresident_page_runs_and_sampled_probe_follow_mincore():
+    import ctypes
+    import mmap
+
+    from freetoken.moe.host_banks import _nonresident_page_runs, _sampled_pages_resident
+
+    area = mmap.mmap(-1, 8 * 4096)
+    view = (ctypes.c_char * len(area)).from_buffer(area)
+    base = ctypes.addressof(view)
+    for page in (0, 1, 4, 7):
+        area[page * 4096] = 1  # fault in
+    vec = (ctypes.c_char * 8)()
+    assert _nonresident_page_runs(base, 8, vec) == [(2, 2), (5, 2)]
+    assert not _sampled_pages_resident(base, 8, 8, vec)
+    assert _sampled_pages_resident(base, 8, 2, vec)  # pages 0 and 7 only
+    del view
+    area.close()
 
 
 def test_prefill_callbacks_do_not_touch_pregate_state():
