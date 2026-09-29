@@ -40,7 +40,7 @@ exec "${FREETOKEN_BIN:-ft}" serve \
   --host 127.0.0.1 --port 8090 \
   --moe-disk-prefill staged --moe-prefill-hot-split on \
   --moe-prefill-split-kernel grouped --moe-bank-hugepages off \
-  --moe-cpu-threads 14 --ple-backend uring --enable-cache-report \
+  --moe-cpu-threads 8 --ple-backend uring --enable-cache-report \
   --moe-disk-layer-profile "$layer_profile" \
   --moe-hot-expert-budget-gib 6 --moe-hot-adapt-interval-steps auto \
   --served-model-name qwen3.6-27b --moe-cpu-willneed recent \
