@@ -338,10 +338,15 @@ def test_quantized_uring_stage_matches_reference(tmp_path, table_format):
     assert "O_DIRECT=yes" in startup
 
 
+@pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
-def test_prefill_slots_stage_side_by_side(tmp_path, table_format):
+def test_prefill_slots_stage_side_by_side(tmp_path, table_format, parallel, monkeypatch):
     """Layer-major staging: a chunk staged into one slot leaves the other slot's rows
-    (and scales) intact, and its local ids gather the reference rows."""
+    (and scales) intact, and its local ids gather the reference rows, whether the
+    data and scale stores are read one after the other or concurrently."""
+    import freetoken.models.qwen4_exp.ple_uring as ple_uring
+
+    monkeypatch.setattr(ple_uring, "_PARALLEL_READ_MIN_ROWS", 1 if parallel else 1 << 30)
     source, reference, _args = _source(tmp_path, table_format)
     backend = UringTable(
         source,
