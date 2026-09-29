@@ -144,6 +144,19 @@ def _tokenize_requests(
     return ok_msgs, ok_results, errors
 
 
+def _logprob_fields(tokenizer, msg: DetokenizeMsg) -> dict:
+    """UserReply logprob fields for one sampled token; empty when none were requested."""
+    if msg.logprob is None:
+        return {}
+    top_ids = msg.top_ids or []
+    return {
+        "token": tokenizer.decode([msg.next_token]),
+        "logprob": msg.logprob,
+        "top_tokens": [tokenizer.decode([t]) for t in top_ids],
+        "top_logprobs": list(msg.top_logprobs or []),
+    }
+
+
 @torch.inference_mode()
 def tokenize_worker(
     *,
@@ -262,6 +275,7 @@ def tokenize_worker(
                         swa_used_tokens=msg.swa_used_tokens,
                         swa_total_tokens=msg.swa_total_tokens,
                         gpu_mem_bytes=msg.gpu_mem_bytes,
+                        **_logprob_fields(tokenizer, msg),
                     )
                     for msg, reply in zip(detokenize_msg, replies, strict=True)
                 ]

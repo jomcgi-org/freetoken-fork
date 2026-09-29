@@ -141,6 +141,24 @@ class GenResult:
     completion_tokens: int
     matched_stop: str | None = None
     cached_tokens: int = 0
+    # OpenAI chat logprobs.content entries, one per sampled token (reasoning included);
+    # None unless the request asked for logprobs.
+    logprobs: list[dict[str, Any]] | None = None
+
+
+def openai_logprob_entry(ack: Any) -> dict[str, Any] | None:
+    """An OpenAI chat ``logprobs.content`` entry for one reply, or None without logprobs."""
+    if getattr(ack, "logprob", None) is None:
+        return None
+
+    def item(token: str, logprob: float) -> dict[str, Any]:
+        return {"token": token, "logprob": logprob, "bytes": list(token.encode())}
+
+    entry = item(ack.token or "", ack.logprob)
+    entry["top_logprobs"] = [
+        item(t, lp) for t, lp in zip(ack.top_tokens or [], ack.top_logprobs or [])
+    ]
+    return entry
 
 
 @dataclass
@@ -768,6 +786,10 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
     cached_tokens = 0
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    logprobs: list[dict[str, Any]] | None = (
+        # getattr probe: generation test doubles pass bare sampling namespaces.
+        [] if getattr(spec.sampling_params, "logprobs", 0) > 0 else None
+    )
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(
@@ -779,6 +801,10 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
         full_content += ack.incremental_output
+        if logprobs is not None:
+            entry = openai_logprob_entry(ack)
+            if entry is not None:
+                logprobs.append(entry)
         if ack.finished:
             engine_finish_reason = getattr(ack, "finish_reason", None)
             engine_matched_stop = getattr(ack, "matched_stop", None)
@@ -804,4 +830,5 @@ async def _generate_full_impl(uid: int, spec: GenSpec, state: Any) -> GenResult:
         completion_tokens=completion_tokens,
         matched_stop=engine_matched_stop,
         cached_tokens=cached_tokens,
+        logprobs=logprobs,
     )

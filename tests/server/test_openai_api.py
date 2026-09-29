@@ -725,3 +725,79 @@ def test_minimax_http_non_stream_forces_implicit_reasoning_without_request_knob(
     message = response["choices"][0]["message"]
     assert message["reasoning_content"] == "private thought"
     assert message["content"] == "visible answer"
+
+
+def _logprob_reply(text: str, token: str, logprob: float, finished: bool = False) -> UserReply:
+    return UserReply(
+        uid=42,
+        incremental_output=text,
+        finished=finished,
+        completion_tokens_delta=1,
+        token=token,
+        logprob=logprob,
+        top_tokens=[token, "x"],
+        top_logprobs=[logprob, logprob - 1.0],
+    )
+
+
+def test_chat_logprobs_request_the_sampled_token_plus_alternatives():
+    spec = chat_request_to_genspec(chat_request(logprobs=True, top_logprobs=2), {})
+    assert spec.sampling_params.logprobs == 3
+    assert chat_request_to_genspec(chat_request(), {}).sampling_params.logprobs == 0
+    # Streaming chat does not return logprobs, so it does not ask the engine for them.
+    streamed = chat_request_to_genspec(chat_request(logprobs=True, stream=True), {})
+    assert streamed.sampling_params.logprobs == 0
+
+
+def test_non_stream_chat_returns_one_logprobs_entry_per_sampled_token():
+    state = FakeState(
+        [
+            _logprob_reply("Hel", "Hel", -0.25),
+            _logprob_reply("lo", "lo", -0.5, finished=True),
+        ]
+    )
+    response = run(
+        handle_chat_completion(
+            chat_request(tools=None, logprobs=True, top_logprobs=1),
+            request=None,
+            state=state,
+            model_sampling={},
+        )
+    )
+    content = response["choices"][0]["logprobs"]["content"]
+    assert [e["token"] for e in content] == ["Hel", "lo"]
+    assert content[0]["logprob"] == -0.25
+    assert content[0]["bytes"] == list(b"Hel")
+    assert content[1]["top_logprobs"][1] == {"token": "x", "logprob": -1.5, "bytes": [120]}
+
+
+def test_non_stream_chat_without_logprobs_reports_null():
+    state = FakeState([UserReply(uid=42, incremental_output="hi", finished=True)])
+    response = run(
+        handle_chat_completion(chat_request(tools=None), request=None, state=state, model_sampling={})
+    )
+    assert response["choices"][0]["logprobs"] is None
+
+
+def test_completion_logprobs_use_the_legacy_shape():
+    state = FakeState(
+        [
+            _logprob_reply("a", "a", -0.1),
+            _logprob_reply("bc", "bc", -0.2, finished=True),
+        ]
+    )
+    response = run(
+        handle_completion(
+            CompletionRequest(model="client-model", prompt="say hi", logprobs=1),
+            request=None,
+            state=state,
+            model_sampling={},
+        )
+    )
+    assert state.sent.sampling_params.logprobs == 2
+    assert response["choices"][0]["logprobs"] == {
+        "tokens": ["a", "bc"],
+        "token_logprobs": [-0.1, -0.2],
+        "top_logprobs": [{"a": -0.1, "x": -1.1}, {"bc": -0.2, "x": -1.2}],
+        "text_offset": [0, 1],
+    }

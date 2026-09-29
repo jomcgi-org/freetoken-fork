@@ -28,6 +28,9 @@ class SamplingParams:
     # Serialized, engine-neutral grammar request. None is the hot-path sentinel: the
     # sampler does not import or initialize the optional grammar backend unless this is set.
     guided_decoding: dict[str, Any] | None = None
+    # OpenAI logprobs: 0 returns none; N >= 1 returns the sampled token's logprob plus
+    # the N - 1 most likely alternatives (chat `top_logprobs` + 1, completions `logprobs`).
+    logprobs: int = 0
 
     @property
     def is_greedy(self) -> bool:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List
+from typing import TYPE_CHECKING, Any, List, NamedTuple
 
 import torch
 from freetoken.utils import is_sm90_supported, nvtx_annotate
@@ -18,6 +18,18 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     guided: "GuidedBatch | None" = None
     has_guided: bool = False
+
+
+class LogprobRows(NamedTuple):
+    """Per-row logprobs for one sampled batch, on the host once the copy event fires.
+
+    ``chosen[i]`` is the sampled token's logprob; ``top_ids``/``top_logprobs`` hold the
+    batch-wide maximum requested alternatives, which each request slices to its own count.
+    """
+
+    chosen: torch.Tensor  # [bs] float32
+    top_ids: torch.Tensor  # [bs, k] int32
+    top_logprobs: torch.Tensor  # [bs, k] float32
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -123,6 +135,27 @@ class Sampler:
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
+
+    def logprobs(
+        self, logits: torch.Tensor, next_tokens: torch.Tensor, batch: Batch
+    ) -> LogprobRows | None:
+        """Host copies of the model's log-softmax at the sampled positions, or None.
+
+        Taken from the untempered logits the sampler saw, so a grammar-constrained row
+        reports logprobs after its mask. Only batches with a logprobs request pay for it.
+        """
+        k = max((r.sampling_params.logprobs for r in batch.reqs), default=0)
+        if k <= 0:
+            return None
+        rows = next_tokens.numel()
+        logp = torch.log_softmax(logits[:rows, : self.vocab_size].float(), dim=-1)
+        chosen = logp.gather(1, next_tokens.long().view(-1, 1)).view(-1)
+        top_logprobs, top_ids = logp.topk(k, dim=-1)
+        return LogprobRows(
+            chosen.to("cpu", non_blocking=True),
+            top_ids.to(torch.int32).to("cpu", non_blocking=True),
+            top_logprobs.to("cpu", non_blocking=True),
+        )
 
     def finish_guided(
         self, batch: Batch, args: BatchSamplingArgs, next_tokens_cpu: torch.Tensor

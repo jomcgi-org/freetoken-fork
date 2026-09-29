@@ -57,6 +57,14 @@ class UserReply(BaseFrontendMsg):
     finish_reason: str | None = None
     # The stop string that ended generation (Anthropic reports it as stop_reason='stop_sequence').
     matched_stop: str | None = None
+    # Requested logprobs for the token behind this reply (one reply per sampled token):
+    # its text and logprob, then the alternatives' texts and logprobs, best first.
+    # Token text is the per-token decode, so it need not line up with
+    # incremental_output, which the detokenizer holds back for stop strings and UTF-8.
+    token: str | None = None
+    logprob: float | None = None
+    top_tokens: list[str] | None = None
+    top_logprobs: list[float] | None = None
 
 
 @dataclass
