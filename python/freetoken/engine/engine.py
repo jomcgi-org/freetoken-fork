@@ -1256,7 +1256,8 @@ class Engine:
                 getattr(config, "moe_pager_budget_gib", 40.0) * 2**30
             ),
             prefill_batch=getattr(config, "moe_cpu_prefill_batch", "on"),
-            max_prefill_tokens=getattr(config, "max_extend_tokens", 2048),
+            prefill_batch_lazy=config.moe_disk_prefill == "staged",
+            max_prefill_tokens=_cpu_prefill_workspace_tokens(config),
         )
         if (
             config.moe_disk_prefill in ("cpu", "staged")
@@ -1616,6 +1617,207 @@ class Engine:
                 req.pending_token_cpu = token
                 req.sample_copy_done = copy_done_event
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def forward_layer_major(
+        self, batches: list[Batch], args: BatchSamplingArgs
+    ) -> ForwardOutput:
+        """Run consecutive prefill chunks of one request layer by layer.
+
+        Equivalent to ``forward_batch`` on each chunk in order, except that each
+        layer runs for every chunk before the next layer, and only the last chunk's
+        logits are computed and sampled (intermediate chunk samples are discarded by
+        the scheduler in chunk-major order too). See ``Qwen4ExpModel.forward_layer_major``.
+        """
+        assert torch.cuda.current_stream() == self.stream
+        assert batches and all(batch.is_prefill for batch in batches)
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.reset_disk_lookahead()
+        cache = self.moe_offload_cache
+        if cache is not None:
+            cache.begin_layer_major_group()
+        trace = os.environ.get("FREETOKEN_LAYER_MAJOR_TRACE", "0") == "1"
+        layer_events = []
+        host_started = time.perf_counter()
+        if trace:
+            begin = torch.cuda.Event(enable_timing=True)
+            begin.record(self.stream)
+            if cache is not None:
+                cache._layer_major_trace = []
+            from freetoken.utils import stage_timer
+
+            stage_timer.enable()
+        self._layer_major_groups = getattr(self, "_layer_major_groups", 0) + 1
+        profile_dir = os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE", "")
+        profile_group = int(os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE_GROUP", "3"))
+        profiler = None
+        if profile_dir and self._layer_major_groups == profile_group:
+            stacks = os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE_STACK", "0") == "1"
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=stacks,
+                with_stack=stacks,
+            )
+            profiler.__enter__()
+            profile_begin = torch.cuda.Event(enable_timing=True)
+            profile_begin.record(self.stream)
+
+        def after_layer(layer_index: int) -> None:
+            if trace:
+                event = torch.cuda.Event(enable_timing=True)
+                event.record(self.stream)
+                layer_events.append(event)
+
+        try:
+            logits = self.model.forward_layer_major(
+                batches, self.ctx.forward_batch, after_layer
+            )
+        finally:
+            if cache is not None:
+                copies = getattr(cache, "_layer_major_trace", None)
+                cache._layer_major_trace = None
+                cache.end_layer_major_group()
+        if profiler is not None:
+            profile_end = torch.cuda.Event(enable_timing=True)
+            profile_end.record(self.stream)
+            torch.cuda.synchronize(self.device)
+            profiler.__exit__(None, None, None)
+            self._write_layer_major_profile(
+                profiler, profile_begin.elapsed_time(profile_end), batches, profile_dir
+            )
+        if trace:
+            from freetoken.utils import stage_timer
+
+            spans = stage_timer.collect()
+            self._log_layer_major_trace(
+                batches, begin, layer_events, copies or [],
+                time.perf_counter() - host_started, spans,
+            )
+        if self.cpu_moe_executor is not None:
+            self.cpu_moe_executor.raise_if_unhealthy()
+        if cache is not None:
+            cache.hot_adapt_prefill_group_boundary(
+                sum(int(batch.input_ids.numel()) for batch in batches)
+            )
+        for batch in batches:
+            for req in batch.reqs:
+                req.complete_one()
+        last = batches[-1]
+        next_tokens_gpu = self.sampler.sample(logits[: last.size], args).to(torch.int32)
+        last.generated_tokens = len(last.reqs)
+        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(self.stream)
+        if args.has_guided:
+            copy_done_event.synchronize()
+            last.mask_us = self.sampler.finish_guided(last, args, next_tokens_cpu)
+        for req, token in zip(last.reqs, next_tokens_cpu):
+            req.pending_token_cpu = token
+            req.sample_copy_done = copy_done_event
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    def _write_layer_major_profile(self, profiler, wall_ms, batches, directory):
+        """Diagnostic: kernel time by name and GPU busy time for one group."""
+        from pathlib import Path
+
+        kernels = [
+            event for event in profiler.events()
+            if getattr(event, "device_type", None) == torch.autograd.DeviceType.CUDA
+        ]
+        intervals = sorted(
+            (event.time_range.start, event.time_range.end) for event in kernels
+        )
+        busy = 0.0
+        cursor = None
+        for start, end in intervals:
+            if cursor is None or start > cursor:
+                busy += end - start
+                cursor = end
+            elif end > cursor:
+                busy += end - cursor
+                cursor = end
+        tokens = sum(int(batch.input_ids.numel()) for batch in batches)
+        path = Path(directory) / f"layer-major-profile-{os.getpid()}-{self._layer_major_groups}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        table = profiler.key_averages().table(sort_by="cuda_time_total", row_limit=60)
+        if os.environ.get("FREETOKEN_LAYER_MAJOR_PROFILE_STACK", "0") == "1":
+            table += "\n\nBy input shape:\n" + profiler.key_averages(
+                group_by_input_shape=True
+            ).table(sort_by="self_cuda_time_total", row_limit=60)
+            table += "\n\nBy stack:\n" + profiler.key_averages(
+                group_by_stack_n=8
+            ).table(sort_by="self_cuda_time_total", row_limit=80)
+        path.write_text(
+            f"chunks={len(batches)} tokens={tokens} group_wall_ms={wall_ms:.0f} "
+            f"kernel_busy_ms={busy / 1000:.0f} kernels={len(kernels)}\n\n" + table
+        )
+        logger.info_rank0(
+            f"Layer-major profile: chunks={len(batches)} tokens={tokens} "
+            f"group_wall_ms={wall_ms:.0f} kernel_busy_ms={busy / 1000:.0f} "
+            f"kernels={len(kernels)} written to {path}"
+        )
+
+    def _log_layer_major_trace(
+        self, batches, begin, layer_events, copies, host_s, spans=()
+    ):
+        """Diagnostic: per-layer GPU time and copy-stream time for one group (syncs)."""
+        torch.cuda.synchronize(self.device)
+        cache = self.moe_offload_cache
+        residency = getattr(cache, "layer_residency", ())
+        layer_ms = []
+        previous = begin
+        for event in layer_events:
+            layer_ms.append(previous.elapsed_time(event))
+            previous = event
+        by_kind: dict[str, list[float]] = {}
+        for index, ms in enumerate(layer_ms):
+            kind = residency[index] if index < len(residency) else "?"
+            by_kind.setdefault(kind, []).append(ms)
+        copy_ms: dict[str, list[float]] = {}
+        copy_host: dict[str, list[float]] = {}
+        disk = [entry for entry in copies if entry[0] == "disk"]
+        jobs = [entry for entry in copies if entry[0] == "diskjob"]
+        copies = [entry for entry in copies if entry[0] not in ("disk", "diskjob")]
+        disk_fragment = ""
+        if disk:
+            disk_fragment = (
+                f" disk_chunks={len(disk)} predicted_rows={sum(e[2] for e in disk)}"
+                f" routed_rows={sum(e[3] for e in disk)} missing_rows={sum(e[4] for e in disk)}"
+                f" job_wait_ms={sum(e[5] for e in disk) * 1000:.0f}"
+                f" route_sync_ms={sum(e[6] for e in disk) * 1000:.0f}"
+                f" miss_stage_ms={sum(e[7] for e in disk) * 1000:.0f}"
+                f" prefetch_jobs={len(jobs)} prefetch_rows={sum(e[2] for e in jobs)}"
+                f" prefetch_host_ms={sum(e[3] for e in jobs) * 1000:.0f}"
+            )
+        for layer_id, started, ended, host in copies:
+            kind = residency[layer_id] if layer_id < len(residency) else "?"
+            copy_ms.setdefault(kind, []).append(started.elapsed_time(ended))
+            copy_host.setdefault(kind, []).append(host * 1000.0)
+        tokens = sum(int(batch.input_ids.numel()) for batch in batches)
+
+        def stats(values):
+            return f"n={len(values)} sum={sum(values):.0f} max={max(values):.0f}" if values else "n=0"
+
+        stage_ms: dict[str, float] = {}
+        for name, started, ended in spans:
+            stage_ms[name] = stage_ms.get(name, 0.0) + started.elapsed_time(ended)
+        stage_fragment = " stages_ms[" + " ".join(
+            f"{name}={ms:.0f}" for name, ms in sorted(stage_ms.items())
+        ) + "]" if stage_ms else ""
+        logger.info_rank0(
+            f"Layer-major trace: chunks={len(batches)} tokens={tokens} "
+            f"gpu_ms={begin.elapsed_time(layer_events[-1]) if layer_events else 0:.0f} "
+            f"host_enqueue_ms={host_s * 1000:.0f} "
+            + " ".join(f"layer_ms[{k}]({stats(v)})" for k, v in sorted(by_kind.items()))
+            + " "
+            + " ".join(f"copy_ms[{k}]({stats(v)})" for k, v in sorted(copy_ms.items()))
+            + " "
+            + " ".join(f"copy_host_ms[{k}]({stats(v)})" for k, v in sorted(copy_host.items()))
+            + disk_fragment
+            + stage_fragment
+        )
 
     def _record_mtp_hidden(self, batch: Batch) -> None:
         hidden = getattr(getattr(self.model, "model", None), "_last_hc_hidden", None)
@@ -2897,6 +3099,15 @@ def _gate_ple_settings(config, model_config, override) -> bool:
             f"ignoring PLE settings: {', '.join(ignored)}"
         )
     return False
+
+
+def _cpu_prefill_workspace_tokens(config) -> int:
+    """Bound CPU scratch by the largest chunk that can take the CPU path."""
+    from freetoken.engine.host_memory import cpu_prefill_workspace_tokens
+
+    # Shared with the host-memory governor so the charged scratch matches the
+    # workspace the executor can allocate (one row below the staged crossover).
+    return cpu_prefill_workspace_tokens(config)
 
 
 def _validate_disk_prefill_task_size(config, cache) -> None:

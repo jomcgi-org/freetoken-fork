@@ -135,6 +135,10 @@ def measure(args):
                               if k not in ("chunks", "text", "reasoning")}), flush=True)
 
         for case in manifest["cases"]:
+            if args.idle_before_cold > 0:
+                # Leave the server idle before the cold request, as live traffic does;
+                # idle-time adaptation runs in this window.
+                time.sleep(args.idle_before_cold)
             for phase in ("cold", "repeat"):
                 row = request(args.base_url, case["messages"], 192)
                 row.update(arm=args.arm, depth=case["depth"], run=case["run"], phase=phase,
@@ -171,6 +175,8 @@ def main():
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--arm", required=True)
     run.add_argument("--base-url", default="http://127.0.0.1:18090")
+    run.add_argument("--idle-before-cold", type=float, default=0.0,
+                     help="seconds of server idle before each case's cold request")
     args = parser.parse_args()
     if args.command == "prepare":
         manifest = prepare(args.source, args.tokenizer, args.depths, args.runs)

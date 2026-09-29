@@ -201,6 +201,7 @@ def test_final_chunk_keeps_interior_anchor_without_counting_skip(tmp_path, cache
     store = DiskPrefixStore(tmp_path, 1 << 20, identity="final-counter")
     cache = SimpleNamespace(
         swa_paged=False,
+        page_size=1,
         prefill_chunk_align=1,
         disk_prefix_store=store,
         note_harness_anchor=store.note_harness_anchor,
@@ -234,6 +235,7 @@ def test_only_nonfinal_chunk_strictly_containing_anchor_opts_in():
 
     cache = SimpleNamespace(
         swa_paged=False,
+        page_size=1,
         prefill_chunk_align=1,
         disk_prefix_store=object(),
         note_harness_anchor=lambda _outcome: None,

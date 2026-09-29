@@ -48,6 +48,16 @@ class PrefillAdder:
     # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
     # across the admission loop -- without this, successive admits all see the full pool.
     reserved_swa: int = 0
+    # Chunk size for every chunk of a request that needs more than one chunk
+    # (layer-major prefill); 0 keeps token_budget. A prompt that fits one chunk is whole.
+    long_chunk: int = 0
+
+    def _kv_reservation_size(self, total_len: int, cached_len: int) -> int:
+        """Return the token-equivalent cost of the additional KV pages for a request."""
+        page_size = self.cache_manager.page_size
+        return (
+            div_ceil(total_len, page_size) - div_ceil(cached_len, page_size)
+        ) * page_size
 
     def _try_allocate_one(self, req: PendingReq):
         if self.table_manager.available_size == 0:
@@ -62,12 +72,14 @@ class PrefillAdder:
             trace.match(req, cached_len, self.cache_manager)
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
-        estimated_len = extend_len + req.output_len
+        estimated_size = self._kv_reservation_size(
+            req.input_len + req.output_len, cached_len
+        )
 
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return None
         self.cache_manager.lock(handle)
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if estimated_size + self.reserved_size > self.cache_manager.available_size:
             return self.cache_manager.unlock(handle)
 
         # Second currency (hybrid GDN): reserve 1 live + 2 ping-pong state slots; evict tree
@@ -148,6 +160,13 @@ class PrefillAdder:
     ) -> Req | None:
         remain_len = pending_req.input_len - cached_len
         chunk_size = min(self.token_budget, remain_len)
+        if self.long_chunk > 0 and (
+            remain_len > self.token_budget or pending_req.chunked_req is not None
+        ):
+            # Every chunk of a multi-chunk prompt, the final remainder included, uses
+            # the group chunk: a group's peak GPU memory is its residual plus one
+            # chunk's transient, so a larger tail chunk could exceed it.
+            chunk_size = min(chunk_size, self.long_chunk)
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -190,7 +209,12 @@ class PrefillAdder:
         is_chunked = chunk_size < remain_len
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
-        self.reserved_size += remain_len + pending_req.output_len
+        # CacheManager allocates each request independently in whole pages. Reserve the same
+        # page span here; charging raw tokens can admit several short requests against one page
+        # even though allocate_paged() needs a separate page for each request.
+        self.reserved_size += self._kv_reservation_size(
+            pending_req.input_len + pending_req.output_len, cached_len
+        )
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx, _slice]
@@ -312,6 +336,7 @@ class PrefillManager:
     pending_list: List[PendingReq] = field(default_factory=list)
     priority_aging_seconds: float = 30.0
     clock: Callable[[], float] = time.monotonic
+    long_chunk: int = 0
 
     def add_one_req(self, req: UserMsg) -> None:
         cache_anchor_len = None
@@ -370,6 +395,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            long_chunk=self.long_chunk,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

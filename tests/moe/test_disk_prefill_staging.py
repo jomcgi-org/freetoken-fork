@@ -341,3 +341,74 @@ def test_selected_staging_matches_full_nvfp4_gemm(tmp_path, tokens, direct_io, r
         assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
     finally:
         staging.synchronize()
+
+
+@pytest.mark.parametrize("workers", [2, 4])
+@pytest.mark.parametrize("rows", [None, [7, 2, 3, 2, -1, 5], []])
+def test_parallel_staging_matches_the_single_reader(tmp_path, workers, rows):
+    shape = (8, 16, 32)
+    payload = bytes((i * 31 + i // 7) % 256 for i in range(8 * 16 * 32))
+    path = tmp_path / "weights.ftw"
+    path.write_bytes(b"xyz" + payload)
+    bank = HostBank(shape, torch.uint8, backing="file", file_path=str(path), file_offset=3)
+    device = torch.device("cuda", torch.cuda.current_device())
+    staging = DiskPrefillStaging(device, chunk_bytes=101, workers=workers)
+    assert staging.pinned_bytes == 2 * workers * 101
+    try:
+        for _ in range(3):
+            target = torch.full(shape, 211, dtype=torch.uint8, device=device)
+            expected = torch.full_like(bank.tensor, 211)
+            selected = list(range(8)) if rows is None else [2, 3, 5, 7] if rows else []
+            expected[selected] = bank.tensor[selected]
+            torch.cuda._sleep(1_000_000)
+            copied = staging.copy_bank(bank.tensor, target, rows)
+            assert torch.equal(target.cpu(), expected)
+            assert copied == len(selected) * 16 * 32
+    finally:
+        staging.synchronize()
+
+
+@pytest.mark.parametrize("workers", [2, 3])
+@pytest.mark.parametrize("reuse_cached_rows", [False, True])
+@pytest.mark.parametrize("rows", [None, [7, 2, 3, 2, -1, 5], []])
+def test_parallel_direct_staging_matches_the_single_reader(tmp_path, workers, reuse_cached_rows, rows):
+    shape = (8, 64, 64)
+    nbytes = 8 * 64 * 64
+    payload = bytes((i * 13 + i // 5) % 256 for i in range(nbytes))
+    path = tmp_path / "weights.ftw"
+    # An unaligned file offset exercises the block-aligned head of each piece.
+    path.write_bytes(b"prefix" + payload)
+    bank = HostBank(shape, torch.uint8, backing="file", file_path=str(path), file_offset=6)
+    device = torch.device("cuda", torch.cuda.current_device())
+    staging = DiskPrefillStaging(
+        device, chunk_bytes=3 * 4096, direct_io=True,
+        reuse_cached_rows=reuse_cached_rows, workers=workers,
+    )
+    try:
+        for _ in range(3):
+            target = torch.full(shape, 211, dtype=torch.uint8, device=device)
+            expected = torch.full_like(bank.tensor, 211)
+            selected = list(range(8)) if rows is None else [2, 3, 5, 7] if rows else []
+            expected[selected] = bank.tensor[selected]
+            torch.cuda._sleep(1_000_000)
+            copied = staging.copy_bank(bank.tensor, target, rows)
+            assert torch.equal(target.cpu(), expected)
+            assert copied == len(selected) * nbytes // 8
+    finally:
+        staging.synchronize()
+
+
+def test_parallel_staging_writes_inference_tensors_from_worker_threads(tmp_path):
+    shape = (4, 64)
+    path = tmp_path / "weights.ftw"
+    path.write_bytes(bytes(range(256)))
+    bank = HostBank(shape, torch.uint8, backing="file", file_path=str(path))
+    device = torch.device("cuda", torch.cuda.current_device())
+    staging = DiskPrefillStaging(device, chunk_bytes=64, workers=2)
+    try:
+        with torch.inference_mode():
+            target = torch.zeros(shape, dtype=torch.uint8, device=device)
+            staging.copy_bank(bank.tensor, target, [0, 3])
+            assert torch.equal(target[[0, 3]].cpu(), bank.tensor[[0, 3]])
+    finally:
+        staging.synchronize()

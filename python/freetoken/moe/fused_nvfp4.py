@@ -7,6 +7,7 @@ so no BF16 copy of the experts is ever materialized.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 import torch
@@ -22,6 +23,7 @@ from freetoken.kernel.triton.nvfp4_fused_moe import (
     _decode_nvfp4_moe_kernel,
     _e2m1_lut,
     _prefill_nvfp4_moe_kernel,
+    _prefill_nvfp4_moe_kernel_v2,
 )
 from freetoken.layers import (
     gelu_and_mul,
@@ -265,7 +267,21 @@ def fused_experts_decode_nvfp4_serial(
     )
 
 
-def _prefill_config(M: int) -> Dict[str, int]:
+# (N, K) of both expert GEMMs of the 2560-hidden / 640-intermediate Qwen3.8-Flash
+# experts (gate_up, down). Offline sweep of the v2 kernel on the RTX 4090
+# (results/.../moebench, 512 experts, skewed top-10): 64 x 128 tiles, 4 warps,
+# 2 stages run 4096 tokens in 5.45 ms (74 TFLOPS) against 26.4 ms for v1 with the
+# default tiles. BLOCK_SIZE_KB stays 32: the K step sets the order of the fp32
+# accumulation, and only M/N tiling, warps and stages change, so every output row
+# is bit-identical (checked on every swept config, v1 and v2).
+_QWEN38_FLASH_PREFILL_SHAPES = frozenset({(1280, 2560), (2560, 640)})
+_LARGE_TILE_MIN_M = 2048
+
+
+def _prefill_config(M: int, N: int | None = None, K: int | None = None) -> Dict[str, int]:
+    if M >= _LARGE_TILE_MIN_M and (N, K) in _QWEN38_FLASH_PREFILL_SHAPES:
+        return dict(BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_KB=32,
+                    GROUP_SIZE_M=8, num_warps=4, num_stages=2)
     # ``BLOCK_SIZE_M`` is coupled to host-side ``moe_align_block_size`` (token padding),
     # so it cannot be picked by triton.autotune; these were chosen by an offline sweep
     # over (BLOCK_M, BLOCK_N, BLOCK_KB, num_warps, num_stages) for the MiniMax-M2 shapes.
@@ -351,7 +367,14 @@ def _prefill_gemm(
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    _prefill_nvfp4_moe_kernel[grid](
+    # v2 computes the same values in the same order as v1 (bit-identical on every
+    # swept config) with coalesced activation loads and table-free e2m1 decode.
+    kernel = (
+        _prefill_nvfp4_moe_kernel
+        if os.environ.get("FREETOKEN_NVFP4_PREFILL_KERNEL", "v2") == "v1"
+        else _prefill_nvfp4_moe_kernel_v2
+    )
+    kernel[grid](
         a, packed, scale, glob, c, topk_weights_flat, sorted_ids, expert_ids,
         num_tokens_post_padded,
         _e2m1_lut(a.device.index),
@@ -396,7 +419,9 @@ def fused_experts_nvfp4(
     two_i = gate_up_packed.shape[1]
     inter = two_i // 2
     dev, dt = hidden_states.device, hidden_states.dtype
-    cfg = _prefill_config(M)
+    # One config serves both GEMMs (BLOCK_SIZE_M is baked into the token alignment);
+    # key it on the gate/up shape.
+    cfg = _prefill_config(M, two_i, H)
 
     if num_experts <= _SGL_ALIGN_MAX_ACTIVE_SLOTS:
         sorted_ids, expert_ids, ntpp = moe_align_block_size(

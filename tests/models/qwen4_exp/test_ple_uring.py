@@ -338,6 +338,48 @@ def test_quantized_uring_stage_matches_reference(tmp_path, table_format):
     assert "O_DIRECT=yes" in startup
 
 
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
+def test_prefill_slots_stage_side_by_side(tmp_path, table_format, parallel, monkeypatch):
+    """Layer-major staging: a chunk staged into one slot leaves the other slot's rows
+    (and scales) intact, and its local ids gather the reference rows, whether the
+    data and scale stores are read one after the other or concurrently."""
+    import freetoken.models.qwen4_exp.ple_uring as ple_uring
+
+    monkeypatch.setattr(ple_uring, "_PARALLEL_READ_MIN_ROWS", 1 if parallel else 1 << 30)
+    source, reference, _args = _source(tmp_path, table_format)
+    backend = UringTable(
+        source,
+        staging_mib=1,
+        queue_depth=7,
+        max_decode_batch_size=2,
+        rows_per_token=3,
+        required_capacity_rows=6,
+        device=torch.device("cpu"),
+        prefetch=False,
+        extension=_FAKE_EXTENSION,
+    )
+    slot_rows = 6
+    assert backend.prefill_slots(slot_rows) >= 2
+    first = torch.tensor([[0, 9, 0], [source.num_rows - 1, 9, 3]])
+    second = torch.tensor([[5, 1, 2], [7, 7, 11]])
+    outs = [torch.empty(2, 3, dtype=torch.int64) for _ in range(2)]
+    local_first = backend.stage_prefill_slot(first, 0, slot_rows, outs[0])
+    local_second = backend.stage_prefill_slot(second, 1, slot_rows, outs[1])
+    assert int(local_second.min()) >= slot_rows
+    for ids, local in ((first, local_first), (second, local_second)):
+        token = object()
+        backend.use_prefill_ids(token, local)
+        got = backend.lookup(token)
+        want = reference.index_select(0, ids.reshape(-1)).view(ids.shape[0], -1)
+        assert torch.equal(got, want)
+    assert backend.uring_stats()["prefill_fills"] == 2
+    with pytest.raises(ValueError):
+        backend.stage_prefill_slot(
+            first, backend.prefill_slots(slot_rows), slot_rows, outs[0]
+        )
+
+
 @pytest.mark.parametrize("table_format", ["fp8", "int4g16", "e2m1g16"])
 def test_quantized_uring_padded_decode_uses_only_live_rows(tmp_path, table_format):
     source, reference, _args = _source(tmp_path, table_format)

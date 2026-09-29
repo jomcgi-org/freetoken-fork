@@ -338,6 +338,7 @@ class CpuMoeExecutor:
         prefill_coalesce: str | bool = "populate",
         prefill_coalesce_budget_bytes: int = 40 << 30,
         prefill_batch: str | bool = "on",
+        prefill_batch_lazy: bool = False,
         max_prefill_tokens: int | None = None,
     ) -> None:
         from freetoken.kernel import _cpu_moe
@@ -445,6 +446,7 @@ class CpuMoeExecutor:
                 f"prefill_batch must be 'on' or 'off', got {prefill_batch!r}"
             )
         self._prefill_batch_requested = prefill_batch == "on"
+        self._prefill_batch_setup_attempted = False
         self._prefill_batch_enabled = False
         self._prefill_batch_warned = False
         self._prefill_batch_rows = 0
@@ -534,7 +536,8 @@ class CpuMoeExecutor:
         )
         self._configure_empty_skip(moe_cpu_empty_skip)
         self._configure_pre_run_callback_mode(moe_cpu_precb)
-        self._configure_prefill_batch()
+        if not prefill_batch_lazy:
+            self._configure_prefill_batch()
         if self._disk_banks:
             self._disk_callback = partial(_disk_prefetch_callback, weakref.ref(self))
             self._ext.set_pre_run_callback(self._disk_callback)
@@ -623,9 +626,12 @@ class CpuMoeExecutor:
             f"H={self.H} I={self.I} experts={self.num_experts} layers={self.num_layers} "
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
+        batch_state = "on" if self._prefill_batch_enabled else "off"
+        if self._prefill_batch_requested and not self._prefill_batch_setup_attempted:
+            batch_state = "deferred"
         logger.info_rank0(
             f"CPU MoE prefill batch: "
-            f"{'on' if self._prefill_batch_enabled else 'off'}, "
+            f"{batch_state}, "
             f"kernel={getattr(self._ext, 'prefill_batch_kernel_name', lambda: 'unknown')()}, "
             f"capacity={self._prefill_batch_capacity} tokens, "
             f"buffers={self._prefill_batch_buffer_bytes / 2**20:.1f} MiB"
@@ -689,8 +695,9 @@ class CpuMoeExecutor:
         self._willneed_guard_steps_remaining = 0
 
     def _configure_prefill_batch(self) -> None:
-        if not self._prefill_batch_requested:
+        if not self._prefill_batch_requested or self._prefill_batch_setup_attempted:
             return
+        self._prefill_batch_setup_attempted = True
         setup = getattr(self._ext, "setup_prefill_batch", None)
         run_batch = getattr(self._ext, "run_prefill_batch_sync", None)
         try:
@@ -1938,6 +1945,9 @@ class CpuMoeExecutor:
         bs = validate_cpu_moe_task_tokens(
             hidden_states.shape[0], source="CPU MoE prefill batch size"
         )
+        # Staged GPU prefill may never enter this CPU fallback. Allocate its
+        # native workspace only when needed, before submitting the first task.
+        self._configure_prefill_batch()
         io = self._prefill_io_for(bs)
         task_hidden = hidden_states
         if self._gpu_prequant:

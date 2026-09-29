@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import math
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from types import ModuleType
@@ -191,6 +192,11 @@ def _make_store(extension: ModuleType, extents: PleUringExtents, queue_depth: in
         ) from exc
 
 
+# Fills of at least this many unique rows read the data and scale stores concurrently
+# (prefill chunks); decode fills stay sequential.
+_PARALLEL_READ_MIN_ROWS = 1024
+
+
 class UringTable:
     """PLE table streamed with strict io_uring reads into bounded pinned staging."""
 
@@ -285,6 +291,9 @@ class UringTable:
         self.format = source.format
         self.scale = source.weight_scale
         self._capacity = capacity
+        # Rows [0, required) serve ordinary chunk and decode fills; the rest of the
+        # bank holds layer-major prefill slots staged ahead of their forward.
+        self._required_rows = int(required_capacity_rows)
         self._bounce_nbytes = bounce_nbytes
         self._rows_per_shard = source.data.rows_per_extent
         self._device = device or (
@@ -369,6 +378,8 @@ class UringTable:
         self._decode_shape: torch.Size | None = None
         self._pending: tuple[torch.Tensor, torch.Tensor, str] | None = None
         self._replay_done: torch.cuda.Event | None = None
+        self._io_lock = threading.Lock()
+        self._scale_reader = None
         self._poisoned = False
         self.reset_stats()
 
@@ -456,7 +467,7 @@ class UringTable:
             "dedup_rate": (1.0 - self._rows_read / requested if requested else 0.0),
         }
 
-    def _read_unique_rows(self, unique: torch.Tensor) -> None:
+    def _read_unique_rows(self, unique: torch.Tensor, base: int = 0) -> None:
         count = unique.numel()
         if self._poisoned:
             raise RuntimeError(
@@ -466,30 +477,16 @@ class UringTable:
         if not count:
             return
         try:
-            self._data_store.read_rows(
-                unique.data_ptr(),
-                count,
-                self._stage_bank.tensor.data_ptr(),
-                self.source.data.row_nbytes,
-            )
+            # One ring per store is not thread-safe: the layer-major stager thread and
+            # forward-path fills share these stores.
+            with self._io_lock:
+                self._read_stores(unique, count, base)
             if self._scale_store is None:
                 return
-            destination = (
-                self._raw_scale_bank.tensor
-                if self._raw_scale_bank is not None
-                else self._stage_scale_bank.tensor
-            )
-            assert self.source.scales is not None
-            self._scale_store.read_rows(
-                unique.data_ptr(),
-                count,
-                destination.data_ptr(),
-                self.source.scales.row_nbytes,
-            )
             if self._raw_scale_bank is not None:
                 assert self._stage_scale_bank is not None
-                serving = self._stage_scale_bank.tensor[:count]
-                serving.copy_(self._raw_scale_bank.tensor[:count])
+                serving = self._stage_scale_bank.tensor[base : base + count]
+                serving.copy_(self._raw_scale_bank.tensor[base : base + count])
                 assert self._global_scales is not None
                 shard_ids = torch.div(
                     unique, self._rows_per_shard, rounding_mode="floor"
@@ -502,16 +499,64 @@ class UringTable:
             self._poisoned = True
             raise
 
+    def _read_stores(self, unique: torch.Tensor, count: int, base: int) -> None:
+        """Read data and scale rows; large fills read both stores concurrently.
+
+        Each store owns its ring and the native reads release the GIL, so a large
+        prefill fill (tens of thousands of small O_DIRECT reads per store) overlaps
+        the two instead of waiting for one store's reads before starting the other.
+        """
+        data_read = (
+            unique.data_ptr(),
+            count,
+            self._stage_bank.tensor[base:].data_ptr(),
+            self.source.data.row_nbytes,
+        )
+        if self._scale_store is None:
+            self._data_store.read_rows(*data_read)
+            return
+        destination = (
+            self._raw_scale_bank.tensor
+            if self._raw_scale_bank is not None
+            else self._stage_scale_bank.tensor
+        )
+        assert self.source.scales is not None
+        scale_read = (
+            unique.data_ptr(),
+            count,
+            destination[base:].data_ptr(),
+            self.source.scales.row_nbytes,
+        )
+        if count < _PARALLEL_READ_MIN_ROWS:
+            self._data_store.read_rows(*data_read)
+            self._scale_store.read_rows(*scale_read)
+            return
+        if self._scale_reader is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._scale_reader = ThreadPoolExecutor(1, thread_name_prefix="ple-scale-read")
+        scales = self._scale_reader.submit(self._scale_store.read_rows, *scale_read)
+        try:
+            self._data_store.read_rows(*data_read)
+        finally:
+            scales.result()
+
     def _stage_rows(
-        self, row_ids: torch.Tensor | Sequence[int], *, phase: str
+        self,
+        row_ids: torch.Tensor | Sequence[int],
+        *,
+        phase: str,
+        base: int = 0,
+        limit: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         ids = torch.as_tensor(row_ids, dtype=torch.int64, device="cpu")
         flat = ids.reshape(-1)
         unique, inverse = torch.unique(flat, sorted=True, return_inverse=True)
-        if unique.numel() > self._capacity:
+        capacity = self._capacity if limit is None else limit
+        if unique.numel() > capacity:
             raise ValueError(
                 f"PLE uring fill needs {unique.numel()} unique rows, staging holds "
-                f"{self._capacity}"
+                f"{capacity}"
             )
         if unique.numel() and (int(unique[0]) < 0 or int(unique[-1]) >= self.num_rows):
             raise IndexError(
@@ -519,7 +564,7 @@ class UringTable:
                 f"[{int(unique[0])}, {int(unique[-1])}]"
             )
         started = time.perf_counter_ns()
-        self._read_unique_rows(unique)
+        self._read_unique_rows(unique, base)
         elapsed = time.perf_counter_ns() - started
         self._rows_requested += flat.numel()
         self._rows_read += unique.numel()
@@ -537,6 +582,33 @@ class UringTable:
     def _prepare(self, row_ids: torch.Tensor, *, phase: str) -> torch.Tensor:
         _unique, inverse = self._stage_rows(row_ids.detach().cpu(), phase=phase)
         return inverse.to(row_ids.device)
+
+    def prefill_slots(self, rows: int) -> int:
+        """How many prefill chunks of ``rows`` row ids fit in the slot region, the
+        rows above those ordinary chunk and decode fills use."""
+        return (self._capacity - self._required_rows) // rows if rows > 0 else 0
+
+    def stage_prefill_slot(
+        self, row_ids: torch.Tensor, slot: int, slot_rows: int, out: torch.Tensor
+    ) -> torch.Tensor:
+        """Read one prefill chunk's unique rows into slot ``slot`` from host ids.
+
+        Slots lie above the rows ordinary fills use, so they may be staged while
+        other forwards run. Writes the chunk's bank-local ids into ``out`` (host, row_ids' shape) and
+        returns that view. Staging a slot while a gather still reads it is the
+        caller's to prevent; other slots are untouched.
+        """
+        base = self._required_rows + int(slot) * int(slot_rows)
+        if base + slot_rows > self._capacity:
+            raise ValueError(f"PLE uring slot {slot} x {slot_rows} exceeds {self._capacity} rows")
+        _unique, inverse = self._stage_rows(row_ids, phase="prefill", base=base, limit=slot_rows)
+        local = out.view(-1)[: inverse.numel()].view(inverse.shape)
+        torch.add(inverse, base, out=local)
+        return local
+
+    def use_prefill_ids(self, token: object, local_ids: torch.Tensor) -> None:
+        """Make the next ``lookup(token)`` gather ``local_ids`` (device) from the bank."""
+        self._pending = (token, local_ids, "prefill")
 
     def prepare_decode(self, row_ids: torch.Tensor) -> None:
         ids = torch.as_tensor(row_ids, dtype=torch.int64, device="cpu")

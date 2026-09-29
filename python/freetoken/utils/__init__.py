@@ -25,8 +25,10 @@ from .mp import (
 )
 from .registry import Registry
 from .torch_utils import nvtx_annotate, torch_dtype
+from . import stage_timer
 
 __all__ = [
+    "stage_timer",
     "cached_load_hf_config",
     "download_hf_weight",
     "load_eos_token_ids",

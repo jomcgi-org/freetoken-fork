@@ -196,13 +196,27 @@ def _hot_staging_gib(config) -> float:
     return hot_staging_budget_bytes(max_swap) / 2**30
 
 
+def cpu_prefill_workspace_tokens(config) -> int:
+    """Largest chunk that can take the CPU prefill path, bounding its workspace.
+
+    Staged execution selects GPU staging for every chunk at or above the
+    inclusive crossover, so the CPU workspace never needs more rows than one
+    below it. Ordinary CPU prefill keeps the full scheduler chunk.
+    """
+    capacity = int(getattr(config, "max_extend_tokens", 2048) or 0)
+    if getattr(config, "moe_disk_prefill", "cpu") == "staged":
+        crossover = int(getattr(config, "moe_disk_prefill_min_tokens", 1024) or 1024)
+        capacity = min(capacity, max(1, crossover - 1))
+    return capacity
+
+
 def _prefill_scratch_gib(config) -> float:
-    """Conservatively charge the CPU MoE prefill workspaces allocated at runtime."""
+    """Charge the CPU MoE prefill workspaces the executor can actually allocate."""
     model = getattr(config, "model_config", None)
     hidden = int(getattr(model, "hidden_size", 0) or 0)
     intermediate = int(getattr(model, "moe_intermediate_size", 0) or 0)
     top_k = int(getattr(model, "num_experts_per_tok", 0) or 0)
-    tokens = int(getattr(config, "max_extend_tokens", 2048) or 0)
+    tokens = cpu_prefill_workspace_tokens(config)
     total = 0
     cpu_tier = (
         getattr(config, "moe_backend", "offload") in ("cpu", "hybrid")

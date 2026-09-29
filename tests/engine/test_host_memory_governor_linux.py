@@ -45,9 +45,29 @@ def test_staging_budget_includes_ring_and_cpu_fallback_with_auto_placement(expli
     )
     cpu_bytes = _prefill_scratch_gib(config) * 2**30
     assert cpu_bytes > 32 << 20
+    # Staged execution bounds the CPU workspace one row below its crossover.
+    config.max_extend_tokens = 1023
+    bounded_bytes = _prefill_scratch_gib(config) * 2**30
+    assert bounded_bytes < cpu_bytes
+    config.max_extend_tokens = 2048
     config.moe_disk_prefill = "staged"
     config.moe_disk_layers = "all" if explicit_disk else None
-    assert _prefill_scratch_gib(config) * 2**30 == cpu_bytes + (64 << 20)
+    assert _prefill_scratch_gib(config) * 2**30 == bounded_bytes + (64 << 20)
+
+
+def test_staged_scratch_charge_does_not_grow_with_chunk_size():
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hidden_size=2048, moe_intermediate_size=512, num_experts_per_tok=8,
+        ),
+        max_extend_tokens=2048, moe_disk_prefill="staged", moe_disk_layers=None,
+        moe_disk_prefill_min_tokens=1024,
+    )
+    small = _prefill_scratch_gib(config)
+    config.max_extend_tokens = 16384
+    assert _prefill_scratch_gib(config) == small
+    config.moe_disk_prefill_min_tokens = 4096
+    assert _prefill_scratch_gib(config) > small
 
 
 def test_fitting_arithmetic_preserves_explicit_budget_and_uses_remainder():

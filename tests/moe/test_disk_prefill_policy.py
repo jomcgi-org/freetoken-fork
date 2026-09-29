@@ -105,3 +105,30 @@ def test_staging_rejects_unsupported_bank_before_allocating_cuda_buffers(disk, u
     with pytest.raises(ValueError, match="ordinary file-backed banks"):
         cache.init_disk_prefill_staging()
     assert cache._disk_prefill_staging is None
+
+
+@pytest.mark.parametrize("mode", ["cpu", "staged"])
+@pytest.mark.parametrize("chunk", [128, 2048, 8192])
+@pytest.mark.parametrize("threshold", [1, 1024, 16384])
+def test_cpu_workspace_covers_every_cpu_chunk(mode, chunk, threshold):
+    from freetoken.engine.engine import _cpu_prefill_workspace_tokens
+
+    config = SimpleNamespace(
+        moe_disk_prefill=mode, max_extend_tokens=chunk,
+        moe_disk_prefill_min_tokens=threshold,
+    )
+    capacity = _cpu_prefill_workspace_tokens(config)
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=8, cache_size=24, device=torch.device("cpu"),
+        moe_disk_prefill=mode, moe_disk_prefill_min_tokens=threshold,
+    )
+    assert 1 <= capacity <= chunk
+    cpu_sizes = []
+    for tokens in range(1, chunk + 1):
+        cache.begin_prefill(tokens)
+        if cache.effective_disk_prefill == "cpu":
+            cpu_sizes.append(tokens)
+            assert tokens <= capacity
+    # Reserve exactly the largest reachable CPU batch, or the API minimum if
+    # all chunks stage on the GPU. This catches an accidentally full allocation.
+    assert capacity == max(cpu_sizes, default=1)

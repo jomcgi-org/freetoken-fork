@@ -325,9 +325,121 @@ def _prefill_nvfp4_moe_kernel(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+@triton.jit
+def _e2m1_to_f32(code):
+    """Exact e2m1 (4-bit) decode to fp32 via the fp16 bit layout (value * 2^-14)."""
+    bits = ((code & 0x7) << 9) | ((code & 0x8) << 12)
+    return bits.to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32) * 16384.0
+
+
+@triton.jit
+def _prefill_nvfp4_moe_kernel_v2(
+    a_ptr,             # [M, K] activations
+    packed_ptr,        # [S, N, K // 2] uint8
+    scale_ptr,         # [S, N, K // 16] fp8-e4m3
+    global_ptr,        # [S, N] fp16
+    c_ptr,             # [num_valid_tokens, N] output (flat over M*top_k)
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,    # cache slot per M-block
+    num_tokens_post_padded_ptr,
+    lut_ptr,
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    stride_am, stride_ak,
+    stride_pe, stride_pn, stride_pkb,
+    stride_se, stride_sn, stride_sblk,
+    stride_ge, stride_gn,
+    stride_cm, stride_cn,
+    stride_tw,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_KB: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_kb = tl.arange(0, BLOCK_SIZE_KB)
+    # Both nibble planes' activations in one contiguous [M, 2*KB] load, split into the
+    # even (low-nibble) and odd (high-nibble) k columns in registers: the same values
+    # and the same two dots as separate stride-2 loads, with coalesced access.
+    offs_k2 = tl.arange(0, 2 * BLOCK_SIZE_KB)
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k2[None, :] * stride_ak)
+
+    slot = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    packed_base = packed_ptr + slot * stride_pe + offs_bn[None, :] * stride_pn
+    scale_base = scale_ptr + slot * stride_se + offs_bn[None, :] * stride_sn
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    K_BYTES = K // 2
+    for kb in range(0, tl.cdiv(K_BYTES, BLOCK_SIZE_KB)):
+        byte_idx = kb * BLOCK_SIZE_KB + offs_kb
+        byte_mask = byte_idx < K_BYTES
+
+        p_ptrs = packed_base + byte_idx[:, None] * stride_pkb
+        bytes_ = tl.load(p_ptrs, mask=byte_mask[:, None], other=0).to(tl.int32)
+        lo = bytes_ & 0xF
+        hi = (bytes_ >> 4) & 0xF
+        sblk = byte_idx // 8
+        s_ptrs = scale_base + sblk[:, None] * stride_sblk
+        if e4m3_native_cx():
+            scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
+        else:
+            scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
+        # e2m1 -> fp32 without the table: the magnitude bits land in an fp16 pattern
+        # whose value is the e2m1 value / 2^14 (normals and the 0.5 subnormal alike),
+        # so the product is exactly the table value.
+        b_lo = _e2m1_to_f32(lo) * scale  # [BLOCK_KB, BLOCK_N]
+        b_hi = _e2m1_to_f32(hi) * scale
+
+        k_mask = (kb * 2 * BLOCK_SIZE_KB + offs_k2) < K
+        a = tl.load(a_ptrs, mask=token_mask[:, None] & k_mask[None, :], other=0.0)
+        a_lo, a_hi = tl.split(tl.reshape(a, (BLOCK_SIZE_M, BLOCK_SIZE_KB, 2)))
+        accumulator += tl.dot(a_lo, b_lo.to(a_lo.dtype))
+        accumulator += tl.dot(a_hi, b_hi.to(a_hi.dtype))
+
+        a_ptrs += BLOCK_SIZE_KB * 2 * stride_ak
+
+    g = tl.load(global_ptr + slot * stride_ge + offs_bn * stride_gn).to(tl.float32)
+    accumulator = accumulator * g[None, :]
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token * stride_tw, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
 __all__ = [
     "_decode_nvfp4_moe_kernel",
     "_decode_nvfp4_marlin_kernel",
     "_prefill_nvfp4_moe_kernel",
+    "_prefill_nvfp4_moe_kernel_v2",
     "_e2m1_lut",
 ]

@@ -486,6 +486,29 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-layer-major-tokens",
+        type=int,
+        default=ServerArgs.prefill_layer_major_tokens,
+        help=(
+            "Run up to this many tokens of consecutive prefill chunks of one request "
+            "layer by layer, so each layer's routed experts are staged once per group "
+            "instead of once per chunk. Holds the group's residual stream on the GPU. "
+            "0 disables (default)."
+        ),
+    )
+
+    parser.add_argument(
+        "--prefill-layer-major-chunk",
+        type=int,
+        default=ServerArgs.prefill_layer_major_chunk,
+        help=(
+            "With --prefill-layer-major-tokens, chunk size for prompts whose remaining "
+            "prefill needs more than one --max-extend-length chunk; shorter prompts keep "
+            "a single chunk. 0 keeps --max-extend-length (default)."
+        ),
+    )
+
+    parser.add_argument(
         "--decode-log-interval",
         type=_positive_int,
         default=ServerArgs.decode_log_interval,

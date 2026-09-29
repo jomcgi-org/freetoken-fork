@@ -202,6 +202,21 @@ _BANK_BYTES_PER_EXPERT = {
 MARLIN_MAX_CACHE_SIZE = 992
 
 
+def _disk_staging_workers() -> int:
+    """Reader threads for buffered DISK prefill staging (FREETOKEN_DISK_STAGING_WORKERS)."""
+    try:
+        return max(1, int(os.environ.get("FREETOKEN_DISK_STAGING_WORKERS", "1")))
+    except ValueError:
+        return 1
+
+
+def _disk_staging_geometry(workers: int) -> dict:
+    """Two slots per worker, with the pinned total near the 64 MiB single ring."""
+    if workers <= 1:
+        return {"workers": 1}
+    return {"workers": workers, "chunk_bytes": max(4 << 20, (64 << 20) // workers)}
+
+
 @dataclass
 class OffloadMoeCache:
     num_layers: int
@@ -280,6 +295,19 @@ class OffloadMoeCache:
             raise ValueError("cached file reads require staged DISK prefill")
         self._staged_prefill_active = False
         self._disk_prefill_staging = None
+        # Layer-major prefill group state (see begin_layer_major_group).
+        self._layer_major_group = False
+        self._layer_major_begun = False
+        self._layer_major_staged: tuple[int, set[int]] | None = None
+        # Predicted DISK staging inside layer-major groups (see begin_layer_major_group).
+        self._lm_predictive = False
+        self._lm_resident: dict[int, set[int]] = {}
+        self._lm_needed: dict[int, set[int]] = {}
+        self._lm_predict: dict[int, set[int]] = {}
+        self._lm_jobs: dict = {}
+        self._lm_executor = None
+        self._lm_bg_staging = None
+        self._lm_copy_stream = None
         self.hot_expert_capacity: dict[int, int] = {}
         assert self.moe_prefill_coalesce in (
             "populate", "on", "off"
@@ -698,7 +726,7 @@ class OffloadMoeCache:
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
-            self.bank_caches[name] = torch.empty(
+            self.bank_caches[name] = torch.zeros(
                 (self.cache_size, *head.shape[1:]),
                 dtype=head.dtype,
                 device=self.device,
@@ -814,17 +842,228 @@ class OffloadMoeCache:
             cached = self.moe_disk_prefill_io == "cached"
             self._disk_prefill_staging = DiskPrefillStaging(
                 self.device, direct_io=cached, reuse_cached_rows=cached,
+                **_disk_staging_geometry(_disk_staging_workers()),
             )
             logger.info_rank0(
                 f"DISK staged prefill: ring={self._disk_prefill_staging.pinned_bytes / 2**20:.0f} MiB, "
                 f"minimum_chunk={self.moe_disk_prefill_min_tokens} tokens, "
-                f"file_io={self.moe_disk_prefill_io}"
+                f"file_io={self.moe_disk_prefill_io}, "
+                f"workers={self._disk_prefill_staging.workers}"
             )
+
+    def begin_layer_major_group(self) -> None:
+        """Run the following prefill chunks layer by layer as one group.
+
+        Every chunk of a layer executes before the next layer, so a layer's experts
+        need to reach the GPU once per group instead of once per chunk. Pinned
+        layers already stay in their double buffer while their chunks run back to
+        back; the group only has to keep ``begin_prefill`` from resetting that
+        bookkeeping on each chunk. DISK layers stage each expert row once per group.
+        """
+        self._layer_major_group = True
+        self._layer_major_begun = False
+        self._layer_major_staged = None
+        # Predicted DISK staging: every layer alternates between the two prefill
+        # double buffers, so a DISK layer's rows can be staged into its buffer while
+        # the previous layer computes from the other one. A background thread reads
+        # the rows this DISK layer routed in the previous group (the prediction) and
+        # copies them on a dedicated stream; at use time only rows the prediction
+        # missed are staged synchronously, so every routed row is always present.
+        self._lm_predictive = bool(
+            os.environ.get("FREETOKEN_LAYER_MAJOR_PREDICT", "1") != "0"
+            and self.moe_disk_prefill == "staged"
+            and self._disk_prefill_staging is not None
+            and self.prefill_overlap
+            and self.prefill_copy_stream is not None
+            and not self.prefill_hit_d2d
+            and "disk" in self.layer_residency
+        )
+        self._lm_resident = {}
+        self._lm_needed = {}
+        self._lm_jobs = {}
+
+    def end_layer_major_group(self) -> None:
+        predictive = self._lm_predictive
+        self._layer_major_group = False
+        self._layer_major_begun = False
+        self._layer_major_staged = None
+        self._lm_predictive = False
+        if predictive:
+            # A job can only be pending for a layer the group never reached (an
+            # aborted forward); finish it before the buffers change hands.
+            for job in self._lm_jobs.values():
+                job.result()
+            self._lm_jobs = {}
+            for layer_id, rows in self._lm_needed.items():
+                if rows:
+                    self._lm_predict[layer_id] = rows
+            self._lm_needed = {}
+            self._lm_resident = {}
+            self._configure_prefill_overlap_layers()
+            self._prefill_buffer_layer = [None, None]
+            self._prefill_buffer_released = [True, True]
+
+    def _lm_claim_buffer(self, layer_id: int) -> int:
+        """Assign ``layer_id``'s group buffer to it (main thread)."""
+        buffer_id = self._prefill_overlap_buffer_ids[layer_id]
+        if self._prefill_buffer_layer[buffer_id] == layer_id:
+            return buffer_id
+        if self._prefill_buffer_layer[buffer_id] is not None:
+            assert self._prefill_buffer_released[buffer_id], (
+                "Prefill overlap buffer is being reused before release"
+            )
+        self._invalidate_prefill_buffer(buffer_id)
+        self._prefill_buffer_layer[buffer_id] = layer_id
+        self._prefill_buffer_released[buffer_id] = False
+        self._lm_resident[layer_id] = set()
+        return buffer_id
+
+    def _lm_copy_rows(self, staging, layer_id: int, buffer_id: int, rows) -> None:
+        for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
+            copied = staging.copy_bank(per_layer[layer_id], buffer[buffer_id], rows)
+            if self.collect_stats:
+                self.disk_prefill_staged_h2d_bytes += copied
+
+    def layer_major_prefetch_disk(self, layer_id: int) -> None:
+        """Start staging a DISK layer's predicted rows into its group buffer."""
+        if (
+            not self._lm_predictive
+            or layer_id >= self.num_layers
+            or self.layer_residency[layer_id] != "disk"
+            or layer_id in self._lm_jobs
+            or self._prefill_buffer_layer[self._prefill_overlap_buffer_ids[layer_id]]
+            == layer_id
+        ):
+            return
+        buffer_id = self._lm_claim_buffer(layer_id)
+        rows = sorted(self._lm_predict.get(layer_id, ()))
+        if not rows:
+            return
+        if self._lm_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            from freetoken.moe.disk_prefill_staging import DiskPrefillStaging
+
+            self._lm_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ft-lm-prefetch"
+            )
+            cached = self.moe_disk_prefill_io == "cached"
+            self._lm_bg_staging = DiskPrefillStaging(
+                self.device,
+                direct_io=cached,
+                reuse_cached_rows=cached,
+                **_disk_staging_geometry(_disk_staging_workers()),
+            )
+            self._lm_copy_stream = torch.cuda.Stream(device=self.device)
+        has_release = self._prefill_buffer_has_release_event[buffer_id]
+        release = self.prefill_release_events[buffer_id] if self.prefill_release_events else None
+        ready = self.prefill_ready_events[buffer_id] if self.prefill_ready_events else None
+        stream = self._lm_copy_stream
+        staging = self._lm_bg_staging
+        device = self.device
+
+        trace = getattr(self, "_layer_major_trace", None)
+        # Inference mode is thread-local; the job copies into the caller's tensors.
+        inference = torch.is_inference_mode_enabled()
+
+        def job() -> None:
+            started = time.perf_counter()
+            if stream is None:  # CPU tests
+                self._lm_copy_rows(staging, layer_id, buffer_id, rows)
+                return
+            with (
+                torch.inference_mode(inference),
+                torch.cuda.device(device),
+                torch.cuda.stream(stream),
+            ):
+                if has_release:
+                    stream.wait_event(release)
+                self._lm_copy_rows(staging, layer_id, buffer_id, rows)
+                ready.record(stream)
+            if trace is not None:
+                trace.append(("diskjob", layer_id, len(rows), time.perf_counter() - started))
+
+        self._lm_resident[layer_id] = set(rows)
+        self._lm_jobs[layer_id] = self._lm_executor.submit(job)
+
+    def layer_major_route_ticket(self, layer_id: int, expert_ids: torch.Tensor):
+        """Start reading back which rows a chunk routes to, without a stream sync.
+
+        A fixed-size presence mask is copied to pinned memory and fenced by an event
+        recorded right after the copy, so waiting on it waits for this chunk's router
+        only, not for work enqueued after it (the next chunk's attention).
+        """
+        if not self._lm_predictive or self.layer_residency[layer_id] != "disk":
+            return None
+        mask = torch.zeros(self.num_experts, dtype=torch.bool, device=expert_ids.device)
+        mask[expert_ids.reshape(-1).long()] = True
+        host = torch.empty(self.num_experts, dtype=torch.bool, pin_memory=True)
+        host.copy_(mask, non_blocking=True)
+        done = torch.cuda.Event()
+        done.record(torch.cuda.current_stream(expert_ids.device))
+        return host, done
+
+    def layer_major_disk_views(
+        self, layer_id: int, expert_ids: torch.Tensor, ticket=None
+    ) -> tuple[torch.Tensor, ...]:
+        """Buffer views holding every row ``expert_ids`` routes to, for one chunk."""
+        buffer_id = self._lm_claim_buffer(layer_id)
+        trace = getattr(self, "_layer_major_trace", None)
+        waited = time.perf_counter()
+        job = self._lm_jobs.pop(layer_id, None)
+        predicted = len(self._lm_resident.get(layer_id, ())) if job is not None else 0
+        if job is not None:
+            job.result()
+            if self._lm_copy_stream is not None:
+                torch.cuda.current_stream(self.device).wait_event(
+                    self.prefill_ready_events[buffer_id]
+                )
+        waited = time.perf_counter() - waited
+        synced = time.perf_counter()
+        if ticket is not None:
+            host, done = ticket
+            done.synchronize()
+            rows = torch.nonzero(host).view(-1).tolist()
+        else:
+            rows = torch.unique(expert_ids).cpu().tolist()
+        synced = time.perf_counter() - synced
+        self._lm_needed.setdefault(layer_id, set()).update(rows)
+        resident = self._lm_resident.setdefault(layer_id, set())
+        missing = [row for row in rows if row not in resident]
+        staged = time.perf_counter()
+        if missing:
+            # On the compute stream: ordered after the prediction's ready wait and
+            # after the buffer's previous occupant.
+            self._lm_copy_rows(self._disk_prefill_staging, layer_id, buffer_id, missing)
+            resident.update(missing)
+        if trace is not None:
+            trace.append(
+                ("disk", layer_id, predicted, len(rows), len(missing), waited, synced,
+                 time.perf_counter() - staged)
+            )
+        return tuple(buffer[buffer_id] for buffer in self.prefill_bank_buffers)
+
+    def _layer_major_missing_rows(self, layer_id: int, rows: list[int]) -> list[int]:
+        """Rows of ``layer_id`` not yet staged into scratch during this group."""
+        if not self._layer_major_group:
+            return rows
+        staged = self._layer_major_staged
+        if staged is None or staged[0] != layer_id:
+            staged = (layer_id, set())
+            self._layer_major_staged = staged
+        missing = [row for row in rows if row not in staged[1]]
+        staged[1].update(missing)
+        return missing
 
     def stage_disk_prefill_layer(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         assert self._disk_prefill_staging is not None, "staging must be initialized before serving"
         assert self.layer_residency[layer_id] == "disk"
         rows = torch.unique(expert_ids).cpu().tolist()
+        rows = self._layer_major_missing_rows(layer_id, rows)
+        if not rows:
+            # Every routed row of this chunk is already in scratch from an earlier
+            # chunk of the same layer in this group.
+            return
         # Sparse copies cannot advertise uncopied experts as cache hits. This
         # applies to layers without protected HOT slots as well as HOT layers.
         self.materialize_layer(layer_id, temporary=True)
@@ -1162,7 +1401,7 @@ class OffloadMoeCache:
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
-            self.bank_caches[name] = torch.empty(
+            self.bank_caches[name] = torch.zeros(
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
             # Rebuild has the same cold, zero-weight fallback as initial setup.
@@ -2695,6 +2934,17 @@ class OffloadMoeCache:
         self._hot_adapt_prefill_tokens_counted = 0
         self._hot_adapt_token_boundary(routed_tokens, "prefill")
 
+    def hot_adapt_prefill_group_boundary(self, group_tokens: int) -> None:
+        """One prefill boundary for a layer-major group of chunks.
+
+        Each chunk counts its tokens as the maximum over layers, which a group would
+        collapse to one chunk; credit the group's routed tokens instead whenever any
+        were observed.
+        """
+        observed = self._hot_adapt_prefill_tokens_counted
+        self._hot_adapt_prefill_tokens_counted = 0
+        self._hot_adapt_token_boundary(int(group_tokens) if observed else 0, "prefill")
+
     def hot_adapt_step_boundary(self, batch_size: int = 1) -> None:
         """Account one decode batch and start any due tick."""
         if batch_size < 0:
@@ -3314,6 +3564,9 @@ class OffloadMoeCache:
             self._prefill_hit_num = torch.zeros((1,), dtype=torch.int64, device=self.device)
 
     def _invalidate_prefill_buffer(self, buffer_id: int) -> None:
+        if buffer_id == 0:
+            # Buffer 0 aliases the DISK staging scratch rows.
+            self._layer_major_staged = None
         slot_start = buffer_id * self.num_experts
         slot_end = slot_start + self.num_experts
         old_ids = self.id_of_slot[slot_start:slot_end]
@@ -3324,6 +3577,12 @@ class OffloadMoeCache:
         self.usage[slot_start:slot_end].zero_()
 
     def begin_prefill(self, num_tokens: int | None = None) -> None:
+        if self._layer_major_group:
+            # A group sets up its prefill once. Repeating it per chunk would drop the
+            # double-buffer bookkeeping and could flip the staged mode on a short tail.
+            if self._layer_major_begun:
+                return
+            self._layer_major_begun = True
         staged = bool(
             self.moe_disk_prefill == "staged" and num_tokens is not None
             and num_tokens >= self.moe_disk_prefill_min_tokens
@@ -3331,6 +3590,11 @@ class OffloadMoeCache:
         if staged != getattr(self, "_staged_prefill_active", False):
             self._staged_prefill_active = staged
             self._configure_prefill_overlap_layers()
+        if self._lm_predictive:
+            # Every layer alternates between the two buffers for this group.
+            self._prefill_overlap_buffer_ids = [
+                layer_id & 1 for layer_id in range(self.num_layers)
+            ]
         self.prefill_selective_active = bool(
             num_tokens is not None
             and 0 < num_tokens <= self.prefill_selective_max_tokens
@@ -3372,6 +3636,9 @@ class OffloadMoeCache:
             )
 
         assert self.banks and self.prefill_bank_buffers
+        if self._lm_predictive and self.layer_residency[layer_id] == "disk":
+            self.layer_major_prefetch_disk(layer_id)
+            return
 
         buffer_id = self._prefill_overlap_buffer_ids[layer_id]
         if self._prefill_buffer_layer[buffer_id] == layer_id:
@@ -3390,6 +3657,7 @@ class OffloadMoeCache:
                         per_layer[layer_id].numel() * per_layer[layer_id].element_size()
                     )
 
+        trace = getattr(self, "_layer_major_trace", None)
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
@@ -3398,7 +3666,17 @@ class OffloadMoeCache:
             with torch.cuda.stream(self.prefill_copy_stream):
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
+                if trace is not None:
+                    started = torch.cuda.Event(enable_timing=True)
+                    started.record(self.prefill_copy_stream)
+                host_started = time.perf_counter()
                 copy()
+                if trace is not None:
+                    ended = torch.cuda.Event(enable_timing=True)
+                    ended.record(self.prefill_copy_stream)
+                    trace.append(
+                        (layer_id, started, ended, time.perf_counter() - host_started)
+                    )
                 self.prefill_ready_events[buffer_id].record(self.prefill_copy_stream)
 
         self._prefill_buffer_layer[buffer_id] = layer_id
