@@ -106,6 +106,14 @@ def test_group_ends_at_the_final_chunk():
     assert final.can_decode
 
 
+def test_every_chunk_of_a_group_carries_the_whole_prompt():
+    sched, pm, _prepared = _scheduler(3 * CHUNK, prompt_len=5 * CHUNK)
+    prompt = pm.pending_list[0].input_ids
+    group = sched._schedule_layer_major_group(_first(sched, pm))
+    assert all(fi.batch.prompt_ids is prompt for fi in group)
+    assert prompt.numel() == 5 * CHUNK
+
+
 def test_final_chunk_joins_a_full_group():
     from freetoken.scheduler.prefill import ChunkedReq
 
