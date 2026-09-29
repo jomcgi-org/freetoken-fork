@@ -76,6 +76,8 @@ runtime source, correctness checks and source-only diagnostic helpers.
 Further batching, dense-operation and speculative-verification work is a
 separate backlog. Give future experiments a bounded budget and an explicit
 workload wall-time target, preserving all task failures and quality checks.
+The [model quality checks](model-quality-checks.md) give a minutes-long output
+parity gate and an hour-long BFCL tool-calling subset for these experiments.
 
 ## Prefill chunk screening, 2026-09-22
 
