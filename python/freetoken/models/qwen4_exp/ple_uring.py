@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import math
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from types import ModuleType
@@ -191,6 +192,11 @@ def _make_store(extension: ModuleType, extents: PleUringExtents, queue_depth: in
         ) from exc
 
 
+# Fills of at least this many unique rows read the data and scale stores concurrently
+# (prefill chunks); decode fills stay sequential.
+_PARALLEL_READ_MIN_ROWS = 1024
+
+
 class UringTable:
     """PLE table streamed with strict io_uring reads into bounded pinned staging."""
 
@@ -372,6 +378,8 @@ class UringTable:
         self._decode_shape: torch.Size | None = None
         self._pending: tuple[torch.Tensor, torch.Tensor, str] | None = None
         self._replay_done: torch.cuda.Event | None = None
+        self._io_lock = threading.Lock()
+        self._scale_reader = None
         self._poisoned = False
         self.reset_stats()
 
@@ -469,26 +477,12 @@ class UringTable:
         if not count:
             return
         try:
-            self._data_store.read_rows(
-                unique.data_ptr(),
-                count,
-                self._stage_bank.tensor[base:].data_ptr(),
-                self.source.data.row_nbytes,
-            )
+            # One ring per store is not thread-safe: the layer-major stager thread and
+            # forward-path fills share these stores.
+            with self._io_lock:
+                self._read_stores(unique, count, base)
             if self._scale_store is None:
                 return
-            destination = (
-                self._raw_scale_bank.tensor
-                if self._raw_scale_bank is not None
-                else self._stage_scale_bank.tensor
-            )
-            assert self.source.scales is not None
-            self._scale_store.read_rows(
-                unique.data_ptr(),
-                count,
-                destination[base:].data_ptr(),
-                self.source.scales.row_nbytes,
-            )
             if self._raw_scale_bank is not None:
                 assert self._stage_scale_bank is not None
                 serving = self._stage_scale_bank.tensor[base : base + count]
@@ -504,6 +498,48 @@ class UringTable:
         except (OSError, RuntimeError):
             self._poisoned = True
             raise
+
+    def _read_stores(self, unique: torch.Tensor, count: int, base: int) -> None:
+        """Read data and scale rows; large fills read both stores concurrently.
+
+        Each store owns its ring and the native reads release the GIL, so a large
+        prefill fill (tens of thousands of small O_DIRECT reads per store) overlaps
+        the two instead of waiting for one store's reads before starting the other.
+        """
+        data_read = (
+            unique.data_ptr(),
+            count,
+            self._stage_bank.tensor[base:].data_ptr(),
+            self.source.data.row_nbytes,
+        )
+        if self._scale_store is None:
+            self._data_store.read_rows(*data_read)
+            return
+        destination = (
+            self._raw_scale_bank.tensor
+            if self._raw_scale_bank is not None
+            else self._stage_scale_bank.tensor
+        )
+        assert self.source.scales is not None
+        scale_read = (
+            unique.data_ptr(),
+            count,
+            destination[base:].data_ptr(),
+            self.source.scales.row_nbytes,
+        )
+        if count < _PARALLEL_READ_MIN_ROWS:
+            self._data_store.read_rows(*data_read)
+            self._scale_store.read_rows(*scale_read)
+            return
+        if self._scale_reader is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._scale_reader = ThreadPoolExecutor(1, thread_name_prefix="ple-scale-read")
+        scales = self._scale_reader.submit(self._scale_store.read_rows, *scale_read)
+        try:
+            self._data_store.read_rows(*data_read)
+        finally:
+            scales.result()
 
     def _stage_rows(
         self,
