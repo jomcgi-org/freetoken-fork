@@ -164,115 +164,263 @@ class Qwen4ExpModel(BaseOP):
                 hiddens.append(
                     self.embed_tokens.forward(batch.input_ids).repeat(1, self.hc_count)
                 )
-        def run_ple(layer, batch):
+        stager = _PleGroupStager.create(self._ple[0], batches) if self._ple else None
+
+        def run_ple(layer, batch, index):
+            nonlocal stager
             if layer.ple is None:
                 return None
             # PLE runs per chunk: a chunk's n-gram context is the previous chunk's
-            # committed window, and the host staging holds one chunk.
+            # committed window.
             from .ple import build_ple_metadata
 
             prepare_ple(batch)
             meta = build_ple_metadata(batch, layer.ple.args, batch.input_ids.device)
+            if stager is not None:
+                try:
+                    token, local_ids = stager.take(index)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning_rank0(
+                        "Layer-major PLE staging failed (%r); staging on the forward path", exc
+                    )
+                    stager.close()
+                    stager = None
+                else:
+                    layer.ple._pending = (meta, token)
+                    layer.ple.ple_embedding.table.use_prefill_ids(token, local_ids)
+                    return meta
             layer.ple.start_prefetch(batch, meta)
             return meta
 
-        def commit_ple(meta, batch):
+        def commit_ple(meta, batch, index):
             if meta is not None:
                 from .ple import commit_ngram_context
 
+                if stager is not None:
+                    stager.release(index)
                 commit_ngram_context(meta, getattr(batch, "fla_metadata", None))
 
         import os
 
         moe_tokens = int(os.environ.get("FREETOKEN_LAYER_MAJOR_MOE_TOKENS", "0") or 0)
-        for layer_index, layer in enumerate(self.layers.op_list):
-            if getattr(layer.mlp, "supports_layer_major_split", False):
-                # Pipeline within the layer: chunk c+1's attention and routing are
-                # enqueued before chunk c's experts, so waiting for c's routed rows
-                # (to stage any the prediction missed) leaves the GPU busy. Chunk c+1's
-                # attention reads only attention state that chunk c's attention wrote;
-                # each chunk runs exactly the operations of ``forward``.
-                pending = {}
+        try:
+            for layer_index, layer in enumerate(self.layers.op_list):
+                if getattr(layer.mlp, "supports_layer_major_split", False):
+                    # Pipeline within the layer: chunk c+1's attention and routing are
+                    # enqueued before chunk c's experts, so waiting for c's routed rows
+                    # (to stage any the prediction missed) leaves the GPU busy. Chunk c+1's
+                    # attention reads only attention state that chunk c's attention wrote;
+                    # each chunk runs exactly the operations of ``forward``.
+                    pending = {}
 
-                attn_kind = "attn_linear" if layer._is_linear else "attn_full"
+                    attn_kind = "attn_linear" if layer._is_linear else "attn_full"
 
-                def attention(index: int) -> None:
-                    batch = batches[index]
-                    with enter(batch):
-                        with stage_timer.span("ple"):
-                            meta = run_ple(layer, batch)
-                        with stage_timer.span(attn_kind):
-                            hidden, block_input, inject = layer.forward_attention(
-                                hiddens[index], batch
-                            )
-                        commit_ple(meta, batch)
-                        with stage_timer.span("moe_prepare"):
-                            prepared = layer.mlp.prepare_layer_major(block_input)
-                        pending[index] = (hidden, inject, prepared)
+                    def attention(index: int) -> None:
+                        batch = batches[index]
+                        with enter(batch):
+                            with stage_timer.span("ple"):
+                                meta = run_ple(layer, batch, index)
+                            with stage_timer.span(attn_kind):
+                                hidden, block_input, inject = layer.forward_attention(
+                                    hiddens[index], batch
+                                )
+                            commit_ple(meta, batch, index)
+                            with stage_timer.span("moe_prepare"):
+                                prepared = layer.mlp.prepare_layer_major(block_input)
+                            pending[index] = (hidden, inject, prepared)
 
-                def experts(index: int) -> None:
-                    with enter(batches[index]):
-                        hidden, inject, prepared = pending.pop(index)
-                        with stage_timer.span("moe_finish"):
-                            out = layer.mlp.finish_layer_major(prepared)
-                        with stage_timer.span("mlp_combine"):
-                            hiddens[index] = layer.mlp_hyper_connection.combine(
-                                hidden, out, inject
-                            )
-
-                if moe_tokens > 0 and hasattr(layer.mlp, "finish_layer_major_batch"):
-                    # Expert batches: consecutive chunks up to moe_tokens share one
-                    # routed-expert GEMM. The next batch's attention is enqueued first.
-                    groups, current, size = [], [], 0
-                    for index, batch in enumerate(batches):
-                        tokens = int(batch.input_ids.numel())
-                        if current and size + tokens > moe_tokens:
-                            groups.append(current)
-                            current, size = [], 0
-                        current.append(index)
-                        size += tokens
-                    groups.append(current)
-
-                    def experts_batch(indices) -> None:
-                        with enter(batches[indices[-1]]):
-                            states = [pending.pop(index) for index in indices]
+                    def experts(index: int) -> None:
+                        with enter(batches[index]):
+                            hidden, inject, prepared = pending.pop(index)
                             with stage_timer.span("moe_finish"):
-                                outs = []
-                                for part in _fit_expert_batch(
-                                    layer.mlp, [state[2] for state in states]
-                                ):
-                                    outs.extend(layer.mlp.finish_layer_major_batch(part))
+                                out = layer.mlp.finish_layer_major(prepared)
                             with stage_timer.span("mlp_combine"):
-                                for index, state, out in zip(indices, states, outs):
-                                    hiddens[index] = layer.mlp_hyper_connection.combine(
-                                        state[0], out, state[1]
-                                    )
+                                hiddens[index] = layer.mlp_hyper_connection.combine(
+                                    hidden, out, inject
+                                )
 
-                    for index in groups[0]:
-                        attention(index)
-                    for position, indices in enumerate(groups):
-                        if position + 1 < len(groups):
-                            for index in groups[position + 1]:
-                                attention(index)
-                        experts_batch(indices)
+                    if moe_tokens > 0 and hasattr(layer.mlp, "finish_layer_major_batch"):
+                        # Expert batches: consecutive chunks up to moe_tokens share one
+                        # routed-expert GEMM. The next batch's attention is enqueued first.
+                        groups, current, size = [], [], 0
+                        for index, batch in enumerate(batches):
+                            tokens = int(batch.input_ids.numel())
+                            if current and size + tokens > moe_tokens:
+                                groups.append(current)
+                                current, size = [], 0
+                            current.append(index)
+                            size += tokens
+                        groups.append(current)
+
+                        def experts_batch(indices) -> None:
+                            with enter(batches[indices[-1]]):
+                                states = [pending.pop(index) for index in indices]
+                                with stage_timer.span("moe_finish"):
+                                    outs = []
+                                    for part in _fit_expert_batch(
+                                        layer.mlp, [state[2] for state in states]
+                                    ):
+                                        outs.extend(layer.mlp.finish_layer_major_batch(part))
+                                with stage_timer.span("mlp_combine"):
+                                    for index, state, out in zip(indices, states, outs):
+                                        hiddens[index] = layer.mlp_hyper_connection.combine(
+                                            state[0], out, state[1]
+                                        )
+
+                        for index in groups[0]:
+                            attention(index)
+                        for position, indices in enumerate(groups):
+                            if position + 1 < len(groups):
+                                for index in groups[position + 1]:
+                                    attention(index)
+                            experts_batch(indices)
+                    else:
+                        attention(0)
+                        for index in range(len(batches)):
+                            if index + 1 < len(batches):
+                                attention(index + 1)
+                            experts(index)
                 else:
-                    attention(0)
-                    for index in range(len(batches)):
-                        if index + 1 < len(batches):
-                            attention(index + 1)
-                        experts(index)
-            else:
-                for index, batch in enumerate(batches):
-                    with enter(batch):
-                        meta = run_ple(layer, batch)
-                        hiddens[index] = layer.forward(hiddens[index], batch)
-                        commit_ple(meta, batch)
-            if after_layer is not None:
-                after_layer(layer_index)
+                    for index, batch in enumerate(batches):
+                        with enter(batch):
+                            meta = run_ple(layer, batch, index)
+                            hiddens[index] = layer.forward(hiddens[index], batch)
+                            commit_ple(meta, batch, index)
+                if after_layer is not None:
+                    after_layer(layer_index)
+        finally:
+            if stager is not None:
+                stager.close()
         last = hiddens[-1]
         del hiddens
         with enter(batches[-1]):
             return self.hyper_connection_mixer.mix(last)[0]
+
+
+class _Ran:
+    """A completed event: host-device work is already ordered."""
+
+    def synchronize(self) -> None:
+        return None
+
+
+class _PleGroupStager:
+    """Stage a layer-major group's PLE rows on a host thread, ahead of the GPU.
+
+    The forward path hashes a chunk's n-grams on the GPU and reads the row ids back,
+    which drains every queued kernel of the group each chunk. Here a thread hashes
+    each chunk from its host tokens (the same hash, ``host_prefill_row_ids``) and
+    reads its unique rows into one of up to ``MAX_SLOTS`` bank slots while earlier
+    layers run. Chunk i's slot is restaged for chunk i + slots only after the event
+    recorded behind chunk i's gather, so a gather never reads a slot being rewritten.
+    """
+
+    MAX_SLOTS = 4
+
+    @classmethod
+    def create(cls, ple, batches) -> "_PleGroupStager | None":
+        import os
+
+        if os.environ.get("FREETOKEN_LAYER_MAJOR_PLE_STAGE", "1") == "0":
+            return None
+        embedding = ple.ple_embedding
+        table = getattr(embedding, "_table", None)
+        if (
+            not torch.cuda.is_available()
+            or not hasattr(table, "stage_prefill_slot")
+            or getattr(embedding, "_host_hash_constants", None) is None
+            or len(batches) < 2
+        ):
+            return None
+        tokens = max(int(batch.input_ids.numel()) for batch in batches)
+        heads = int(table.local_ids.shape[1])
+        slots = min(cls.MAX_SLOTS, table.prefill_slots(tokens * heads))
+        if slots < 2:
+            return None
+        return cls(embedding, table, batches, tokens, heads, slots)
+
+    def __init__(
+        self, embedding, table, batches, tokens: int, heads: int, slots: int
+    ) -> None:
+        import threading
+
+        self._embedding = embedding
+        self._table = table
+        self._reqs = [getattr(b, "padded_reqs", None) or b.reqs for b in batches]
+        self._tokens = tokens
+        self._slot_rows = tokens * heads
+        self._slots = slots
+        self._device = batches[0].input_ids.device
+        cuda = self._device.type == "cuda"
+        self._out = [
+            torch.empty((tokens, heads), dtype=torch.int64, pin_memory=cuda)
+            for _ in range(slots)
+        ]
+        count = len(batches)
+        self._results: list = [None] * count
+        self._ready = [threading.Event() for _ in range(count)]
+        self._released = [threading.Event() for _ in range(count)]
+        self._done: list = [None] * count
+        self._stop = False
+        self._inference = torch.is_inference_mode_enabled()
+        self._thread = threading.Thread(target=self._run, name="ple-group-stager", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        with torch.inference_mode(self._inference):
+            for index, reqs in enumerate(self._reqs):
+                previous = index - self._slots
+                if previous >= 0:
+                    self._released[previous].wait()
+                    if self._stop:
+                        return
+                    self._done[previous].synchronize()
+                if self._stop:
+                    return
+                try:
+                    ids = self._embedding.host_prefill_row_ids(reqs, self._tokens)
+                    slot = index % self._slots
+                    self._results[index] = self._table.stage_prefill_slot(
+                        ids, slot, self._slot_rows, self._out[slot]
+                    )
+                except BaseException as exc:  # noqa: BLE001
+                    self._fail_from(index, exc)
+                    return
+                self._ready[index].set()
+
+    def _fail_from(self, index: int, exc: BaseException) -> None:
+        for later in range(index, len(self._results)):
+            self._results[later] = exc
+            self._ready[later].set()
+
+    def take(self, index: int):
+        """The chunk's lookup token and bank-local ids, copied to the device."""
+        self._ready[index].wait()
+        result = self._results[index]
+        if isinstance(result, BaseException):
+            raise result
+        return object(), result.to(self._device, non_blocking=True)
+
+    def release(self, index: int) -> None:
+        """Mark chunk ``index``'s gather enqueued; its slot frees once it has run."""
+        if self._device.type == "cuda":
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self._device))
+            self._done[index] = event
+        else:
+            self._done[index] = _Ran()
+        self._released[index].set()
+
+    def close(self) -> None:
+        """Stop the thread and wait for every enqueued gather, so later forwards
+        (decode stages its rows at the bank's start) may reuse the slots."""
+        self._stop = True
+        for event in self._released:
+            event.set()
+        self._thread.join()
+        for event in self._done:
+            if event is not None:
+                event.synchronize()
 
 
 _EXPERT_BATCH_MARGIN_BYTES = 768 << 20
