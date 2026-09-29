@@ -90,6 +90,9 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     function_call: Any | None = None
     logit_bias: dict[str, float] | None = None
+    # Returned for non-streaming responses; a streaming request ignores them.
+    logprobs: bool = False
+    top_logprobs: int | None = Field(default=None, ge=0, le=20)
     response_format: dict[str, Any] | None = None
     # FreeToken extension. Higher values are admitted sooner; this does not preempt
     # a request whose forward is already running.
@@ -119,7 +122,7 @@ class CompletionRequest(BaseModel):
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     ignore_eos: bool = False
-    logprobs: int | None = None
+    logprobs: int | None = Field(default=None, ge=0, le=20)
     echo: bool = False
     suffix: str | None = None
     logit_bias: dict[str, float] | None = None

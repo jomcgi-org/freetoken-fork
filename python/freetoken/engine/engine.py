@@ -35,7 +35,7 @@ from freetoken.utils import (
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory
-from .sample import BatchSamplingArgs, Sampler
+from .sample import BatchSamplingArgs, LogprobRows, Sampler
 from freetoken.kvcache import create_kv_pool, resolve_pool_class
 from freetoken.kvcache.base import CacheRebuildRejected
 from freetoken.kvcache.cache_status import _supports_swa_ratio
@@ -350,6 +350,8 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    # Host logprob rows aligned with next_tokens_cpu; None unless a request asked.
+    logprobs: LogprobRows | None = None
 
 
 class Engine:
@@ -1597,7 +1599,10 @@ class Engine:
             assert logits is not None
             batch_logits = logits[: batch.size]
             next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
+            logprobs = self.sampler.logprobs(batch_logits, next_tokens_gpu, batch)
             batch.generated_tokens = len(batch.reqs)
+        else:
+            logprobs = None  # the MTP gate excludes logprobs requests
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -1616,7 +1621,7 @@ class Engine:
             for req, token in zip(batch.reqs, next_tokens_cpu):
                 req.pending_token_cpu = token
                 req.sample_copy_done = copy_done_event
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, logprobs)
 
     def forward_layer_major(
         self, batches: list[Batch], args: BatchSamplingArgs
@@ -1706,6 +1711,7 @@ class Engine:
                 req.complete_one()
         last = batches[-1]
         next_tokens_gpu = self.sampler.sample(logits[: last.size], args).to(torch.int32)
+        logprobs = self.sampler.logprobs(logits[: last.size], next_tokens_gpu, last)
         last.generated_tokens = len(last.reqs)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
@@ -1716,7 +1722,7 @@ class Engine:
         for req, token in zip(last.reqs, next_tokens_cpu):
             req.pending_token_cpu = token
             req.sample_copy_done = copy_done_event
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event, logprobs)
 
     def _write_layer_major_profile(self, profiler, wall_ms, batches, directory):
         """Diagnostic: kernel time by name and GPU busy time for one group."""

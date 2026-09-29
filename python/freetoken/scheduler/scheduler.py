@@ -737,7 +737,10 @@ class Scheduler(SchedulerIOMixin):
                 self._process_last_data(item)
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        # Positional: overlap-loop test doubles pass bare 3-tuples without logprobs.
+        batch = last_data[0].batch
+        _, next_tokens_cpu, copy_done, *rest = last_data[1]
+        logprob_rows = rest[0] if rest else None
         copy_done.synchronize()
         # getattr probe: overlap-loop test doubles predate the engine attribute.
         engine = getattr(self, "engine", None)
@@ -840,16 +843,22 @@ class Scheduler(SchedulerIOMixin):
                         and not finished
                     ):
                         req.toolcall_anchor_len = req.input_ids.numel()
-                    reply.append(
-                        DetokenizeMsg(
-                            uid=req.uid,
-                            next_token=next_token,
-                            finished=finished,
-                            finish_reason=finish_reason,
-                            matched_stop=matched_stop,
-                            stop_strs=req.sampling_params.stop_strs or None,
-                        )
+                    msg = DetokenizeMsg(
+                        uid=req.uid,
+                        next_token=next_token,
+                        finished=finished,
+                        finish_reason=finish_reason,
+                        matched_stop=matched_stop,
+                        stop_strs=req.sampling_params.stop_strs or None,
                     )
+                    n_logprobs = req.sampling_params.logprobs
+                    if n_logprobs > 0 and logprob_rows is not None:
+                        msg.logprob = float(logprob_rows.chosen[i])
+                        msg.top_ids = logprob_rows.top_ids[i, : n_logprobs - 1].tolist()
+                        msg.top_logprobs = logprob_rows.top_logprobs[
+                            i, : n_logprobs - 1
+                        ].tolist()
+                    reply.append(msg)
                     if finished:
                         break
 
@@ -1674,6 +1683,7 @@ class Scheduler(SchedulerIOMixin):
             and len(batch.reqs) == 1
             and batch.reqs[0].sampling_params.is_greedy
             and batch.reqs[0].sampling_params.guided_decoding is None
+            and batch.reqs[0].sampling_params.logprobs == 0
             and batch.reqs[0].mtp_hidden is not None
         )
         if mtp_verify:

@@ -112,6 +112,8 @@ def chat_request_to_genspec(
         stop=req.stop,
     )
     sampling_params.guided_decoding = guided
+    if req.logprobs and not req.stream:
+        sampling_params.logprobs = (req.top_logprobs or 0) + 1
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=sampling_params,
@@ -302,6 +304,9 @@ async def handle_chat_completion(
             {
                 "index": 0,
                 "message": message,
+                "logprobs": (
+                    {"content": result.logprobs} if result.logprobs is not None else None
+                ),
                 "finish_reason": result.finish_reason,
             }
         ],
@@ -526,6 +531,7 @@ async def handle_completion(
             one_prompt_tokens = 0
             one_completion_tokens = 0
             one_cached_tokens = 0
+            logprobs = _CompletionLogprobs() if req.logprobs is not None else None
             async for ack in state.wait_for_ack(uid):
                 if getattr(ack, "error", None):
                     raise GenerationError(
@@ -537,6 +543,8 @@ async def handle_completion(
                 one_completion_tokens += ack.completion_tokens_delta
                 one_cached_tokens += ack.cached_tokens
                 text += ack.incremental_output
+                if logprobs is not None:
+                    logprobs.add(ack)
                 if ack.finished:
                     finish_reason = getattr(ack, "finish_reason", None) or "stop"
                     break
@@ -546,6 +554,7 @@ async def handle_completion(
                 one_prompt_tokens,
                 one_completion_tokens,
                 one_cached_tokens,
+                logprobs.as_openai() if logprobs is not None else None,
             )
 
         try:
@@ -561,11 +570,13 @@ async def handle_completion(
             )
         if isinstance(collected, ClientDisconnectedResponse):
             return collected
-        text, finish_reason, pt, ct, cached = collected
+        text, finish_reason, pt, ct, cached, logprobs = collected
         prompt_tokens += pt
         completion_tokens += ct
         cached_tokens += cached
-        choices.append({"index": index, "text": text, "finish_reason": finish_reason, "logprobs": None})
+        choices.append(
+            {"index": index, "text": text, "finish_reason": finish_reason, "logprobs": logprobs}
+        )
 
     return {
         "id": f"cmpl-{uuid.uuid4().hex}",
@@ -598,7 +609,12 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
-        if ack.incremental_output:
+        logprobs = None
+        if req.logprobs is not None and getattr(ack, "logprob", None) is not None:
+            one = _CompletionLogprobs()
+            one.add(ack)
+            logprobs = one.as_openai()
+        if ack.incremental_output or logprobs is not None:
             yield _sse(
                 {
                     "id": f"cmpl-{uid}",
@@ -610,7 +626,7 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
                             "text": ack.incremental_output,
                             "index": 0,
                             "finish_reason": None,
-                            "logprobs": None,
+                            "logprobs": logprobs,
                         }
                     ],
                 }
@@ -644,6 +660,38 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
     yield b"data: [DONE]\n\n"
 
 
+class _CompletionLogprobs:
+    """Accumulates the legacy completions ``logprobs`` object, one sampled token per reply.
+
+    Tokens are per-token decodes, so ``text_offset`` indexes their concatenation, which
+    can differ from the returned text where a stop string was trimmed."""
+
+    def __init__(self) -> None:
+        self.tokens: list[str] = []
+        self.token_logprobs: list[float] = []
+        self.top_logprobs: list[dict[str, float]] = []
+        self.text_offset: list[int] = []
+        self._offset = 0
+
+    def add(self, ack: Any) -> None:
+        if getattr(ack, "logprob", None) is None:
+            return
+        token = ack.token or ""
+        self.tokens.append(token)
+        self.token_logprobs.append(ack.logprob)
+        self.top_logprobs.append(dict(zip(ack.top_tokens or [], ack.top_logprobs or [])))
+        self.text_offset.append(self._offset)
+        self._offset += len(token)
+
+    def as_openai(self) -> dict[str, Any]:
+        return {
+            "tokens": self.tokens,
+            "token_logprobs": self.token_logprobs,
+            "top_logprobs": self.top_logprobs,
+            "text_offset": self.text_offset,
+        }
+
+
 def create_error_response(
     message: str,
     status_code: int = 400,
@@ -668,7 +716,7 @@ def _resolve_sampling(
     req: ChatCompletionRequest | CompletionRequest,
     model_sampling: dict[str, Any],
 ) -> SamplingParams:
-    return resolve_sampling(
+    params = resolve_sampling(
         temperature=req.temperature,
         top_k=req.top_k,
         top_p=req.top_p,
@@ -677,6 +725,10 @@ def _resolve_sampling(
         model_sampling=model_sampling,
         stop=req.stop,
     )
+    if isinstance(req, CompletionRequest) and req.logprobs is not None:
+        # Completions logprobs=N: the sampled token plus the N most likely alternatives.
+        params.logprobs = req.logprobs + 1
+    return params
 
 
 def _tools_for_template(req: ChatCompletionRequest) -> list[dict[str, Any]] | None:
@@ -778,8 +830,6 @@ def _response_format_unsupported(response_format: dict[str, Any] | None) -> bool
 def _completion_unsupported_reason(req: CompletionRequest) -> str | None:
     if _is_token_prompt(req.prompt):
         return "OpenAI token-id prompt inputs are not supported; pass text prompt strings instead"
-    if req.logprobs is not None:
-        return "logprobs is not supported"
     if req.echo:
         return "echo is not supported"
     if req.suffix is not None:
