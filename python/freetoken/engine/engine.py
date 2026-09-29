@@ -3127,17 +3127,32 @@ def _router_gates_by_layer(model) -> dict[int, torch.Tensor]:
     """Map MoE layer id -> router weight [num_experts, hidden] for pre-gating.
 
     A router is a MoE block's ``gate`` linear next to ``experts`` carrying a
-    ``layer_id``. Models without that shape yield an empty map (pre-gating off).
+    ``layer_id``. Walks BaseOP attribute trees (and nn.Module children) the way
+    ``iter_offload_moe_layers`` does. Models without that shape yield an empty map.
     """
+    from freetoken.layers import BaseOP
+
     gates: dict[int, torch.Tensor] = {}
-    for module in model.modules():
-        experts = getattr(module, "experts", None)
-        gate = getattr(module, "gate", None)
-        layer_id = getattr(experts, "layer_id", None)
-        weight = getattr(gate, "weight", None)
-        if layer_id is None or not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+    seen: set[int] = set()
+    stack = [model]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
             continue
-        gates[int(layer_id)] = weight
+        seen.add(id(node))
+        if isinstance(node, (list, tuple)):
+            stack.extend(node)
+            continue
+        if not isinstance(node, (BaseOP, torch.nn.Module)):
+            continue
+        experts = getattr(node, "experts", None)
+        weight = getattr(getattr(node, "gate", None), "weight", None)
+        layer_id = getattr(experts, "layer_id", None)
+        if layer_id is not None and isinstance(weight, torch.Tensor) and weight.dim() == 2:
+            gates[int(layer_id)] = weight
+        stack.extend(vars(node).values())
+        if isinstance(node, torch.nn.Module):
+            stack.extend(node.children())
     return gates
 
 

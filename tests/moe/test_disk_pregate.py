@@ -196,3 +196,30 @@ def test_pregate_thread_drains_queue_and_exits():
     assert executor._disk_banks[2][0].calls == [[1, 4]]
     assert not executor._pregate_thread.is_alive()
     assert cpu_executor._PREGATE_LOG_STEPS > 0
+
+
+def test_router_gates_by_layer_walks_baseop_trees():
+    from freetoken.engine.engine import _router_gates_by_layer
+    from freetoken.layers import BaseOP
+
+    class Experts(BaseOP):
+        def __init__(self, layer_id):
+            self.layer_id = layer_id
+
+    class Gate(BaseOP):
+        def __init__(self):
+            self.weight = torch.zeros(8, 4)
+
+    class Block(BaseOP):
+        def __init__(self, layer_id):
+            self.gate = Gate()
+            self.experts = Experts(layer_id)
+
+    class Model(BaseOP):
+        def __init__(self):
+            self.layers = [Block(1), Block(4)]
+
+    model = Model()
+    gates = _router_gates_by_layer(model)
+    assert sorted(gates) == [1, 4]
+    assert gates[4] is model.layers[1].gate.weight
