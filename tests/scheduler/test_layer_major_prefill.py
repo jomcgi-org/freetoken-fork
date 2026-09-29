@@ -106,6 +106,23 @@ def test_group_ends_at_the_final_chunk():
     assert final.can_decode
 
 
+def test_final_chunk_joins_a_full_group():
+    from freetoken.scheduler.prefill import ChunkedReq
+
+    # 3 full chunks fill the budget; the final 3 tokens join rather than run alone.
+    sched, pm, prepared = _scheduler(3 * CHUNK, prompt_len=3 * CHUNK + 3)
+    group = sched._schedule_layer_major_group(_first(sched, pm))
+    assert prepared == [[(0, CHUNK)], [(CHUNK, CHUNK)], [(2 * CHUNK, CHUNK)], [(3 * CHUNK, 3)]]
+    assert not isinstance(group[-1].batch.reqs[0], ChunkedReq) and not pm.runnable
+
+
+def test_only_the_final_chunk_overruns_the_budget():
+    # Two chunks remain after the budget: the group stops at the budget as before.
+    sched, pm, prepared = _scheduler(3 * CHUNK, prompt_len=4 * CHUNK + 3)
+    group = sched._schedule_layer_major_group(_first(sched, pm))
+    assert len(group) == 3 and pm.runnable
+
+
 def test_no_group_leaves_the_first_chunk_untouched():
     sched, pm, prepared = _scheduler(CHUNK + 1, prompt_len=4 * CHUNK)
     first = _first(sched, pm)
