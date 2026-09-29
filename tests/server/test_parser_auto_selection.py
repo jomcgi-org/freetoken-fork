@@ -348,3 +348,13 @@ def test_hot_adapt_idle_zero_is_the_cli_kill_switch():
     )
 
     assert args.moe_hot_adapt_idle_ms == 0
+
+
+def test_moe_disk_pregate_experts_defaults_off_and_parses():
+    base = ["--model", ANON_PATH, "--dtype", "bfloat16"]
+    default, _ = parse_args(base)
+    on, _ = parse_args([*base, "--moe-disk-pregate-experts", "16"])
+    assert default.moe_disk_pregate_experts == 0
+    assert on.moe_disk_pregate_experts == 16
+    with pytest.raises((SystemExit, ValueError)):
+        parse_args([*base, "--moe-disk-pregate-experts", "-1"])
