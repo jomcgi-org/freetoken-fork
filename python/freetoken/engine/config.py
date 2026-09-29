@@ -162,6 +162,10 @@ class EngineConfig:
     moe_cpu_willneed: str = "always"
     moe_cpu_willneed_recent_steps: int = 256
     moe_cpu_willneed_fault_ceiling: float = 2000.0
+    # Pre-gating: at each DISK decode layer, rank the next DISK layer's non-HOT experts
+    # with that layer's router on the current router input and WILLNEED the top N one
+    # layer early. Advisory page-cache IO only; 0 disables it.
+    moe_disk_pregate_experts: int = 0
     # Host expert-tier budgets are resolved together at engine startup. The pin
     # budget is internal; its explicit input remains FREETOKEN_PIN_BUDGET_GB.
     host_cache_reserve_gib: float | None = None
@@ -397,6 +401,8 @@ class EngineConfig:
             or self.moe_cpu_willneed_fault_ceiling <= 0
         ):
             raise ValueError("--moe-cpu-willneed-fault-ceiling must be positive")
+        if not 0 <= int(self.moe_disk_pregate_experts) <= 128:
+            raise ValueError("--moe-disk-pregate-experts must be in [0, 128]")
         if self.moe_disk_decode not in ("cpu", "gpufetch"):
             raise ValueError(
                 "--moe-disk-decode must be 'cpu' or 'gpufetch', got "

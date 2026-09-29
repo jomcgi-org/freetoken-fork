@@ -1249,6 +1249,7 @@ class Engine:
             moe_cpu_willneed=config.moe_cpu_willneed,
             moe_cpu_willneed_recent_steps=config.moe_cpu_willneed_recent_steps,
             moe_cpu_willneed_fault_ceiling=config.moe_cpu_willneed_fault_ceiling,
+            disk_pregate_experts=getattr(config, "moe_disk_pregate_experts", 0),
             prefill_coalesce=(
                 getattr(config, "moe_prefill_coalesce", "populate")
                 if config.moe_disk_prefill in ("cpu", "staged")
@@ -1271,6 +1272,11 @@ class Engine:
                 "`python setup.py build_ext --inplace` or reinstall the wheel"
             )
         cache.set_cpu_executor(executor)
+        if executor.disk_pregate_experts:
+            executor.configure_disk_pregate(
+                _router_gates_by_layer(self.model),
+                getattr(cache, "hot_row_for_expert", None),
+            )
         if config.moe_disk_prefill == "staged":
             cache.init_disk_prefill_staging()
         cache.init_disk_gpufetch(
@@ -3043,6 +3049,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_willneed": "always",
     "moe_cpu_willneed_recent_steps": 256,
     "moe_cpu_willneed_fault_ceiling": 2000.0,
+    "moe_disk_pregate_experts": 0,
     "host_cache_reserve_gib": None,
     "moe_pager_budget_gib": None,
     "moe_cpu_threads": 0,
@@ -3114,6 +3121,24 @@ def _cpu_prefill_workspace_tokens(config) -> int:
     # Shared with the host-memory governor so the charged scratch matches the
     # workspace the executor can allocate (one row below the staged crossover).
     return cpu_prefill_workspace_tokens(config)
+
+
+def _router_gates_by_layer(model) -> dict[int, torch.Tensor]:
+    """Map MoE layer id -> router weight [num_experts, hidden] for pre-gating.
+
+    A router is a MoE block's ``gate`` linear next to ``experts`` carrying a
+    ``layer_id``. Models without that shape yield an empty map (pre-gating off).
+    """
+    gates: dict[int, torch.Tensor] = {}
+    for module in model.modules():
+        experts = getattr(module, "experts", None)
+        gate = getattr(module, "gate", None)
+        layer_id = getattr(experts, "layer_id", None)
+        weight = getattr(gate, "weight", None)
+        if layer_id is None or not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+            continue
+        gates[int(layer_id)] = weight
+    return gates
 
 
 def _validate_disk_prefill_task_size(config, cache) -> None:

@@ -1313,6 +1313,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-disk-pregate-experts",
+        type=int,
+        default=ServerArgs.moe_disk_pregate_experts,
+        help=(
+            "Decode pre-gating: at each DISK layer, run the next DISK layer's router "
+            "on this layer's router input and WILLNEED its top N non-HOT experts one "
+            "layer early (advisory page-cache IO; default: 0 = off)."
+        ),
+    )
+
+    parser.add_argument(
         "--host-cache-reserve-gib",
         type=_nonnegative_float,
         default=ServerArgs.host_cache_reserve_gib,

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import mmap
 import os
+import queue
 import threading
 import time
 import weakref
@@ -58,6 +59,8 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 _FLAG_SLOTS_PER_LAYER = 16
 _WILLNEED_FAULT_WINDOW_STEPS = 64
 _WILLNEED_GUARD_HOLD_STEPS = 256
+# Decode steps between pre-gating stat log lines (--moe-disk-pregate-experts).
+_PREGATE_LOG_STEPS = 512
 
 # MoeTask::num_tokens and CpuMoeExecutor::create_task use a signed C++ int.
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
@@ -335,6 +338,7 @@ class CpuMoeExecutor:
         moe_cpu_willneed: str = "always",
         moe_cpu_willneed_recent_steps: int = 256,
         moe_cpu_willneed_fault_ceiling: float = 2000.0,
+        disk_pregate_experts: int = 0,
         prefill_coalesce: str | bool = "populate",
         prefill_coalesce_budget_bytes: int = 40 << 30,
         prefill_batch: str | bool = "on",
@@ -480,6 +484,22 @@ class CpuMoeExecutor:
         )
         self._disk_previous_experts: dict[int, tuple[int, ...]] = {}
         self._disk_predicted_experts: dict[int, tuple[int, ...]] = {}
+        # Pre-gating stays inert until configure_disk_pregate() hands over routers.
+        self.disk_pregate_experts = (
+            max(0, int(disk_pregate_experts)) if self._disk_banks else 0
+        )
+        self._pregate_next: dict[int, int] = {}
+        self._pregate_gates: dict[int, torch.Tensor] = {}
+        self._pregate_hot: torch.Tensor | None = None
+        self._pregate_host: torch.Tensor | None = None
+        self._pregate_pad: torch.Tensor | None = None
+        self._pregate_queue: queue.SimpleQueue | None = None
+        self._pregate_pending: dict[int, frozenset] = {}
+        self._pregate_seq = [0] * self.num_layers
+        self._pregate_stop = False
+        self._pregate_warned = False
+        self._pregate_steps = 0
+        self._reset_pregate_stats()
         for layer_id, banks in self._disk_banks.items():
             pagers = {getattr(bank, "_pager", None) for bank in banks}
             for pager in pagers - {None}:
@@ -1237,6 +1257,14 @@ class CpuMoeExecutor:
         banks = self._disk_banks.get(int(layer_id))
         if not banks or not selected:
             return 0
+        pages = self._advise_rows(banks, selected)
+        self._disk_prefetch_calls[layer_id] += 1
+        self._disk_prefetch_pages[layer_id] += pages
+        return pages
+
+    @staticmethod
+    def _advise_rows(banks, selected) -> int:
+        """WILLNEED one layer's selected expert rows across its banks; returns pages."""
         pages = 0
         paged_banks: set[int] = set()
         by_pager: dict[object, list] = {}
@@ -1251,8 +1279,6 @@ class CpuMoeExecutor:
             bank.prefetch_experts(selected) for bank in banks
             if id(bank) not in paged_banks
         )
-        self._disk_prefetch_calls[layer_id] += 1
-        self._disk_prefetch_pages[layer_id] += pages
         return pages
 
     def _populate_selected(
@@ -1331,6 +1357,10 @@ class CpuMoeExecutor:
         """
         if getattr(self, "_moe_cpu_willneed", "always") == "recent":
             self._update_willneed_fault_guard()
+        if getattr(self, "_pregate_host", None) is not None:
+            self._pregate_steps += 1
+            if self._pregate_steps % _PREGATE_LOG_STEPS == 0:
+                self._log_pregate_stats()
         if not getattr(self, "_disk_lookahead_enabled", False):
             return 0
         previous = getattr(self, "_disk_previous_experts", {})
@@ -1345,6 +1375,189 @@ class CpuMoeExecutor:
         """Make the next decode step cold after a prefill or cache reset boundary."""
         self._disk_previous_experts = {}
         self._disk_predicted_experts = {}
+        self._pregate_pending = {}
+
+    # -- Decode pre-gating (--moe-disk-pregate-experts) ---------------------------
+    #
+    # At DISK layer L, the GPU runs the router of the next DISK layer L' on L's router
+    # input, masks L''s HOT experts and takes the top F ids. They reach pinned host
+    # memory with L's routing D2H (same stream, before the doorbell), so L's pre-run
+    # callback can read them and hand them to a background thread that issues
+    # MADV_WILLNEED for L' while L's CPU compute and the GPU layers in between run.
+    # Advisory only: outputs never depend on it.
+
+    def configure_disk_pregate(
+        self,
+        gates: dict[int, torch.Tensor],
+        hot_row_for_expert: torch.Tensor | None = None,
+    ) -> int:
+        """Enable pre-gating given router weights by MoE layer. Returns #pairs."""
+        fetch = min(int(self.disk_pregate_experts), self.num_experts)
+        if fetch <= 0:
+            return 0
+        disk = sorted(self._disk_banks)
+        pairs: dict[int, int] = {}
+        for src, dst in zip(disk, disk[1:]):
+            weight = gates.get(dst)
+            if weight is None or tuple(weight.shape) != (self.num_experts, self.H):
+                continue
+            pairs[src] = dst
+        if not pairs:
+            logger.warning_rank0(
+                "--moe-disk-pregate-experts: no DISK layer pair has a usable router; "
+                "pre-gating disabled"
+            )
+            self.disk_pregate_experts = 0
+            return 0
+        if hot_row_for_expert is not None and tuple(hot_row_for_expert.shape) != (
+            self.num_layers, self.num_experts,
+        ):
+            hot_row_for_expert = None
+        self.disk_pregate_experts = fetch
+        self._pregate_next = pairs
+        self._pregate_gates = {src: gates[dst] for src, dst in pairs.items()}
+        self._pregate_hot = hot_row_for_expert
+        alloc = alloc_pinned_tensor if self.device.type == "cuda" else torch.empty
+        host = alloc(self.num_layers, self.max_tokens, fetch, dtype=torch.int32)
+        host.fill_(-1)
+        self._pregate_pad = torch.full(
+            (self.max_tokens, fetch), -1, dtype=torch.int32, device=self.device
+        )
+        self._pregate_queue = queue.SimpleQueue()
+        try:
+            allowed = set(os.sched_getaffinity(0))
+        except AttributeError:
+            allowed = set()
+        spare = sorted(allowed - set(getattr(self, "core_ids", ()) or ()))
+        thread = threading.Thread(
+            target=_pregate_main,
+            args=(weakref.ref(self), self._pregate_queue, spare),
+            name="freetoken-disk-pregate",
+            daemon=True,
+        )
+        thread.start()
+        self._pregate_thread = thread
+        self._pregate_host = host
+        logger.info_rank0(
+            f"DISK pre-gating: top {fetch} non-HOT experts of the next DISK layer for "
+            f"{len(pairs)} DISK layer pairs; advice thread on CPUs "
+            f"{spare if spare else 'unpinned'}"
+        )
+        return len(pairs)
+
+    def _pregate_issue(
+        self, layer_id: int, target: int, hidden_states: torch.Tensor
+    ) -> None:
+        """Queue (capturable) the next DISK layer's top-F non-HOT ids into pinned memory."""
+        bs = hidden_states.shape[0]
+        if bs > self.max_tokens:
+            return
+        weight = self._pregate_gates[layer_id]
+        x = hidden_states if hidden_states.dtype == weight.dtype else hidden_states.to(
+            weight.dtype
+        )
+        logits = torch.nn.functional.linear(x, weight)
+        if self._pregate_hot is not None:
+            logits = logits.masked_fill(self._pregate_hot[target] >= 0, float("-inf"))
+        ids = torch.topk(logits, self.disk_pregate_experts, dim=-1, sorted=False).indices
+        host = self._pregate_host[layer_id]
+        host[:bs].copy_(ids.to(torch.int32), non_blocking=True)
+        if bs < self.max_tokens:
+            host[bs:].copy_(self._pregate_pad[: self.max_tokens - bs], non_blocking=True)
+
+    def _pregate_on_layer(self, layer_id: int, selected: list[int]) -> None:
+        """Pre-run callback hook: score L's prediction, forward the next one."""
+        dst = self._pregate_next.get(layer_id)
+        if dst is not None:
+            row = self._pregate_host[layer_id].view(-1).tolist()
+            ids = list(dict.fromkeys(e for e in row if 0 <= e < self.num_experts))
+            self._pregate_pending[dst] = frozenset(ids)
+            self._pregate_queue.put((dst, ids, self._pregate_seq[dst]))
+        self._pregate_seq[layer_id] += 1
+        predicted = self._pregate_pending.pop(layer_id, None)
+        if predicted is None or not selected:
+            return
+        self._pregate_cold_routes += len(selected)
+        self._pregate_cold_hits += sum(1 for e in selected if e in predicted)
+        if getattr(self, "_moe_cpu_willneed", "always") == "recent":
+            step = self._willneed_layer_steps[layer_id]
+            last = self._willneed_last_touch[layer_id]
+            window = self._willneed_recent_steps
+            stale = [e for e in selected if step - last[e] >= window]
+            self._pregate_stale_routes += len(stale)
+            self._pregate_stale_hits += sum(1 for e in stale if e in predicted)
+
+    def _pregate_advise(self, layer_id: int, ids: list[int], seq: int) -> None:
+        """Background-thread body for one prediction: filter, then WILLNEED."""
+        if seq != self._pregate_seq[layer_id]:
+            self._pregate_late += 1
+            return
+        if getattr(self, "_moe_cpu_willneed", "always") == "recent":
+            step = self._willneed_layer_steps[layer_id]
+            last = self._willneed_last_touch[layer_id]
+            window = self._willneed_recent_steps
+            keep = [e for e in ids if step - last[e] >= window]
+            self._pregate_recent_skips += len(ids) - len(keep)
+            ids = keep
+        if not ids:
+            return
+        started = time.perf_counter_ns()
+        pages = self._advise_rows(self._disk_banks[layer_id], ids)
+        self._pregate_advise_ns += time.perf_counter_ns() - started
+        self._pregate_advised += len(ids)
+        self._pregate_pages += pages
+        if seq != self._pregate_seq[layer_id]:
+            self._pregate_finished_late += 1
+
+    def _reset_pregate_stats(self) -> None:
+        self._pregate_cold_routes = 0
+        self._pregate_cold_hits = 0
+        self._pregate_stale_routes = 0
+        self._pregate_stale_hits = 0
+        self._pregate_advised = 0
+        self._pregate_pages = 0
+        self._pregate_advise_ns = 0
+        self._pregate_recent_skips = 0
+        self._pregate_late = 0
+        self._pregate_finished_late = 0
+        self._pregate_window_steps = 0
+
+    def pregate_stats(self, *, reset: bool = False) -> dict:
+        """Pre-gating coverage and advice counters since the last reset."""
+        steps = max(1, self._pregate_steps - self._pregate_window_steps)
+        result = {
+            "steps": steps,
+            "coverage_cold": (
+                self._pregate_cold_hits / self._pregate_cold_routes
+                if self._pregate_cold_routes else 0.0
+            ),
+            "coverage_nonrecent": (
+                self._pregate_stale_hits / self._pregate_stale_routes
+                if self._pregate_stale_routes else 0.0
+            ),
+            "nonrecent_experts_per_step": self._pregate_stale_routes / steps,
+            "advised_experts_per_step": self._pregate_advised / steps,
+            "advised_mib_per_step": self._pregate_pages * 4096 / 2**20 / steps,
+            "recent_skips_per_step": self._pregate_recent_skips / steps,
+            "advise_us_per_step": self._pregate_advise_ns / 1000 / steps,
+            "late_drops": self._pregate_late,
+            "finished_late": self._pregate_finished_late,
+        }
+        if reset:
+            window = self._pregate_steps
+            self._reset_pregate_stats()
+            self._pregate_window_steps = window
+        return result
+
+    def _log_pregate_stats(self) -> None:
+        stats = self.pregate_stats(reset=True)
+        logger.info_rank0(
+            "DISK pre-gating: "
+            + ", ".join(
+                f"{k}: {v:.3f}" if isinstance(v, float) else f"{k}: {v}"
+                for k, v in stats.items()
+            )
+        )
 
     def _update_willneed_fault_guard(self) -> None:
         """Advance the rolling major-fault guard at a decode-step boundary."""
@@ -1411,6 +1624,8 @@ class CpuMoeExecutor:
         if not banks:
             return 0
         selected, counted_pairs = _dedupe_decode_routes(expert_ids, self.num_experts)
+        if not is_prefill and getattr(self, "_pregate_host", None) is not None:
+            self._pregate_on_layer(int(layer_id), selected)
         if not is_prefill:
             self._disk_decode_steps += 1
             self._disk_route_pairs += counted_pairs if route_pairs is None else int(route_pairs)
@@ -2028,6 +2243,11 @@ class CpuMoeExecutor:
 
             hidden_states = act_quant_fp8_roundtrip(hidden_states, block=128)
 
+        if getattr(self, "_pregate_host", None) is not None:
+            target = self._pregate_next.get(int(layer_id))
+            if target is not None:
+                self._pregate_issue(int(layer_id), target, hidden_states)
+
         # D2H: ship this step's activations + routing to pinned host memory.
         if timing is not None:
             timing.d2h_start.record(torch.cuda.current_stream())
@@ -2156,6 +2376,37 @@ def _disk_prefetch_callback(
         if executor._disk_prefetch_error is None:
             executor._disk_prefetch_error = exc
             logger.error(f"DISK expert prefetch failed: {exc}")
+
+
+def _pregate_main(executor_ref, work: queue.SimpleQueue, cpus: list[int]) -> None:
+    """Pre-gating advice thread: WILLNEED predicted rows off the callback path."""
+    if cpus:
+        try:
+            os.sched_setaffinity(0, cpus)
+        except (AttributeError, OSError):
+            pass
+    while True:
+        try:
+            item = work.get(timeout=1.0)
+        except queue.Empty:
+            executor = executor_ref()
+            if executor is None or executor._pregate_stop:
+                return
+            del executor
+            continue
+        if item is None:
+            return
+        executor = executor_ref()
+        if executor is None:
+            return
+        try:
+            executor._pregate_advise(*item)
+        except BaseException as exc:
+            if not executor._pregate_warned:
+                executor._pregate_warned = True
+                logger.warning(f"DISK pre-gating advice failed: {exc}")
+        finally:
+            del executor
 
 
 def _watchdog_main(executor_ref) -> None:
