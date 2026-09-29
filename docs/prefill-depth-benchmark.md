@@ -769,3 +769,71 @@ deploy after `contab1` and `lmstage5`.
 A node-4 hard hang at 15:40 UTC on 2026-09-28 (no panic record, journals
 closed uncleanly, idle between benchmark requests) interrupted the first run
 of these benchmarks; they were rerun after the reboot.
+
+## Group size, decode breakdown and kernel probes, 2026-09-29
+
+### Confirmations
+
+- Request-level PLE stager, reversed order (`lmstage5`): 100k cold 24.14 s as
+  the first arm against 26.45 s for the group stager (`lmstage4`: 23.93 s
+  against 26.68 s).
+- Concurrent PLE data and scale reads (`lmtrace11`): the first group's PLE span
+  went from 1.5-1.8 s to 0.79-0.97 s; later groups 0.08-0.16 s.
+- Continuation walls (`contab1`, four fresh servers alternating v2 and the
+  tail/stager build, two passes each, 24 sessions with exact parity): fresh
+  server totals 253.6 and 247.0 s (v2) against 292.6 and 244.3 s; warm pass
+  totals 222.4 and 156.3 s against 158.0 and 152.9 s. The earlier gap was
+  cold-start variance.
+- One `lmstage5` depth row (8k repeat) diverged while CPU-heavy tests ran on the
+  host. Cold experts run on the CPU (W4A8), with different rounding than the GPU
+  path, and HOT adaptation timing decides which experts run where, so host load
+  can change a greedy token. The same build matched in three other runs.
+  Benchmarks need a quiet host.
+
+### Group size
+
+`lmgroup1`-`lmgroup3`, live-like driver (verify warm-up, three fresh 100k
+prompts 90 s apart) on `main`:
+
+| Arm (order) | 100k cold TTFT | Warm decode | NVMe per 100k |
+| --- | ---: | ---: | ---: |
+| 32k groups, `--memory-ratio 0.87` (1st) | 23.04 s | 17.2 tok/s | 50-65 GiB |
+| 64k groups, `--memory-ratio 0.87` (2nd) | 21.86 s | 16.5 tok/s | 37-39 GiB |
+| 32k groups, 0.90 (3rd) | 22.71 s | 17.4 tok/s | |
+
+64k groups and whole-prompt groups ran out of GPU memory at the default 0.90
+(the automatic sizing gives every byte above the `1 - memory_ratio` headroom to
+KV and expert slots); lowering the HOT budget did not free any. At 0.87 the
+64k groups fit, every row matched, and the prompt makes one expert pass fewer.
+
+### Decode breakdown
+
+`--moe-step-timing` on the continuation workload (`lmdecode1`): a decode step
+takes about 30 ms, of which the 19 GPU-resident layers take 3.0 ms and the 29
+DISK layers 26.1 ms (about 0.9 ms each, against 0.16 ms). CPU expert compute is
+0.29 ms per DISK layer (about 1.7 cold experts, 137-313 MB of weights per
+step); host-device copies are 0.56 ms per step. Decode is bound by the GPU
+waiting on the CPU partial of each DISK layer. Fetching predicted cold experts
+to the GPU a layer ahead would remove most of that wait, but it changes which
+experts run on the GPU (W4A16) and the CPU (W4A8), so it needs a new parity
+reference.
+
+### Kernel probes
+
+- Tile sweep of the v2 prefill MoE kernel (`moebench/bench_tiles2.py`, 105
+  configurations at M = 4096, 8192, 16384, all bit-identical): the shipped tiles
+  are within 0-3% of the best at every M. The kernel is faster per token at
+  larger M (4.44 against 5.65 ms per 4096 tokens at M = 16384), which only
+  cross-chunk expert batching reaches, and that does not fit on the 4090.
+- FP8 (e4m3) tensor-core MMA with fp32 accumulation (`moebench/bench_fp8.py`,
+  weights cast to e4m3 after dequantization, activations quantized per row per
+  K tile): 5.05 against 5.65 ms per 4096 tokens at M = 4096 and 4.06 against
+  4.45 ms at M = 16384, with 5.5% relative RMS error on the MoE layer output.
+  The kernel is bound by dequantization and data movement, not MMA rate; not
+  pursued.
+
+### Deployment
+
+`main` (`0b67820`) serves from `/disks/nvme-02/src/freetoken-serve`; the
+live-like driver measured 100k cold 23.47 s on it (`lmgroup1`), against 30.4 s
+for v2 (`livelike9`).

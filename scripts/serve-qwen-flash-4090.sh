@@ -11,12 +11,13 @@
 # (every request starts with one) began at a 26% hot rate: live 100k cold ~108 s
 # against ~92 s without them. The post-prefill tick keeps decode after a long
 # prefill at the idle-tick level (2026-09-27 idlegap/livelike sweeps).
-# Long prompts prefill layer by layer in 32k-token groups of 4096-token chunks
+# Long prompts prefill layer by layer in 64k-token groups of 4096-token chunks
 # (a prompt that fits one 8192-token chunk stays whole), DISK experts stage through
 # 8 parallel readers with predicted rows, cold rows by direct I/O and resident rows
-# from the page cache: 100k cold ~53 s against ~92 s (docs/prefill-depth-benchmark.md,
-# "Layer-major prefill and DISK staging"). The group budget follows free GPU memory;
-# raise --prefill-layer-major-tokens on larger GPUs.
+# from the page cache (docs/prefill-depth-benchmark.md). A group holds its residual
+# (20 KiB per token) on the GPU: 64k groups need --memory-ratio 0.87, which leaves
+# ~0.7 GB more activation headroom than the 0.9 default at the cost of that many
+# expert slots; they OOM at 0.9. 100k cold ~22 s. Raise both on larger GPUs.
 set -euo pipefail
 if (( $# < 2 )); then
   printf 'Usage: %s MODEL_PATH LAYER_PROFILE_JSON [extra ft serve arguments]\n' "$0" >&2
@@ -51,4 +52,5 @@ exec "${FREETOKEN_BIN:-ft}" serve \
   --moe-disk-prefill-io cached --moe-hot-staging-io mmap \
   --moe-hot-host-cache reclaim \
   --moe-hot-adapt-idle-ms 0 --moe-hot-adapt-post-prefill-tick on \
-  --prefill-layer-major-tokens 32768 --prefill-layer-major-chunk 4096 "$@"
+  --prefill-layer-major-tokens 65536 --prefill-layer-major-chunk 4096 \
+  --memory-ratio 0.87 "$@"
