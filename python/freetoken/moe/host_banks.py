@@ -221,6 +221,30 @@ def _sampled_pages_resident(address: int, npages: int, samples: int, vec) -> boo
     return True
 
 
+# Linux caps one MADV_WILLNEED / FADV_WILLNEED on a file at max(read_ahead_kb,
+# max_sectors_kb) worth of pages (force_page_cache_ra); both are 128 KiB on the
+# node-4 NVMe, so a 1.6 MiB expert row advised in one call prefetched only its first
+# 128 KiB. FREETOKEN_DISK_WILLNEED_CHUNK_KB > 0 splits advice into calls of that size;
+# 0 keeps one call per coalesced range.
+_WILLNEED_CHUNK = int(os.environ.get("FREETOKEN_DISK_WILLNEED_CHUNK_KB", "0") or 0) * 1024
+
+
+def _willneed(address: int, length: int) -> None:
+    """``MADV_WILLNEED`` a page-aligned span, split into readahead-sized calls."""
+    chunk = _WILLNEED_CHUNK
+    if chunk <= 0 or length <= chunk:
+        _madvise(address, length, mmap.MADV_WILLNEED)
+        return
+    libc = _libc()
+    end = address + length
+    while address < end:
+        size = min(chunk, end - address)
+        if libc.madvise(address, size, mmap.MADV_WILLNEED):
+            err = ctypes.get_errno()
+            raise OSError(err, f"madvise({size} bytes): {os.strerror(err)}")
+        address += size
+
+
 def _madvise(address: int, length: int, advice: int) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.madvise(
@@ -1064,11 +1088,7 @@ class HostBank:
         pages = 0
         for advise_start, length in ranges:
             advise_end = min(len(self._buf), advise_start + length)
-            _madvise(
-                self._mapping_addr + advise_start,
-                advise_end - advise_start,
-                mmap.MADV_WILLNEED,
-            )
+            _willneed(self._mapping_addr + advise_start, advise_end - advise_start)
             pages += (advise_end - advise_start + _BLK - 1) // _BLK
         return pages
 
@@ -1107,9 +1127,7 @@ class HostBank:
                 continue
             rows.append(row)
             for start, count in runs:
-                if _libc().madvise(base + start * _BLK, count * _BLK, mmap.MADV_WILLNEED):
-                    err = ctypes.get_errno()
-                    raise OSError(err, f"madvise({count} pages): {os.strerror(err)}")
+                _willneed(base + start * _BLK, count * _BLK)
                 pages += count
         return pages, rows
 

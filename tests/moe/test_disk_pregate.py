@@ -260,3 +260,20 @@ def test_router_gates_by_layer_walks_baseop_trees():
     gates = _router_gates_by_layer(model)
     assert sorted(gates) == [1, 4]
     assert gates[4] is model.layers[1].gate.weight
+
+
+def test_willneed_splits_advice_into_readahead_sized_calls(monkeypatch):
+    from freetoken.moe import host_banks
+
+    calls = []
+
+    class Libc:
+        def madvise(self, address, size, advice):
+            calls.append((address, size))
+            return 0
+
+    monkeypatch.setattr(host_banks, "_libc", lambda: Libc())
+    monkeypatch.setattr(host_banks, "_WILLNEED_CHUNK", 128 * 1024)
+    host_banks._willneed(1 << 20, 300 * 1024)
+    assert calls == [(1 << 20, 128 * 1024), ((1 << 20) + 128 * 1024, 128 * 1024),
+                     ((1 << 20) + 256 * 1024, 44 * 1024)]
