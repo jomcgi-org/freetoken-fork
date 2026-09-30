@@ -18,6 +18,12 @@
 # (20 KiB per token) on the GPU: 64k groups need --memory-ratio 0.87, which leaves
 # ~0.7 GB more activation headroom than the 0.9 default at the cost of that many
 # expert slots; they OOM at 0.9. 100k cold ~22 s. Raise both on larger GPUs.
+# Pinned (non-DISK) layers decode in hybrid mode: each layer fetches at most 2 missing
+# experts per step over PCIe into the GPU LRU and the CPU W4A8 executor computes the
+# rest in place from the pinned host bank, concurrently with the GPU's cached experts.
+# Prefill is unchanged. PCIe gather fell from 7.4 to 3.5 ms per token and decode rose
+# ~9% (2026-09-30 cpuinplace screens; docs/4090-performance.md). Caps 0/1 starve the
+# LRU and 3/4 fetch too much.
 set -euo pipefail
 if (( $# < 2 )); then
   printf 'Usage: %s MODEL_PATH LAYER_PROFILE_JSON [extra ft serve arguments]\n' "$0" >&2
@@ -34,7 +40,7 @@ export FREETOKEN_PREFILL_HOT_OVERLAP=0
 export FREETOKEN_DISK_STAGING_WORKERS="${FREETOKEN_DISK_STAGING_WORKERS:-8}"
 exec "${FREETOKEN_BIN:-ft}" serve \
   --model "$model_path" \
-  --moe-backend offload --moe-cache-auto \
+  --moe-backend hybrid --moe-hybrid-max-fetch 2 --moe-cache-auto \
   --max-running-requests 1 --linear-state-cache-ratio 4.0 \
   --max-extend-length "${FREETOKEN_PREFILL_CHUNK:-8192}" --max-seq-len-override 100352 \
   --host 127.0.0.1 --port 8090 \
