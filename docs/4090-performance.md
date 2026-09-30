@@ -175,3 +175,59 @@ The continuation workload fell from 234.6 to 187.6 s (-20%). The 100k rows
 decode only 81 tokens right after a prefill that streams about 34 GiB, so their
 decode figure is mostly post-prefill warm-up. The 32k cached repeat regressed
 about 11% in both bracketed pairs and remains open.
+
+## Pinned-layer misses on the CPU, 2026-09-30
+
+The 19 pinned layers used to copy every GPU-cache miss over PCIe
+(`fast_index_copy_multi`, a UVA gather from the pinned bank): 7.4 ms of a
+38.4 ms decode step in an Nsight capture. The existing hybrid backend computes
+misses on the CPU instead. The CPU W4A8 executor reads the pinned host bank in
+place while the GPU computes its cached experts, then the partials merge
+(`_decode_split_partials`, the same path the DISK layers' HOT/COLD split uses).
+`--moe-hybrid-max-fetch N` still fetches the N most recently active misses per
+layer and step, so the GPU LRU keeps learning. DISK layers, the HOT set,
+prefill (including layer-major groups), PLE and CUDA graphs are unchanged.
+
+The CPU pool also serves the DISK layers, but layers run in sequence, so the
+pinned layers' CPU work lands in time the pool was idle. The one config change
+was letting `--moe-hot-host-cache reclaim` accept `hybrid`. It only touches
+DISK HOT rows.
+
+Screens (`--moe-step-timing`, four 1000-token greedy decodes, tok/s):
+
+| Arm | essay1 | essay2 | doc | essay1b | step | CPU compute/step | CPU bytes/step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| offload (ABBA mean) | 27.6 | 25.1 | 19.4 | 30.1 | 37.4 ms | 8.6 ms | 362 MB |
+| fetch 2 (ABBA mean) | 31.4 | 26.4 | 21.0 | 31.9 | 34.4 ms | 11.0 ms | 490 MB |
+| fetch 3 (2 arms) | 30.3 | 24.8 | 20.3 | 30.6 | 35.9 ms | 10.6 ms | 442 MB |
+| fetch 1 (sweep) | 31.0 | 24.3 | 19.3 | 29.5 | 36.6 ms | 14.2 ms | 562 MB |
+| fetch 0 (sweep) | 26.4 | 21.8 | 18.0 | 25.0 | 41.9 ms | 19.3 ms | 918 MB |
+
+With fetch 0 the LRU never fills and the CPU computes every pinned route. With
+fetch 2, Nsight puts the PCIe gather at 3.5 ms per token and the step at
+35.2 ms. The `cipq1` qualification (ABBA: offload, hybrid, hybrid, offload):
+
+| Row | offload | hybrid fetch 2 |
+| --- | ---: | ---: |
+| continuation total (mean) | 190.1 s | 166.8 s |
+| warm decode | 32.1 tok/s | 34.5 tok/s |
+| 8k cold / repeat decode | 29.6 / 36.0 tok/s | 29.3 / 37.4 tok/s |
+| 32k cold / repeat decode | 23.4 / 25.0 tok/s | 20.2 / 23.8 tok/s |
+| 100k cold TTFT | 21.8 s | 21.6 s |
+| 100k-row decode (81 tokens) | 27.6 tok/s | 27.7 tok/s |
+
+The continuation tasks passed with exact fixed-work parity, and the live-like
+texts matched on all rows. The 32k rows decode 81 to 451 tokens right after a
+prefill that evicted the LRU. Hybrid refills it at most 2 experts per layer per
+step, so these rows are slightly slower. The spread is within the arm-to-arm
+noise, but it is the only row that moved the wrong way.
+
+Numerics move from GPU A16 to the CPU W4A8 path for the CPU-computed routes.
+Offload itself is not deterministic run to run, because HOT adaptation moves
+experts between the GPU and CPU paths. So `bench/parity.py` fails
+offload-vs-offload too: 10 of 14 replays failed, and 27% of tokens matched
+before the first divergence. Measured against the same offload baseline, on
+the positions where neither run had diverged (536 tokens), hybrid matched
+offload's own run-to-run drift: top-5 KL 0.0020 against 0.0021, and mean
+|dlogprob| 0.018 against 0.018. BFCL subset: offload 41/54 and 34/54 on two
+runs, hybrid 36/54 (+2 net against the second offload run).
