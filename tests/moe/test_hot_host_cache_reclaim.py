@@ -240,3 +240,17 @@ def test_incompatible_placement_is_rejected(override):
     config.update(override)
     with pytest.raises(ValueError, match="HOT host-cache reclamation requires"):
         EngineConfig(**config)
+
+
+@pytest.mark.parametrize("backend,ok", [("offload", True), ("hybrid", True), ("cpu", False)])
+def test_reclaim_backend_guard(backend, ok):
+    # hybrid only changes pinned layers' decode (misses on the CPU); DISK HOT rows are
+    # untouched, so reclaim composes with it. The all-CPU backend stays rejected.
+    config = dict(model_path="/tmp/model", tp_info=DistributedInfo(0, 1), dtype=torch.bfloat16,
+                  moe_backend=backend, moe_disk_prefill="staged", moe_disk_decode="cpu",
+                  moe_hot_host_cache="reclaim")
+    if ok:
+        assert EngineConfig(**config).moe_backend == backend
+    else:
+        with pytest.raises(ValueError, match="HOT host-cache reclamation requires"):
+            EngineConfig(**config)
