@@ -175,3 +175,58 @@ The continuation workload fell from 234.6 to 187.6 s (-20%). The 100k rows
 decode only 81 tokens right after a prefill that streams about 34 GiB, so their
 decode figure is mostly post-prefill warm-up. The 32k cached repeat regressed
 about 11% in both bracketed pairs and remains open.
+
+## KV reservation versus HOT experts, 2026-09-30
+
+The profile reserves 100352 KV tokens at startup. On this model only the 12
+full-attention layers (QSA sparse attention) keep per-token KV; the 36 GDN
+layers keep a fixed recurrent state. A token costs 12,288 bytes of FP8 K/V plus
+768 bytes of compressed index keys, about 12.7 KiB. The whole reservation
+is 1.22 GiB of K/V, so shrinking it to 16384 tokens frees about 1.1 GiB, or
+395 expert slots (3320 to 3715). The GDN state pool (9 slots, about 1 GiB) does
+not scale with context. The largest idle block at decode is the 2.8 GiB
+`--memory-ratio 0.87` headroom, which the 64k layer-major prefill needs.
+
+Extra slots only help if the HOT set grows. The 20 GPU-resident layers compute
+every expert on the GPU either way, and more LRU slots for them did not change
+decode. The `screen1` screen (results in `results/kvstream/`) ran four 1000-token greedy decodes (short
+prompts and a 12.5k-token document) per arm, in mirrored order (A B C D D C B A):
+
+| Arm | HOT/layer | Slots | Mean tok/s (pair) | Major faults (pair) |
+| --- | ---: | ---: | ---: | ---: |
+| 100352 reserved (baseline) | 79 / 82 | 3320 | 21.6 / 26.4 | 1.58M / 0.79M |
+| 16384 reserved, HOT 7 GiB | 92 / 96 | 3715 | 24.0 / 28.1 | 1.07M / 0.41M |
+| 16384 reserved, HOT 6 GiB | 80 / 80 | 3715 | 21.3 / 26.1 | 1.36M / 0.92M |
+| `--kv-ladder on` (floor 65536) | 80 / 80 | 3484 | 24.3 / 22.1 | 0.97M / 1.05M |
+
+Across the bracket, only the larger HOT set gained (+8.6% decode). The static
+16384 reservation cannot serve 100k prompts, so it is not a deployable profile.
+The page cache warmed during the run, and the DISK layer count moved from 29 to
+28 between the first and last arms, so the per-arm figures drift. None of the
+1000-token decodes matched between arms, including the two baselines. Which
+experts are HOT decides whether an expert runs on the GPU (W4A16) or the CPU
+(W4A8), so this screen is not a parity gate.
+
+The existing KV ladder cannot deliver the gain as it stands:
+
+- The floor is at least two 32768-token steps (65536), so it frees only 164
+  slots (about 0.4 GiB).
+- Growth refuses any rung that would consume protected HOT capacity. The HOT
+  budget therefore can only be as large as the capped pool allows, so freed
+  slots reach the LRU and never the HOT set.
+- Admission plans for input plus `max_tokens`. With the 32768-token default
+  output budget, most requests grow the pool right away, and growth is one-way
+  until restart.
+- Growth is slow. In `growth1`, the ladder (floor 65536, cap 100352) served the
+  live-like rows with parity against `workspacecurve1-0`. The first 100k
+  prompt waited on a 107 s rebuild: TTFT was 130.1 s, against 22.4 and 22.1 s
+  for the next two 100k prompts. The rebuild frees the slot cache and streams all 2296 protected
+  HOT rows back from the DISK banks through the 193-row staging ring.
+
+The ladder stays off. Delivering the +8% needs growth that shrinks the HOT set
+in place without a full reload (and ideally shrinks back), or KV streaming
+like Strata's `--kv-resident`. The streaming option keeps the whole
+KV in pinned host memory and a resident window of at least 20480 tokens per QSA
+layer in VRAM. Strata reports +6% at 128K and +23% only at 262K. At this
+profile's 100k cap the stake is about 1.1 GiB, and the sparse attention would
+read up to 2048 selected tokens per layer per step across PCIe.
