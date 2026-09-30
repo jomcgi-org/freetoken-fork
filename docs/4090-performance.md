@@ -142,3 +142,36 @@ warm second and third sessions) and raised decode 10-17%, with prefill
 unchanged. The serve script now passes `--moe-cpu-threads 8`. The remaining
 CPU-side cost is the page-fault stalls and about 6 ms per step of worker wake
 and GIL-bound WILLNEED callback.
+
+## DISK-bank readahead, 2026-09-30
+
+On kernel 6.8 a single `MADV_WILLNEED` reads at most `max(read_ahead_kb,
+max_sectors_kb)`, and both were 128 KiB on the model's NVMe. So every decode
+WILLNEED for a cold expert row (about 1.6 MiB for gate/up) prefetched only its
+first 128 KiB, and the rest of the row arrived one major fault at a time: about
+120-140k major faults per 10 s on the worker CPUs, all in the expert banks.
+`perf record -e major-faults` put 61% in gate_up, 36% in down and 3% in scales.
+
+Raising `read_ahead_kb` to 2048 on the model drive lets one WILLNEED or fault
+cover a whole row. Major faults fell to 1-36k per 10 s. The host sets it with a
+udev rule matched to the drive's serial number:
+
+    # /etc/udev/rules.d/60-freetoken-nvme-readahead.rules
+    ACTION=="add|change", SUBSYSTEM=="block", KERNEL=="nvme*n1", ATTRS{serial}=="<serial>", ATTR{queue/read_ahead_kb}="2048"
+
+The `raq` qualification ran 8 workers in ABBA order (128, 2048, 2048, 128).
+Every arm matched the continuation and depth-row parity references. ABBA means:
+
+| Row | TTFT 128 -> 2048 | Decode 128 -> 2048 |
+| --- | ---: | ---: |
+| warm decode | 6.23 -> 6.12 s | 23.9 -> 29.2 tok/s |
+| 8k cold | 4.36 -> 4.37 s | 17.3 -> 25.2 tok/s |
+| 8k repeat | 1.23 -> 1.19 s | 24.3 -> 33.0 tok/s |
+| 32k cold | 10.72 -> 10.72 s | 10.9 -> 18.9 tok/s |
+| 32k repeat | 1.56 -> 1.90 s | 22.6 -> 20.1 tok/s |
+| 100k cold | 21.85 -> 21.83 s | 17.7 -> 19.1 tok/s |
+
+The continuation workload fell from 234.6 to 187.6 s (-20%). The 100k rows
+decode only 81 tokens right after a prefill that streams about 34 GiB, so their
+decode figure is mostly post-prefill warm-up. The 32k cached repeat regressed
+about 11% in both bracketed pairs and remains open.
