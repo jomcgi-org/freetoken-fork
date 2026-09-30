@@ -343,12 +343,12 @@ class EngineConfig:
         if self.moe_hot_host_cache not in ("retain", "reclaim"):
             raise ValueError("--moe-hot-host-cache must be 'retain' or 'reclaim'")
         if self.moe_hot_host_cache == "reclaim" and (
-            self.moe_backend != "offload" or self.moe_disk_prefill != "staged"
+            self.moe_backend not in ("offload", "hybrid") or self.moe_disk_prefill != "staged"
             or self.moe_disk_decode != "cpu" or self.moe_prefill_hot_split != "on"
             or self.moe_disk_pager != "madvise" or self.moe_bank_hugepages_tmpfs is not None
         ):
             raise ValueError(
-                "HOT host-cache reclamation requires offload, staged DISK prefill, "
+                "HOT host-cache reclamation requires offload or hybrid, staged DISK prefill, "
                 "CPU DISK decode, HOT prefill splitting, madvise paging and no tmpfs mirror"
             )
         if self.moe_disk_prefill_io == "cached" and self.moe_disk_prefill != "staged":
