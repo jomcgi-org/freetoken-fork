@@ -49,6 +49,7 @@ def _executor(disk_layers=(0, 2, 5), *, experts=8, hidden=4, fetch=2, max_tokens
     executor._pregate_warned = False
     executor._pregate_steps = 0
     executor._pregate_vec = None
+    executor._pregate_checked_at = {}
     executor._reset_pregate_stats()
     return executor
 
@@ -122,6 +123,11 @@ def test_callback_forwards_prediction_and_scores_it_at_the_target_layer():
     assert stats["coverage_cold"] == 0.5
     assert 2 not in executor._pregate_pending
 
+    # A repeat prediction within the recheck window is not probed again.
+    executor._pregate_advise(2, [3, 6], executor._pregate_seq[2])
+    assert executor._disk_banks[2][0].calls == [[3, 6], [3, 4]]
+    assert executor._pregate_recheck_skips == 2
+
     # A prediction whose target layer already ran is dropped.
     executor._pregate_advise(2, [7], 0)
     assert executor._pregate_late == 1
@@ -145,7 +151,7 @@ def test_recent_mode_scores_nonrecent_and_advises_by_residency_not_recency():
     executor._willneed_last_touch[2][3] = 9  # recently used at layer 2
 
     class ProbeBank(_Bank):
-        tensor = torch.zeros(8, 1024, dtype=torch.uint8)
+        tensor = torch.zeros(8, 64 * 1024, dtype=torch.uint8)
 
         def prefetch_nonresident_rows(self, row_ids, vec, probe_pages=0):
             self.calls.append(list(row_ids))

@@ -64,6 +64,10 @@ _WILLNEED_GUARD_HOLD_STEPS = 256
 _PREGATE_LOG_STEPS = 512
 # Evenly spaced pages sampled per bank row before a full-row mincore (0 = always full).
 _PREGATE_PROBE_PAGES = int(os.environ.get("FREETOKEN_PREGATE_PROBE_PAGES", "4"))
+# Decode steps a probed (cached or advised) predicted row is trusted before re-probing.
+_PREGATE_RECHECK_STEPS = int(os.environ.get("FREETOKEN_PREGATE_RECHECK_STEPS", "16"))
+# Bank rows smaller than this are not probed (nvfp4 per-row fp16 globals).
+_PREGATE_MIN_ROW_BYTES = 16 * 1024
 
 # MoeTask::num_tokens and CpuMoeExecutor::create_task use a signed C++ int.
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
@@ -503,6 +507,7 @@ class CpuMoeExecutor:
         self._pregate_warned = False
         self._pregate_steps = 0
         self._pregate_vec = None
+        self._pregate_checked_at: dict[int, list[int]] = {}
         self._reset_pregate_stats()
         for layer_id, banks in self._disk_banks.items():
             pagers = {getattr(bank, "_pager", None) for bank in banks}
@@ -1501,8 +1506,19 @@ class CpuMoeExecutor:
         if seq != self._pregate_seq[layer_id]:
             self._pregate_late += 1
             return
+        # Rows verified cached (or already advised) a few steps ago are skipped:
+        # predictions repeat across steps and a probe costs ~10 us per bank row.
+        now = self._pregate_steps
+        checked_at = self._pregate_checked_at.setdefault(
+            layer_id, [-(1 << 30)] * self.num_experts
+        )
+        fresh = [e for e in ids if now - checked_at[e] >= _PREGATE_RECHECK_STEPS]
+        self._pregate_recheck_skips += len(ids) - len(fresh)
+        ids = fresh
         if not ids:
             return
+        for e in ids:
+            checked_at[e] = now
         banks = self._disk_banks[layer_id]
         started = time.perf_counter_ns()
         pages = 0
@@ -1518,7 +1534,10 @@ class CpuMoeExecutor:
                 pages += bank.prefetch_experts(ids)
                 missing.update(ids)
                 continue
-            need = bank.tensor.stride(0) * bank.tensor.element_size() // 4096 + 2
+            row_bytes = bank.tensor.stride(0) * bank.tensor.element_size()
+            if row_bytes < _PREGATE_MIN_ROW_BYTES:
+                continue  # per-expert globals: a few KiB, shared hot pages
+            need = row_bytes // 4096 + 2
             if self._pregate_vec is None or len(self._pregate_vec) < need:
                 self._pregate_vec = (ctypes.c_char * need)()
             bank_pages, bank_missing = probe(ids, self._pregate_vec, _PREGATE_PROBE_PAGES)
@@ -1541,6 +1560,7 @@ class CpuMoeExecutor:
         self._pregate_stale_hits = 0
         self._pregate_advised = 0
         self._pregate_checked = 0
+        self._pregate_recheck_skips = 0
         self._pregate_pages = 0
         self._pregate_advise_ns = 0
         self._pregate_late = 0
@@ -1562,6 +1582,7 @@ class CpuMoeExecutor:
             ),
             "nonrecent_experts_per_step": self._pregate_stale_routes / steps,
             "checked_experts_per_step": self._pregate_checked / steps,
+            "recheck_skips_per_step": self._pregate_recheck_skips / steps,
             "missing_experts_per_step": self._pregate_advised / steps,
             "advised_mib_per_step": self._pregate_pages * 4096 / 2**20 / steps,
             "advise_us_per_step": self._pregate_advise_ns / 1000 / steps,
