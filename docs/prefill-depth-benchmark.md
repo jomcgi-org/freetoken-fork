@@ -838,6 +838,47 @@ uncovered. The lever that remains is the CPU round trip itself: a DISK layer
 takes 0.9 ms against 0.16 ms for a GPU-resident layer, of which the CPU expert
 compute is 0.29 ms.
 
+### Pre-gating DISK experts into the page cache (null result, 2026-09-30)
+
+`--moe-disk-pregate-experts F` (default 0, off) runs the next DISK layer's router
+on each DISK layer's router input inside the decode graph, masks that layer's HOT
+experts, and ships the top F ids to pinned memory with the routing D2H. The
+pre-run callback hands them to a background thread (pinned off the MoE worker
+cores). That thread probes page-cache residency with `mincore` (4 sampled pages
+per bank row, then the full row) and issues `MADV_WILLNEED` for uncached runs one
+layer early. Outputs are unaffected, since the advice is advisory only.
+
+Live coverage is higher than the offline estimate above: 70% (F=8) and 81% (F=16)
+of cold routes, and about 70% of cold routes to experts not used in the last 256
+steps. Coverage did not translate into speed. Screens were ABBA, 8 workers,
+`--moe-step-timing`, steptiming-client decodes, and results live in
+`results/pregate/`:
+
+| Screen | Arm | Step ms | Essay decode tok/s | Major faults/token (essay2) | NVMe GiB/1000 tok (essay1b) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| screen3, read_ahead_kb=128 | off | 42.2 / 41.8 | 22.5-27.5 | 501 / 517 | 1.7 / 1.5 |
+| | F=8 | 43.3 / 46.3 | 19.8-26.4 | 633 / 833 | 2.9 / 3.8 |
+| | F=16 | 47.5 / 46.1 | 19.5-25.0 | 722 / 617 | 5.5 / 6.0 |
+| screen4, read_ahead_kb=2048 | off | 39.2 / 38.1 | 24.7-29.3 | 116 / 143 | 2.5 / 2.5 |
+| | F=16 | 40.5 / 39.7 | 23.8-27.9 | 197 / 209 | 6.4 / 8.5 |
+
+The reason is that decode major faults came from truncated WILLNEED, not from
+missing lead time. Linux caps a single `MADV_WILLNEED`/`FADV_WILLNEED` on a file
+at max(`read_ahead_kb`, `max_sectors_kb`) pages (`force_page_cache_ra`). Both
+limits were 128 KiB on node-4's NVMe, so every DISK prefetch (reactive, lookahead,
+pre-gated) read only the first 128 KiB of each coalesced range, which is 8% of a
+1.6 MiB gate_up row. A scratch-file probe confirmed it: after one call on a
+1.6 MiB range 32 pages were resident, and after 128 KiB calls all 400 were.
+`perf record -e major-faults -d` (faultrec1) put 100% of decode major faults in
+FTW expert banks (gate_up_packed 61%, down_packed 36%, gate_up_scale 3%), about
+57 faulted pages per faulting row. Raising `read_ahead_kb` to 2048 (now a udev rule
+on node-4) cut faults about 4x and made decode 20-30% faster. After that fix the
+reactive advice already covers almost everything, and pre-gating only adds
+mispredicted IO (+3-6 GiB per 1000 tokens) plus about 10 ms per step of
+advice-thread CPU. `FREETOKEN_DISK_WILLNEED_CHUNK_KB=N` splits the advice into
+N KiB calls, a software alternative to raising `read_ahead_kb` on other hosts;
+it is off by default and has not been screened.
+
 ### Kernel probes
 
 - Tile sweep of the v2 prefill MoE kernel (`moebench/bench_tiles2.py`, 105
