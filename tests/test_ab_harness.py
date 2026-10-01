@@ -235,3 +235,24 @@ def test_dry_run_mixed_thinking_end_to_end(monkeypatch, capsys, tmp_path):
     out = capsys.readouterr().out
     assert rc == 0 and out.count("--workload mixed-thinking") == 4 and out.count("GPU guard") == 4
     assert "--max-tokens" not in out
+
+
+def test_per_arm_model_serves_that_model_and_restores_its_plan(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, *a, **k: subprocess.CompletedProcess(cmd, 0, "d" * 40 + "\n", ""))
+    rc = ab.main(["--dry-run", "--dropin", str(FIXTURE), "--results-dir", str(tmp_path / "res"),
+                  "--arm", "base=main", "--arm", "mtp=main", "--model", "mtp:/models/other-mtp.ftw",
+                  "--flags", "mtp:--speculative-mtp on"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    launches = [l for l in out.splitlines() if l.startswith("+ systemd-run")]
+    base = [l for l in launches if "-base-" in l]
+    mtp = [l for l in launches if "-mtp-" in l]
+    assert all("/models/other-mtp.ftw" in l and "--speculative-mtp on" in l for l in mtp)
+    assert not any("/models/other-mtp.ftw" in l for l in base)
+    assert "/models/other-mtp.ftw/freetoken_hot_plan.json   # same starting plan" in out
+    assert "/models/other-mtp.ftw/freetoken_hot_plan.json   # other model's own plan" in out
+
+
+def test_model_flag_requires_a_declared_arm():
+    with pytest.raises(SystemExit):
+        ab.main(["--dry-run", "--dropin", str(FIXTURE), "--arm", "a=main", "--arm", "b=main", "--model", "c:/x"])
