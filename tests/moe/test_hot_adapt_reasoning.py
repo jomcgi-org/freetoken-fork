@@ -344,3 +344,61 @@ def test_reasoning_seed_validated_and_applied(monkeypatch):
 
     assert cache.decayed_reasoning_freq[0].tolist() == [1.0, 2.0, 3.0, 4.0]
     assert cache.decayed_decode_freq[0].tolist() == [4.0, 3.0, 2.0, 1.0]
+
+
+def _real_cache(monkeypatch):
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=5, cache_size=7, device=torch.device("cpu"),
+        prefill_overlap=False, decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    sources = {
+        "gate_up": [torch.arange(5 * 4 * 3).view(5, 4, 3)],
+        "down": [torch.arange(5 * 3 * 2).view(5, 3, 2)],
+    }
+    cache.set_bank_sources(
+        sources, layer_residency=[HostResidency.DISK.value], hot_expert_ids={0: (1, 4)},
+    )
+    return cache, sum(b[0][0].numel() * b[0].element_size() for b in sources.values())
+
+
+@pytest.mark.parametrize("histories", ["shared", "split", "split3"])
+def test_configure_hot_adaptation_accepts_every_histories_value(monkeypatch, histories):
+    """Regression: the real startup path (configure_hot_adaptation) rejected split3."""
+    cache, row_bytes = _real_cache(monkeypatch)
+    cache.configure_hot_adaptation(
+        half_life_steps=2, interval_steps=1000,
+        max_swap_bytes=row_bytes, expert_bytes=row_bytes,
+        histories=histories, aim="phase",
+        persisted_counter_seed={0: (1.0, 2.0, 3.0, 4.0, 5.0)},
+        persisted_reasoning_counter_seed=(
+            {0: (5.0, 4.0, 3.0, 2.0, 1.0)} if histories == "split3" else None
+        ),
+    )
+    try:
+        assert cache.hot_adapt_histories == histories
+        assert (cache.decayed_prefill_freq is not None) == (histories != "shared")
+        assert (cache.decayed_reasoning_freq is not None) == (histories == "split3")
+        if histories == "split3":
+            # Same storage as the stack the kernel indexes by phase.
+            assert cache.decayed_reasoning_freq.data_ptr() == (
+                cache.decayed_decode_freq.data_ptr()
+                + cache.decayed_decode_freq.numel() * 4
+            )
+            assert cache.decayed_reasoning_freq[0].tolist() == [5.0, 4.0, 3.0, 2.0, 1.0]
+            assert cache._hot_adapt_reasoning_snapshot_host.shape == (1, 5)
+        assert cache.decayed_decode_freq[0].tolist() == [1.0, 2.0, 3.0, 4.0, 5.0]
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+def test_configure_hot_adaptation_still_rejects_unknown_histories(monkeypatch):
+    cache, row_bytes = _real_cache(monkeypatch)
+    with pytest.raises(ValueError, match="split3"):
+        cache.configure_hot_adaptation(
+            half_life_steps=2, interval_steps=0,
+            max_swap_bytes=row_bytes, expert_bytes=row_bytes, histories="split4",
+        )

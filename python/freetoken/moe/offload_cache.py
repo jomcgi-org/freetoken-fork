@@ -1602,8 +1602,10 @@ class OffloadMoeCache:
             or not 0 <= prefill_weight <= 1
         ):
             raise ValueError("HOT prefill weight must be finite and in [0, 1]")
-        if histories not in ("shared", "split"):
-            raise ValueError("HOT adaptation histories must be 'shared' or 'split'")
+        if histories not in ("shared", "split", "split3"):
+            raise ValueError(
+                "HOT adaptation histories must be 'shared', 'split' or 'split3'"
+            )
         if aim not in ("blend", "phase"):
             raise ValueError("HOT adaptation aim must be 'blend' or 'phase'")
         if (
