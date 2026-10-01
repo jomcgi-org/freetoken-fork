@@ -242,9 +242,9 @@ def _fake_host(tmp_path, monkeypatch, *, limit, current, total_gib=100, avail_gi
     )
     monkeypatch.setattr(
         host_memory,
-        "cgroup_memory_headroom",
+        "cgroup_memory_bounds",
         functools.partial(
-            host_memory.cgroup_memory_headroom,
+            host_memory.cgroup_memory_bounds,
             cgroup_root=root,
             proc_cgroup_path=proc,
         ),
@@ -253,12 +253,13 @@ def _fake_host(tmp_path, monkeypatch, *, limit, current, total_gib=100, avail_gi
 
 def test_apply_cgroup_bound_takes_the_minimum():
     host = HostMemoryInfo(total_gib=100, available_gib=90, swap_total_gib=4)
-    assert apply_cgroup_bound(host, None) == (host, "host")
-    assert apply_cgroup_bound(host, 95 * 2**30) == (host, "host")
-    bounded, bound = apply_cgroup_bound(host, 30 * 2**30)
+    gib = 2**30
+    assert apply_cgroup_bound(host, None, None) == (host, "host")
+    assert apply_cgroup_bound(host, 200 * gib, 150 * gib) == (host, "host")
+    bounded, bound = apply_cgroup_bound(host, 40 * gib, 30 * gib)
     assert bound == "cgroup"
     assert bounded == HostMemoryInfo(
-        total_gib=30, available_gib=30, swap_total_gib=4, swap_free_gib=0
+        total_gib=40, available_gib=30, swap_total_gib=4, swap_free_gib=0
     )
 
 
@@ -283,8 +284,8 @@ def test_governor_finite_cgroup_limits_derived_budgets(tmp_path, monkeypatch):
     config = SimpleNamespace(moe_pager_budget_gib=None)
     budgets = govern_host_memory(config, environ={}, _logger=fake_logger)
     assert budgets.available_gib == pytest.approx(30)
-    assert budgets.total_gib == pytest.approx(30)
-    assert budgets.reserve_gib == 8  # scales with the bound, not host MemTotal
+    assert budgets.total_gib == pytest.approx(40)  # the limit, not the headroom
+    assert budgets.reserve_gib == 8
     assert budgets.ceiling_gib == pytest.approx(22)
     assert budgets.pin_gib + budgets.pager_gib == pytest.approx(22)
     assert any("Host memory bound: cgroup" in m for m in fake_logger.infos)
@@ -317,10 +318,25 @@ def test_governor_without_cgroup_files_is_host_only(tmp_path, monkeypatch):
     _fake_host(tmp_path, monkeypatch, limit="max", current=0)
     from freetoken.engine import host_memory
 
-    monkeypatch.setattr(host_memory, "cgroup_memory_headroom", lambda: None)
+    monkeypatch.setattr(host_memory, "cgroup_memory_bounds", lambda: (None, None))
     fake_logger = _Logger()
     budgets = govern_host_memory(
         SimpleNamespace(moe_pager_budget_gib=None), environ={}, _logger=fake_logger
     )
     assert budgets.available_gib == 90
     assert any("Host memory bound: host" in m for m in fake_logger.infos)
+
+
+def test_total_and_reserve_follow_limit_not_headroom(tmp_path, monkeypatch):
+    # 200 GiB host, 100 GiB limit, 80 GiB already used: headroom 20 GiB.
+    _fake_host(
+        tmp_path, monkeypatch, limit=100 * 2**30, current=80 * 2**30,
+        total_gib=200, avail_gib=190,
+    )
+    budgets = govern_host_memory(
+        SimpleNamespace(moe_pager_budget_gib=None), environ={}, _logger=_Logger()
+    )
+    assert budgets.total_gib == pytest.approx(100)
+    assert budgets.available_gib == pytest.approx(20)
+    assert budgets.reserve_gib == pytest.approx(15)  # 15% of the limit
+    assert budgets.ceiling_gib == pytest.approx(5)

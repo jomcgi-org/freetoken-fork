@@ -344,3 +344,21 @@ def test_hybrid_v1_and_v2_membership_is_not_a_failure(memory_files: FakeMemoryFi
 
     assert memory_files.remaining() == 6_000_000
     assert memory_files.effective() == 6_000_000
+
+
+def test_bounds_report_tightest_limit_and_headroom(memory_files: FakeMemoryFiles):
+    from freetoken.memory import cgroup_memory_bounds
+
+    memory_files.membership("0::/tenant/job")
+    memory_files.v2(memory_files.root / "tenant", 20_000_000, 14_000_000)
+    memory_files.v2(memory_files.root / "tenant" / "job", 12_000_000, 3_000_000)
+    kwargs = dict(
+        cgroup_root=memory_files.root, proc_cgroup_path=memory_files.proc_cgroup
+    )
+
+    assert cgroup_memory_bounds(**kwargs) == (12_000_000, 6_000_000)
+    memory_files.v2(memory_files.root / "tenant", "max", 0)
+    memory_files.v2(memory_files.root / "tenant" / "job", "max", 0)
+    assert cgroup_memory_bounds(**kwargs) == (None, None)
+    memory_files.v2(memory_files.root / "tenant" / "job", "bad", 0)
+    assert cgroup_memory_bounds(**kwargs) == (0, 0)

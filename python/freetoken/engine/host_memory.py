@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from freetoken.memory import cgroup_memory_headroom
+from freetoken.memory import cgroup_memory_bounds
 from freetoken.utils import init_logger
 
 
@@ -74,27 +74,30 @@ def read_linux_memory_info(
 
 
 def apply_cgroup_bound(
-    memory: HostMemoryInfo, cgroup_remaining_bytes: int | None
+    memory: HostMemoryInfo,
+    cgroup_limit_bytes: int | None,
+    cgroup_remaining_bytes: int | None,
 ) -> tuple[HostMemoryInfo, str]:
-    """Clamp host counters to the cgroup headroom; return ``(memory, bound)``.
+    """Clamp host counters to the cgroup; return ``(memory, bound)``.
 
-    ``bound`` is ``"host"`` (no finite cgroup limit, or it is looser than the
-    host figure; ``memory`` is returned unchanged) or ``"cgroup"``. Total is
-    clamped too so the default reserve scales with what the cgroup can hold,
-    not with the host's MemTotal. Swap counters are left as reported.
+    ``total`` becomes min(MemTotal, cgroup limit) and ``available`` becomes
+    min(MemAvailable, limit - current). Total follows the limit, not the
+    headroom, so the default reserve does not shrink as the process allocates.
+    ``bound`` is ``"host"`` (no finite limit, or looser than the host figures;
+    ``memory`` is returned unchanged) or ``"cgroup"``. Swap is left as reported.
     """
-    if cgroup_remaining_bytes is None:
+    if cgroup_limit_bytes is None or cgroup_remaining_bytes is None:
         return memory, "host"
-    cgroup_gib = cgroup_remaining_bytes / 2**30
-    if cgroup_gib >= memory.available_gib:
+    limit_gib = cgroup_limit_bytes / 2**30
+    remaining_gib = cgroup_remaining_bytes / 2**30
+    total = min(memory.total_gib, limit_gib)
+    available = min(memory.available_gib, remaining_gib)
+    if total == memory.total_gib and available == memory.available_gib:
         return memory, "host"
     return (
         HostMemoryInfo(
-            # Total must stay positive; with zero headroom available=0 gates anyway.
-            total_gib=(
-                min(memory.total_gib, cgroup_gib) if cgroup_gib > 0 else memory.total_gib
-            ),
-            available_gib=cgroup_gib,
+            total_gib=total,
+            available_gib=available,
             swap_total_gib=memory.swap_total_gib,
             swap_free_gib=memory.swap_free_gib,
         ),
@@ -297,7 +300,7 @@ def govern_host_memory(
     if memory is None:
         memory = read_linux_memory_info()
         host_memory = memory
-        memory, bound = apply_cgroup_bound(memory, cgroup_memory_headroom())
+        memory, bound = apply_cgroup_bound(memory, *cgroup_memory_bounds())
         bound_note = (
             f"Host memory bound: {bound} "
             f"(host available={host_memory.available_gib:.2f} GiB, "

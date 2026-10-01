@@ -91,21 +91,21 @@ def _cgroup_pair_remaining(
     current_name: str,
     *,
     v1: bool = False,
-) -> tuple[bool, int | None]:
-    """Return ``(limit_present, finite_remaining_or_none)`` for one cgroup."""
+) -> tuple[bool, int | None, int | None]:
+    """Return ``(limit_present, finite_remaining, finite_limit)`` for one cgroup."""
     limit_path = Path(directory) / limit_name
     current_path = Path(directory) / current_name
     limit_present, limit_text = _read_bounded_ascii(limit_path, _CGROUP_VALUE_MAX_BYTES)
     if not limit_present:
-        return False, None
+        return False, None, None
     if not v1 and limit_text in ("max", "max\n"):
-        return True, None
+        return True, None, None
 
     limit = _parse_u64_counter(limit_text)
     if limit is None:
         raise ValueError(f"malformed cgroup memory limit: {limit_path}")
     if v1 and limit >= _CGROUP_V1_UNLIMITED_MIN:
-        return True, None
+        return True, None, None
 
     current_present, current_text = _read_bounded_ascii(
         current_path, _CGROUP_VALUE_MAX_BYTES
@@ -115,7 +115,7 @@ def _cgroup_pair_remaining(
     current = _parse_u64_counter(current_text)
     if current is None:
         raise ValueError(f"malformed cgroup memory usage: {current_path}")
-    return True, max(0, limit - current)
+    return True, max(0, limit - current), limit
 
 
 def _read_cgroup_memberships(proc_cgroup_path: Path) -> tuple[str | None, str | None]:
@@ -204,36 +204,38 @@ def _cgroup_hierarchy_remaining(
     current_name: str,
     *,
     v1: bool = False,
-) -> tuple[bool, int | None]:
-    """Return ``(hierarchy_seen, tightest finite ancestor headroom)``."""
+) -> tuple[bool, int | None, int | None]:
+    """Return ``(hierarchy_seen, tightest headroom, tightest finite limit)``."""
     root = Path(root)
     current = _cgroup_control_directory(root, member_path, limit_name)
     if current is None:
-        return False, None
+        return False, None, None
 
     seen = False
     remaining = None
+    limit = None
     for _ in range(_CGROUP_MAX_ANCESTORS):
-        present, candidate = _cgroup_pair_remaining(
+        present, candidate, candidate_limit = _cgroup_pair_remaining(
             current, limit_name, current_name, v1=v1
         )
         seen = seen or present
         if candidate is not None:
             remaining = candidate if remaining is None else min(remaining, candidate)
+            limit = candidate_limit if limit is None else min(limit, candidate_limit)
         if current == root:
             break
         parent = current.parent
         if parent == current or (parent != root and root not in parent.parents):
             break
         current = parent
-    return seen, remaining
+    return seen, remaining, limit
 
 
-def _cgroup_memory_remaining(
+def _cgroup_memory_bounds(
     cgroup_root: Path = Path("/sys/fs/cgroup"),
     proc_cgroup_path: Path = Path("/proc/self/cgroup"),
-) -> int | None:
-    """Return this process's tightest finite cgroup memory headroom.
+) -> tuple[int | None, int | None]:
+    """Return ``(limit, headroom)``: tightest finite cgroup limit and headroom.
 
     Cgroup v2 is authoritative whenever its memory controller is visible.
     ``max`` is a known-unlimited value.  Only when v2 is absent do we try the
@@ -242,14 +244,14 @@ def _cgroup_memory_remaining(
     """
     root = Path(cgroup_root)
     v2_path, v1_path = _read_cgroup_memberships(proc_cgroup_path)
-    v2_seen, remaining = _cgroup_hierarchy_remaining(
+    v2_seen, remaining, limit = _cgroup_hierarchy_remaining(
         root, v2_path, "memory.max", "memory.current"
     )
     if v2_seen:
-        return remaining
+        return limit, remaining
 
     for v1_root in (root / "memory", root):
-        v1_seen, remaining = _cgroup_hierarchy_remaining(
+        v1_seen, remaining, limit = _cgroup_hierarchy_remaining(
             v1_root,
             v1_path,
             "memory.limit_in_bytes",
@@ -257,8 +259,34 @@ def _cgroup_memory_remaining(
             v1=True,
         )
         if v1_seen:
-            return remaining
-    return None
+            return limit, remaining
+    return None, None
+
+
+def _cgroup_memory_remaining(
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> int | None:
+    """Return this process's tightest finite cgroup memory headroom."""
+    return _cgroup_memory_bounds(cgroup_root, proc_cgroup_path)[1]
+
+
+def cgroup_memory_bounds(
+    *,
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+) -> tuple[int | None, int | None]:
+    """Return ``(limit, headroom)`` bytes of the tightest finite cgroup bound.
+
+    ``limit`` is the smallest finite ``memory.max`` along the ancestry (what the
+    cgroup can hold); ``headroom`` is the smallest ``limit - current``. Both are
+    ``None`` when unlimited/unknown. Malformed or unreadable control files fail
+    closed to ``(0, 0)``.
+    """
+    try:
+        return _cgroup_memory_bounds(Path(cgroup_root), Path(proc_cgroup_path))
+    except ValueError:
+        return 0, 0
 
 
 def cgroup_memory_headroom(
@@ -310,4 +338,4 @@ def effective_memory_available(
     return min(host_available, cgroup_remaining)
 
 
-__all__ = ["cgroup_memory_headroom", "effective_memory_available"]
+__all__ = ["cgroup_memory_bounds", "cgroup_memory_headroom", "effective_memory_available"]
