@@ -193,6 +193,12 @@ class EngineConfig:
     # Patch 11-lite intentionally supports one draft only. Keep the explicit
     # knob so attempts to reuse older K>1 launch commands fail loudly.
     mtp_draft_tokens: int = 1
+    # Non-expert (attention / GDN / shared-expert / hyper-connection) projection dtype. "fp8"
+    # quantizes the BF16 checkpoint weights at load to E4M3 with a per-output-row fp32 scale and
+    # reads them with a W8A16 kernel (Qwen3.8-Flash-Next). fp8_lm_head None = auto: on with fp8
+    # dense unless --speculative-mtp on (the MTP draft head shares the lm_head).
+    dense_weight_dtype: str = "bf16"
+    fp8_lm_head: str | None = None
     cuda_graph_bs: List[int] | None = None
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
@@ -261,6 +267,11 @@ class EngineConfig:
         )
 
         validate_speculative_mtp(self.speculative_mtp)
+        from freetoken.models.dense_fp8 import resolve_dense_fp8_policy
+
+        resolve_dense_fp8_policy(
+            self.dense_weight_dtype, self.fp8_lm_head, self.speculative_mtp
+        )
         validate_mtp_draft_tokens(self.mtp_draft_tokens)
         if self.kv_cache_dtype not in ("auto", "bf16", "fp8_e4m3"):
             raise ValueError(

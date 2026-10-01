@@ -111,6 +111,28 @@ tail split. HOT residency treats a missing or malformed per-expert section as a 
 error because guessing a partition would silently spend pinned memory. Startup logs
 include selected layer ids, top-N, pinned bytes, and the profiled hot-pair rate.
 
+### FP8 non-expert weights
+
+The Flash-Next checkpoint keeps every non-expert projection in BF16 (8.4 GB read per
+decode step, about 800-955 GB/s on a 4090, so bytes are the only lever).
+`--dense-weight-dtype fp8` quantizes them at load to E4M3 with one fp32 scale per output
+row (`absmax / 448`) and reads them in a W8A16 Triton GEMV (BF16 activations, fp32
+accumulate, BF16 out): attention q|k|v and o, GDN `in_proj`/`out_proj`, the shared expert,
+and every hyper-connection projection, 4.2 GB less per step and 4.2 GB less resident VRAM
+with `lm_head`. Embeddings, norms, the router and shared-expert gate, the QSA indexer
+projection, the PLE projections and the MTP head stay BF16. Weights are quantized one tensor
+at a time while streaming, so peak load memory is below the BF16 load. `--moe-cache-auto`
+and the KV pool are sized from the measured post-load free memory, so the freed bytes grow
+the HOT expert set; the startup log reports them.
+
+`--fp8-lm-head {on,off}` defaults to `on` with fp8 dense weights, but to `off` with
+`--speculative-mtp on`: the MTP draft head projects through the target's `lm_head`, and an
+FP8 head zeroed draft acceptance elsewhere. Explicit `on` with MTP is rejected. Rows above
+32 (prefill) dequantize the layer's weight to a temporary BF16 buffer and use the BF16
+matmul. `FREETOKEN_FP8_GEMV_TUNE=1` times a small fixed set of GEMV launch configs per
+projection shape at startup, before CUDA graph capture. `bench/fp8_dense_gemv.py` compares
+BF16 and FP8 bandwidth per shape.
+
 ### File-backed PLE table
 
 Qwen3.8-Flash-Next defaults to `--ple-backend pinned`, which keeps its PLE n-gram

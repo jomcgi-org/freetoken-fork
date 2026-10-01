@@ -330,6 +330,25 @@ def _make_dummy_weight_state_dict(
     return state_dict
 
 
+def _apply_dense_weight_dtype(model, config: EngineConfig):
+    """Swap the model's non-expert projections for per-row FP8 layers when
+    ``--dense-weight-dtype fp8`` (None for bf16). Runs on the meta-device model."""
+    from freetoken.models.dense_fp8 import resolve_dense_fp8_policy
+
+    policy = resolve_dense_fp8_policy(
+        config.dense_weight_dtype, config.fp8_lm_head, config.speculative_mtp
+    )
+    if not policy.enabled:
+        return None
+    if not hasattr(model, "apply_dense_weight_dtype"):
+        raise ValueError("--dense-weight-dtype fp8 is supported only by Qwen3.8-Flash-Next")
+    logger.info_rank0(
+        f"--dense-weight-dtype fp8: per-row E4M3 non-expert weights, lm_head "
+        f"{'fp8' if policy.lm_head else 'bf16'}"
+    )
+    return model.apply_dense_weight_dtype(policy)
+
+
 def _materialize_loaded_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     weights: Iterable[Tuple[str, torch.Tensor]],
@@ -405,7 +424,10 @@ class Engine:
                 if config.tp_info.size != 1:
                     raise ValueError("--speculative-mtp on currently requires --tp-size 1")
                 self.model.enable_mtp(self.mtp_quant)
+            self.dense_fp8 = _apply_dense_weight_dtype(self.model, config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        if self.dense_fp8 is not None:
+            logger.info_rank0(self.dense_fp8.summary())
         self._mtp_head_bytes = 0
         if config.speculative_mtp == "on":
             self._mtp_head_bytes = _state_dict_nbytes(self.model.mtp.state_dict())
@@ -415,6 +437,14 @@ class Engine:
             )
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
+        if getattr(self, "dense_fp8", None) is not None:
+            # --moe-cache-auto / the KV pool are sized below from this measurement (and
+            # _sync_get_memory empties the allocator cache first), so the freed BF16 bytes flow
+            # into the HOT expert set without any estimate of their own.
+            logger.info_rank0(
+                f"Resident weights after FP8 dense quantization: {mem_GB(self._weights_bytes)} "
+                f"(dense BF16 copy freed: {mem_GB(self.dense_fp8.freed_bytes)})"
+            )
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -624,6 +654,10 @@ class Engine:
 
                 mtp_weights = iter_mtp_weights(config.model_path, self.device)
             weights = itertools.chain(weights, mtp_weights)
+        if getattr(self, "dense_fp8", None) is not None:
+            from freetoken.models.dense_fp8 import quantize_loaded_weights
+
+            weights = quantize_loaded_weights(weights, model_state, self.device)
         return _materialize_loaded_weight_state_dict(
             model_state,
             weights,

@@ -15,6 +15,7 @@ immediate combine::
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, List
 
@@ -547,6 +548,37 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+
+    def apply_dense_weight_dtype(self, policy):
+        """``--dense-weight-dtype fp8``: swap the non-expert projections (and, per ``policy``,
+        the lm_head) for per-row FP8 layers while the model is still on the meta device. The MTP
+        head is built from its own BF16 layers and is not converted. Returns the report."""
+        from freetoken.models.dense_fp8 import apply_dense_fp8
+
+        report = apply_dense_fp8(self, policy)
+        self._dense_fp8_shapes = report.shapes
+        return report
+
+    def prepare_for_runtime(self) -> None:
+        """Engine hook, after the weights and before CUDA graph capture. With
+        ``FREETOKEN_FP8_GEMV_TUNE=1`` it times the small fixed GEMV config set for every distinct
+        FP8 projection shape and records the winners, so capture only ever replays fixed
+        configs. Off by default (the shape heuristic is used); never fatal."""
+        shapes = getattr(self, "_dense_fp8_shapes", None)
+        if not shapes or os.environ.get("FREETOKEN_FP8_GEMV_TUNE") != "1":
+            return
+        from freetoken.kernel.triton.fp8_dense_linear import tune_gemv
+
+        try:
+            best = tune_gemv(shapes)
+        except Exception as exc:  # tuning is an optimization; keep the default plans
+            logger.warning(f"FP8 GEMV tuning failed ({exc!r}); using default launch configs")
+            return
+        for (n, k, _), plan in best.items():
+            logger.info(
+                f"FP8 GEMV tuned N={n} K={k}: block_n={plan.block_n} block_k={plan.block_k} "
+                f"split_k={plan.split_k} warps={plan.num_warps} stages={plan.num_stages}"
+            )
 
     def enable_mtp(self, mtp_quant: str = "bf16") -> None:
         """Build the optional head while the engine is still on the meta device."""
