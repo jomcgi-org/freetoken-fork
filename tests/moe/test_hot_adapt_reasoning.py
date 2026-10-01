@@ -402,3 +402,119 @@ def test_configure_hot_adaptation_still_rejects_unknown_histories(monkeypatch):
             half_life_steps=2, interval_steps=0,
             max_swap_bytes=row_bytes, expert_bytes=row_bytes, histories="split4",
         )
+
+
+# --- production-visible logging ------------------------------------------------------
+
+
+class _Log:
+    def __init__(self):
+        self.lines = []
+
+    def info_rank0(self, message):
+        self.lines.append(message)
+
+    def __getattr__(self, _name):
+        return lambda *_a, **_k: None
+
+
+def _plan_with_log(monkeypatch, histories, reasoning_phase, boundary="decode"):
+    from freetoken.moe import hot_adapt
+
+    monkeypatch.setattr(
+        hot_adapt, "recompute_hot_partition", lambda *_a, **_k: {0: (0,)}
+    )
+    cache = _split3_cache(monkeypatch, histories=histories)
+    log = _Log()
+    monkeypatch.setitem(type(cache)._plan_hot_adaptation.__globals__, "logger", log)
+    cache._hot_adapt_snapshot_host = torch.tensor([ANSWER[0]])
+    cache._hot_adapt_prefill_snapshot_host = torch.tensor([PREFILL[0]])
+    cache._hot_adapt_reasoning_snapshot_host = torch.tensor([REASONING[0]])
+    cache._hot_adapt_tick_reasoning = reasoning_phase
+    cache.hot_expert_capacity = {0: 1}
+    cache.hot_adapt_aim = "phase"
+    cache.hot_adapt_prefill_blend = 0.25
+    cache.hot_adapt_expert_bytes = 1
+    cache.num_experts = 4
+    cache._hot_slot_owners = {0: [0]}
+    cache.hot_adapt_max_swap_bytes = 1
+    cache.hot_adapt_hot_budget_bytes = 1
+    cache.hot_adapt_boundary_cap_frac = 1.0
+    cache.hot_adapt_ticks_reasoning = 3
+    cache.hot_adapt_ticks_answer = 4
+    cache._plan_hot_adaptation(
+        None, token=1, swap_budget_bytes=1, boundary=boundary, tick_count=1
+    )
+    return log.lines[-1]
+
+
+def test_tick_line_carries_aim_and_per_history_ticks(monkeypatch):
+    line = _plan_with_log(monkeypatch, "split3", True)
+    assert "boundary=decode" in line
+    assert "aim=reasoning" in line and "ticks_reasoning=3" in line
+    assert "ticks_answer=4" in line and "reasoning_share=" in line
+    assert "aim=answer" in _plan_with_log(monkeypatch, "split3", False)
+    assert "aim=reasoning" in _plan_with_log(monkeypatch, "split3", True, "prefill")
+
+
+def test_tick_line_for_split_has_no_split3_fields(monkeypatch):
+    line = _plan_with_log(monkeypatch, "split", False)
+    assert "aim=" not in line and "ticks_reasoning" not in line
+    assert "decode_pair_rate=" in line
+
+
+def test_decode_pair_rate_is_comparable_across_split_and_split3(monkeypatch):
+    """Same traffic, hot row 0: split sees it as one decode history, split3 as two."""
+    import re
+
+    def decode_rate(line):
+        return float(re.search(r"decode_pair_rate=([0-9.]+)%", line).group(1))
+
+    from freetoken.moe import hot_adapt
+
+    both = ANSWER[0]
+    merged = tuple(a + r for a, r in zip(ANSWER[0], REASONING[0]))
+    # split arm: one decode history holding answer + reasoning traffic.
+    split_cache_line = None
+    monkeypatch.setattr(
+        hot_adapt, "recompute_hot_partition", lambda *_a, **_k: {0: (0,)}
+    )
+    cache = _split3_cache(monkeypatch, histories="split")
+    log = _Log()
+    monkeypatch.setitem(type(cache)._plan_hot_adaptation.__globals__, "logger", log)
+    cache._hot_adapt_snapshot_host = torch.tensor([merged])
+    cache._hot_adapt_prefill_snapshot_host = torch.tensor([PREFILL[0]])
+    cache._hot_adapt_tick_reasoning = False
+    cache.hot_expert_capacity = {0: 1}
+    cache.hot_adapt_aim = "phase"
+    cache.hot_adapt_prefill_blend = 0.25
+    cache.hot_adapt_expert_bytes = 1
+    cache.num_experts = 4
+    cache._hot_slot_owners = {0: [0]}
+    cache.hot_adapt_max_swap_bytes = 1
+    cache.hot_adapt_hot_budget_bytes = 1
+    cache.hot_adapt_boundary_cap_frac = 1.0
+    cache._plan_hot_adaptation(
+        None, token=1, swap_budget_bytes=1, boundary="decode", tick_count=1
+    )
+    split_cache_line = log.lines[-1]
+    split3_line = _plan_with_log(monkeypatch, "split3", True)
+    assert both  # row 0 holds 8 of 18 decode counts
+    assert decode_rate(split_cache_line) == pytest.approx(decode_rate(split3_line))
+    assert decode_rate(split3_line) == pytest.approx(100 * 8 / 18, abs=0.01)
+
+
+def test_phase_flip_is_logged_and_rate_limited(monkeypatch):
+    cache = _split3_cache(monkeypatch)
+    log = _Log()
+    monkeypatch.setitem(type(cache).set_decode_phase.__globals__, "logger", log)
+    clock = iter([100.0, 100.2, 100.4, 102.0])
+    monkeypatch.setattr(
+        type(cache).set_decode_phase.__globals__["time"], "monotonic", lambda: next(clock)
+    )
+    for phase in (True, False, True, False):
+        cache.set_decode_phase(phase)
+
+    assert len(log.lines) == 2  # first flip, then the one after the 1 s window
+    assert "-> reasoning" in log.lines[0]
+    assert "-> answer" in log.lines[1] and "suppressed_since_last_log=2" in log.lines[1]

@@ -2285,6 +2285,7 @@ class OffloadMoeCache:
         assert self._hot_adapt_snapshot_host is not None
         from freetoken.moe.hot_adapt import (
             aim_histories,
+            blend_histories,
             hot_catchup_swap_bytes,
             plan_hot_swaps,
             recompute_hot_partition,
@@ -2315,6 +2316,12 @@ class OffloadMoeCache:
                 )
                 for layer_id in self.hot_expert_capacity
             }
+        # Aim-independent decode coverage (answer + reasoning, no prefill), so a
+        # split/split3 A/B compares like with like; the aimed rate below is not.
+        decode_view = (
+            counts if reasoning_counts is None
+            else blend_histories(counts, reasoning_counts, 1.0)
+        )
         counts = aim_histories(
             counts,
             prefill_counts,
@@ -2357,13 +2364,35 @@ class OffloadMoeCache:
         )
         rate = hot / total if total else 0.0
         if boundary != "idle":
+            decode_total = sum(sum(layer) for layer in decode_view.values())
+            decode_hot = sum(
+                decode_view[layer_id][expert]
+                for layer_id, rows in owners.items()
+                for expert in rows if expert is not None
+            )
+            split3_fragment = ""
+            if reasoning_counts is not None:
+                reasoning_total = sum(sum(layer) for layer in reasoning_counts.values())
+                if getattr(self, "hot_adapt_aim", "blend") == "phase":
+                    aim = "reasoning" if self._hot_adapt_tick_reasoning else "answer"
+                else:
+                    aim = "both"
+                split3_fragment = (
+                    f", aim={aim}, "
+                    f"reasoning_share="
+                    f"{reasoning_total / decode_total if decode_total else 0.0:.2%}, "
+                    f"ticks_reasoning={getattr(self, 'hot_adapt_ticks_reasoning', 0)}, "
+                    f"ticks_answer={getattr(self, 'hot_adapt_ticks_answer', 0)}"
+                )
             logger.info_rank0(
                 f"MoE HOT adaptation tick token={token}, boundary={boundary}: "
                 f"decayed_hot_pair_rate={rate:.2%}, "
+                f"decode_pair_rate={decode_hot / decode_total if decode_total else 0.0:.2%}, "
                 f"ticks={tick_count}, planned_swaps={len(swaps)}, "
                 f"max_swap_gib_per_tick="
                 f"{self.hot_adapt_max_swap_bytes / 2**30:.2f}, "
                 f"boundary_cap_frac={self.hot_adapt_boundary_cap_frac:.2f}"
+                f"{split3_fragment}"
             )
         return swaps, rate, tick_count
 
@@ -3045,6 +3074,23 @@ class OffloadMoeCache:
         if reasoning != self._decode_phase_reasoning:
             self._decode_phase_reasoning = reasoning
             self.decode_phase_idx.fill_(1 if reasoning else 0)
+            self._log_decode_phase_flip(reasoning)
+
+    def _log_decode_phase_flip(self, reasoning: bool) -> None:
+        """One INFO line per phase flip, at most one per second (flips are per request,
+        but a bs>1 mix could flip every step); suppressed flips are counted."""
+        self._decode_phase_flips = getattr(self, "_decode_phase_flips", 0) + 1
+        now = time.monotonic()
+        last = getattr(self, "_decode_phase_flip_logged_at", None)
+        if last is not None and now - last < 1.0:
+            return
+        suppressed = self._decode_phase_flips - getattr(self, "_decode_phase_flips_logged", 0) - 1
+        self._decode_phase_flip_logged_at = now
+        self._decode_phase_flips_logged = self._decode_phase_flips
+        logger.info_rank0(
+            f"MoE HOT decode phase -> {'reasoning' if reasoning else 'answer'} "
+            f"(flips={self._decode_phase_flips}, suppressed_since_last_log={suppressed})"
+        )
 
     def hot_adapt_prefill_boundary(self) -> None:
         """Account only prefill tokens observed by the HOT split counting path."""
