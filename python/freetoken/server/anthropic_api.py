@@ -49,6 +49,7 @@ from .generation import (
     count_prompt_tokens,
     generate_events,
     generate_full,
+    parse_reasoning_budget,
     render_messages,
     resolve_sampling,
     split_tool_lists,
@@ -337,6 +338,11 @@ def convert_anthropic_to_genspec(
         chat_template_kwargs=ctk,
         template_tools=template_tools,
         parser_tools=parser_tools,
+        reasoning_budget_tokens=(
+            parse_reasoning_budget(req.thinking.get("budget_tokens"), "thinking.budget_tokens")
+            if req.thinking and req.thinking.get("type") == "enabled"
+            else None
+        ),
     )
 
 

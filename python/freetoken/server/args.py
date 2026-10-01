@@ -33,6 +33,9 @@ class ServerArgs(SchedulerConfig):
     # Default max output (decode) tokens for a request that omits one. None falls back to the
     # adapter's built-in default (32k).
     max_output_tokens: int | None = None
+    # Default hard cap on reasoning tokens per request; 0 = unlimited. A request's own
+    # budget (max_reasoning_tokens / reasoning.max_tokens / thinking.budget_tokens) overrides it.
+    reasoning_budget_tokens: int = 0
     # Cancel scheduler work when the HTTP peer goes away. Kept as on/off to match the CLI
     # spelling and leave room for future disconnect policies without adding inverse flags.
     abort_on_disconnect: str = "on"
@@ -107,6 +110,15 @@ def parse_args(
         if not 0 <= rate <= 1:
             raise argparse.ArgumentTypeError("must be in [0, 1]")
         return rate
+
+    def _non_negative_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
 
     def _positive_int(value: str) -> int:
         try:
@@ -330,6 +342,17 @@ def parse_args(
         type=_positive_int,
         default=ServerArgs.max_output_tokens,
         help="Default max output tokens for requests that omit one (default 32k).",
+    )
+
+    parser.add_argument(
+        "--reasoning-budget-tokens",
+        type=_non_negative_int,
+        default=ServerArgs.reasoning_budget_tokens,
+        help=(
+            "Default hard cap on reasoning tokens per request (0 = unlimited). Once spent "
+            "without the model closing reasoning, the end-of-thinking tag is forced. A "
+            "request's own budget overrides it."
+        ),
     )
 
     parser.add_argument(

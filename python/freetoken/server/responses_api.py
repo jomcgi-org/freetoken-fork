@@ -74,6 +74,7 @@ from .generation import (
     await_with_disconnect,
     generate_events,
     generate_full,
+    parse_reasoning_budget,
     render_messages,
     resolve_sampling,
     split_tool_lists,
@@ -265,6 +266,9 @@ def convert_responses_to_genspec(
         template_tools=template_tools,
         parser_tools=parser_tools,
         priority=req.priority,
+        reasoning_budget_tokens=parse_reasoning_budget(
+            (req.reasoning or {}).get("max_tokens"), "reasoning.max_tokens"
+        ),
     )
 
 

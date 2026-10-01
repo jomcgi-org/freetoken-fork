@@ -28,6 +28,9 @@ class SamplingParams:
     # Serialized, engine-neutral grammar request. None is the hot-path sentinel: the
     # sampler does not import or initialize the optional grammar backend unless this is set.
     guided_decoding: dict[str, Any] | None = None
+    # Hard reasoning budget: {"tokens": N, "end": "</think>", "start": str | None, "open": bool}.
+    # None (or tokens == 0) is unlimited; the sampler then does no per-step work for it.
+    reasoning_budget: dict[str, Any] | None = None
     # OpenAI logprobs: 0 returns none; N >= 1 returns the sampled token's logprob plus
     # the N - 1 most likely alternatives (chat `top_logprobs` + 1, completions `logprobs`).
     logprobs: int = 0
@@ -101,6 +104,8 @@ class Req:
     # Stateful optional-backend matcher. Kept request-owned because decode batches are
     # re-formed every step and each sequence advances through its grammar independently.
     guided_state: Any | None = field(default=None, init=False, repr=False)
+    # Host-side counter for SamplingParams.reasoning_budget (see freetoken.reasoning_budget).
+    reasoning_budget_state: Any | None = field(default=None, init=False, repr=False)
     # Advisory routed-expert working set recovered while this request waited in
     # the admission queue. It never participates in model math.
     expert_profile: Any | None = field(default=None, init=False, repr=False)

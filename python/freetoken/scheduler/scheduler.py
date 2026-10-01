@@ -1683,6 +1683,15 @@ class Scheduler(SchedulerIOMixin):
             and len(batch.reqs) == 1
             and batch.reqs[0].sampling_params.is_greedy
             and batch.reqs[0].sampling_params.guided_decoding is None
+            # A live reasoning budget forces a token per step, which a multi-token draft
+            # chain cannot honor; MTP resumes once reasoning has closed.
+            and not (
+                batch.reqs[0].sampling_params.reasoning_budget is not None
+                and not (
+                    batch.reqs[0].reasoning_budget_state is not None
+                    and batch.reqs[0].reasoning_budget_state.done
+                )
+            )
             and batch.reqs[0].sampling_params.logprobs == 0
             and batch.reqs[0].mtp_hidden is not None
         )

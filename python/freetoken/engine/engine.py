@@ -1606,7 +1606,7 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        if args.has_guided:
+        if args.needs_host_tokens:
             # XGrammar advances on host token ids. This synchronization is deliberately
             # confined to constrained batches; ordinary overlap scheduling is unchanged.
             copy_done_event.synchronize()
@@ -1716,7 +1716,7 @@ class Engine:
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        if args.has_guided:
+        if args.needs_host_tokens:
             copy_done_event.synchronize()
             last.mask_us = self.sampler.finish_guided(last, args, next_tokens_cpu)
         for req, token in zip(last.reqs, next_tokens_cpu):
