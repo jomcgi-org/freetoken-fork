@@ -256,3 +256,21 @@ def test_per_arm_model_serves_that_model_and_restores_its_plan(monkeypatch, caps
 def test_model_flag_requires_a_declared_arm():
     with pytest.raises(SystemExit):
         ab.main(["--dry-run", "--dropin", str(FIXTURE), "--arm", "a=main", "--arm", "b=main", "--model", "c:/x"])
+
+
+def test_long_doc_workload_is_one_growing_conversation(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_ask(args, name, content, thinking=False, stream=False, messages=None, max_tokens=None):
+        seen.append((name, [m["role"] for m in messages], max_tokens))
+        return dict(name=name, wall=1.0, tokens=10, tok_s=10.0, _text=f"answer {name}")
+
+    monkeypatch.setattr(client, "ask", fake_ask)
+    out = tmp_path / "rows.json"
+    client.main([str(out), "--workload", "long-doc"])
+    assert [s[0] for s in seen] == ["doc", "t1", "t2", "t3"]
+    assert seen[0][1] == ["user"] and seen[0][2] == 300
+    assert seen[3][1] == ["user", "assistant", "user", "assistant", "user", "assistant", "user"]
+    rows = json.loads(out.read_text())
+    assert all("_text" not in r for r in rows)
+    assert client.LONG_DOC_CHARS <= len(client.long_doc()) <= client.LONG_DOC_CHARS + 100
