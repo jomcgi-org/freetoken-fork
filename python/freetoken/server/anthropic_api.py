@@ -36,6 +36,13 @@ from .disconnect import ClientDisconnectedResponse, DisconnectAwareStreamingResp
 from .generation import (
     KEEPALIVE,
     keepalive_interval_s,
+    admission_wait_s,
+    prime_events,
+    progress_comment,
+    progress_event_comment,
+    progress_requested,
+    retry_headers,
+    Progress,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -127,9 +134,19 @@ async def handle_anthropic_messages(
 
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:
+        # Wait briefly for the engine's first signal so a known refusal (prompt too long,
+        # capacity) is a real HTTP status rather than an in-band error on a committed 200.
+        gen = generate_events(uid, spec, state, source="/v1/messages", progress=True)
+        err, gen = await prime_events(gen, admission_wait_s())
+        if err is not None:
+            return _anthropic_error_response(
+                err.status_code,
+                "api_error" if err.status_code >= 500 else "invalid_request_error",
+                str(err),
+            )
         events = anthropic_event_stream(
-            generate_events(uid, spec, state, source="/v1/messages"),
-            req.model, uid, cache_report=cache_report,
+            gen, req.model, uid, cache_report=cache_report,
+            progress=progress_requested(request),
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
@@ -418,7 +435,8 @@ def _anthropic_usage(
 
 
 async def anthropic_event_stream(
-    events: AsyncIterator[Any], model: str, uid: int, cache_report: bool = False
+    events: AsyncIterator[Any], model: str, uid: int, cache_report: bool = False,
+    progress: bool = False,
 ) -> AsyncIterator[str]:
     """Format the protocol-neutral GenEvent stream into Anthropic SSE events.
 
@@ -470,6 +488,10 @@ async def anthropic_event_stream(
         ),
     ))
 
+    if progress:
+        # `ping` events cannot carry data, so progress rides in SSE comments.
+        yield progress_comment("queued").decode()
+
     def _open_tool(name: str | None, ordinal: int | None, stable: bool = True) -> list[str]:
         nonlocal block_open, tool_args_sent, tool_ordinal, tool_stable
         frames: list[str] = []
@@ -504,6 +526,10 @@ async def anthropic_event_stream(
         async for ev in events:
             if ev is KEEPALIVE:
                 yield _event(AnthropicStreamEvent(type="ping"))
+
+            elif isinstance(ev, Progress):
+                if progress:
+                    yield progress_event_comment(ev).decode()
 
             elif isinstance(ev, ReasoningDelta):
                 # Streamed as a native thinking block (Claude Code renders these).
@@ -642,6 +668,7 @@ def _anthropic_error_response(
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
+        headers=retry_headers(status_code),
         content=AnthropicErrorResponse(
             error=AnthropicError(type=err_type, message=message)
         ).model_dump(),

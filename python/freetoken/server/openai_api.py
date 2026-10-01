@@ -32,6 +32,7 @@ from .generation import (
     KEEPALIVE,
     ContentDelta,
     GenDone,
+    GenEvent,
     GenerationError,
     GenSpec,
     ReasoningDelta,
@@ -42,6 +43,13 @@ from .generation import (
     generate_events,
     generate_full,
     keepalive_interval_s,
+    admission_wait_s,
+    prime_events,
+    progress_event_comment,
+    progress_comment,
+    progress_requested,
+    retry_headers,
+    Progress,
     parse_reasoning_budget,
     prerender_error,
     render_messages,
@@ -280,7 +288,21 @@ async def handle_chat_completion(
     uid = await submit_generation(spec, state)
 
     if req.stream:
-        chunks = stream_chat_completion_chunks(uid, req, state, spec)
+        # Wait briefly for the engine's first signal: a refusal it knows up front (prompt too
+        # long, invalid params, capacity) becomes a real HTTP status instead of an in-band
+        # error on a committed 200. The first event ends the wait, so the normal path is free.
+        events = generate_events(uid, spec, state, source="/v1/chat/completions", progress=True)
+        err, events = await prime_events(events, admission_wait_s())
+        if err is not None:
+            return create_error_response(
+                str(err),
+                status_code=err.status_code,
+                err_type="server_error" if err.status_code >= 500 else "invalid_request_error",
+                code=err.code,
+            )
+        chunks = stream_chat_completion_chunks(
+            uid, req, state, spec, events=events, progress=progress_requested(request)
+        )
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
         return DisconnectAwareStreamingResponse(
@@ -337,8 +359,14 @@ async def stream_chat_completion_chunks(
     req: ChatCompletionRequest,
     state: Any,
     spec: GenSpec | None = None,
+    *,
+    events: AsyncIterator[GenEvent] | None = None,
+    progress: bool = False,
 ) -> AsyncIterator[bytes]:
-    """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
+    """Format generate_events() into the OpenAI chat.completion.chunk SSE stream.
+
+    ``events`` is an already-started generate_events(progress=True) stream (the handler
+    primes it before committing); ``progress`` emits ``: progress`` comment frames."""
     if spec is None:
         spec = chat_request_to_genspec(req, {}, state.config)
     yield _sse(
@@ -349,15 +377,19 @@ async def stream_chat_completion_chunks(
         )
     )
 
+    if progress:
+        yield progress_comment("queued")
+
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
-    events = with_keepalive(
-        generate_events(uid, spec, state, source="/v1/chat/completions"),
-        keepalive_interval_s(),
-    )
+    if events is None:
+        events = generate_events(
+            uid, spec, state, source="/v1/chat/completions", progress=progress
+        )
+    events = with_keepalive(events, keepalive_interval_s())
     while True:
         try:
             ev = await events.__anext__()
@@ -380,6 +412,9 @@ async def stream_chat_completion_chunks(
             # SSE comment: every SSE parser ignores it, and it keeps the stream from going
             # silent through a long queue/prefill (Node undici closes bodies idle for 300 s).
             yield b": keepalive\n\n"
+        elif isinstance(ev, Progress):
+            if progress:
+                yield progress_event_comment(ev)
         elif isinstance(ev, ReasoningDelta):
             yield _sse(
                 _chat_chunk(
@@ -722,6 +757,7 @@ def create_error_response(
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
+        headers=retry_headers(status_code),
         content={
             "error": {
                 "message": message,

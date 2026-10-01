@@ -676,8 +676,21 @@ def test_route_nonstream_error_returns_400():
     assert "too long" in r.json()["error"]["message"]
 
 
-def test_route_stream_error_emits_failed_event():
+def test_route_stream_preflight_error_is_http_400():
     client = _client(_ErrState([]))
+    r = client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "stream": True})
+    assert r.status_code == 400, r.text  # known before the first event: no SSE commit
+    assert "too long" in r.json()["error"]["message"]
+
+
+class _LateErrState(FakeState):
+    async def wait_for_ack(self, uid):
+        yield UserReply(uid=uid, incremental_output="hi", finished=False, completion_tokens_delta=1)
+        yield UserReply(uid=uid, incremental_output="", finished=True, error="late failure")
+
+
+def test_route_stream_error_emits_failed_event():
+    client = _client(_LateErrState([]))
     r = client.post("/v1/responses", json={"model": "gpt-x", "input": "hi", "stream": True})
     assert r.status_code == 200, r.text  # stream already started; failure is in-band
     etypes = [
