@@ -446,6 +446,29 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--dense-weight-dtype",
+        choices=["bf16", "fp8"],
+        default=ServerArgs.dense_weight_dtype,
+        help=(
+            "Storage dtype of the non-expert projections (attention, GatedDeltaNet, shared "
+            "expert, hyper-connection). 'fp8' quantizes the BF16 weights at load to E4M3 with a "
+            "per-output-row fp32 scale and frees the BF16 copy (Qwen3.8 Flash-Next only). "
+            "Default: bf16 (unchanged)."
+        ),
+    )
+
+    parser.add_argument(
+        "--fp8-lm-head",
+        choices=["on", "off"],
+        default=ServerArgs.fp8_lm_head,
+        help=(
+            "Quantize lm_head to FP8 too (needs --dense-weight-dtype fp8). Default: on, except "
+            "off with --speculative-mtp on, whose draft head shares the lm_head (an FP8 head "
+            "zeroed draft acceptance elsewhere); explicit 'on' with MTP is rejected."
+        ),
+    )
+
+    parser.add_argument(
         "--mtp-draft-tokens",
         type=int,
         default=ServerArgs.mtp_draft_tokens,
