@@ -103,6 +103,8 @@ class EngineConfig:
     moe_hot_adapt_prefill_weight: float = 1.0
     moe_hot_adapt_histories: str = "shared"
     moe_hot_adapt_aim: str = "blend"
+    moe_hot_adapt_phase_other_weight: float = 0.05
+    moe_hot_adapt_phase_min_steps: int = 0
     moe_hot_adapt_prefill_blend: float = 0.25
     moe_hot_adapt_prefill_normalize: str = "off"
     moe_hot_adapt_prefill_run_cap_frac: float = 0.0
@@ -467,6 +469,14 @@ class EngineConfig:
                 "--moe-hot-adapt-histories must be 'shared', 'split' or 'split3', got "
                 f"{self.moe_hot_adapt_histories!r}"
             )
+        weight = self.moe_hot_adapt_phase_other_weight
+        if isinstance(weight, bool) or not math.isfinite(weight) or not 0 <= weight <= 1:
+            raise ValueError(
+                "--moe-hot-adapt-phase-other-weight must be finite and in [0, 1]"
+            )
+        steps = self.moe_hot_adapt_phase_min_steps
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("--moe-hot-adapt-phase-min-steps must be a non-negative integer")
         if self.moe_hot_adapt_aim not in ("blend", "phase"):
             raise ValueError(
                 "--moe-hot-adapt-aim must be 'blend' or 'phase', got "

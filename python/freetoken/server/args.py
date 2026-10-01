@@ -1063,6 +1063,26 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-adapt-phase-other-weight",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_phase_other_weight,
+        help=(
+            "split3 + aim phase: weight in [0, 1] of the non-aimed decode history "
+            "(default: 0.05; 1.0 equals split's combined decode history)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-phase-min-steps",
+        type=int,
+        default=ServerArgs.moe_hot_adapt_phase_min_steps,
+        help=(
+            "split3 + aim phase: the decode aim switches phase only after this many "
+            "consecutive decode steps in the new phase (default: 0, immediate)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-prefill-blend",
         type=float,
         default=ServerArgs.moe_hot_adapt_prefill_blend,

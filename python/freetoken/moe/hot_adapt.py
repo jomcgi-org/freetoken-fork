@@ -959,6 +959,7 @@ def aim_histories(
     boundary: str,
     reasoning_phase: bool,
     prefill_blend: float,
+    other_weight: float = PHASE_TIEBREAK_BLEND,
 ) -> dict[int, tuple[float, ...]]:
     """Counts the HOT planner ranks experts by, for the current aim.
 
@@ -971,8 +972,9 @@ def aim_histories(
     split3, aim=blend:  answer + reasoning + w * prefill.
     split3, aim=phase:  the aimed decode history is the reasoning one while
         ``reasoning_phase`` else the answer one. Prefill boundary -> prefill +
-        w * aimed + w * TIEBREAK * other; decode/idle boundary -> aimed +
-        TIEBREAK * other. Prefill never enters a decode aim, as in split.
+        w * aimed + w * W * other; decode/idle boundary -> aimed + W * other,
+        where W = ``other_weight`` (default TIEBREAK; 1.0 reproduces split's
+        combined decode history). Prefill never enters a decode aim, as in split.
     """
     if prefill_counts is None and reasoning_counts is None:
         return {
@@ -994,7 +996,7 @@ def aim_histories(
         aimed, other = reasoning_counts, decode_counts
     else:
         aimed, other = decode_counts, reasoning_counts
-    decode_aim = blend_histories(aimed, other, PHASE_TIEBREAK_BLEND)
+    decode_aim = blend_histories(aimed, other, other_weight)
     if boundary != "prefill" or prefill_counts is None:
         return decode_aim
     return blend_histories(prefill_counts, decode_aim, prefill_blend)

@@ -437,6 +437,12 @@ class OffloadMoeCache:
         # The host flips it with a stream-ordered fill between steps; no sync.
         self.decode_phase_idx = torch.zeros(1, dtype=torch.int32, device=self.device)
         self._decode_phase_reasoning = False
+        # The phase the planner aims at: the raw phase, held back by
+        # hot_adapt_phase_min_steps consecutive decode steps before it may switch.
+        self._hot_adapt_aim_reasoning = False
+        self._decode_phase_run_steps = 0
+        self.hot_adapt_phase_other_weight = 0.05
+        self.hot_adapt_phase_min_steps = 0
         self.hot_adapt_ticks_reasoning = 0
         self.hot_adapt_ticks_answer = 0
         self._hot_adapt_ticks_reasoning_reported = 0
@@ -1562,6 +1568,8 @@ class OffloadMoeCache:
         prefill_weight: float = 1.0,
         histories: str = "shared",
         aim: str = "blend",
+        phase_other_weight: float = 0.05,
+        phase_min_steps: int = 0,
         prefill_blend: float = 0.25,
         prefill_normalize: str = "off",
         prefill_run_cap_frac: float = 0.0,
@@ -1608,6 +1616,18 @@ class OffloadMoeCache:
             )
         if aim not in ("blend", "phase"):
             raise ValueError("HOT adaptation aim must be 'blend' or 'phase'")
+        if (
+            isinstance(phase_other_weight, bool)
+            or not math.isfinite(phase_other_weight)
+            or not 0 <= phase_other_weight <= 1
+        ):
+            raise ValueError("HOT phase other-history weight must be finite and in [0, 1]")
+        if (
+            isinstance(phase_min_steps, bool)
+            or not isinstance(phase_min_steps, int)
+            or phase_min_steps < 0
+        ):
+            raise ValueError("HOT phase minimum steps must be a non-negative integer")
         if (
             isinstance(prefill_blend, bool)
             or not math.isfinite(prefill_blend)
@@ -1659,6 +1679,8 @@ class OffloadMoeCache:
         self.hot_adapt_prefill_weight = float(prefill_weight)
         self.hot_adapt_histories = histories
         self.hot_adapt_aim = aim
+        self.hot_adapt_phase_other_weight = float(phase_other_weight)
+        self.hot_adapt_phase_min_steps = int(phase_min_steps)
         self.hot_adapt_prefill_blend = float(prefill_blend)
         self.hot_adapt_prefill_normalize = prefill_normalize
         self.decayed_prefill_freq = (
@@ -1801,6 +1823,9 @@ class OffloadMoeCache:
         logger.info_rank0(
             f"MoE HOT adaptation intervals: mode={mode}, "
             f"aim={self.hot_adapt_aim}, "
+            f"histories={self.hot_adapt_histories}, "
+            f"phase_other_weight={self.hot_adapt_phase_other_weight:g}, "
+            f"phase_min_steps={self.hot_adapt_phase_min_steps}, "
             f"unit=routed_tokens, "
             f"hot_budget_gib={self.hot_adapt_hot_budget_bytes / 2**30:.2f}, "
             f"max_swap_gib={self.hot_adapt_max_swap_bytes / 2**30:.2f}, "
@@ -2330,6 +2355,7 @@ class OffloadMoeCache:
             boundary=boundary,
             reasoning_phase=getattr(self, "_hot_adapt_tick_reasoning", False),
             prefill_blend=getattr(self, "hot_adapt_prefill_blend", 0.25),
+            other_weight=getattr(self, "hot_adapt_phase_other_weight", 0.05),
         )
         budget_bytes = sum(self.hot_expert_capacity.values()) * self.hot_adapt_expert_bytes
         desired = recompute_hot_partition(
@@ -2792,7 +2818,7 @@ class OffloadMoeCache:
                 self._complete_hot_adaptation_tick(staging_seconds=0.0)
                 return
         assert self._hot_adapt_snapshot_host is not None
-        self._hot_adapt_tick_reasoning = getattr(self, "_decode_phase_reasoning", False)
+        self._hot_adapt_tick_reasoning = getattr(self, "_hot_adapt_aim_reasoning", False)
         self._hot_adapt_snapshot_device.copy_(self.decayed_decode_freq)
         if getattr(self, "decayed_prefill_freq", None) is not None:
             assert self._hot_adapt_prefill_snapshot_device is not None
@@ -3040,7 +3066,7 @@ class OffloadMoeCache:
             self.hot_adapt_ticks_decode += tick_count
         if getattr(self, "decayed_reasoning_freq", None) is not None:
             # Which decode history the planner will aim at for this tick.
-            if getattr(self, "_decode_phase_reasoning", False):
+            if getattr(self, "_hot_adapt_aim_reasoning", False):
                 self.hot_adapt_ticks_reasoning += tick_count
             else:
                 self.hot_adapt_ticks_answer += tick_count
@@ -3074,7 +3100,23 @@ class OffloadMoeCache:
         if reasoning != self._decode_phase_reasoning:
             self._decode_phase_reasoning = reasoning
             self.decode_phase_idx.fill_(1 if reasoning else 0)
+            self._decode_phase_run_steps = 0
+            if getattr(self, "hot_adapt_phase_min_steps", 0) <= 0:
+                self._hot_adapt_aim_reasoning = reasoning
             self._log_decode_phase_flip(reasoning)
+
+    def _advance_phase_aim(self) -> None:
+        """Hysteresis, host-side: after a flip the planner keeps its previous aim until
+        the new phase has lasted hot_adapt_phase_min_steps consecutive decode steps.
+        Route counting is unaffected (it follows the raw phase via the device index)."""
+        if getattr(self, "decayed_reasoning_freq", None) is None:
+            return
+        self._decode_phase_run_steps = getattr(self, "_decode_phase_run_steps", 0) + 1
+        if (
+            self._hot_adapt_aim_reasoning != self._decode_phase_reasoning
+            and self._decode_phase_run_steps >= getattr(self, "hot_adapt_phase_min_steps", 0)
+        ):
+            self._hot_adapt_aim_reasoning = self._decode_phase_reasoning
 
     def _log_decode_phase_flip(self, reasoning: bool) -> None:
         """One INFO line per phase flip, at most one per second (flips are per request,
@@ -3113,6 +3155,7 @@ class OffloadMoeCache:
         """Account one decode batch and start any due tick."""
         if batch_size < 0:
             raise ValueError("HOT adaptation decode batch size must be non-negative")
+        self._advance_phase_aim()
         self._hot_adapt_token_boundary(batch_size, "decode")
 
     @property
@@ -3136,8 +3179,9 @@ class OffloadMoeCache:
                 dict(enumerate(reasoning_freq.tolist())) if reasoning_freq is not None else None,
                 aim=getattr(self, "hot_adapt_aim", "blend"),
                 boundary=getattr(self, "_hot_adapt_tick_boundary", None) or "decode",
-                reasoning_phase=getattr(self, "_decode_phase_reasoning", False),
+                reasoning_phase=getattr(self, "_hot_adapt_aim_reasoning", False),
                 prefill_blend=getattr(self, "hot_adapt_prefill_blend", 0.25),
+                other_weight=getattr(self, "hot_adapt_phase_other_weight", 0.05),
             )
             counts = [blended[layer_id] for layer_id in range(self.num_layers)]
         total = sum(sum(layer) for layer in counts)
@@ -3563,7 +3607,7 @@ class OffloadMoeCache:
                 if reasoning_total + answer_total else 0.0
             )
             result["hot_adapt_decode_aim"] = (
-                "reasoning" if self._decode_phase_reasoning else "answer"
+                "reasoning" if self._hot_adapt_aim_reasoning else "answer"
             ) if getattr(self, "hot_adapt_aim", "blend") == "phase" else "both"
             result["hot_adapt_ticks_reasoning"] = (
                 self.hot_adapt_ticks_reasoning - self._hot_adapt_ticks_reasoning_reported

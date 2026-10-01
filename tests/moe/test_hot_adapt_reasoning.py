@@ -231,6 +231,7 @@ def test_status_reports_aimed_history_and_per_history_ticks(monkeypatch):
     cache.decayed_decode_freq[0] = torch.tensor([1.0, 0.0, 0.0, 0.0])
     cache.decayed_reasoning_freq[0] = torch.tensor([0.0, 3.0, 0.0, 0.0])
     cache._decode_phase_reasoning = True
+    cache._hot_adapt_aim_reasoning = True
     cache.hot_adapt_ticks_reasoning = 5
     cache.hot_adapt_ticks_answer = 2
 
@@ -518,3 +519,144 @@ def test_phase_flip_is_logged_and_rate_limited(monkeypatch):
     assert len(log.lines) == 2  # first flip, then the one after the 1 s window
     assert "-> reasoning" in log.lines[0]
     assert "-> answer" in log.lines[1] and "suppressed_since_last_log=2" in log.lines[1]
+
+
+# --- tunables: phase-other-weight and phase-min-steps --------------------------------
+
+
+@pytest.mark.parametrize("reasoning_phase", [True, False])
+def test_other_weight_one_reproduces_split_combined_decode_history(reasoning_phase):
+    from freetoken.moe.hot_adapt import recompute_hot_partition
+
+    combined = {0: tuple(a + r for a, r in zip(ANSWER[0], REASONING[0]))}
+    split = aim_histories(
+        combined, PREFILL, None,
+        aim="phase", boundary="decode", reasoning_phase=reasoning_phase, prefill_blend=0.25,
+    )
+    split3 = aim_histories(
+        ANSWER, PREFILL, REASONING,
+        aim="phase", boundary="decode", reasoning_phase=reasoning_phase,
+        prefill_blend=0.25, other_weight=1.0,
+    )
+    assert split3[0] == pytest.approx(split[0])
+    kw = dict(budget_bytes=2, expert_bytes=1, num_experts=4, capacities={0: 2})
+    assert recompute_hot_partition(split3, frozenset({0}), **kw) == recompute_hot_partition(
+        split, frozenset({0}), **kw
+    )
+
+
+def test_other_weight_zero_is_pure_aimed_history_and_default_is_tiebreak():
+    pure = aim_histories(
+        ANSWER, PREFILL, REASONING, aim="phase", boundary="decode",
+        reasoning_phase=True, prefill_blend=0.25, other_weight=0.0,
+    )
+    assert pure[0] == REASONING[0]
+    assert _aim("decode", True) == pytest.approx(
+        aim_histories(
+            ANSWER, PREFILL, REASONING, aim="phase", boundary="decode",
+            reasoning_phase=True, prefill_blend=0.25, other_weight=0.05,
+        )[0]
+    )
+
+
+def test_plan_uses_configured_other_weight(monkeypatch):
+    from freetoken.moe import hot_adapt
+
+    seen = []
+    monkeypatch.setattr(
+        hot_adapt, "recompute_hot_partition",
+        lambda counts, *_a, **_k: (seen.append(counts), {0: (0,)})[1],
+    )
+    cache = _split3_cache(monkeypatch)
+    cache._hot_adapt_snapshot_host = torch.tensor([ANSWER[0]])
+    cache._hot_adapt_prefill_snapshot_host = torch.tensor([PREFILL[0]])
+    cache._hot_adapt_reasoning_snapshot_host = torch.tensor([REASONING[0]])
+    cache._hot_adapt_tick_reasoning = True
+    cache.hot_adapt_phase_other_weight = 1.0
+    cache.hot_expert_capacity = {0: 1}
+    cache.hot_adapt_aim = "phase"
+    cache.hot_adapt_prefill_blend = 0.25
+    cache.hot_adapt_expert_bytes = 1
+    cache.num_experts = 4
+    cache._hot_slot_owners = {0: [0]}
+    cache.hot_adapt_max_swap_bytes = 1
+    cache.hot_adapt_hot_budget_bytes = 1
+    cache.hot_adapt_boundary_cap_frac = 1.0
+    cache._plan_hot_adaptation(None, token=1, swap_budget_bytes=1, boundary="decode", tick_count=1)
+    assert seen[0][0] == pytest.approx(tuple(a + r for a, r in zip(ANSWER[0], REASONING[0])))
+
+
+def _hysteresis_cache(monkeypatch, min_steps):
+    cache = _split3_cache(monkeypatch)
+    cache._hot_adapt_aim_reasoning = False
+    cache._decode_phase_run_steps = 0
+    cache.hot_adapt_phase_min_steps = min_steps
+    monkeypatch.setitem(type(cache).set_decode_phase.__globals__, "logger", _Log())
+    return cache
+
+
+def test_min_steps_zero_switches_aim_immediately(monkeypatch):
+    cache = _hysteresis_cache(monkeypatch, 0)
+    cache.set_decode_phase(True)
+    assert cache._hot_adapt_aim_reasoning is True
+    cache.set_decode_phase(False)
+    assert cache._hot_adapt_aim_reasoning is False
+
+
+def test_min_steps_holds_previous_aim_until_phase_has_lasted(monkeypatch):
+    cache = _hysteresis_cache(monkeypatch, 3)
+    cache.set_decode_phase(True)
+    # The device index (route counting) follows the raw phase at once...
+    assert cache.decode_phase_idx.item() == 1
+    assert cache._hot_adapt_aim_reasoning is False
+    cache._advance_phase_aim()
+    cache._advance_phase_aim()
+    assert cache._hot_adapt_aim_reasoning is False  # 2 of 3 steps
+    cache._advance_phase_aim()
+    assert cache._hot_adapt_aim_reasoning is True
+    # ...and a short answer blip does not move the aim back.
+    cache.set_decode_phase(False)
+    cache._advance_phase_aim()
+    cache.set_decode_phase(True)
+    for _ in range(5):
+        cache._advance_phase_aim()
+    assert cache._hot_adapt_aim_reasoning is True
+    assert cache._decode_phase_run_steps == 5
+
+
+def test_tick_snapshot_uses_held_aim_not_raw_phase(monkeypatch):
+    cache = _hysteresis_cache(monkeypatch, 10)
+    cache.set_decode_phase(True)
+    line = _plan_with_log(monkeypatch, "split3", cache._hot_adapt_aim_reasoning)
+    assert "aim=answer" in line
+
+
+def test_startup_log_reports_both_tunables(monkeypatch):
+    cache, row_bytes = _real_cache(monkeypatch)
+    log = _Log()
+    monkeypatch.setitem(type(cache).configure_hot_adaptation.__globals__, "logger", log)
+    cache.configure_hot_adaptation(
+        half_life_steps=2, interval_steps=1000, max_swap_bytes=row_bytes,
+        expert_bytes=row_bytes, histories="split3", aim="phase",
+        phase_other_weight=0.3, phase_min_steps=7,
+    )
+    try:
+        line = next(l for l in log.lines if "adaptation intervals" in l)
+        assert "phase_other_weight=0.3" in line and "phase_min_steps=7" in line
+        assert cache.hot_adapt_phase_other_weight == 0.3
+        assert cache.hot_adapt_phase_min_steps == 7
+    finally:
+        cache.shutdown_hot_adaptation()
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"phase_other_weight": 1.5}, {"phase_other_weight": float("nan")},
+               {"phase_min_steps": -1}, {"phase_min_steps": 1.5}]
+)
+def test_configure_rejects_invalid_tunables(monkeypatch, kwargs):
+    cache, row_bytes = _real_cache(monkeypatch)
+    with pytest.raises(ValueError, match="phase"):
+        cache.configure_hot_adaptation(
+            half_life_steps=2, interval_steps=0, max_swap_bytes=row_bytes,
+            expert_bytes=row_bytes, histories="split3", **kwargs,
+        )

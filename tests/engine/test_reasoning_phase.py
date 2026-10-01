@@ -118,6 +118,21 @@ def test_config_accepts_split3_and_keeps_default():
         _config(moe_hot_adapt_histories="split4")
 
 
+def test_phase_tunables_defaults_flags_and_validation():
+    from freetoken.server.args import parse_args
+
+    assert _config().moe_hot_adapt_phase_other_weight == 0.05
+    assert _config().moe_hot_adapt_phase_min_steps == 0
+    args, _ = parse_args([
+        "--model", "/tmp/nonexistent-model", "--dtype", "bfloat16",
+        "--moe-hot-adapt-phase-other-weight", "0.5", "--moe-hot-adapt-phase-min-steps", "12",
+    ])
+    assert (args.moe_hot_adapt_phase_other_weight, args.moe_hot_adapt_phase_min_steps) == (0.5, 12)
+    for bad in ({"moe_hot_adapt_phase_other_weight": 2.0}, {"moe_hot_adapt_phase_min_steps": -1}):
+        with pytest.raises(ValueError, match="phase"):
+            _config(**bad)
+
+
 def test_cli_flag_accepts_split3():
     from freetoken.server.args import parse_args
 
