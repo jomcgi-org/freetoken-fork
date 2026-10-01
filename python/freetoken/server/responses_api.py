@@ -62,6 +62,13 @@ from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     KEEPALIVE,
     keepalive_interval_s,
+    admission_wait_s,
+    prime_events,
+    progress_comment,
+    progress_event_comment,
+    progress_requested,
+    retry_headers,
+    Progress,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -169,9 +176,15 @@ async def handle_responses(
 
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:
+        # Wait briefly for the engine's first signal so a known refusal (prompt too long,
+        # capacity) is a real HTTP status rather than an in-band error on a committed 200.
+        gen = generate_events(uid, spec, state, source="/v1/responses", progress=True)
+        err, gen = await prime_events(gen, admission_wait_s())
+        if err is not None:
+            return _error_response(err.status_code, str(err), err.code)
         events = responses_stream_generator(
-            generate_events(uid, spec, state, source="/v1/responses"), req, response_id, created,
-            cache_report=cache_report,
+            gen, req, response_id, created,
+            cache_report=cache_report, progress=progress_requested(request),
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
@@ -493,6 +506,7 @@ async def responses_stream_generator(
     response_id: str,
     created: int,
     cache_report: bool = False,
+    progress: bool = False,
 ) -> AsyncIterator[str]:
     seq = _Seq()
 
@@ -508,6 +522,11 @@ async def responses_stream_generator(
     yield _sse(ResponseInProgressEvent(
         type="response.in_progress", sequence_number=seq.next(), response=snapshot("in_progress", []),
     ))
+
+    if progress:
+        # SSE comments, not response.in_progress fields: the event model is a strict
+        # openai type, and comments are invisible to standard parsers.
+        yield progress_comment("queued").decode()
 
     output_items: list[Any] = []
     output_index = 0
@@ -606,6 +625,10 @@ async def responses_stream_generator(
                     type="response.in_progress", sequence_number=seq.next(),
                     response=snapshot("in_progress", output_items),
                 ))
+
+            elif isinstance(ev, Progress):
+                if progress:
+                    yield progress_event_comment(ev).decode()
 
             elif isinstance(ev, ReasoningDelta):
                 # Streamed as a first-class reasoning item (codex renders
@@ -770,6 +793,7 @@ def _sse(event) -> str:
 def _error_response(status_code: int, message: str, code: str | None = None) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
+        headers=retry_headers(status_code),
         content={"error": {
             "message": message,
             "type": "server_error" if status_code >= 500 else "invalid_request_error",

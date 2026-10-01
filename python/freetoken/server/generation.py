@@ -129,7 +129,24 @@ class GenDone:
     cached_tokens: int = 0
 
 
-GenEvent = ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta | GenDone
+@dataclass
+class Progress:
+    """A request stage for opt-in progress frames (``X-FreeToken-Include-Progress``):
+    ``prefill`` once the scheduler admits the prompt (``total`` prompt tokens, ``reused``
+    served from the prefix cache, ``done`` = tokens already computed at that point), and
+    ``generating`` before the first sampled token. Only produced when generate_events()
+    is called with ``progress=True``; adapters drop it unless the client opted in."""
+
+    stage: str
+    done: int = 0
+    total: int = 0
+    reused: int = 0
+
+
+GenEvent = (
+    ReasoningDelta | ContentDelta | ToolCallStart | ToolCallArgsDelta | ToolCallsDelta
+    | GenDone | Progress
+)
 
 
 @dataclass
@@ -550,6 +567,110 @@ async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
             task.cancel()
 
 
+RETRY_AFTER_S = "5"
+
+
+def retry_headers(status_code: int) -> dict[str, str] | None:
+    """``Retry-After`` for a capacity/OOM refusal (503) so clients back off and retry."""
+    return {"Retry-After": RETRY_AFTER_S} if status_code == 503 else None
+
+
+PROGRESS_HEADER = "x-freetoken-include-progress"
+
+
+def progress_requested(request: Any | None) -> bool:
+    """True when the client opted into progress frames with ``X-FreeToken-Include-Progress: 1``."""
+    if request is None:
+        return False
+    value = request.headers.get(PROGRESS_HEADER)
+    return value is not None and value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def progress_comment(stage: str, **fields: int) -> bytes:
+    """One progress frame as an SSE comment line, which standard SSE parsers ignore."""
+    payload = json.dumps({"stage": stage, **fields}, separators=(",", ":"))
+    return f": progress {payload}\n\n".encode()
+
+
+def progress_event_comment(ev: Progress) -> bytes:
+    if ev.stage == "prefill":
+        return progress_comment("prefill", done=ev.done, total=ev.total, reused=ev.reused)
+    return progress_comment(ev.stage)
+
+
+ADMISSION_WAIT_ENV = "FREETOKEN_ADMISSION_WAIT_S"
+DEFAULT_ADMISSION_WAIT_S = 2.0
+
+
+def admission_wait_s() -> float:
+    """Longest a streaming route waits for the engine's first signal (an admission refusal,
+    a prefill-admitted ack or a token) before committing the 200 SSE response. Refusals the
+    scheduler knows up front (prompt too long, invalid params) arrive within it, so they can
+    still be a real HTTP status. ``FREETOKEN_ADMISSION_WAIT_S`` overrides it; ``0`` commits
+    immediately (refusals then ride in-stream)."""
+    raw = os.environ.get(ADMISSION_WAIT_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_ADMISSION_WAIT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_ADMISSION_WAIT_S
+    return value if value >= 0 else DEFAULT_ADMISSION_WAIT_S
+
+
+async def prime_events(
+    events: AsyncIterator[GenEvent], wait_s: float
+) -> tuple[GenerationError | None, AsyncIterator[GenEvent]]:
+    """Wait up to ``wait_s`` for the first event of ``events`` so a streaming route can
+    return a failure the engine already knows (a ``GenerationError`` raised before any
+    output) as a plain HTTP error instead of an in-band error on a committed 200.
+
+    Returns ``(error, stream)``. With an error, ``stream`` is exhausted. Otherwise
+    ``stream`` replays the first event (if one arrived in time) and then the rest;
+    arrival of the first event ends the wait, so the normal path adds no latency. Later
+    failures, and any non-GenerationError, propagate through ``stream`` unchanged."""
+
+    async def _empty():
+        return
+        yield  # pragma: no cover
+
+    aiter = events.__aiter__()
+    if wait_s <= 0:
+        return None, aiter
+    task = asyncio.ensure_future(aiter.__anext__())
+    try:
+        await asyncio.wait({task}, timeout=wait_s)
+    except BaseException:
+        task.cancel()
+        raise
+    if task.done() and not task.cancelled():
+        exc = task.exception()
+        if isinstance(exc, GenerationError):
+            return exc, _empty()
+
+    async def _resume():
+        pending = task
+        try:
+            while True:
+                if pending is None:
+                    pending = asyncio.ensure_future(aiter.__anext__())
+                try:
+                    ev = await pending
+                except StopAsyncIteration:
+                    pending = None
+                    return
+                pending = None
+                yield ev
+        finally:
+            if pending is not None:
+                pending.cancel()
+            aclose = getattr(aiter, "aclose", None)
+            if aclose is not None and pending is None:
+                await aclose()
+
+    return None, _resume()
+
+
 def _record_generation(
     *,
     source: str | None,
@@ -586,7 +707,7 @@ def _record_generation(
 
 
 async def generate_events(
-    uid: int, spec: GenSpec, state: Any, *, source: str | None = None
+    uid: int, spec: GenSpec, state: Any, *, source: str | None = None, progress: bool = False
 ) -> AsyncIterator[GenEvent]:
     """Wraps `_generate_events_impl` to log the request with its totals, read off the terminal
     `GenDone`. The `finally` still records the row on a mid-stream disconnect — but with 0 tokens
@@ -597,7 +718,7 @@ async def generate_events(
     first_token_at: float | None = None
     error: str | None = None
     try:
-        async for ev in _generate_events_impl(uid, spec, state):
+        async for ev in _generate_events_impl(uid, spec, state, progress=progress):
             if isinstance(ev, GenDone):
                 prompt_tokens = ev.prompt_tokens
                 completion_tokens = ev.completion_tokens
@@ -638,7 +759,9 @@ async def generate_full(
         )
 
 
-async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIterator[GenEvent]:
+async def _generate_events_impl(
+    uid: int, spec: GenSpec, state: Any, *, progress: bool = False
+) -> AsyncIterator[GenEvent]:
     """Protocol-neutral streaming generation. Yields semantic events (reasoning /
     content / tool-call deltas) terminated by exactly one GenDone. Produces no wire
     format — the OpenAI/Anthropic/Responses streamers format these into their own.
@@ -742,6 +865,7 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
 
     engine_finish_reason: str | None = None
     engine_matched_stop: str | None = None
+    generating_sent = False
     async for ack in state.wait_for_ack(uid):
         if getattr(ack, "error", None):
             raise GenerationError(
@@ -749,6 +873,17 @@ async def _generate_events_impl(uid: int, spec: GenSpec, state: Any) -> AsyncIte
                 getattr(ack, "error_code", None),
                 getattr(ack, "error_status_code", 400),
             )
+        if progress:
+            # Prompt-admission ack: the prompt length and prefix-cache hit are known and
+            # prefill is starting. First sampled token: prefill is over.
+            if ack.prompt_tokens_delta > 0:
+                yield Progress(
+                    "prefill", done=ack.cached_tokens, total=ack.prompt_tokens_delta,
+                    reused=ack.cached_tokens,
+                )
+            if ack.completion_tokens_delta > 0 and not generating_sent:
+                generating_sent = True
+                yield Progress("generating")
         prompt_tokens += ack.prompt_tokens_delta
         completion_tokens += ack.completion_tokens_delta
         cached_tokens += ack.cached_tokens
