@@ -45,6 +45,9 @@ class UserMsg(BaseBackendMsg):
     # so fresh sessions can reuse it even when their first user message differs.
     cache_anchor_len: int | None = None
     cache_anchor_kind: str | None = None
+    # Token boundary that opens the request's last message (agent loops resend the
+    # same history plus one new message). Persisted like the root anchor.
+    cache_last_anchor_len: int | None = None
 
 
 @dataclass

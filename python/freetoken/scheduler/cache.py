@@ -83,6 +83,9 @@ class CacheManager:
             "harness_anchor_skipped_final_chunk": 0,
             "harness_anchor_skipped_no_store": 0,
             "harness_anchor_skipped_unaligned": 0,
+            "harness_anchor_persisted_last_message": 0,
+            "harness_anchor_skipped_last_message_shallow": 0,
+            "harness_anchor_skipped_last_message_unaligned": 0,
         }
 
     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
@@ -437,6 +440,8 @@ class CacheManager:
         if self._queue_disk_prefix(req, length, page_indices, frozen):
             self.note_harness_anchor("persisted")
             self.note_harness_anchor("persisted_final" if final else "persisted_intermediate")
+            if req.cache_anchor_kind == "last_message":
+                self.note_harness_anchor("persisted_last_message")
 
     def note_harness_anchor(self, outcome: str) -> None:
         """Record one anchor outcome, including disabled-store drops for unit observability."""

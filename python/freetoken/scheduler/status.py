@@ -281,7 +281,13 @@ class SchedulerStatusReporter:
             f"harness_anchor_skipped_no_store: "
             f"{stats.get('harness_anchor_skipped_no_store', 0)}, "
             f"harness_anchor_skipped_unaligned: "
-            f"{stats.get('harness_anchor_skipped_unaligned', 0)}"
+            f"{stats.get('harness_anchor_skipped_unaligned', 0)}, "
+            f"harness_anchor_persisted_last_message: "
+            f"{stats.get('harness_anchor_persisted_last_message', 0)}, "
+            f"harness_anchor_skipped_last_message_shallow: "
+            f"{stats.get('harness_anchor_skipped_last_message_shallow', 0)}, "
+            f"harness_anchor_skipped_last_message_unaligned: "
+            f"{stats.get('harness_anchor_skipped_last_message_unaligned', 0)}"
         )
 
 

@@ -95,7 +95,7 @@ def _tokenize_requests(
     logger: Any,
 ) -> tuple[
     List[TokenizeMsg],
-    List[tuple[torch.Tensor, int | None, str | None]],
+    List[tuple[torch.Tensor, int | None, str | None, int | None]],
     List[UserReply],
 ]:
     """Tokenize independently, returning backend work plus terminal frontend errors.
@@ -104,7 +104,7 @@ def _tokenize_requests(
     only when the scheduler later confirms first-prefill admission.
     """
     ok_msgs: List[TokenizeMsg] = []
-    ok_results: List[tuple[torch.Tensor, int | None, str | None]] = []
+    ok_results: List[tuple[torch.Tensor, int | None, str | None, int | None]] = []
     errors: List[UserReply] = []
     for msg in messages:
         try:
@@ -116,6 +116,10 @@ def _tokenize_requests(
                 cache_anchor_len = cache_anchor_kind = None
             else:
                 tokens, cache_anchor_len, cache_anchor_kind = tokenize_with_anchor(msg)
+            last_message_anchor = getattr(tokenize_manager, "last_message_anchor", None)
+            last_anchor_len = (
+                last_message_anchor(msg, tokens) if last_message_anchor is not None else None
+            )
         except Exception as exc:  # noqa: BLE001 — isolate, never crash the worker
             logger.warning(f"tokenization failed for request {msg.uid}: {exc!r}")
             errors.append(
@@ -140,7 +144,7 @@ def _tokenize_requests(
             )
             continue
         ok_msgs.append(msg)
-        ok_results.append((tokens, cache_anchor_len, cache_anchor_kind))
+        ok_results.append((tokens, cache_anchor_len, cache_anchor_kind, last_anchor_len))
     return ok_msgs, ok_results, errors
 
 
@@ -169,6 +173,7 @@ def tokenize_worker(
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
     harness_prefixes: tuple[str, ...] = (),
+    last_message_anchor: bool = False,
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
@@ -181,7 +186,11 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer, harness_prefixes=harness_prefixes)
+    tokenize_manager = TokenizeManager(
+        tokenizer,
+        harness_prefixes=harness_prefixes,
+        last_message_anchor=last_message_anchor,
+    )
     detokenize_manager = DetokenizeManager(
         tokenizer, load_eos_token_ids(tokenizer_path, tokenizer)
     )
@@ -315,6 +324,7 @@ def tokenize_worker(
                             arrival_time=msg.arrival_time,
                             cache_anchor_len=result[1],
                             cache_anchor_kind=result[2],
+                            cache_last_anchor_len=result[3],
                         )
                         for msg, result in zip(ok_msgs, ok_results, strict=True)
                     ]

@@ -641,6 +641,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-last-message-anchor",
+        type=str,
+        choices=["on", "off"],
+        default=ServerArgs.kv_last_message_anchor,
+        help=(
+            "Persist the state at the boundary that opens each request's last message "
+            "(requires the disk prefix cache on a hybrid model; default: on)."
+        ),
+    )
+
+    parser.add_argument(
         "--lazy-restore",
         type=str,
         choices=["on", "off"],

@@ -60,8 +60,11 @@ class TokenizeManager:
         tokenizer: PreTrainedTokenizerBase,
         *,
         harness_prefixes: Sequence[str] | None = None,
+        last_message_anchor: bool = False,
     ) -> None:
         self.tokenizer = tokenizer
+        self._last_message_anchor = last_message_anchor
+        self._turn_markup_ids: frozenset[int] | None = None
         self._harness_prefixes = _parse_harness_prefixes(
             _DEFAULT_HARNESS_PREFIXES if harness_prefixes is None else harness_prefixes
         )
@@ -112,6 +115,56 @@ class TokenizeManager:
         if anchor <= 0 or anchor >= input_ids.numel():
             return input_ids, None, None
         return input_ids, anchor, kind
+
+    def last_message_anchor(self, msg: TokenizeMsg, input_ids: torch.Tensor) -> int | None:
+        """Token index that opens the last message of a chat request, or None.
+
+        Recurrent state cannot be cut back to a shorter prefix, so the boundary
+        must be declared before prefill. The request is rendered a second time
+        with the last message's content replaced by a probe string; everything
+        before the first differing character is shared by every request that
+        only changes its last message. The anchor is the position right after
+        the last special/added token (turn markup) inside that shared text. Such
+        tokens are split out before BPE runs, so the tokens before one depend
+        only on the text before it, and a different last message cannot move it.
+        Encoding just the shared text keeps the extra work proportional to the
+        history rather than a second whole-prompt tokenization. Any failure
+        leaves normal tokenization intact.
+        """
+        if not self._last_message_anchor or not isinstance(msg.text, list) or not msg.text:
+            return None
+        try:
+            kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
+            real = self.render_prompt(msg)
+            last = msg.text[-1]
+            probe_messages = [*msg.text[:-1], {**last, "content": _probe_content(last)}]
+            probe = self._render(probe_messages, msg.tools, kwargs)
+            shared = _common_prefix_chars(real, probe)
+            if shared <= 0 or shared >= len(real):
+                return None
+            shared_ids = self._encode_prompt(real[:shared], templated=True)
+            markup = self._markup_ids()
+            anchor = 0
+            for index in range(int(shared_ids.numel()) - 1, -1, -1):
+                if int(shared_ids[index]) in markup:
+                    anchor = index + 1
+                    break
+            if anchor <= 0 or anchor >= input_ids.numel():
+                return None
+            if not torch.equal(shared_ids[:anchor], input_ids[:anchor]):
+                return None  # the template or tokenizer is not prefix-stable here
+            return anchor
+        except Exception:  # an unprobeable template must not reject a request
+            return None
+
+    def _markup_ids(self) -> frozenset[int]:
+        if self._turn_markup_ids is None:
+            ids = {int(i) for i in getattr(self.tokenizer, "all_special_ids", None) or ()}
+            get_added = getattr(self.tokenizer, "get_added_vocab", None)
+            if get_added is not None:
+                ids.update(int(i) for i in get_added().values())
+            self._turn_markup_ids = frozenset(ids)
+        return self._turn_markup_ids
 
     def _cached_preamble(
         self,
@@ -335,6 +388,23 @@ def _content_text(content: Any) -> str:
             if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
     return ""
+
+
+def _common_prefix_chars(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    for index in range(limit):
+        if left[index] != right[index]:
+            return index
+    return limit
+
+
+def _probe_content(message: dict[str, Any]) -> str | list[dict[str, Any]]:
+    """Replacement content whose first character differs from the real content."""
+    text = _content_text(message.get("content"))
+    probe = "\ue000probe" if not text.startswith("\ue000") else "\ue001probe"
+    if isinstance(message.get("content"), list):
+        return [{"type": "text", "text": probe}]
+    return probe
 
 
 def _common_prefix_len(left: torch.Tensor, right: torch.Tensor) -> int:

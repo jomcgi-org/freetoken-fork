@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, List, Tuple
@@ -19,6 +20,23 @@ if TYPE_CHECKING:
     from .table import TableManager
 
 logger = init_logger(__name__)
+
+# A last-message anchor is planned only when it lies at least this many tokens past
+# both the harness root anchor and the request's disk/radix cache hit. A state write
+# costs tens of MB of staged tensors and a chunk split, so a smaller gain is not worth it.
+LAST_MESSAGE_ANCHOR_MIN_GAIN = 512
+LAST_MESSAGE_ANCHOR_KIND = "last_message"
+
+
+def _pending_anchors(pending_req: PendingReq) -> list[tuple[int, str | None]]:
+    """The request's declared cache points, shallowest first."""
+    anchors: list[tuple[int, str | None]] = []
+    if pending_req.cache_anchor_len is not None:
+        anchors.append((pending_req.cache_anchor_len, pending_req.cache_anchor_kind))
+    last = getattr(pending_req, "cache_last_anchor_len", None)
+    if last is not None:
+        anchors.append((last, LAST_MESSAGE_ANCHOR_KIND))
+    return sorted(anchors, key=lambda anchor: anchor[0])
 
 
 def _maybe_pinned(t: torch.Tensor) -> torch.Tensor:
@@ -167,6 +185,18 @@ class PrefillAdder:
             # the group chunk: a group's peak GPU memory is its residual plus one
             # chunk's transient, so a larger tail chunk could exceed it.
             chunk_size = min(chunk_size, self.long_chunk)
+        self._shed_shallow_last_anchor(pending_req, cached_len)
+        anchors = _pending_anchors(pending_req)
+        inside = [a for a, _ in anchors if cached_len < a < cached_len + chunk_size]
+        if len(inside) > 1:
+            # A chunk snapshots one boundary, so end it on the first chunk edge past the
+            # shallower anchor; the deeper one then lies strictly inside a later chunk.
+            from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+            unit = max(CHUNK_SIZE, int(getattr(self.cache_manager, "prefill_chunk_align", 1)))
+            split_end = (inside[0] // unit + 1) * unit
+            if split_end < inside[1]:
+                chunk_size = split_end - cached_len
         if self.cache_manager.swa_paged:
             # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
             # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
@@ -248,29 +278,34 @@ class PrefillAdder:
         req.lazy_kv_restore = lazy_kv_restore
         req.restore_started_at = restore_started_at
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
-        anchor = pending_req.cache_anchor_len
-        req.cache_anchor_persistable = bool(
-            anchor is not None
-            and self.cache_manager.disk_prefix_store is not None
-            and req.extend_len > 0
-            and req.cached_len < anchor < req.cached_len + req.extend_len
-        )
-        req.cache_anchor_len = anchor if req.cache_anchor_persistable else None
-        req.cache_anchor_kind = (
-            pending_req.cache_anchor_kind if req.cache_anchor_persistable else None
-        )
-        if (
-            anchor is not None
-            and not isinstance(req, ChunkedReq)
-            and not req.cache_anchor_persistable
-            and req.cached_len <= anchor <= req.cached_len + req.extend_len
-        ):
-            self.cache_manager.note_harness_anchor("skipped_final_chunk")
+        end = req.cached_len + req.extend_len
+        chosen = None
+        if self.cache_manager.disk_prefix_store is not None and req.extend_len > 0:
+            for candidate in anchors:
+                if req.cached_len < candidate[0] < end:
+                    chosen = candidate
+                    break
+        req.cache_anchor_persistable = chosen is not None
+        req.cache_anchor_len = chosen[0] if chosen else None
+        req.cache_anchor_kind = chosen[1] if chosen else None
+        if not isinstance(req, ChunkedReq):
+            for candidate in anchors:
+                if candidate is not chosen and req.cached_len <= candidate[0] <= end:
+                    self.cache_manager.note_harness_anchor("skipped_final_chunk")
         req.expert_profile = pending_req.expert_profile
         req.expert_profile_restored = bool(
             pending_req.expert_profile is not None and cached_len > 0
         )
         return req
+
+    def _shed_shallow_last_anchor(self, pending_req: PendingReq, cached_len: int) -> None:
+        """Drop the last-message anchor when the cache hit already covers most of it."""
+        last = getattr(pending_req, "cache_last_anchor_len", None)
+        if last is None or pending_req.chunked_req is not None:
+            return
+        if last < cached_len + LAST_MESSAGE_ANCHOR_MIN_GAIN:
+            pending_req.cache_last_anchor_len = None
+            self.cache_manager.note_harness_anchor("skipped_last_message_shallow")
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:
         if self.token_budget <= 0:
@@ -356,6 +391,23 @@ class PrefillManager:
             cache_anchor_len = aligned if aligned > 0 else None
             if cache_anchor_len is not None:
                 cache_anchor_kind = getattr(req, "cache_anchor_kind", None)
+        cache_last_anchor_len = None
+        raw_last = getattr(req, "cache_last_anchor_len", None)
+        if raw_last is not None:
+            if not is_hybrid or disk_prefix_store is None:
+                self.cache_manager.note_harness_anchor("skipped_no_store")
+            else:
+                from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+                # Persisting needs the recurrence grid and the disk page size to agree.
+                grid = math.lcm(CHUNK_SIZE, int(getattr(self.cache_manager, "page_size", 1)))
+                aligned = align_down(raw_last, grid)
+                if aligned <= 0:
+                    self.cache_manager.note_harness_anchor("skipped_last_message_unaligned")
+                elif aligned < (cache_anchor_len or 0) + LAST_MESSAGE_ANCHOR_MIN_GAIN:
+                    self.cache_manager.note_harness_anchor("skipped_last_message_shallow")
+                else:
+                    cache_last_anchor_len = aligned
         pending = PendingReq(
             req.uid,
             req.input_ids,
@@ -365,6 +417,7 @@ class PrefillManager:
             arrival_time=req.arrival_time,
             cache_anchor_len=cache_anchor_len,
             cache_anchor_kind=cache_anchor_kind,
+            cache_last_anchor_len=cache_last_anchor_len,
         )
         # This is the multi-lane payoff seam: the request has just entered the
         # waiting queue, before it owns a table row or reaches first prefill.

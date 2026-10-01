@@ -420,6 +420,9 @@ def test_disk_status_includes_harness_anchor_counters():
         "harness_anchor_skipped_final_chunk": 4,
         "harness_anchor_skipped_no_store": 5,
         "harness_anchor_skipped_unaligned": 6,
+        "harness_anchor_persisted_last_message": 7,
+        "harness_anchor_skipped_last_message_shallow": 8,
+        "harness_anchor_skipped_last_message_unaligned": 9,
     }
     reporter = SchedulerStatusReporter(
         log=lambda _line: None,
@@ -432,3 +435,6 @@ def test_disk_status_includes_harness_anchor_counters():
     assert "harness_anchor_skipped_final_chunk: 4" in line
     assert "harness_anchor_skipped_no_store: 5" in line
     assert "harness_anchor_skipped_unaligned: 6" in line
+    assert "harness_anchor_persisted_last_message: 7" in line
+    assert "harness_anchor_skipped_last_message_shallow: 8" in line
+    assert "harness_anchor_skipped_last_message_unaligned: 9" in line
