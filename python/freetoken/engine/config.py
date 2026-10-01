@@ -124,6 +124,9 @@ class EngineConfig:
     # Staged file reads: buffered by default; cached reuses resident rows and
     # reads cold rows directly, without changing which experts execute.
     moe_disk_prefill_io: str = "buffered"
+    # "cold": staged prefill advises DONTNEED on staged rows decode has not routed
+    # to recently, so staging does not displace decode's page cache.
+    moe_disk_prefill_evict: str = "off"
     # Warm a CPU prefill layer's bounded routed union. "populate" reads the file,
     # "on" keeps advisory WILLNEED, and "off" preserves the original seam behavior.
     # The setting is inert for the DISK copy path.
@@ -344,6 +347,10 @@ class EngineConfig:
             raise ValueError("--moe-disk-prefill-min-tokens must be positive")
         if self.moe_disk_prefill_io not in ("buffered", "cached"):
             raise ValueError("--moe-disk-prefill-io must be 'buffered' or 'cached'")
+        if self.moe_disk_prefill_evict not in ("off", "cold"):
+            raise ValueError("--moe-disk-prefill-evict must be 'off' or 'cold'")
+        if self.moe_disk_prefill_evict == "cold" and self.moe_disk_prefill != "staged":
+            raise ValueError("--moe-disk-prefill-evict cold requires --moe-disk-prefill staged")
         if self.moe_hot_staging_io not in ("mmap", "buffered"):
             raise ValueError("--moe-hot-staging-io must be 'mmap' or 'buffered'")
         if self.moe_hot_host_cache not in ("retain", "reclaim"):

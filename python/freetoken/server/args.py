@@ -1182,6 +1182,17 @@ def parse_args(
         help="Minimum chunk size for staged DISK GPU prefill (default: %(default)s tokens).",
     )
     parser.add_argument(
+        "--moe-disk-prefill-evict",
+        choices=["off", "cold"],
+        default=ServerArgs.moe_disk_prefill_evict,
+        help=(
+            "Page-cache hygiene for staged DISK prefill: 'cold' advises DONTNEED on "
+            "each staged layer's rows that decode has not routed to in the last 256 "
+            "steps (pages decode maps stay), and logs bytes advised/kept per prefill "
+            "(default: off)."
+        ),
+    )
+    parser.add_argument(
         "--moe-disk-prefill-io",
         choices=["buffered", "cached"],
         default=ServerArgs.moe_disk_prefill_io,

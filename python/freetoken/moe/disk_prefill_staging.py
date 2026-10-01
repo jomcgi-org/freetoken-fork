@@ -18,6 +18,22 @@ from freetoken.moe.host_banks import _BLK, _preadv_all, coalesced_row_ranges
 _RESIDENCY_BITS = bytes(value & 1 for value in range(256))
 
 
+def cold_row_ranges(rows, keep_rows, row_bytes: int, base_offset: int = 0):
+    """Split staged rows into DONTNEED ranges and bytes kept for decode.
+
+    Returns ``(ranges, kept_bytes)``. ``ranges`` are coalesced ``(offset, length)``
+    byte ranges of the staged rows outside ``keep_rows``, shifted by ``base_offset``;
+    ``kept_bytes`` is the size of the staged rows inside it.
+    """
+    keep = frozenset(keep_rows or ())
+    staged = sorted({int(row) for row in rows if int(row) >= 0})
+    cold = [row for row in staged if row not in keep]
+    return (
+        coalesced_row_ranges(cold, row_bytes, base_offset=base_offset),
+        (len(staged) - len(cold)) * row_bytes,
+    )
+
+
 class DiskPrefillStaging:
     """Read exact file ranges into two pinned buffers and copy unchanged bytes.
 
@@ -31,6 +47,7 @@ class DiskPrefillStaging:
     def __init__(
         self, device: torch.device, *, chunk_bytes: int = 32 << 20,
         direct_io: bool = False, reuse_cached_rows: bool = False, workers: int = 1,
+        evict_cold: bool = False,
     ):
         self.device = torch.device(device)
         chunk_bytes = int(chunk_bytes)
@@ -45,6 +62,10 @@ class DiskPrefillStaging:
         self.chunk_bytes = chunk_bytes
         self.direct_io = direct_io
         self.reuse_cached_rows = reuse_cached_rows
+        # Drop staged rows that decode does not need from the page cache once read.
+        self.evict_cold = bool(evict_cold)
+        self.evict_advised_bytes = 0
+        self.evict_kept_bytes = 0
         if reuse_cached_rows:
             self._probe_bytes = min(chunk_bytes, 32 << 20)
             self._residency = bytearray(self._probe_bytes // mmap.PAGESIZE + 2)
@@ -91,6 +112,38 @@ class DiskPrefillStaging:
             if self._pending[slot]:
                 event.synchronize()
                 self._pending[slot] = False
+
+    def take_evict_counters(self) -> tuple[int, int]:
+        """Return and reset (bytes advised DONTNEED, staged bytes kept)."""
+        counters = (self.evict_advised_bytes, self.evict_kept_bytes)
+        self.evict_advised_bytes = self.evict_kept_bytes = 0
+        return counters
+
+    def _evict_cold_rows(self, bank, source, rows, keep_rows, file_offset: int) -> None:
+        """posix_fadvise(DONTNEED) the staged rows that are not decode-hot.
+
+        Runs after every read of the call has completed (the bytes live in the
+        pinned ring). The kernel drops only clean pages that no process maps and
+        that lie wholly inside a range, so pages decode currently maps through the
+        DISK bank mmap, and pages shared with a kept neighbour row, stay.
+        """
+        row_bytes = source.stride(0) * source.element_size()
+        ranges, kept = cold_row_ranges(
+            range(source.shape[0]) if rows is None else rows,
+            keep_rows, row_bytes, file_offset,
+        )
+        self.evict_kept_bytes += kept
+        if not ranges:
+            return
+        fd = os.open(bank._file_path, os.O_RDONLY)
+        try:
+            for start, length in ranges:
+                os.posix_fadvise(fd, start, length, os.POSIX_FADV_DONTNEED)
+                self.evict_advised_bytes += length
+        except OSError:
+            pass  # advisory only
+        finally:
+            os.close(fd)
 
     def _residency_snapshot(self, address: int, length: int) -> tuple[bytes | None, int]:
         """Bounded, advisory page state. Failure must select a real file read."""
@@ -236,7 +289,9 @@ class DiskPrefillStaging:
                 os.close(cached_fd)
             os.close(fd)
 
-    def copy_bank(self, source: torch.Tensor, destination: torch.Tensor, rows=None) -> int:
+    def copy_bank(
+        self, source: torch.Tensor, destination: torch.Tensor, rows=None, keep_rows=None,
+    ) -> int:
         """Copy all rows, or the exact valid row union, to original row positions.
 
         Source tensors must retain their authoritative file-backed HostBank.
@@ -248,6 +303,9 @@ class DiskPrefillStaging:
         separately because the kernel can fall back for unsupported inodes.
         It must not run across a concurrent fork; the serving worker owns the
         ring after spawning.
+
+        With ``evict_cold``, staged rows outside ``keep_rows`` (the decode-hot
+        experts) are then advised DONTNEED so staging leaves no page-cache residue.
         """
         bank = getattr(source, "_freetoken_host_bank", None)
         if bank is None or not bank._disk or bank._uffd or bank._file_path is None:
@@ -273,7 +331,10 @@ class DiskPrefillStaging:
         target = destination.view(torch.uint8).view(-1)
         stream = torch.cuda.current_stream(self.device)
         if self._pool is not None:
-            return self._copy_parallel(bank, file_offset, ranges, target, stream, source)
+            copied = self._copy_parallel(bank, file_offset, ranges, target, stream, source)
+            if self.evict_cold:
+                self._evict_cold_rows(bank, source, rows, keep_rows, file_offset)
+            return copied
         copied = 0
         flags = os.O_RDONLY | (os.O_DIRECT if self.direct_io else 0)
         fd = os.open(bank._file_path, flags)
@@ -325,4 +386,6 @@ class DiskPrefillStaging:
             if cached_fd is not None:
                 os.close(cached_fd)
             os.close(fd)
+        if self.evict_cold:
+            self._evict_cold_rows(bank, source, rows, keep_rows, file_offset)
         return copied

@@ -1341,6 +1341,30 @@ class CpuMoeExecutor:
             if layer_id in self._disk_predicted_experts
         )
 
+    def enable_decode_hot_tracking(self, window_steps: int = 256) -> None:
+        """Start recording which DISK experts decode routed to, per layer.
+
+        Host-only bookkeeping on routes already on the host; never reads the GPU.
+        """
+        if int(window_steps) <= 0:
+            raise ValueError("decode-hot window must be positive")
+        if getattr(self, "_decode_hot_window", None) is None:
+            never = -(1 << 60)
+            self._decode_last_touch = {
+                layer_id: [never] * self.num_experts for layer_id in self._disk_banks
+            }
+            self._decode_layer_steps = [0] * self.num_layers
+        self._decode_hot_window = int(window_steps)
+
+    def decode_hot_experts(self, layer_id: int) -> frozenset[int]:
+        """Experts the last ``window`` decode steps of this DISK layer routed to."""
+        window = getattr(self, "_decode_hot_window", None)
+        last_touch = getattr(self, "_decode_last_touch", {}).get(int(layer_id))
+        if window is None or last_touch is None:
+            return frozenset()
+        floor = self._decode_layer_steps[int(layer_id)] - window
+        return frozenset(e for e, step in enumerate(last_touch) if step >= floor)
+
     def reset_disk_lookahead(self) -> None:
         """Make the next decode step cold after a prefill or cache reset boundary."""
         self._disk_previous_experts = {}
@@ -1417,6 +1441,13 @@ class CpuMoeExecutor:
             self._disk_distinct_experts += len(selected)
         if is_prefill:
             return self._prefetch_selected(layer_id, selected)
+
+        if getattr(self, "_decode_hot_window", None) is not None:
+            step = self._decode_layer_steps[int(layer_id)]
+            self._decode_layer_steps[int(layer_id)] = step + 1
+            last_touch = self._decode_last_touch[int(layer_id)]
+            for expert in selected:
+                last_touch[expert] = step
 
         if getattr(self, "_moe_cpu_willneed", "always") == "recent":
             selected = self._filter_recent_willneed(int(layer_id), selected)

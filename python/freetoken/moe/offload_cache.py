@@ -236,6 +236,9 @@ class OffloadMoeCache:
     moe_disk_prefill: str = "cpu"
     moe_disk_prefill_min_tokens: int = 1024
     moe_disk_prefill_io: str = "buffered"
+    # "cold": after staging a layer's rows, posix_fadvise(DONTNEED) the ones decode
+    # has not routed to recently, so staging does not displace decode's page cache.
+    moe_disk_prefill_evict: str = "off"
     moe_hot_staging_io: str = "mmap"
     moe_hot_host_cache: str = "retain"
     moe_prefill_coalesce: str = "populate"
@@ -282,6 +285,10 @@ class OffloadMoeCache:
             raise ValueError("staged DISK prefill needs a positive token threshold")
         if self.moe_disk_prefill_io not in ("buffered", "cached"):
             raise ValueError("moe_disk_prefill_io must be 'buffered' or 'cached'")
+        if self.moe_disk_prefill_evict not in ("off", "cold"):
+            raise ValueError("moe_disk_prefill_evict must be 'off' or 'cold'")
+        if self.moe_disk_prefill_evict == "cold" and self.moe_disk_prefill != "staged":
+            raise ValueError("cold page-cache eviction requires staged DISK prefill")
         if self.moe_hot_staging_io not in ("mmap", "buffered"):
             raise ValueError("moe_hot_staging_io must be 'mmap' or 'buffered'")
         if self.moe_hot_staging_io == "buffered" and self.quant_format != "nvfp4":
@@ -842,12 +849,14 @@ class OffloadMoeCache:
             cached = self.moe_disk_prefill_io == "cached"
             self._disk_prefill_staging = DiskPrefillStaging(
                 self.device, direct_io=cached, reuse_cached_rows=cached,
+                evict_cold=self.moe_disk_prefill_evict == "cold",
                 **_disk_staging_geometry(_disk_staging_workers()),
             )
             logger.info_rank0(
                 f"DISK staged prefill: ring={self._disk_prefill_staging.pinned_bytes / 2**20:.0f} MiB, "
                 f"minimum_chunk={self.moe_disk_prefill_min_tokens} tokens, "
                 f"file_io={self.moe_disk_prefill_io}, "
+                f"evict={self.moe_disk_prefill_evict}, "
                 f"workers={self._disk_prefill_staging.workers}"
             )
 
@@ -883,6 +892,8 @@ class OffloadMoeCache:
         self._lm_jobs = {}
 
     def end_layer_major_group(self) -> None:
+        if getattr(self, "moe_disk_prefill_evict", "off") == "cold":
+            self.log_disk_prefill_evict_summary()
         predictive = self._lm_predictive
         self._layer_major_group = False
         self._layer_major_begun = False
@@ -918,9 +929,37 @@ class OffloadMoeCache:
         self._lm_resident[layer_id] = set()
         return buffer_id
 
+    def _decode_hot_rows(self, layer_id: int):
+        """Experts to keep in the page cache while staging evicts the rest."""
+        if self.moe_disk_prefill_evict != "cold" or self.cpu_executor is None:
+            return None
+        return self.cpu_executor.decode_hot_experts(layer_id)
+
+    def _keep_rows_kwargs(self, layer_id: int) -> dict:
+        keep = self._decode_hot_rows(layer_id)
+        return {} if keep is None else {"keep_rows": keep}
+
+    def log_disk_prefill_evict_summary(self) -> None:
+        """Log and reset the staging eviction counters (one line per prefill)."""
+        staging_list = [self._disk_prefill_staging, getattr(self, "_lm_bg_staging", None)]
+        advised = kept = 0
+        for staging in staging_list:
+            if staging is not None and getattr(staging, "evict_cold", False):
+                got = staging.take_evict_counters()
+                advised += got[0]
+                kept += got[1]
+        if advised or kept:
+            logger.info_rank0(
+                f"DISK prefill evict=cold: DONTNEED advised {advised / 2**20:.0f} MiB, "
+                f"kept {kept / 2**20:.0f} MiB (decode-hot)"
+            )
+
     def _lm_copy_rows(self, staging, layer_id: int, buffer_id: int, rows) -> None:
         for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-            copied = staging.copy_bank(per_layer[layer_id], buffer[buffer_id], rows)
+            copied = staging.copy_bank(
+                per_layer[layer_id], buffer[buffer_id], rows,
+                **self._keep_rows_kwargs(layer_id),
+            )
             if self.collect_stats:
                 self.disk_prefill_staged_h2d_bytes += copied
 
@@ -952,6 +991,7 @@ class OffloadMoeCache:
                 self.device,
                 direct_io=cached,
                 reuse_cached_rows=cached,
+                evict_cold=self.moe_disk_prefill_evict == "cold",
                 **_disk_staging_geometry(_disk_staging_workers()),
             )
             self._lm_copy_stream = torch.cuda.Stream(device=self.device)
@@ -1071,6 +1111,7 @@ class OffloadMoeCache:
         for per_layer, destination in self.banks:
             copied = self._disk_prefill_staging.copy_bank(
                 per_layer[layer_id], destination[:self.num_experts], rows,
+                **self._keep_rows_kwargs(layer_id),
             )
             if self.collect_stats:
                 self.disk_prefill_staged_h2d_bytes += copied
@@ -1523,6 +1564,8 @@ class OffloadMoeCache:
             "set_cpu_executor requires CPU/hybrid decode or DISK gpufetch"
         )
         self.cpu_executor = executor
+        if self.moe_disk_prefill_evict == "cold" and hasattr(executor, "enable_decode_hot_tracking"):
+            executor.enable_decode_hot_tracking()
 
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""

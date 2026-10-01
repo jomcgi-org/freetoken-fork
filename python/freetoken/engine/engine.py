@@ -996,6 +996,7 @@ class Engine:
                 moe_disk_prefill=config.moe_disk_prefill,
                 moe_disk_prefill_min_tokens=getattr(config, "moe_disk_prefill_min_tokens", 1024),
                 moe_disk_prefill_io=getattr(config, "moe_disk_prefill_io", "buffered"),
+                moe_disk_prefill_evict=getattr(config, "moe_disk_prefill_evict", "off"),
                 moe_hot_staging_io=getattr(config, "moe_hot_staging_io", "mmap"),
                 moe_hot_host_cache=getattr(config, "moe_hot_host_cache", "retain"),
                 moe_prefill_coalesce=getattr(
@@ -3035,6 +3036,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_prefill": "cpu",
     "moe_disk_prefill_min_tokens": 1024,
     "moe_disk_prefill_io": "buffered",
+    "moe_disk_prefill_evict": "off",
     "moe_prefill_coalesce": "populate",
     "moe_prefill_hot_split": "on",
     "moe_prefill_split_kernel": "grouped",
