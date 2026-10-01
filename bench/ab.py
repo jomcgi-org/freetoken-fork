@@ -277,12 +277,13 @@ def parse_arms(args):
     if args.spec:
         for a in json.loads(Path(args.spec).read_text())["arms"]:
             arms[a["name"]] = {"name": a["name"], "rev": a.get("rev") or a.get("tree"), "env": dict(a.get("env", {})),
-                               "flags": shlex.split(a["flags"]) if isinstance(a.get("flags"), str) else list(a.get("flags", []))}
+                               "flags": shlex.split(a["flags"]) if isinstance(a.get("flags"), str) else list(a.get("flags", [])),
+                               "model": a.get("model")}
     for spec in args.arm or []:
         name, _, rev = spec.partition("=")
         if not rev:
             raise SystemExit(f"--arm wants NAME=REV, got {spec!r}")
-        arms[name] = {"name": name, "rev": rev, "env": {}, "flags": []}
+        arms[name] = {"name": name, "rev": rev, "env": {}, "flags": [], "model": None}
     for spec in args.env or []:
         name, _, kv = spec.partition(":")
         k, _, v = kv.partition("=")
@@ -294,6 +295,11 @@ def parse_arms(args):
         if name not in arms:
             raise SystemExit(f"--flags wants ARM:'--flag value' for a declared arm, got {spec!r}")
         arms[name]["flags"] += shlex.split(fl)
+    for spec in getattr(args, "model", None) or []:
+        name, _, path = spec.partition(":")
+        if name not in arms or not path:
+            raise SystemExit(f"--model wants ARM:/path/to/model.ftw for a declared arm, got {spec!r}")
+        arms[name]["model"] = path
     if len(arms) < 2:
         raise SystemExit("need at least two arms (--arm NAME=REV twice, or --spec)")
     for a in arms.values():
@@ -412,6 +418,7 @@ class Runner:
         self.out = Path(args.results_dir) if args.results_dir else ROOT / f"results/ab-{self.stamp}"
         self.plan = Path(self.model) / "freetoken_hot_plan.json"
         self.plan_bak = self.out / "hot_plan.backup.json"
+        self.foreign_plans = {}
         self.runs = []
         self.as_user = ["sudo", "-n", "-u", USER] if (os.geteuid() == 0 or self.dry) else []
         spec = importlib.util.spec_from_file_location("adapt_ticks_check", HERE / "adapt-ticks-check.py")
@@ -510,6 +517,11 @@ class Runner:
         os.chown(dst, st.st_uid, st.st_gid)
 
     def restore_plan(self):
+        for plan, orig in self.foreign_plans.items():
+            if self.dry:
+                print(f"+ cp -p {orig} {plan}   # other model's own plan", flush=True)
+            elif orig.exists():
+                self.copy_plan(orig, plan)
         if self.dry:
             print(f"+ cp -p {self.plan_bak} {self.plan}   # if a backup exists", flush=True)
         elif self.plan_bak.exists():
@@ -518,14 +530,26 @@ class Runner:
         elif self.plan.exists():  # there was no plan before the run, so drop the arm-written one
             self.plan.unlink()
 
-    def reset_plan(self):
-        """Every arm starts from the same plan: the production one (backup) or none (cold)."""
+    def arm_model(self, arm):
+        return arm.get("model") or self.model
+
+    def reset_plan(self, arm=None):
+        """Every arm starts from the same plan: the production one (backup) or none (cold).
+
+        An arm on a different model (--model) gets the production plan copied into that
+        model's directory; its own plan is saved once and put back by restore_plan."""
+        plan = Path(self.arm_model(arm)) / "freetoken_hot_plan.json" if arm else self.plan
+        if plan != self.plan:
+            orig = self.out / f"hot_plan.{arm['name']}.orig.json"
+            if not self.dry and plan.exists() and not orig.exists():
+                shutil.copy2(plan, orig)
+            self.foreign_plans[plan] = orig
         if self.args.plan_mode == "cold":
-            self.sh("rm", "-f", self.plan)
+            self.sh("rm", "-f", plan)
         elif self.dry:
-            print(f"+ cp -p {self.plan_bak} {self.plan}   # same starting plan for every arm", flush=True)
+            print(f"+ cp -p {self.plan_bak} {plan}   # same starting plan for every arm", flush=True)
         elif self.plan_bak.exists():
-            self.copy_plan(self.plan_bak, self.plan)
+            self.copy_plan(self.plan_bak, plan)
 
     # ---- one arm
     def build_unit_cmd(self, arm, unit, cache_dir):
@@ -537,7 +561,7 @@ class Runner:
         cmd = ["systemd-run", f"--unit={unit}", f"--uid={USER}", "--collect", f"--working-directory={tree}",
                "-p", "KillMode=control-group", "-p", "TimeoutStopSec=45", "-p", f"RuntimeMaxSec={self.args.arm_cap}",
                *[f"--setenv={k}={v}" for k, v in env.items()],
-               "/bin/bash", f"{tree}/{SERVE_SCRIPT}", self.model, self.profile, *sargs]
+               "/bin/bash", f"{tree}/{SERVE_SCRIPT}", self.arm_model(arm), self.profile, *sargs]
         return cmd, env
 
     def run_arm(self, arm, slot):
@@ -562,7 +586,7 @@ class Runner:
                 (self.out / f"{tag}.run.json").write_text(json.dumps(rec, indent=1))
                 self.runs.append(rec)
                 return
-        self.reset_plan()
+        self.reset_plan(arm)
         self.do(f"mkdir {cache_dir} (empty, owned by {USER})", self._mkcache, cache_dir)
         if self.args.cache_state == "cold":
             self.sh("sync")
@@ -767,6 +791,8 @@ def make_parser():
     p.add_argument("--arm", action="append", metavar="NAME=REV", help="git revision of freetoken-fork, or an absolute tree path")
     p.add_argument("--env", action="append", metavar="ARM:KEY=VALUE")
     p.add_argument("--flags", action="append", metavar="ARM:'--flag value'")
+    p.add_argument("--model", action="append", metavar="ARM:PATH",
+                   help="serve this arm from another model directory (e.g. a checkpoint with MTP tensors)")
     p.add_argument("--repeats", type=int, default=1, help="balanced passes (ABBA per pass for two arms); default 1")
     p.add_argument("--cache-state", choices=["cold", "warm"], default="cold")
     p.add_argument("--plan-mode", choices=["backup", "cold"], default="backup",
