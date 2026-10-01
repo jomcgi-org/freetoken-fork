@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from freetoken.memory import cgroup_memory_bounds
 from freetoken.utils import init_logger
 
 
@@ -69,6 +70,38 @@ def read_linux_memory_info(
         available_gib=values["MemAvailable"] / kib_per_gib,
         swap_total_gib=values.get("SwapTotal", 0) / kib_per_gib,
         swap_free_gib=values.get("SwapFree", 0) / kib_per_gib,
+    )
+
+
+def apply_cgroup_bound(
+    memory: HostMemoryInfo,
+    cgroup_limit_bytes: int | None,
+    cgroup_remaining_bytes: int | None,
+) -> tuple[HostMemoryInfo, str]:
+    """Clamp host counters to the cgroup; return ``(memory, bound)``.
+
+    ``total`` becomes min(MemTotal, cgroup limit) and ``available`` becomes
+    min(MemAvailable, limit - current). Total follows the limit, not the
+    headroom, so the default reserve does not shrink as the process allocates.
+    ``bound`` is ``"host"`` (no finite limit, or looser than the host figures;
+    ``memory`` is returned unchanged) or ``"cgroup"``. Swap is left as reported.
+    """
+    if cgroup_limit_bytes is None or cgroup_remaining_bytes is None:
+        return memory, "host"
+    limit_gib = cgroup_limit_bytes / 2**30
+    remaining_gib = cgroup_remaining_bytes / 2**30
+    total = min(memory.total_gib, limit_gib)
+    available = min(memory.available_gib, remaining_gib)
+    if total == memory.total_gib and available == memory.available_gib:
+        return memory, "host"
+    return (
+        HostMemoryInfo(
+            total_gib=total,
+            available_gib=available,
+            swap_total_gib=memory.swap_total_gib,
+            swap_free_gib=memory.swap_free_gib,
+        ),
+        "cgroup",
     )
 
 
@@ -263,8 +296,16 @@ def govern_host_memory(
     _logger=logger,
 ) -> HostMemoryBudgets:
     """Resolve an engine config's host budgets and report startup pressure."""
+    bound_note = None
     if memory is None:
         memory = read_linux_memory_info()
+        host_memory = memory
+        memory, bound = apply_cgroup_bound(memory, *cgroup_memory_bounds())
+        bound_note = (
+            f"Host memory bound: {bound} "
+            f"(host available={host_memory.available_gib:.2f} GiB, "
+            f"effective available={memory.available_gib:.2f} GiB)"
+        )
     if environ is None:
         environ = os.environ
 
@@ -283,6 +324,8 @@ def govern_host_memory(
         hot_staging_gib=_hot_staging_gib(config),
         prefill_scratch_gib=_prefill_scratch_gib(config),
     )
+    if bound_note is not None:
+        _logger.info_rank0(bound_note)
     object.__setattr__(config, "host_cache_reserve_gib", budgets.reserve_gib)
     object.__setattr__(config, "moe_pin_budget_gib", budgets.pin_gib)
     object.__setattr__(config, "moe_pager_budget_gib", budgets.pager_gib)
