@@ -49,6 +49,9 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Host page-cache estimate + live counters (HostCacheMonitor.stats_block), set on
+    # one reply per status-line interval so /v1/stats can show it. None otherwise.
+    host_memory: dict | None = None
     # Requested logprobs for this token: the sampled token's, then the most likely
     # alternatives (ids and logprobs, best first). None unless the request asked.
     logprob: float | None = None

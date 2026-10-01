@@ -378,10 +378,23 @@ class Scheduler(SchedulerIOMixin):
             log=_status_log,
             decode_log_interval=config.decode_log_interval,
             disk_prefix_store=self.disk_prefix_store,
+            host_monitor=self._make_host_cache_monitor(config),
         )
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+
+    def _make_host_cache_monitor(self, config):
+        """Live page-cache monitor beside the startup reserve estimate (offload only)."""
+        budgets = getattr(self.engine, "_host_budgets", None)
+        if budgets is None:
+            return None
+        from freetoken.engine.host_memory import HostCacheMonitor
+
+        return HostCacheMonitor.from_budgets(
+            budgets,
+            max_majflt_per_step=config.host_cache_pressure_majflt_per_step,
+        )
 
     def _make_kv_ladder_policy(self):
         """Bind the pure ladder policy to this engine's measured pool costs."""
@@ -913,6 +926,12 @@ class Scheduler(SchedulerIOMixin):
             queue_priority_bands=queue_priority_bands,
             max_wait_seconds=max_wait_seconds,
         )
+        monitor = getattr(self.status_reporter, "host_monitor", None)
+        if reply and monitor is not None:
+            # Hand the block over only when there is a reply to carry it.
+            host_memory = monitor.pop_fresh()
+            if host_memory is not None:
+                reply[0].host_memory = host_memory
         self.send_result(reply)
 
     def _match_stop_str(self, req: Req) -> str | None:
