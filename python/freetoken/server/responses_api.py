@@ -61,6 +61,7 @@ from .disconnect import ClientDisconnectedResponse, DisconnectAwareStreamingResp
 from .generation import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     KEEPALIVE,
+    keepalive_interval_s,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -82,10 +83,9 @@ from .generation import (
 from .request_logger import log_request
 from .priority import resolve_request_priority
 
-# Seconds of event silence before a keep-alive frame is emitted on the stream.
+# Keep-alive interval is shared across routes (generation.keepalive_interval_s).
 # codex's stream-idle timeout (default 300s) only resets on a data-bearing SSE
 # frame, so long queue/prefill or decode gaps must be bridged with real events.
-KEEPALIVE_INTERVAL_S = 15.0
 
 class ResponsesRequest(BaseModel):
     """The subset of the Responses request FreeToken honors (extra fields allowed)."""
@@ -592,7 +592,7 @@ async def responses_stream_generator(
             item_id=current["id"], output_index=output_index, delta=fragment,
         ))
 
-    events = with_keepalive(events, KEEPALIVE_INTERVAL_S)
+    events = with_keepalive(events, keepalive_interval_s())
     try:
         async for ev in events:
             if ev is KEEPALIVE:

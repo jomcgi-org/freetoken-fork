@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from .anthropic_api import register_anthropic_routes
 from .accounting import AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
+from .generation import KEEPALIVE, keepalive_interval_s, with_keepalive
 from .disconnect import (
     ClientDisconnectedResponse,
     DisconnectAwareStreamingResponse,
@@ -1044,8 +1045,14 @@ async def generate(req: GenerateRequest, request: Request):
         )
     )
 
+    async def keepalive_frames():
+        frames = with_keepalive(state.stream_generate(uid), keepalive_interval_s())
+        async with contextlib.aclosing(frames):
+            async for chunk in frames:
+                yield b": keepalive\n\n" if chunk is KEEPALIVE else chunk
+
     return DisconnectAwareStreamingResponse(
-        state.stream_with_cancellation(state.stream_generate(uid), request, uid),
+        state.stream_with_cancellation(keepalive_frames(), request, uid),
         media_type="text/event-stream",
         request=request,
     )
