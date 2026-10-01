@@ -146,9 +146,13 @@ What each line does:
   repeated idle adaptation ticks. The default is 2000 milliseconds.
 - `--moe-hot-adapt-prefill-weight N`: scales prefill route counts before they
   update HOT adaptation counters. The default is 1.0.
-- `--moe-hot-adapt-histories {shared,split}`: keeps prefill and decode route
-  histories together or in separate counters. The default is `shared`, which
-  preserves the original ranking behavior.
+- `--moe-hot-adapt-histories {shared,split,split3}`: keeps prefill and decode
+  route histories together or in separate counters. `split3` additionally keeps
+  reasoning-phase and answer-phase decode counters apart (the phase comes from
+  the `--reasoning-parser` tags; with `--moe-hot-adapt-aim phase` the hot set
+  aims at the phase that is running, with 5% of the other decode history as a
+  tie-breaker). The default is `shared`, which preserves the original ranking
+  behavior.
 - `--moe-hot-adapt-prefill-blend N`: ranks split histories as decode plus this
   fraction of prefill history. The default is 0.25.
 - `--moe-hot-adapt-prefill-normalize {off,tokens}`: with split histories,

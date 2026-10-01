@@ -317,23 +317,35 @@ def resolve_reasoning_budget(spec: GenSpec, state: Any) -> dict[str, Any] | None
         tokens = getattr(state.config, "reasoning_budget_tokens", 0) or 0
     if tokens <= 0:
         return None
+    tags = _reasoning_tag_spec(spec, state)
+    return None if tags is None else {"tokens": tokens, **tags}
+
+
+def _reasoning_tag_spec(spec: GenSpec, state: Any) -> dict[str, Any] | None:
     parser = _make_reasoning_parser(spec, state)
     detector = getattr(parser, "detector", None)
     end = getattr(detector, "think_end_token", "")
     if not end:
         return None
     return {
-        "tokens": tokens,
         "end": end,
         "start": detector.think_start_token or None,
         "open": bool(detector.force_reasoning),
     }
 
 
+def resolve_reasoning_phase(spec: GenSpec, state: Any) -> dict[str, Any] | None:
+    """Tag spec for the HOT adapter's phase tracker, or None unless histories=split3."""
+    if getattr(state.config, "moe_hot_adapt_histories", "shared") != "split3":
+        return None
+    return _reasoning_tag_spec(spec, state)
+
+
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
     spec.sampling_params.reasoning_budget = resolve_reasoning_budget(spec, state)
+    spec.sampling_params.reasoning_phase = resolve_reasoning_phase(spec, state)
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(

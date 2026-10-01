@@ -803,6 +803,9 @@ class Scheduler(SchedulerIOMixin):
                 for next_token_tensor in tokens:
                     req.append_host(next_token_tensor.unsqueeze(0))
                     next_token = int(next_token_tensor.item())
+                    phase_state = getattr(req, "reasoning_phase_state", None)
+                    if phase_state is not None:
+                        phase_state.observe(next_token)
                     # EOS / stop-string -> "stop", output budget exhausted -> "length";
                     # EOS and stop strings win over length. Host length, rather than
                     # req.can_decode, is required when one MTP step has already advanced

@@ -95,7 +95,19 @@ def ensure_experts_hot(
         if history == "prefill" and cache.decayed_prefill_freq is not None
         else cache.decayed_decode_freq
     )
+    # split3: decode rows land in the reasoning or answer history, chosen on device
+    # by cache.decode_phase_idx so the choice is replayable inside a CUDA graph.
+    phase_stride = (
+        cache.decayed_decode_freq.numel()
+        if history == "decode" and getattr(cache, "decayed_reasoning_freq", None) is not None
+        else 0
+    )
     if not expert_ids.is_cuda:
+        if phase_stride:
+            decayed_freq = (
+                cache.decayed_reasoning_freq
+                if int(cache.decode_phase_idx.item()) else decayed_freq
+            )
         return _ensure_experts_hot_cpu(
             cache,
             layer_id,
@@ -111,6 +123,7 @@ def ensure_experts_hot(
         record_stats=record_stats,
         route_weight=route_weight,
         decayed_freq=decayed_freq,
+        phase_stride=phase_stride,
     )
 
 
@@ -265,6 +278,7 @@ def _ensure_experts_hot_gpu(
     record_stats: bool,
     route_weight: float,
     decayed_freq: torch.Tensor,
+    phase_stride: int = 0,
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -283,12 +297,15 @@ def _ensure_experts_hot_gpu(
         cache.num_missing_full,
         cache.stat_hot_pairs,
         cache.stat_hot_total_pairs,
+        cache.decode_phase_idx,
         layer_id,
         expert_ids.numel(),
         cache.num_experts,
         cache.cache_size,
         cache._hot_decay_factor,
         float(route_weight),
+        phase_stride,
+        PHASE=phase_stride != 0,
         HOT_ADAPT=cache.hot_adapt_enabled,
         RECORD_STATS=record_stats,
         COLLECT_STATS=record_stats and getattr(cache, "collect_stats", False),
@@ -696,12 +713,15 @@ def _ensure_experts_hot_kernel(
     num_missing_full_ptr,
     stat_hot_pairs_ptr,
     stat_total_pairs_ptr,
+    phase_idx_ptr,
     layer_id,
     num_active,
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     decay_factor,
     route_weight,
+    phase_stride,
+    PHASE: tl.constexpr,
     HOT_ADAPT: tl.constexpr,
     RECORD_STATS: tl.constexpr,
     COLLECT_STATS: tl.constexpr,
@@ -744,12 +764,17 @@ def _ensure_experts_hot_kernel(
             route_count += (off_e == expert).to(tl.int32)
     is_active = (route_count > 0) & eligible
     if HOT_ADAPT and RECORD_STATS:
-        decayed = tl.load(decayed_freq_ptr + base + off_e, mask=e_mask, other=0.0)
+        freq_base = base
+        if PHASE:
+            # Stacked (answer, reasoning) decode histories; the host flips the index
+            # between steps with a device fill, so no capture-time branch is baked in.
+            freq_base = base + tl.load(phase_idx_ptr).to(tl.int64) * phase_stride
+        decayed = tl.load(decayed_freq_ptr + freq_base + off_e, mask=e_mask, other=0.0)
         route_count_fp32 = route_count.to(tl.float32)
         if WEIGHTED:
             route_count_fp32 *= route_weight
         tl.store(
-            decayed_freq_ptr + base + off_e,
+            decayed_freq_ptr + freq_base + off_e,
             decayed * decay_factor + route_count_fp32,
             mask=e_mask,
         )

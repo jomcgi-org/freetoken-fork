@@ -8,11 +8,20 @@ from freetoken.core import Batch
 
 
 def _hot_adapt_history_status_fragment(disk: dict) -> str:
-    """Format the HOT ranking history mode and prefill share."""
-    return (
+    """Format the HOT ranking history mode, prefill share and, for split3, the
+    reasoning share, the decode history being aimed at, and per-history tick counts."""
+    fragment = (
         f"hot_adapt_histories: {disk.get('hot_adapt_histories', 'shared')}, "
         f"decayed_prefill_share: {disk.get('decayed_prefill_share', 0.0):.2%}"
     )
+    if "decayed_reasoning_share" in disk:
+        fragment += (
+            f", decayed_reasoning_share: {disk['decayed_reasoning_share']:.2%}"
+            f", hot_adapt_decode_aim: {disk.get('hot_adapt_decode_aim', 'both')}"
+            f", hot_adapt_ticks_reasoning: {disk.get('hot_adapt_ticks_reasoning', 0)}"
+            f", hot_adapt_ticks_answer: {disk.get('hot_adapt_ticks_answer', 0)}"
+        )
+    return fragment
 
 
 @dataclass

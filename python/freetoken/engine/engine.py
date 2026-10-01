@@ -1047,7 +1047,14 @@ class Engine:
                 persisted_prefill_counter_seed=(
                     getattr(hot_plan_seed, "prefill_counters", None)
                     if hot_plan_seed is not None
-                    and getattr(config, "moe_hot_adapt_histories", "shared") == "split"
+                    and getattr(config, "moe_hot_adapt_histories", "shared")
+                    in ("split", "split3")
+                    else None
+                ),
+                persisted_reasoning_counter_seed=(
+                    getattr(hot_plan_seed, "reasoning_counters", None)
+                    if hot_plan_seed is not None
+                    and getattr(config, "moe_hot_adapt_histories", "shared") == "split3"
                     else None
                 ),
                 persisted_seeded_layers=(
@@ -1543,6 +1550,16 @@ class Engine:
                 # Do not carry decode routing across a prefill boundary. The first
                 # subsequent decode step intentionally falls back to reactive advice.
                 self.cpu_moe_executor.reset_disk_lookahead()
+        if (
+            self.moe_offload_cache is not None
+            and getattr(self.moe_offload_cache, "decayed_reasoning_freq", None) is not None
+        ):
+            # Host-only: the tracker is advanced by the scheduler from tokens it has
+            # already drained (one step behind), so this adds no device sync. Prefill
+            # batches set it too, so a prefill boundary aims at the phase about to run.
+            self.moe_offload_cache.set_decode_phase(
+                self.sampler.batch_in_reasoning(batch)
+            )
         step_timing_marks = None
         if (
             self.config.moe_step_timing
@@ -1640,6 +1657,8 @@ class Engine:
         cache = self.moe_offload_cache
         if cache is not None:
             cache.begin_layer_major_group()
+            if getattr(cache, "decayed_reasoning_freq", None) is not None:
+                cache.set_decode_phase(self.sampler.batch_in_reasoning(batches[-1]))
         trace = os.environ.get("FREETOKEN_LAYER_MAJOR_TRACE", "0") == "1"
         layer_events = []
         host_started = time.perf_counter()

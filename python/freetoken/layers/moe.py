@@ -728,7 +728,7 @@ class OffloadMoELayer(MoELayer):
 
     def _observe_hot_prefill(self, cache: OffloadMoeCache, topk_ids: torch.Tensor) -> None:
         """Update the existing HOT histories and remap the supplied scratch ids."""
-        if getattr(cache, "hot_adapt_histories", "shared") == "split":
+        if getattr(cache, "hot_adapt_histories", "shared") in ("split", "split3"):
             routed_tokens = (
                 int(topk_ids.shape[0])
                 if topk_ids.ndim

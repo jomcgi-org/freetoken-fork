@@ -146,6 +146,32 @@ class Sampler:
                 forced.append((row, token))
         return budget_reqs, forced
 
+    def reasoning_phase_state(self, req: Any):
+        """The request's non-forcing reasoning tracker, created on first use, or None
+        when the request carries no tag spec (histories != split3, or no tag pair)."""
+        state = req.reasoning_phase_state
+        if state is None:
+            spec = req.sampling_params.reasoning_phase
+            if spec is None or self._guided_tokenizer is None:
+                return None
+            from freetoken.reasoning_budget import create_reasoning_budget_state
+
+            state = req.reasoning_phase_state = create_reasoning_budget_state(
+                spec, self._guided_tokenizer
+            )
+        return state
+
+    def batch_in_reasoning(self, batch: Batch) -> bool:
+        """Whether any row of ``batch`` is inside a reasoning block. The expert counters
+        are per layer, not per row, so a mixed batch is attributed to reasoning if any
+        row reasons (batch size is 1 in production; this keeps bs>1 well defined)."""
+        reasoning = False
+        for req in batch.reqs:
+            state = self.reasoning_phase_state(req)
+            if state is not None and state.reasoning_active:
+                reasoning = True
+        return reasoning
+
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
         guided, created, has_guided = self._prepare_guided(batch)

@@ -422,10 +422,25 @@ class OffloadMoeCache:
         self._hot_adapt_swaps_reported = 0
         self._hot_adapt_idle_swaps_reported = 0
         self._hot_decay_factor = 1.0
-        self.decayed_decode_freq = torch.zeros(
-            (self.num_layers, self.num_experts), dtype=torch.float32, device=self.device
+        # Decode histories share one stacked allocation so the HOT kernel can pick the
+        # row on device: [0] answer (the only decode history unless split3) and [1]
+        # reasoning. decayed_reasoning_freq stays None until histories=split3.
+        self._decayed_decode_stack = torch.zeros(
+            (2, self.num_layers, self.num_experts),
+            dtype=torch.float32,
+            device=self.device,
         )
+        self.decayed_decode_freq = self._decayed_decode_stack[0]
+        self.decayed_reasoning_freq: torch.Tensor | None = None
         self.decayed_prefill_freq: torch.Tensor | None = None
+        # Device-side phase selector read by the decode kernel (0 answer, 1 reasoning).
+        # The host flips it with a stream-ordered fill between steps; no sync.
+        self.decode_phase_idx = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._decode_phase_reasoning = False
+        self.hot_adapt_ticks_reasoning = 0
+        self.hot_adapt_ticks_answer = 0
+        self._hot_adapt_ticks_reasoning_reported = 0
+        self._hot_adapt_ticks_answer_reported = 0
         # Session profiles are configured by Engine before graph capture. The fixed
         # table-indexed sketch is address-stable, so decode collection is capturable;
         # admission prefetch and protection updates remain outside graph capture.
@@ -460,6 +475,9 @@ class OffloadMoeCache:
         self._hot_adapt_prefill_snapshot_host: torch.Tensor | None = None
         self._hot_adapt_snapshot_device: torch.Tensor | None = None
         self._hot_adapt_prefill_snapshot_device: torch.Tensor | None = None
+        self._hot_adapt_reasoning_snapshot_host: torch.Tensor | None = None
+        self._hot_adapt_reasoning_snapshot_device: torch.Tensor | None = None
+        self._hot_adapt_tick_reasoning = False
         self._hot_adapt_snapshot_ready = None
         self._hot_adapt_copy_stream: torch.cuda.Stream | None = None
         self._hot_adapt_tick_interval_tokens = 0
@@ -476,6 +494,7 @@ class OffloadMoeCache:
         # separate so JSON encoding and fsync never occupy the rerank worker.
         self._hot_plan_counter_seed: dict[int, tuple[float, ...]] = {}
         self._hot_plan_prefill_counter_seed: dict[int, tuple[float, ...]] = {}
+        self._hot_plan_reasoning_counter_seed: dict[int, tuple[float, ...]] = {}
         self._hot_plan_path: str | None = None
         self._hot_plan_identity = None
         self._hot_plan_tier_commit = ""
@@ -1549,6 +1568,7 @@ class OffloadMoeCache:
         post_prefill_tick: bool = False,
         persisted_counter_seed: Mapping[int, tuple[float, ...]] | None = None,
         persisted_prefill_counter_seed: Mapping[int, tuple[float, ...]] | None = None,
+        persisted_reasoning_counter_seed: Mapping[int, tuple[float, ...]] | None = None,
         persisted_seeded_layers: frozenset[int] = frozenset(),
         hot_plan_path: str | None = None,
         hot_plan_identity=None,
@@ -1641,8 +1661,11 @@ class OffloadMoeCache:
         self.hot_adapt_prefill_normalize = prefill_normalize
         self.decayed_prefill_freq = (
             torch.zeros_like(self.decayed_decode_freq)
-            if histories == "split"
+            if histories in ("split", "split3")
             else None
+        )
+        self.decayed_reasoning_freq = (
+            self._decayed_decode_stack[1] if histories == "split3" else None
         )
         self.hot_adapt_prefill_run_cap_frac = float(prefill_run_cap_frac)
         self.hot_adapt_post_prefill_tick = post_prefill_tick
@@ -1675,6 +1698,16 @@ class OffloadMoeCache:
                     f"persisted HOT prefill counter layer {layer_id} has invalid geometry"
                 )
         self._hot_plan_prefill_counter_seed = prefill_seed
+        reasoning_seed = {
+            int(layer_id): tuple(float(value) for value in row)
+            for layer_id, row in (persisted_reasoning_counter_seed or {}).items()
+        }
+        for layer_id, row in reasoning_seed.items():
+            if layer_id not in self.hot_expert_capacity or len(row) != self.num_experts:
+                raise ValueError(
+                    f"persisted HOT reasoning counter layer {layer_id} has invalid geometry"
+                )
+        self._hot_plan_reasoning_counter_seed = reasoning_seed
         self._apply_hot_plan_counter_seed()
         fully_seeded = (
             bool(self.hot_expert_capacity)
@@ -1796,6 +1829,16 @@ class OffloadMoeCache:
             self._hot_adapt_prefill_snapshot_device = torch.empty_like(
                 self.decayed_prefill_freq
             )
+        if self.decayed_reasoning_freq is not None:
+            self._hot_adapt_reasoning_snapshot_host = torch.empty(
+                (self.num_layers, self.num_experts),
+                dtype=torch.float32,
+                device="cpu",
+                pin_memory=pin,
+            )
+            self._hot_adapt_reasoning_snapshot_device = torch.empty_like(
+                self.decayed_reasoning_freq
+            )
         if self.device.type == "cuda":
             self._hot_adapt_copy_stream = torch.cuda.Stream(device=self.device)
             self._hot_adapt_snapshot_ready = torch.cuda.Event()
@@ -1811,6 +1854,13 @@ class OffloadMoeCache:
                 self, "_hot_plan_prefill_counter_seed", {}
             ).items():
                 self.decayed_prefill_freq[layer_id].copy_(
+                    torch.tensor(row, dtype=torch.float32, device=self.device)
+                )
+        if getattr(self, "decayed_reasoning_freq", None) is not None:
+            for layer_id, row in getattr(
+                self, "_hot_plan_reasoning_counter_seed", {}
+            ).items():
+                self.decayed_reasoning_freq[layer_id].copy_(
                     torch.tensor(row, dtype=torch.float32, device=self.device)
                 )
 
@@ -2232,7 +2282,7 @@ class OffloadMoeCache:
             ready.synchronize()
         assert self._hot_adapt_snapshot_host is not None
         from freetoken.moe.hot_adapt import (
-            blend_histories,
+            aim_histories,
             hot_catchup_swap_bytes,
             plan_hot_swaps,
             recompute_hot_partition,
@@ -2242,7 +2292,10 @@ class OffloadMoeCache:
             layer_id: tuple(float(value) for value in self._hot_adapt_snapshot_host[layer_id])
             for layer_id in self.hot_expert_capacity
         }
-        if getattr(self, "hot_adapt_histories", "shared") == "split":
+        prefill_counts = None
+        reasoning_counts = None
+        histories = getattr(self, "hot_adapt_histories", "shared")
+        if histories in ("split", "split3"):
             assert self._hot_adapt_prefill_snapshot_host is not None
             prefill_counts = {
                 layer_id: tuple(
@@ -2251,23 +2304,24 @@ class OffloadMoeCache:
                 )
                 for layer_id in self.hot_expert_capacity
             }
-            if getattr(self, "hot_adapt_aim", "blend") == "phase":
-                if boundary == "prefill":
-                    # Keep the active prefill covered while still retaining bounded
-                    # evidence from the decode history.
-                    counts = blend_histories(
-                        prefill_counts,
-                        counts,
-                        getattr(self, "hot_adapt_prefill_blend", 0.25),
-                    )
-                else:
-                    counts = blend_histories(counts, prefill_counts, 0)
-            else:
-                counts = blend_histories(
-                    counts,
-                    prefill_counts,
-                    getattr(self, "hot_adapt_prefill_blend", 0.25),
+        if histories == "split3":
+            assert self._hot_adapt_reasoning_snapshot_host is not None
+            reasoning_counts = {
+                layer_id: tuple(
+                    float(value)
+                    for value in self._hot_adapt_reasoning_snapshot_host[layer_id]
                 )
+                for layer_id in self.hot_expert_capacity
+            }
+        counts = aim_histories(
+            counts,
+            prefill_counts,
+            reasoning_counts,
+            aim=getattr(self, "hot_adapt_aim", "blend"),
+            boundary=boundary,
+            reasoning_phase=getattr(self, "_hot_adapt_tick_reasoning", False),
+            prefill_blend=getattr(self, "hot_adapt_prefill_blend", 0.25),
+        )
         budget_bytes = sum(self.hot_expert_capacity.values()) * self.hot_adapt_expert_bytes
         desired = recompute_hot_partition(
             counts,
@@ -2529,6 +2583,7 @@ class OffloadMoeCache:
         counters: torch.Tensor,
         prefill_counters: torch.Tensor | None,
         fence: _HotPlanWriteFence,
+        reasoning_counters: torch.Tensor | None = None,
     ) -> bool:
         from freetoken.moe.hot_adapt import atomic_write_hot_plan, make_hot_plan_document
 
@@ -2553,15 +2608,32 @@ class OffloadMoeCache:
                 if prefill_counters is not None
                 else None
             ),
+            decayed_reasoning_counters=(
+                {
+                    layer_id: reasoning_counters[layer_id].tolist()
+                    for layer_id in sorted(self.hot_expert_capacity)
+                }
+                if reasoning_counters is not None
+                else None
+            ),
             ranking_counters=(
                 {
                     layer_id: (
                         counters[layer_id]
-                        + self.hot_adapt_prefill_blend * prefill_counters[layer_id]
+                        + (
+                            reasoning_counters[layer_id]
+                            if reasoning_counters is not None
+                            else 0
+                        )
+                        + (
+                            self.hot_adapt_prefill_blend * prefill_counters[layer_id]
+                            if prefill_counters is not None
+                            else 0
+                        )
                     ).tolist()
                     for layer_id in sorted(self.hot_expert_capacity)
                 }
-                if prefill_counters is not None
+                if prefill_counters is not None or reasoning_counters is not None
                 else None
             ),
         )
@@ -2623,6 +2695,12 @@ class OffloadMoeCache:
             if decayed_prefill_freq is not None
             else None
         )
+        decayed_reasoning_freq = getattr(self, "decayed_reasoning_freq", None)
+        reasoning_counters = (
+            decayed_reasoning_freq.detach().to("cpu", copy=True)
+            if decayed_reasoning_freq is not None
+            else None
+        )
         self._hot_plan_last_snapshot = now
         fence = _HotPlanWriteFence()
         self._hot_plan_write_fence = fence
@@ -2632,6 +2710,7 @@ class OffloadMoeCache:
             counters,
             prefill_counters,
             fence,
+            reasoning_counters,
         )
         return self._hot_plan_future
 
@@ -2682,10 +2761,14 @@ class OffloadMoeCache:
                 self._complete_hot_adaptation_tick(staging_seconds=0.0)
                 return
         assert self._hot_adapt_snapshot_host is not None
+        self._hot_adapt_tick_reasoning = getattr(self, "_decode_phase_reasoning", False)
         self._hot_adapt_snapshot_device.copy_(self.decayed_decode_freq)
         if getattr(self, "decayed_prefill_freq", None) is not None:
             assert self._hot_adapt_prefill_snapshot_device is not None
             self._hot_adapt_prefill_snapshot_device.copy_(self.decayed_prefill_freq)
+        if getattr(self, "decayed_reasoning_freq", None) is not None:
+            assert self._hot_adapt_reasoning_snapshot_device is not None
+            self._hot_adapt_reasoning_snapshot_device.copy_(self.decayed_reasoning_freq)
         ready = None
         if self.device.type == "cuda":
             assert self._hot_adapt_copy_stream is not None
@@ -2704,10 +2787,23 @@ class OffloadMoeCache:
                         self._hot_adapt_prefill_snapshot_device,
                         non_blocking=True,
                     )
+                if getattr(self, "decayed_reasoning_freq", None) is not None:
+                    assert self._hot_adapt_reasoning_snapshot_host is not None
+                    assert self._hot_adapt_reasoning_snapshot_device is not None
+                    self._hot_adapt_reasoning_snapshot_host.copy_(
+                        self._hot_adapt_reasoning_snapshot_device,
+                        non_blocking=True,
+                    )
                 self._hot_adapt_snapshot_ready.record(self._hot_adapt_copy_stream)
             ready = self._hot_adapt_snapshot_ready
         else:
             self._hot_adapt_snapshot_host.copy_(self._hot_adapt_snapshot_device)
+            if getattr(self, "decayed_reasoning_freq", None) is not None:
+                assert self._hot_adapt_reasoning_snapshot_host is not None
+                assert self._hot_adapt_reasoning_snapshot_device is not None
+                self._hot_adapt_reasoning_snapshot_host.copy_(
+                    self._hot_adapt_reasoning_snapshot_device
+                )
             if getattr(self, "decayed_prefill_freq", None) is not None:
                 assert self._hot_adapt_prefill_snapshot_host is not None
                 assert self._hot_adapt_prefill_snapshot_device is not None
@@ -2911,6 +3007,12 @@ class OffloadMoeCache:
             self.hot_adapt_ticks_prefill += tick_count
         else:
             self.hot_adapt_ticks_decode += tick_count
+        if getattr(self, "decayed_reasoning_freq", None) is not None:
+            # Which decode history the planner will aim at for this tick.
+            if getattr(self, "_decode_phase_reasoning", False):
+                self.hot_adapt_ticks_reasoning += tick_count
+            else:
+                self.hot_adapt_ticks_answer += tick_count
         self._hot_adapt_deferred_logged = False
         if tracker is not None:
             tracker.tick_started()
@@ -2927,6 +3029,20 @@ class OffloadMoeCache:
                 if force_post_prefill else None
             ),
         )
+
+    def set_decode_phase(self, reasoning: bool) -> None:
+        """Route the next decode step's counts to the reasoning or answer history.
+
+        Host-only decision (the scheduler's lagged token tracker); the device index
+        changes with one stream-ordered fill, and only when the phase flips, so the
+        normal path adds no sync. A no-op unless histories=split3.
+        """
+        reasoning = bool(reasoning)
+        if getattr(self, "decayed_reasoning_freq", None) is None:
+            return
+        if reasoning != self._decode_phase_reasoning:
+            self._decode_phase_reasoning = reasoning
+            self.decode_phase_idx.fill_(1 if reasoning else 0)
 
     def hot_adapt_prefill_boundary(self) -> None:
         """Account only prefill tokens observed by the HOT split counting path."""
@@ -2961,26 +3077,20 @@ class OffloadMoeCache:
         if not self.hot_adapt_enabled:
             return 0.0
         counts = self.decayed_decode_freq.tolist()
-        if getattr(self, "decayed_prefill_freq", None) is not None:
-            from freetoken.moe.hot_adapt import blend_histories
+        prefill_freq = getattr(self, "decayed_prefill_freq", None)
+        reasoning_freq = getattr(self, "decayed_reasoning_freq", None)
+        if prefill_freq is not None or reasoning_freq is not None:
+            from freetoken.moe.hot_adapt import aim_histories
 
-            decode_counts = dict(enumerate(counts))
-            prefill_counts = dict(enumerate(self.decayed_prefill_freq.tolist()))
-            if getattr(self, "hot_adapt_aim", "blend") == "phase":
-                if getattr(self, "_hot_adapt_tick_boundary", None) == "prefill":
-                    blended = blend_histories(
-                        prefill_counts,
-                        decode_counts,
-                        getattr(self, "hot_adapt_prefill_blend", 0.25),
-                    )
-                else:
-                    blended = blend_histories(decode_counts, prefill_counts, 0)
-            else:
-                blended = blend_histories(
-                    decode_counts,
-                    prefill_counts,
-                    getattr(self, "hot_adapt_prefill_blend", 0.25),
-                )
+            blended = aim_histories(
+                dict(enumerate(counts)),
+                dict(enumerate(prefill_freq.tolist())) if prefill_freq is not None else None,
+                dict(enumerate(reasoning_freq.tolist())) if reasoning_freq is not None else None,
+                aim=getattr(self, "hot_adapt_aim", "blend"),
+                boundary=getattr(self, "_hot_adapt_tick_boundary", None) or "decode",
+                reasoning_phase=getattr(self, "_decode_phase_reasoning", False),
+                prefill_blend=getattr(self, "hot_adapt_prefill_blend", 0.25),
+            )
             counts = [blended[layer_id] for layer_id in range(self.num_layers)]
         total = sum(sum(layer) for layer in counts)
         hot = sum(
@@ -3397,6 +3507,22 @@ class OffloadMoeCache:
             result["decayed_prefill_share"] = (
                 prefill_total / history_total if history_total else 0.0
             )
+        if getattr(self, "decayed_reasoning_freq", None) is not None:
+            reasoning_total = float(self.decayed_reasoning_freq.sum().item())
+            answer_total = float(self.decayed_decode_freq.sum().item())
+            result["decayed_reasoning_share"] = (
+                reasoning_total / (reasoning_total + answer_total)
+                if reasoning_total + answer_total else 0.0
+            )
+            result["hot_adapt_decode_aim"] = (
+                "reasoning" if self._decode_phase_reasoning else "answer"
+            ) if getattr(self, "hot_adapt_aim", "blend") == "phase" else "both"
+            result["hot_adapt_ticks_reasoning"] = (
+                self.hot_adapt_ticks_reasoning - self._hot_adapt_ticks_reasoning_reported
+            )
+            result["hot_adapt_ticks_answer"] = (
+                self.hot_adapt_ticks_answer - self._hot_adapt_ticks_answer_reported
+            )
         result["hot_adapt_ticks_prefill"] = ticks_prefill
         result["hot_adapt_prefill_run_swaps"] = getattr(
             self, "_hot_adapt_prefill_run_swaps", 0
@@ -3418,6 +3544,8 @@ class OffloadMoeCache:
             self._prefill_cpu_experts = 0
             self._hot_adapt_ticks_reported = self.hot_adapt_ticks
             self._hot_adapt_ticks_prefill_reported = self.hot_adapt_ticks_prefill
+            self._hot_adapt_ticks_reasoning_reported = self.hot_adapt_ticks_reasoning
+            self._hot_adapt_ticks_answer_reported = self.hot_adapt_ticks_answer
             self._hot_adapt_ticks_decode_reported = self.hot_adapt_ticks_decode
             self._hot_adapt_ticks_idle_reported = self.hot_adapt_ticks_idle
             self._hot_adapt_swaps_reported = self.hot_adapt_swaps
@@ -3996,6 +4124,8 @@ class OffloadMoeCache:
         self.decayed_decode_freq.zero_()
         if getattr(self, "decayed_prefill_freq", None) is not None:
             self.decayed_prefill_freq.zero_()
+        if getattr(self, "decayed_reasoning_freq", None) is not None:
+            self.decayed_reasoning_freq.zero_()
         self._apply_hot_plan_counter_seed()
         if self.session_profile_ids is not None:
             self.session_profile_ids.fill_(-1)

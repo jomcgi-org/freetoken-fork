@@ -1044,9 +1044,15 @@ def parse_args(
 
     parser.add_argument(
         "--moe-hot-adapt-histories",
-        choices=["shared", "split"],
+        choices=["shared", "split", "split3"],
         default=ServerArgs.moe_hot_adapt_histories,
-        help="HOT adaptation route histories (default: shared).",
+        help=(
+            "HOT adaptation route histories (default: shared). split keeps "
+            "prefill apart from decode; split3 also keeps reasoning-phase decode "
+            "apart from answer-phase decode (phase tracked from the reasoning "
+            "parser's tags, so it needs --reasoning-parser; without one split3 "
+            "behaves like split with an empty reasoning history)."
+        ),
     )
 
     parser.add_argument(

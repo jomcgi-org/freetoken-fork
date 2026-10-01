@@ -51,6 +51,9 @@ class HotPlanSeed:
     tier_commit: str
     tier_mismatch: bool
     prefill_counters: dict[int, tuple[float, ...]] = field(default_factory=dict)
+    # Reasoning-phase decode history (histories=split3). Absent in plans written by
+    # older servers or by split/shared runs; an empty dict then seeds nothing.
+    reasoning_counters: dict[int, tuple[float, ...]] = field(default_factory=dict)
 
 
 def allocate_hot_capacity(
@@ -308,11 +311,14 @@ def load_hot_plan(
     protected = raw.get("protected_slots")
     counters_raw = raw.get("decayed_counters")
     prefill_counters_raw = raw.get("decayed_prefill_counters")
+    reasoning_counters_raw = raw.get("decayed_reasoning_counters")
     ranked_raw = raw.get("counter_ranked")
     if not all(isinstance(section, dict) for section in (protected, counters_raw, ranked_raw)):
         raise ValueError("HOT plan layer sections must be objects")
     if prefill_counters_raw is not None and not isinstance(prefill_counters_raw, dict):
         raise ValueError("HOT plan prefill counter section must be an object")
+    if reasoning_counters_raw is not None and not isinstance(reasoning_counters_raw, dict):
+        raise ValueError("HOT plan reasoning counter section must be an object")
 
     selected = {
         layer_id: tuple(int(expert) for expert in static_expert_ids.get(layer_id, ()))
@@ -320,6 +326,7 @@ def load_hot_plan(
     }
     counters: dict[int, tuple[float, ...]] = {}
     prefill_counters: dict[int, tuple[float, ...]] = {}
+    reasoning_counters: dict[int, tuple[float, ...]] = {}
     seeded_layers: set[int] = set()
     partially_seeded_layers: set[int] = set()
     for layer_id in sorted(disk_layer_ids):
@@ -363,12 +370,16 @@ def load_hot_plan(
             prefill_counters[layer_id] = _validated_counter_row(
                 prefill_counters_raw.get(key), num_experts, layer_id
             )
+        if reasoning_counters_raw is not None and key in reasoning_counters_raw:
+            reasoning_counters[layer_id] = _validated_counter_row(
+                reasoning_counters_raw.get(key), num_experts, layer_id
+            )
         seeded_layers.add(layer_id)
     if not seeded_layers:
         raise ValueError("HOT plan has no protected layers for this process")
     if not any(
         any(value != 0.0 for value in row)
-        for rows in (counters, prefill_counters)
+        for rows in (counters, prefill_counters, reasoning_counters)
         for row in rows.values()
     ):
         raise ValueError("HOT plan counters are all zero")
@@ -388,6 +399,7 @@ def load_hot_plan(
         tier_commit=saved_tier,
         tier_mismatch=saved_tier != tier_commit,
         prefill_counters=prefill_counters,
+        reasoning_counters=reasoning_counters,
     )
 
 
@@ -403,6 +415,7 @@ def make_hot_plan_document(
     decayed_counters: Mapping[int, Sequence[float]],
     capacity_policy: str = "equal",
     decayed_prefill_counters: Mapping[int, Sequence[float]] | None = None,
+    decayed_reasoning_counters: Mapping[int, Sequence[float]] | None = None,
     ranking_counters: Mapping[int, Sequence[float]] | None = None,
     written_at: float | None = None,
 ) -> dict[str, Any] | None:
@@ -434,6 +447,20 @@ def make_hot_plan_document(
             )
         if any(not math.isfinite(value) or value < 0 for value in row):
             raise ValueError(f"prefill counter layer {layer_id} has an invalid value")
+    reasoning_rows = {
+        int(layer_id): tuple(float(value) for value in row)
+        for layer_id, row in (decayed_reasoning_counters or {}).items()
+    }
+    if reasoning_rows and set(reasoning_rows) != set(counter_rows):
+        raise ValueError("decode and reasoning counter layers must match")
+    for layer_id, row in reasoning_rows.items():
+        if len(row) != num_experts:
+            raise ValueError(
+                f"reasoning counter layer {layer_id} has {len(row)} values, "
+                f"expected {num_experts}"
+            )
+        if any(not math.isfinite(value) or value < 0 for value in row):
+            raise ValueError(f"reasoning counter layer {layer_id} has an invalid value")
     ranked_rows = {
         int(layer_id): tuple(float(value) for value in row)
         for layer_id, row in (ranking_counters or counter_rows).items()
@@ -450,7 +477,7 @@ def make_hot_plan_document(
             raise ValueError(f"ranking counter layer {layer_id} has an invalid value")
     if not any(
         any(value != 0.0 for value in row)
-        for rows in (counter_rows, prefill_rows)
+        for rows in (counter_rows, prefill_rows, reasoning_rows)
         for row in rows.values()
     ):
         return None
@@ -465,6 +492,12 @@ def make_hot_plan_document(
             struct.pack(f"<{num_experts}f", *row)
         ).decode("ascii")
         for layer_id, row in prefill_rows.items()
+    }
+    reasoning_counters = {
+        str(layer_id): base64.b64encode(
+            struct.pack(f"<{num_experts}f", *row)
+        ).decode("ascii")
+        for layer_id, row in reasoning_rows.items()
     }
     protected: dict[str, list[int]] = {}
     ranked: dict[str, list[int]] = {}
@@ -500,6 +533,8 @@ def make_hot_plan_document(
     }
     if prefill_counters:
         document["decayed_prefill_counters"] = prefill_counters
+    if reasoning_counters:
+        document["decayed_reasoning_counters"] = reasoning_counters
     return document
 
 
@@ -907,6 +942,62 @@ def blend_histories(
             for decode, prefill in zip(decode_row, prefill_row)
         )
     return result
+
+
+# Weight of the non-aimed decode history when aiming at one phase (split3). Both
+# decode histories are in the same units (one count per routed pair per step), so a
+# small fixed share only breaks ties between experts the aimed phase rates alike.
+PHASE_TIEBREAK_BLEND = 0.05
+
+
+def aim_histories(
+    decode_counts: Mapping[int, Sequence[float]],
+    prefill_counts: Mapping[int, Sequence[float]] | None,
+    reasoning_counts: Mapping[int, Sequence[float]] | None,
+    *,
+    aim: str,
+    boundary: str,
+    reasoning_phase: bool,
+    prefill_blend: float,
+) -> dict[int, tuple[float, ...]]:
+    """Counts the HOT planner ranks experts by, for the current aim.
+
+    ``decode_counts`` is the answer-phase (or only) decode history,
+    ``reasoning_counts`` the reasoning-phase one (histories=split3, else None) and
+    ``prefill_counts`` the prefill one (split/split3, else None).
+
+    split, aim=blend:   decode + w * prefill.
+    split, aim=phase:   prefill boundary -> prefill + w * decode; else decode.
+    split3, aim=blend:  answer + reasoning + w * prefill.
+    split3, aim=phase:  the aimed decode history is the reasoning one while
+        ``reasoning_phase`` else the answer one. Prefill boundary -> prefill +
+        w * aimed + w * TIEBREAK * other; decode/idle boundary -> aimed +
+        TIEBREAK * other. Prefill never enters a decode aim, as in split.
+    """
+    if prefill_counts is None and reasoning_counts is None:
+        return {
+            layer_id: tuple(float(v) for v in row)
+            for layer_id, row in decode_counts.items()
+        }
+    if reasoning_counts is None:
+        if aim == "phase":
+            if boundary == "prefill":
+                return blend_histories(prefill_counts, decode_counts, prefill_blend)
+            return blend_histories(decode_counts, prefill_counts, 0)
+        return blend_histories(decode_counts, prefill_counts, prefill_blend)
+    if aim != "phase":
+        merged = blend_histories(decode_counts, reasoning_counts, 1.0)
+        if prefill_counts is None:
+            return merged
+        return blend_histories(merged, prefill_counts, prefill_blend)
+    if reasoning_phase:
+        aimed, other = reasoning_counts, decode_counts
+    else:
+        aimed, other = decode_counts, reasoning_counts
+    decode_aim = blend_histories(aimed, other, PHASE_TIEBREAK_BLEND)
+    if boundary != "prefill" or prefill_counts is None:
+        return decode_aim
+    return blend_histories(prefill_counts, decode_aim, prefill_blend)
 
 
 def recompute_hot_partition(

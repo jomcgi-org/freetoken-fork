@@ -462,9 +462,9 @@ class EngineConfig:
             raise ValueError(
                 "--moe-hot-adapt-prefill-weight must be finite and in [0, 1]"
             )
-        if self.moe_hot_adapt_histories not in ("shared", "split"):
+        if self.moe_hot_adapt_histories not in ("shared", "split", "split3"):
             raise ValueError(
-                "--moe-hot-adapt-histories must be 'shared' or 'split', got "
+                "--moe-hot-adapt-histories must be 'shared', 'split' or 'split3', got "
                 f"{self.moe_hot_adapt_histories!r}"
             )
         if self.moe_hot_adapt_aim not in ("blend", "phase"):

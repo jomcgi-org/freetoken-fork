@@ -31,6 +31,10 @@ class SamplingParams:
     # Hard reasoning budget: {"tokens": N, "end": "</think>", "start": str | None, "open": bool}.
     # None (or tokens == 0) is unlimited; the sampler then does no per-step work for it.
     reasoning_budget: dict[str, Any] | None = None
+    # Tag spec ({"end", "start", "open"}) for the non-forcing phase tracker that tells
+    # the HOT expert adapter whether a decode step is reasoning (--moe-hot-adapt-histories
+    # split3). None when the adapter does not need it or the parser has no tag pair.
+    reasoning_phase: dict[str, Any] | None = None
     # OpenAI logprobs: 0 returns none; N >= 1 returns the sampled token's logprob plus
     # the N - 1 most likely alternatives (chat `top_logprobs` + 1, completions `logprobs`).
     logprobs: int = 0
@@ -106,6 +110,8 @@ class Req:
     guided_state: Any | None = field(default=None, init=False, repr=False)
     # Host-side counter for SamplingParams.reasoning_budget (see freetoken.reasoning_budget).
     reasoning_budget_state: Any | None = field(default=None, init=False, repr=False)
+    # Same tracker without a budget; fed by the scheduler from tokens it already reads.
+    reasoning_phase_state: Any | None = field(default=None, init=False, repr=False)
     # Advisory routed-expert working set recovered while this request waited in
     # the admission queue. It never participates in model math.
     expert_profile: Any | None = field(default=None, init=False, repr=False)
