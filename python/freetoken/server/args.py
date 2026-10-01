@@ -1352,7 +1352,8 @@ def parse_args(
         default=ServerArgs.host_cache_reserve_gib,
         help=(
             "Host RAM reserved for the OS and expert-tier file cache. The default is "
-            "max(8 GiB, 15%% of MemTotal)."
+            "max(8 GiB, 15%% of MemTotal, estimated DISK-tier page-cache demand "
+            "plus prefix-cache headroom). An explicit value is used as given."
         ),
     )
 

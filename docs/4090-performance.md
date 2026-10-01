@@ -231,3 +231,28 @@ the positions where neither run had diverged (536 tokens), hybrid matched
 offload's own run-to-run drift: top-5 KL 0.0020 against 0.0021, and mean
 |dlogprob| 0.018 against 0.018. BFCL subset: offload 41/54 and 34/54 on two
 runs, hybrid 36/54 (+2 net against the second offload run).
+
+## Troubleshooting: starts but crawls on long prompts
+
+Symptom: the server starts, answers short prompts at normal speed, then drops to
+a few tokens per second on a long one, with the disk busy and the process in `D`
+state. `MemAvailable` looks fine and swap is idle.
+
+Cause: the DISK tier and the disk prefix cache read and write through the page
+cache. The pinned banks, HOT staging and pager fit under the host ceiling, but
+too little file cache is left for the DISK layers' routed experts (and the
+prefix cache's restores and fsync'd writes), so every step faults to NVMe. The
+server is short of file cache, not of memory.
+
+The startup log shows the reserve it is protecting in the `Host memory budget
+table` line (`reserve`, `disk_tier_cache`, `prefix_cache_headroom`). When the
+pinned budgets leave less cache than that estimate it logs
+`HOST FILE CACHE PRESSURE`. The estimate is a floor: two layers of routed
+experts with `--prefill-layer-major-tokens`, every disk layer without it, plus
+1 GiB for the PLE table's hot rows and 3 GiB when `--kv-disk-cache-gib` is set.
+The `Host memory measured` line reports `VmLck`/`VmPin`/`VmRSS` after the banks
+are pinned; `free` understates what locked pages hold.
+
+Knobs: lower `--moe-hot-expert-budget-gib` or `--kv-reserve-tokens` (less pinned
+memory), or raise `--host-cache-reserve-gib`. An explicit reserve is never
+raised automatically.
