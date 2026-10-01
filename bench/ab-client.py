@@ -25,6 +25,26 @@ TOPICS = ["how a mechanical watch keeps time", "the causes of the 1929 stock mar
           "the rules and strategy of chess openings", "how lithium-ion batteries degrade",
           "the formation of the Himalayas", "how compilers optimise loops"]
 ROUNDS = 6
+# long-doc (issue #16): one ~70k-token document turn, then three follow-up turns in the same
+# conversation. The follow-ups' decode tok/s shows whether the document's prefill re-aimed the
+# HOT set away from conversation decode.
+LONG_DOC_CHARS = 240_000
+LONG_DOC_QUESTIONS = [("t1", "What are the three most important performance decisions in that material, and why?"),
+                      ("t2", "Write a detailed design for a new feature that would fit this codebase."),
+                      ("t3", "Now critique that design: risks, failure modes, and how you would test it.")]
+
+
+def long_doc():
+    parts, n = [], 0
+    for f in sorted(DOCS.glob("*.md")) + sorted((DOCS.parent / "python" / "freetoken").rglob("*.py")):
+        text = f.read_text(errors="replace")
+        parts.append(f"=== {f.name} ===\n{text}")
+        n += len(text)
+        if n >= LONG_DOC_CHARS:
+            break
+    return "Reference material follows.\n\n" + "\n\n".join(parts)[:LONG_DOC_CHARS]
+
+
 MIXED = [(f"r{i // 2 + 1}-{'think' if i % 2 == 0 else 'plain'}", f"Explain {t}, step by step.", i % 2 == 0)
          for i, t in enumerate(TOPICS)]  # (name, prompt, thinking); round r is requests 2r-2 and 2r-1
 PREFIX_CHARS = 24
@@ -61,9 +81,9 @@ def nvme_sectors():
 def emit(**kw): print(json.dumps(kw), flush=True)
 
 
-def ask(args, name, content, thinking=False, stream=False):
-    body = {"model": "qwen3.6-27b", "messages": [{"role": "user", "content": content}],
-            "max_tokens": args.max_tokens, "temperature": 0, "seed": 0,
+def ask(args, name, content, thinking=False, stream=False, messages=None, max_tokens=None):
+    body = {"model": "qwen3.6-27b", "messages": messages or [{"role": "user", "content": content}],
+            "max_tokens": max_tokens or args.max_tokens, "temperature": 0, "seed": 0,
             "chat_template_kwargs": {"enable_thinking": thinking}}
     if stream:
         body.update(stream=True, stream_options={"include_usage": True})
@@ -74,7 +94,10 @@ def ask(args, name, content, thinking=False, stream=False):
     extra = {}
     with urllib.request.urlopen(req, timeout=args.request_cap) as r:
         if not stream:
-            tokens = json.load(r)["usage"]["completion_tokens"]
+            resp = json.load(r)
+            tokens = resp["usage"]["completion_tokens"]
+            extra = dict(prompt_tokens=resp["usage"].get("prompt_tokens"),
+                         _text=resp["choices"][0]["message"].get("content") or "")
         else:
             tokens, reasoning, answer, usage = 0, 0, 0, None
             for raw in r:
@@ -103,25 +126,37 @@ def ask(args, name, content, thinking=False, stream=False):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("out")
-    ap.add_argument("--workload", choices=["default", "mixed-thinking"], default="default")
+    ap.add_argument("--workload", choices=["default", "mixed-thinking", "long-doc"], default="default")
     ap.add_argument("--warmup", action="store_true")
     ap.add_argument("--port", type=int, default=18090)
     ap.add_argument("--max-tokens", type=int, default=None, help="default 1000, or 600 for mixed-thinking")
     ap.add_argument("--request-cap", type=float, default=1800)
     args = ap.parse_args(argv)
-    measured = MEASURED if args.workload == "default" else MIXED
-    args.max_tokens = args.max_tokens or (1000 if args.workload == "default" else 600)
+    measured = {"default": MEASURED, "mixed-thinking": MIXED, "long-doc": []}[args.workload]
+    args.max_tokens = args.max_tokens or (600 if args.workload == "mixed-thinking" else 1000)
     check_disjoint(WARMUP, measured)
     if args.warmup:
         for name, prompt in WARMUP:
-            emit(event="done", warmup=True, **ask(args, name, prompt))
+            w = ask(args, name, prompt)
+            w.pop("_text", None)
+            emit(event="done", warmup=True, **w)
     rows = []
+    if args.workload == "long-doc":
+        convo = [{"role": "user", "content": long_doc() + "\n\nSummarize it briefly."}]
+        for name, question in [("doc", None)] + LONG_DOC_QUESTIONS:
+            if question:
+                convo.append({"role": "user", "content": question})
+            r = ask(args, name, None, messages=list(convo), max_tokens=300 if name == "doc" else None)
+            convo.append({"role": "assistant", "content": r.pop("_text")})
+            rows.append(r)
+            emit(event="done", **r)
     for name, prompt, *flag in measured:
         if flag:
             r = ask(args, name, prompt, thinking=flag[0], stream=True)
             r.update(thinking=flag[0], round=int(name[1:].split("-")[0]))
         else:
             r = ask(args, name, prompt)
+            r.pop("_text", None)
         rows.append(r)
         emit(event="done", **r)
     Path(args.out).write_text(json.dumps(rows, indent=1))

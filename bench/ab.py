@@ -802,7 +802,7 @@ def make_parser():
     p.add_argument("--min-adapt-ticks", type=int, default=3)
     p.add_argument("--dropin", default=DROPIN)
     p.add_argument("--results-dir")
-    p.add_argument("--workload", choices=["default", "mixed-thinking"], default="default",
+    p.add_argument("--workload", choices=["default", "mixed-thinking", "long-doc"], default="default",
                    help="default: essays + doc, 1000 tokens; mixed-thinking: 6 rounds of thinking/plain, 600 tokens")
     p.add_argument("--gpu-wait-minutes", type=int, default=10,
                    help="before each arm, wait this long for other GPU processes to exit, then fail the arm")
