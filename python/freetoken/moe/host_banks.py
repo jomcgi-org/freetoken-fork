@@ -179,8 +179,16 @@ def _aligned_anonymous_mapping(length: int) -> tuple[mmap.mmap, memoryview, int]
     return raw, memoryview(raw)[offset:offset + length], address
 
 
+_libc = None
+
+
 def _madvise(address: int, length: int, advice: int) -> None:
-    libc = ctypes.CDLL(None, use_errno=True)
+    # CDLL(None) costs ~7 us per construction and decode issues dozens of these per
+    # layer, so the handle is created once. errno stays per-thread via use_errno.
+    global _libc
+    libc = _libc
+    if libc is None:
+        libc = _libc = ctypes.CDLL(None, use_errno=True)
     if libc.madvise(
         ctypes.c_void_p(address), ctypes.c_size_t(length), ctypes.c_int(advice)
     ):
@@ -1192,7 +1200,10 @@ def coalesced_page_ranges(
     """
     if expert_stride <= 0 or page_size <= 0:
         raise ValueError("expert_stride and page_size must be positive")
-    pages: set[int] = set()
+    # Half-open page intervals per expert, merged when they overlap or touch. This
+    # is O(experts) where the earlier per-page set was O(pages): a decode layer's
+    # ten ~MiB rows cost ~150 us per bank in Python on the critical path.
+    spans: list[tuple[int, int]] = []
     for raw in expert_ids:
         expert_id = int(raw)
         if expert_id < 0:
@@ -1203,19 +1214,20 @@ def coalesced_page_ranges(
             raise ValueError(f"expert id {expert_id} exceeds bank size {limit}")
         lo += page_offset
         hi += page_offset
-        pages.update(range(lo // page_size, (hi + page_size - 1) // page_size))
-    if not pages:
+        spans.append((lo // page_size, (hi + page_size - 1) // page_size))
+    if not spans:
         return []
-    ordered = sorted(pages)
+    spans.sort()
     out: list[tuple[int, int]] = []
-    start = prev = ordered[0]
-    for page in ordered[1:]:
-        if page == prev + 1:
-            prev = page
+    start, end = spans[0]
+    for lo_page, hi_page in spans[1:]:
+        if lo_page <= end:
+            if hi_page > end:
+                end = hi_page
             continue
-        out.append((start * page_size, (prev - start + 1) * page_size))
-        start = prev = page
-    out.append((start * page_size, (prev - start + 1) * page_size))
+        out.append((start * page_size, (end - start) * page_size))
+        start, end = lo_page, hi_page
+    out.append((start * page_size, (end - start) * page_size))
     return out
 
 
