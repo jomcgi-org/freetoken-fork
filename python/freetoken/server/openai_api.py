@@ -42,6 +42,7 @@ from .generation import (
     generate_events,
     generate_full,
     keepalive_interval_s,
+    parse_reasoning_budget,
     prerender_error,
     render_messages,
     resolve_sampling,
@@ -124,7 +125,17 @@ def chat_request_to_genspec(
         template_tools=_tools_for_template(req),
         parser_tools=(_all_tool_dicts(req.tools) if _should_parse_tools(req) else None),
         priority=req.priority,
+        reasoning_budget_tokens=_chat_reasoning_budget(req),
     )
+
+
+def _chat_reasoning_budget(req: ChatCompletionRequest) -> int | None:
+    """`max_reasoning_tokens`, else `reasoning.max_tokens`. Never derived from an effort."""
+    if req.max_reasoning_tokens is not None:
+        return parse_reasoning_budget(req.max_reasoning_tokens, "max_reasoning_tokens")
+    if isinstance(req.reasoning, dict):
+        return parse_reasoning_budget(req.reasoning.get("max_tokens"), "reasoning.max_tokens")
+    return None
 
 
 def _all_tool_dicts(tools) -> list[dict[str, Any]]:

@@ -201,6 +201,7 @@ def test_unconstrained_sampler_prepare_does_not_initialize_backend(monkeypatch):
         can_decode=True,
         sampling_params=SimpleNamespace(
             guided_decoding=None,
+            reasoning_budget=None,
             is_greedy=True,
         )
     )

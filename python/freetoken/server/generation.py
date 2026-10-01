@@ -174,6 +174,9 @@ class GenSpec:
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
     priority: int = 0
+    # Per-request hard reasoning budget from the wire (None = not given, use the server
+    # default; 0 = explicitly unlimited). Resolved into SamplingParams in submit_generation.
+    reasoning_budget_tokens: int | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -293,9 +296,44 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
+def parse_reasoning_budget(value: Any, param: str) -> int | None:
+    """Validate a wire reasoning budget: None passes through, otherwise a non-negative int
+    (0 = unlimited). Raises ValueError, which every adapter surfaces as a 400."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{param} must be a non-negative integer; got {value!r}")
+    return value
+
+
+def resolve_reasoning_budget(spec: GenSpec, state: Any) -> dict[str, Any] | None:
+    """The engine-facing budget for this request, or None when unlimited.
+
+    A request value (even 0) overrides the server default. The end tag, and the start tag
+    when the template does not pre-open reasoning, come from the configured reasoning
+    parser; parsers without a plain tag pair (Harmony, ATEM) cannot be budgeted."""
+    tokens = spec.reasoning_budget_tokens
+    if tokens is None:
+        tokens = getattr(state.config, "reasoning_budget_tokens", 0) or 0
+    if tokens <= 0:
+        return None
+    parser = _make_reasoning_parser(spec, state)
+    detector = getattr(parser, "detector", None)
+    end = getattr(detector, "think_end_token", "")
+    if not end:
+        return None
+    return {
+        "tokens": tokens,
+        "end": end,
+        "start": detector.think_start_token or None,
+        "open": bool(detector.force_reasoning),
+    }
+
+
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    spec.sampling_params.reasoning_budget = resolve_reasoning_budget(spec, state)
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(

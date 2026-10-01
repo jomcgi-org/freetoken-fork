@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, NamedTuple
 
 import torch
@@ -18,6 +18,14 @@ class BatchSamplingArgs:
     top_p: torch.Tensor | None = None
     guided: "GuidedBatch | None" = None
     has_guided: bool = False
+    # Reasoning budget: rows observed this step (host token ids needed afterwards) and the
+    # (row, token) pairs whose logits are collapsed to the forced end-tag token.
+    budget_reqs: "list[tuple[int, Any]]" = field(default_factory=list)
+    forced: "list[tuple[int, int]]" = field(default_factory=list)
+
+    @property
+    def needs_host_tokens(self) -> bool:
+        return self.has_guided or bool(self.budget_reqs)
 
 
 class LogprobRows(NamedTuple):
@@ -65,6 +73,15 @@ def sample_impl(
     return sampling.top_k_top_p_sampling_from_probs(probs, top_k, top_p)
 
 
+def force_tokens(logits: torch.Tensor, forced: list[tuple[int, int]]) -> None:
+    """Collapse each (row, token) row of ``logits`` to that single token, in place."""
+    rows = torch.tensor([r for r, _ in forced], dtype=torch.long, device=logits.device)
+    ids = torch.tensor([t for _, t in forced], dtype=torch.long, device=logits.device)
+    kept = logits[rows, ids]
+    logits[rows] = float("-inf")
+    logits[rows, ids] = kept
+
+
 @dataclass
 class Sampler:
     device: torch.device
@@ -102,13 +119,46 @@ class Sampler:
         guided, created = self._get_guided_decoder().prepare(batch.reqs)
         return guided, created, True
 
+    def _prepare_reasoning_budget(self, batch: Batch):
+        budget_reqs: list[tuple[int, Any]] = []
+        forced: list[tuple[int, int]] = []
+        for row, req in enumerate(batch.reqs):
+            spec = req.sampling_params.reasoning_budget
+            if spec is None or not spec.get("tokens") or not req.can_decode:
+                continue
+            if req.reasoning_budget_state is None:
+                from freetoken.reasoning_budget import create_reasoning_budget_state
+
+                if self._guided_tokenizer is None:
+                    raise RuntimeError("reasoning budget tokenizer was not initialized")
+                req.reasoning_budget_state = create_reasoning_budget_state(
+                    spec, self._guided_tokenizer
+                )
+            state = req.reasoning_budget_state
+            if state.done:
+                continue
+            budget_reqs.append((row, state))
+            token = state.forced_token
+            # A live grammar owns this row's mask; forcing a token it may reject would
+            # crash the matcher, so grammar-constrained rows are not budgeted.
+            guided_state = req.guided_state
+            if token is not None and not (guided_state is not None and guided_state.active):
+                forced.append((row, token))
+        return budget_reqs, forced
+
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
         guided, created, has_guided = self._prepare_guided(batch)
         batch.constrained_requests = created
+        budget_reqs, forced = (
+            self._prepare_reasoning_budget(batch)
+            if any(p.reasoning_budget is not None for p in params)
+            else ([], [])
+        )
         if all(p.is_greedy for p in params):
             return BatchSamplingArgs(
-                temperatures=None, guided=guided, has_guided=has_guided
+                temperatures=None, guided=guided, has_guided=has_guided,
+                budget_reqs=budget_reqs, forced=forced,
             )
 
         MIN_P = MIN_T = 1e-6
@@ -124,6 +174,7 @@ class Sampler:
         return BatchSamplingArgs(
             temperatures, top_k=top_k, top_p=top_p,
             guided=guided, has_guided=has_guided,
+            budget_reqs=budget_reqs, forced=forced,
         )
 
     @nvtx_annotate("Sampler")
@@ -132,6 +183,8 @@ class Sampler:
             if args.guided is not None:
                 assert self._guided_decoder is not None
                 self._guided_decoder.apply_mask(logits, args.guided)
+            if args.forced:
+                force_tokens(logits, args.forced)
             if args.temperatures is None:  # greedy sampling
                 return torch.argmax(logits, dim=-1)
             return sample_impl(logits.float(), args.temperatures, args.top_k, args.top_p)
@@ -160,6 +213,8 @@ class Sampler:
     def finish_guided(
         self, batch: Batch, args: BatchSamplingArgs, next_tokens_cpu: torch.Tensor
     ) -> float:
+        for row, state in args.budget_reqs:
+            state.observe(int(next_tokens_cpu[row].item()))
         if args.guided is None:
             # A delayed response grammar can have no active rows yet. It still must
             # observe unrestricted reasoning tokens to find its activation marker.

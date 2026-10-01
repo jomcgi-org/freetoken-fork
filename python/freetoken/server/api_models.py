@@ -84,6 +84,9 @@ class ChatCompletionRequest(BaseModel):
     # existed) instead of becoming a bare 422 at the route boundary; the handler
     # reads the dict form and 400s only on an unknown "type" value.
     thinking: Any | None = None
+    # Hard reasoning-token budget (FreeToken extension; also read from reasoning.max_tokens).
+    max_reasoning_tokens: int | None = None
+    reasoning: Any | None = None
     ignore_eos: bool = False
     tools: list[Tool] | None = None
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceObject | None = None
