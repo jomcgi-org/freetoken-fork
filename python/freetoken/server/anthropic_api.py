@@ -35,6 +35,7 @@ from .anthropic_models import (
 from .disconnect import ClientDisconnectedResponse, DisconnectAwareStreamingResponse
 from .generation import (
     KEEPALIVE,
+    keepalive_interval_s,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -56,9 +57,9 @@ from .generation import (
 )
 from .request_logger import log_request
 
-# Emit a protocol-native `ping` event after this many seconds of stream silence,
-# bridging long queue/prefill/decode gaps for clients with stream-idle timeouts.
-KEEPALIVE_INTERVAL_S = 15.0
+# A protocol-native `ping` event is emitted after generation.keepalive_interval_s()
+# seconds of stream silence, bridging long queue/prefill/decode gaps for clients
+# with stream-idle timeouts.
 
 # OpenAI finish_reason -> Anthropic stop_reason (vLLM's stop_reason_map).
 STOP_REASON_MAP = {
@@ -492,7 +493,7 @@ async def anthropic_event_stream(
     tool_args_sent = ""
     tool_ordinal: int | None = None
     tool_stable = True
-    events = with_keepalive(events, KEEPALIVE_INTERVAL_S)
+    events = with_keepalive(events, keepalive_interval_s())
     try:
         async for ev in events:
             if ev is KEEPALIVE:

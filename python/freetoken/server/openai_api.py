@@ -29,6 +29,7 @@ from .api_models import (
 from .function_call_parser import ToolCallItem
 from .disconnect import ClientDisconnectedResponse, DisconnectAwareStreamingResponse
 from .generation import (
+    KEEPALIVE,
     ContentDelta,
     GenDone,
     GenerationError,
@@ -40,10 +41,12 @@ from .generation import (
     await_with_disconnect,
     generate_events,
     generate_full,
+    keepalive_interval_s,
     prerender_error,
     render_messages,
     resolve_sampling,
     submit_generation,
+    with_keepalive,
 )
 from .priority import resolve_request_priority
 from .request_logger import log_request
@@ -340,7 +343,10 @@ async def stream_chat_completion_chunks(
     cached_tokens = 0
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
-    events = generate_events(uid, spec, state, source="/v1/chat/completions")
+    events = with_keepalive(
+        generate_events(uid, spec, state, source="/v1/chat/completions"),
+        keepalive_interval_s(),
+    )
     while True:
         try:
             ev = await events.__anext__()
@@ -359,7 +365,11 @@ async def stream_chat_completion_chunks(
                 }}
             )
             break
-        if isinstance(ev, ReasoningDelta):
+        if ev is KEEPALIVE:
+            # SSE comment: every SSE parser ignores it, and it keeps the stream from going
+            # silent through a long queue/prefill (Node undici closes bodies idle for 300 s).
+            yield b": keepalive\n\n"
+        elif isinstance(ev, ReasoningDelta):
             yield _sse(
                 _chat_chunk(
                     req,

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -464,12 +465,33 @@ def _valid_json(text: str) -> bool:
 KEEPALIVE = object()
 """Sentinel yielded by with_keepalive() when the event stream has been silent."""
 
+DEFAULT_KEEPALIVE_INTERVAL_S = 15.0
+KEEPALIVE_ENV = "FREETOKEN_SSE_KEEPALIVE_S"
+
+
+def keepalive_interval_s() -> float:
+    """Seconds of stream silence before a keep-alive frame, shared by every streaming
+    route. ``FREETOKEN_SSE_KEEPALIVE_S`` overrides it (read per call); ``0`` disables
+    keep-alives. Unset or unparsable/negative values fall back to the default."""
+    raw = os.environ.get(KEEPALIVE_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_KEEPALIVE_INTERVAL_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_KEEPALIVE_INTERVAL_S
+    return value if value >= 0 else DEFAULT_KEEPALIVE_INTERVAL_S
+
 
 async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
     """Yield events from ``events``, interspersing the KEEPALIVE sentinel whenever
     ``interval`` seconds pass without one (covers queue/prefill silence before the
     first event too). Exceptions propagate unchanged; the pending read is cancelled
-    when the consumer closes."""
+    when the consumer closes. ``interval <= 0`` disables keep-alives (pass-through)."""
+    if interval <= 0:
+        async for ev in events:
+            yield ev
+        return
     aiter = events.__aiter__()
     task = None
     try:
