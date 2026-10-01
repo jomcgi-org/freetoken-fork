@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -16,6 +16,14 @@ _DEFAULT_RESERVE_FRACTION = 0.15
 _MIN_RESERVE_GIB = 8.0
 _PIN_SPLIT = 28
 _PAGER_SPLIT = 22
+# Page-cache demand the default reserve does not model. The disk prefix cache
+# restores and writes (safetensors + fsync) through the page cache; the PLE
+# table's hot rows are read through it whenever the table is not pinned.
+_PREFIX_CACHE_HEADROOM_GIB = 3.0
+_PLE_HOT_ROWS_GIB = 1.0
+# Layer-major prefill stages each layer once per group, so only the layer being
+# computed and the one being read ahead need to be cache-resident.
+_LAYER_MAJOR_RESIDENT_LAYERS = 2
 
 
 @dataclass(frozen=True)
@@ -43,6 +51,8 @@ class HostMemoryBudgets:
     remainder_gib: float
     pin_derived: bool
     pager_derived: bool
+    disk_tier_cache_gib: float = 0.0
+    prefix_cache_headroom_gib: float = 0.0
 
 
 def read_linux_memory_info(
@@ -151,20 +161,32 @@ def fit_host_memory_budgets(
     pager_gib: float | None,
     hot_staging_gib: float = 0.0,
     prefill_scratch_gib: float = 0.0,
+    disk_tier_cache_gib: float = 0.0,
+    prefix_cache_headroom_gib: float = 0.0,
 ) -> HostMemoryBudgets:
-    """Fit explicit and derived expert-tier budgets under one host-memory ceiling."""
+    """Fit explicit and derived expert-tier budgets under one host-memory ceiling.
+
+    A derived reserve is ``max(default, disk_tier_cache + prefix_cache_headroom)``
+    so the page cache DISK-tier reads and the prefix cache compete for is not
+    handed to the pinned banks and pager. An explicit reserve is used as given.
+    """
     _validate_optional_budget("--host-cache-reserve-gib", reserve_gib)
     _validate_optional_budget("FREETOKEN_PIN_BUDGET_GB", pin_gib)
     _validate_optional_budget("--moe-pager-budget-gib", pager_gib)
     _validate_optional_budget("HOT staging", hot_staging_gib)
     _validate_optional_budget("prefill scratch", prefill_scratch_gib)
+    _validate_optional_budget("DISK-tier cache", disk_tier_cache_gib)
+    _validate_optional_budget("prefix-cache headroom", prefix_cache_headroom_gib)
     if memory.total_gib <= 0 or memory.available_gib < 0:
         raise ValueError(
             "MemTotal must be positive and MemAvailable must be non-negative"
         )
 
     resolved_reserve = (
-        default_host_cache_reserve_gib(memory.total_gib)
+        max(
+            default_host_cache_reserve_gib(memory.total_gib),
+            float(disk_tier_cache_gib) + float(prefix_cache_headroom_gib),
+        )
         if reserve_gib is None
         else float(reserve_gib)
     )
@@ -217,6 +239,8 @@ def fit_host_memory_budgets(
         ),
         pin_derived=pin_derived,
         pager_derived=pager_derived,
+        disk_tier_cache_gib=float(disk_tier_cache_gib),
+        prefix_cache_headroom_gib=float(prefix_cache_headroom_gib),
     )
 
 
@@ -288,6 +312,142 @@ def _prefill_scratch_gib(config) -> float:
     return total / 2**30
 
 
+def _disk_capable_geometry(config) -> tuple[int, int, int] | None:
+    """``(num_moe_layers, num_experts, expert_bytes)`` of a disk-capable checkpoint."""
+    model = getattr(config, "model_config", None)
+    layers = int(getattr(model, "num_moe_layers", 0) or 0)
+    experts = int(getattr(model, "num_experts", 0) or 0)
+    path = getattr(config, "model_path", None)
+    if layers <= 0 or experts <= 0 or not path:
+        return None
+    try:
+        from freetoken.checkpoint.safetensors_bank_index import (
+            indexed_bank_byte_breakdown,
+        )
+        from freetoken.moe.expert_banks import ftw_bank_byte_breakdown
+
+        breakdown = ftw_bank_byte_breakdown(path) or indexed_bank_byte_breakdown(path)
+    except Exception:
+        return None
+    if breakdown is None or breakdown[0] % (layers * experts):
+        return None
+    return layers, experts, breakdown[0] // (layers * experts)
+
+
+def _estimated_disk_layers(config, pin_gib: float) -> tuple[int, int, int, int] | None:
+    """``(disk_layers, num_experts, expert_bytes, num_moe_layers)`` or ``None``.
+
+    Explicit ``--moe-disk-layers`` is authoritative. Otherwise the layers the pin
+    budget cannot hold go to the DISK tier, as engine residency planning does.
+    """
+    spec = getattr(config, "moe_disk_layers", None)
+    if spec:
+        model = getattr(config, "model_config", None)
+        layers = int(getattr(model, "num_moe_layers", 0) or 0)
+        experts = int(getattr(model, "num_experts", 0) or 0)
+        geometry = _disk_capable_geometry(config)
+        if geometry is not None:
+            layers, experts, expert_bytes = geometry
+        else:
+            from freetoken.moe.expert_banks import bank_bytes_per_expert
+
+            expert_bytes = bank_bytes_per_expert(model) or 0
+        if layers <= 0 or experts <= 0 or expert_bytes <= 0:
+            return None
+        try:
+            from freetoken.engine.engine import _parse_disk_layers_spec
+
+            count = len(_parse_disk_layers_spec(spec, layers))
+        except Exception:
+            return None
+        return count, experts, expert_bytes, layers
+    if getattr(config, "moe_backend", "offload") not in ("offload", "hybrid"):
+        return None
+    geometry = _disk_capable_geometry(config)
+    if geometry is None:
+        return None
+    layers, experts, expert_bytes = geometry
+    pinned = int(pin_gib * 2**30 // (experts * expert_bytes))
+    return max(0, layers - pinned), experts, expert_bytes, layers
+
+
+def _disk_tier_cache_gib(config, pin_gib: float = 0.0) -> float:
+    """Page cache the DISK tier's staged reads want, as a floor not the whole table.
+
+    Per disk layer, the experts one ``max_extend_tokens`` chunk routes to at
+    ``top_k`` (expected distinct under uniform routing) times the expert bytes,
+    for every disk layer a chunk-major prefill re-reads each chunk. Layer-major
+    prefill stages each layer once per group, so only a couple of layers need to
+    be resident. Plus a fixed allowance for the PLE table's hot rows when it is
+    read through the file cache.
+    """
+    total = 0.0
+    if getattr(config, "ple_backend", "pinned") != "pinned":
+        total += _PLE_HOT_ROWS_GIB
+    estimate = _estimated_disk_layers(config, pin_gib)
+    if estimate is None:
+        return total
+    disk_layers, experts, expert_bytes, _ = estimate
+    top_k = int(getattr(getattr(config, "model_config", None),
+                        "num_experts_per_tok", 0) or 0)
+    tokens = int(getattr(config, "max_extend_tokens", 2048) or 0)
+    if disk_layers <= 0 or top_k <= 0 or tokens <= 0:
+        return total
+    distinct = experts * (1.0 - (1.0 - min(1.0, top_k / experts)) ** tokens)
+    resident = disk_layers
+    if int(getattr(config, "prefill_layer_major_tokens", 0) or 0) > 0:
+        resident = min(disk_layers, _LAYER_MAJOR_RESIDENT_LAYERS)
+    return total + resident * distinct * expert_bytes / 2**30
+
+
+def _prefix_cache_headroom_gib(config) -> float:
+    if float(getattr(config, "kv_disk_cache_gib", 0.0) or 0.0) > 0:
+        return _PREFIX_CACHE_HEADROOM_GIB
+    return 0.0
+
+
+def read_process_residency(
+    path: str | os.PathLike[str] = "/proc/self/status",
+) -> dict[str, float]:
+    """Locked, pinned and resident GiB of this process (``VmLck``/``VmPin``/``VmRSS``)."""
+    out: dict[str, float] = {}
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        key, _, raw = line.partition(":")
+        if key in ("VmLck", "VmPin", "VmRSS"):
+            fields = raw.split()
+            if fields:
+                out[key] = int(fields[0]) / 2**20
+    return out
+
+
+def log_measured_host_residency(
+    budgets: HostMemoryBudgets, *, _logger=logger, status_path="/proc/self/status",
+) -> None:
+    """Report what the process holds after the banks are pinned, beside the estimate.
+
+    Locked pages make ``free``/``MemAvailable`` understate residency, so the
+    measured figures come from the process itself.
+    """
+    measured = read_process_residency(status_path)
+    if not measured:
+        return
+    estimate = (
+        budgets.pin_gib + budgets.hot_staging_gib
+        + budgets.prefill_scratch_gib + budgets.pager_gib
+    )
+    _logger.info_rank0(
+        "Host memory measured: "
+        + ", ".join(f"{k}={v:.2f} GiB" for k, v in measured.items())
+        + f" | estimate: pinned_banks={budgets.pin_gib:.2f} GiB, "
+        f"committed (banks+staging+scratch+pager)={estimate:.2f} GiB, "
+        f"disk_tier_cache={budgets.disk_tier_cache_gib:.2f} GiB (page cache, not held)"
+    )
+
+
 def govern_host_memory(
     config,
     *,
@@ -316,13 +476,40 @@ def govern_host_memory(
         raise ValueError(
             "FREETOKEN_PIN_BUDGET_GB must be a finite non-negative number"
         ) from exc
-    budgets = fit_host_memory_budgets(
-        memory,
-        reserve_gib=getattr(config, "host_cache_reserve_gib", None),
+    explicit_reserve = getattr(config, "host_cache_reserve_gib", None)
+    fit_kwargs = dict(
+        reserve_gib=explicit_reserve,
         pin_gib=pin_gib,
         pager_gib=getattr(config, "moe_pager_budget_gib", None),
         hot_staging_gib=_hot_staging_gib(config),
         prefill_scratch_gib=_prefill_scratch_gib(config),
+    )
+    prefix_headroom = _prefix_cache_headroom_gib(config)
+    budgets = fit_host_memory_budgets(memory, **fit_kwargs)
+    if explicit_reserve is None:
+        # The disk layer count follows the pin budget, so size the DISK-tier demand
+        # from the budget the default reserve yields (one pass: folding the demand
+        # in shrinks the pin budget, which would only grow the estimate further).
+        # A fold that would overflow explicit budgets is dropped with a warning.
+        disk_cache = _disk_tier_cache_gib(config, budgets.pin_gib)
+        if disk_cache + prefix_headroom > budgets.reserve_gib:
+            try:
+                budgets = fit_host_memory_budgets(
+                    memory,
+                    **fit_kwargs,
+                    disk_tier_cache_gib=disk_cache,
+                    prefix_cache_headroom_gib=prefix_headroom,
+                )
+            except ValueError:
+                _logger.warning_rank0(
+                    "Host cache reserve cannot cover the DISK-tier page-cache "
+                    f"demand ({disk_cache + prefix_headroom:.2f} GiB) without "
+                    "overflowing the explicit budgets; keeping the default reserve."
+                )
+    budgets = replace(
+        budgets,
+        disk_tier_cache_gib=_disk_tier_cache_gib(config, budgets.pin_gib),
+        prefix_cache_headroom_gib=prefix_headroom,
     )
     if bound_note is not None:
         _logger.info_rank0(bound_note)
@@ -342,6 +529,8 @@ def govern_host_memory(
         f"prefill_scratch={budgets.prefill_scratch_gib:.2f} GiB, "
         f"pager={budgets.pager_gib:.2f} GiB ({pager_source}), "
         f"reserve={budgets.reserve_gib:.2f} GiB, "
+        f"disk_tier_cache={budgets.disk_tier_cache_gib:.2f} GiB, "
+        f"prefix_cache_headroom={budgets.prefix_cache_headroom_gib:.2f} GiB, "
         f"remainder={budgets.remainder_gib:.2f} GiB, "
         f"target pin:pager={_PIN_SPLIT}:{_PAGER_SPLIT}"
     )
@@ -353,6 +542,18 @@ def govern_host_memory(
             f"total={memory.swap_total_gib:.2f} GiB). Likely cause: pinned banks, "
             "HOT staging, prefill scratch, and pager budgets plus file-cache demand "
             "exceeded host RAM."
+        )
+
+    cache_room = budgets.reserve_gib + budgets.remainder_gib
+    demand = _disk_tier_cache_gib(config, budgets.pin_gib) + prefix_headroom
+    if demand > cache_room + 1e-9:
+        _logger.warning_rank0(
+            "HOST FILE CACHE PRESSURE: the pinned budgets fit but leave "
+            f"{cache_room:.2f} GiB of page cache for an estimated "
+            f"{demand:.2f} GiB of DISK-tier reads and prefix-cache I/O. The "
+            "server will start, then decode and prefill will fault to disk. "
+            "Lower --moe-hot-expert-budget-gib / --kv-reserve-tokens or raise "
+            "--host-cache-reserve-gib."
         )
 
     return budgets

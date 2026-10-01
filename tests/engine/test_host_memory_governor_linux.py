@@ -14,8 +14,12 @@ from freetoken.engine.host_memory import (
     fit_host_memory_budgets,
     govern_host_memory,
     read_linux_memory_info,
+    _disk_tier_cache_gib,
     _prefill_scratch_gib,
+    log_measured_host_residency,
+    read_process_residency,
 )
+from freetoken.engine import host_memory
 
 
 pytestmark = pytest.mark.skipif(
@@ -340,3 +344,150 @@ def test_total_and_reserve_follow_limit_not_headroom(tmp_path, monkeypatch):
     assert budgets.available_gib == pytest.approx(20)
     assert budgets.reserve_gib == pytest.approx(15)  # 15% of the limit
     assert budgets.ceiling_gib == pytest.approx(5)
+
+
+# node-4 production: flash-e2m1.ftw (48 layers x 512 experts x 2772480 B), top_k 10,
+# 8192-token chunks, layer-major prefill, 500 GiB disk prefix cache, PLE over uring.
+# total/available are the values the 2026-10-01 startup log reported.
+_EXPERT_BYTES = 2772480
+
+
+def _prod_config(**overrides):
+    values = dict(
+        model_path="/models/flash-e2m1.ftw",
+        model_config=SimpleNamespace(
+            hidden_size=2560, moe_intermediate_size=640, num_experts_per_tok=10,
+            num_moe_layers=48, num_experts=512,
+        ),
+        host_cache_reserve_gib=None, moe_pager_budget_gib=None,
+        moe_backend="hybrid", moe_disk_layers=None, moe_disk_prefill="staged",
+        moe_hot_expert_budget_gib=6, moe_hot_adapt_max_swap_gib=0.5,
+        max_extend_tokens=8192, moe_disk_prefill_min_tokens=1024,
+        ple_backend="uring", kv_disk_cache_gib=500,
+        prefill_layer_major_tokens=65536, moe_prefill_coalesce="populate",
+        moe_cpu_prefill_batch="on",
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.fixture(autouse=True)
+def _fixture_geometry(monkeypatch):
+    monkeypatch.setattr(
+        host_memory, "_disk_capable_geometry", lambda config: (48, 512, _EXPERT_BYTES),
+    )
+
+
+_PROD_MEMORY = HostMemoryInfo(total_gib=61.91, available_gib=57.22)
+
+
+def test_disk_tier_cache_is_resident_layers_times_routed_footprint():
+    layer_gib = 512 * _EXPERT_BYTES / 2**30
+    # 8192 tokens x top_k 10 touch effectively every expert, so a chunk reads whole layers.
+    config = _prod_config(moe_disk_layers="29", prefill_layer_major_tokens=0)
+    assert _disk_tier_cache_gib(config) == pytest.approx(1.0 + 29 * layer_gib, rel=1e-6)
+    # Layer-major prefill stages each layer once per group: two layers stay resident.
+    config.prefill_layer_major_tokens = 65536
+    assert _disk_tier_cache_gib(config) == pytest.approx(1.0 + 2 * layer_gib, rel=1e-6)
+    # One token routes to top_k experts only.
+    config.max_extend_tokens = 1
+    assert _disk_tier_cache_gib(config) == pytest.approx(
+        1.0 + 2 * 10 * _EXPERT_BYTES / 2**30, rel=1e-6
+    )
+    config.ple_backend = "pinned"
+    config.moe_disk_layers = None
+    assert _disk_tier_cache_gib(config, pin_gib=1000) == 0.0
+
+
+def test_auto_disk_layers_follow_the_pin_budget():
+    config = _prod_config(prefill_layer_major_tokens=0)
+    small_pin = _disk_tier_cache_gib(config, pin_gib=26.4)
+    big_pin = _disk_tier_cache_gib(config, pin_gib=40)
+    assert small_pin > big_pin > 1.0
+
+
+def test_fit_reserve_is_max_of_default_and_disk_demand():
+    base = fit_host_memory_budgets(
+        _PROD_MEMORY, reserve_gib=None, pin_gib=None, pager_gib=None,
+    )
+    low = fit_host_memory_budgets(
+        _PROD_MEMORY, reserve_gib=None, pin_gib=None, pager_gib=None,
+        disk_tier_cache_gib=3.64, prefix_cache_headroom_gib=3.0,
+    )
+    assert low.reserve_gib == base.reserve_gib
+    assert low.pin_gib == base.pin_gib and low.pager_gib == base.pager_gib
+    high = fit_host_memory_budgets(
+        _PROD_MEMORY, reserve_gib=None, pin_gib=None, pager_gib=None,
+        disk_tier_cache_gib=20, prefix_cache_headroom_gib=3.0,
+    )
+    assert high.reserve_gib == 23.0
+    assert high.pin_gib < base.pin_gib
+    explicit = fit_host_memory_budgets(
+        _PROD_MEMORY, reserve_gib=5, pin_gib=None, pager_gib=None,
+        disk_tier_cache_gib=20, prefix_cache_headroom_gib=3.0,
+    )
+    assert explicit.reserve_gib == 5
+
+
+def test_production_budgets_are_unchanged_and_quiet():
+    """node-4 resolved reserve=9.29 pin=26.40 pager=20.74 before this change."""
+    log = _Logger()
+    budgets = govern_host_memory(
+        _prod_config(), memory=_PROD_MEMORY, environ={}, _logger=log,
+    )
+    assert budgets.reserve_gib == pytest.approx(9.2865)
+    assert budgets.pin_gib == pytest.approx(26.40, abs=0.01)
+    assert budgets.pager_gib == pytest.approx(20.74, abs=0.01)
+    assert log.warnings == []
+    assert "disk_tier_cache=3.64 GiB" in log.infos[0]
+    assert "prefix_cache_headroom=3.00 GiB" in log.infos[0]
+
+
+def test_chunk_major_prefill_folds_disk_demand_into_the_reserve():
+    log = _Logger()
+    budgets = govern_host_memory(
+        _prod_config(prefill_layer_major_tokens=0),
+        memory=_PROD_MEMORY, environ={}, _logger=log,
+    )
+    assert budgets.reserve_gib > 40
+    assert budgets.pin_gib < 26.4
+
+
+def test_explicit_reserve_is_kept_and_crawl_condition_warns():
+    log = _Logger()
+    budgets = govern_host_memory(
+        _prod_config(host_cache_reserve_gib=2, prefill_layer_major_tokens=0),
+        memory=_PROD_MEMORY, environ={}, _logger=log,
+    )
+    assert budgets.reserve_gib == 2
+    assert len(log.warnings) == 1
+    assert log.warnings[0].startswith("HOST FILE CACHE PRESSURE")
+    assert "--host-cache-reserve-gib" in log.warnings[0]
+
+
+def test_fold_that_overflows_explicit_budgets_falls_back_with_warning():
+    log = _Logger()
+    budgets = govern_host_memory(
+        _prod_config(moe_pager_budget_gib=20, prefill_layer_major_tokens=0),
+        memory=_PROD_MEMORY, environ={"FREETOKEN_PIN_BUDGET_GB": "26"}, _logger=log,
+    )
+    assert budgets.reserve_gib == pytest.approx(9.2865)
+    assert any("cannot cover the DISK-tier" in w for w in log.warnings)
+    assert any(w.startswith("HOST FILE CACHE PRESSURE") for w in log.warnings)
+
+
+def test_measured_residency_is_reported_next_to_the_estimate(tmp_path):
+    status = tmp_path / "status"
+    status.write_text("Name:\tft\nVmLck:\t 20971520 kB\nVmPin:\t 1048576 kB\n"
+                      "VmRSS:\t 31457280 kB\n")
+    assert read_process_residency(status) == {"VmLck": 20.0, "VmPin": 1.0, "VmRSS": 30.0}
+    budgets = fit_host_memory_budgets(
+        _PROD_MEMORY, reserve_gib=None, pin_gib=None, pager_gib=None,
+        disk_tier_cache_gib=3.64,
+    )
+    log = _Logger()
+    log_measured_host_residency(budgets, _logger=log, status_path=status)
+    assert "VmLck=20.00 GiB" in log.infos[0] and "estimate" in log.infos[0]
+    log = _Logger()
+    log_measured_host_residency(budgets, _logger=log, status_path=tmp_path / "missing")
+    assert log.infos == []

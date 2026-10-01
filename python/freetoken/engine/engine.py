@@ -367,7 +367,7 @@ class Engine:
         if is_offload_moe_backend(config.moe_backend):
             from freetoken.engine.host_memory import govern_host_memory
 
-            govern_host_memory(config)
+            self._host_budgets = govern_host_memory(config)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -442,6 +442,11 @@ class Engine:
                 self._host_tables_bytes = int(self.model.load_host_tables(config) or 0)
             if is_offload_moe_backend(config.moe_backend):
                 self._init_offload_moe_cache(config)
+        host_budgets = getattr(self, "_host_budgets", None)
+        if host_budgets is not None:
+            from freetoken.engine.host_memory import log_measured_host_residency
+
+            log_measured_host_residency(host_budgets)
         hugepage_after = read_meminfo_hugepages()
         if hugepage_scope.banks:
             for line in format_hugepage_status(
