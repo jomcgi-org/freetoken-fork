@@ -121,10 +121,6 @@ def main() -> None:
         del w, q
         torch.cuda.empty_cache()
 
-    if len(args.m) and 1 in args.m:
-        step = [r for r in rows if r["M"] == 1 and r["shape"] != "lm_head"]
-        print("\nM=1 only: per-shape speedups above; the layer counts per step are in the PR "
-              "(qkv x12, o_proj x12, in_proj x36, out_proj x36, shared x48, hc x96+2, lm_head x1).")
     if args.json:
         with open(args.json, "w") as f:
             json.dump(rows, f, indent=2)
