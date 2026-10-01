@@ -24,6 +24,8 @@
 # Prefill is unchanged. PCIe gather fell from 7.4 to 3.5 ms per token and decode rose
 # ~9% (2026-09-30 cpuinplace screens; docs/4090-performance.md). Caps 0/1 starve the
 # LRU and 3/4 fetch too much.
+# Non-expert projections and lm_head run as per-row FP8 (E4M3): 7.8 -> 3.9 GiB read per
+# decode step, decode +14-24% and BFCL subset 38/54 vs 35/54 for BF16 (2026-10-01, #117).
 set -euo pipefail
 if (( $# < 2 )); then
   printf 'Usage: %s MODEL_PATH LAYER_PROFILE_JSON [extra ft serve arguments]\n' "$0" >&2
@@ -59,4 +61,5 @@ exec "${FREETOKEN_BIN:-ft}" serve \
   --moe-hot-host-cache reclaim \
   --moe-hot-adapt-idle-ms 0 --moe-hot-adapt-post-prefill-tick on \
   --prefill-layer-major-tokens 65536 --prefill-layer-major-chunk 4096 \
+  --dense-weight-dtype "${FREETOKEN_DENSE_WEIGHT_DTYPE:-fp8}" \
   --memory-ratio 0.87 "$@"
