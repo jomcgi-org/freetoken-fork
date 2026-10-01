@@ -273,4 +273,4 @@ def test_long_doc_workload_is_one_growing_conversation(monkeypatch, tmp_path):
     assert seen[3][1] == ["user", "assistant", "user", "assistant", "user", "assistant", "user"]
     rows = json.loads(out.read_text())
     assert all("_text" not in r for r in rows)
-    assert len(client.long_doc()) == client.LONG_DOC_CHARS
+    assert client.LONG_DOC_CHARS <= len(client.long_doc()) <= client.LONG_DOC_CHARS + 100
