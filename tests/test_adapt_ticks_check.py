@@ -59,3 +59,15 @@ def test_empty_journal_is_invalid():
     summary = check.summarize("")
     assert summary["mode"] is None
     assert check.verdict(summary, 1) == "INVALID"
+
+
+def test_real_journal_tick_lines_are_counted_by_boundary():
+    # lines copied from a production-style journal (2026-10-01 A/A run); no hot_adapt_ticks_* stats lines at all
+    text = (ROOT / "tests" / "bench_fixtures" / "journal-ticks.log").read_text()
+    summary = check.summarize(text)
+    assert summary["ticks"] == {"prefill": 2, "decode": 3, "idle": 0}
+    assert check.verdict(summary, 3) == "VALID"
+    rates = summary["hot_pair_rate"]
+    assert rates["n"] == 5 and 30 < rates["min"] < rates["max"] < 70
+    events = check.tick_events(text)
+    assert all(e[0] is not None for e in events) and events[0][1] == "decode"

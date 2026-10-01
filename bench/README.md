@@ -17,6 +17,11 @@ first. `--plan-mode backup|cold` starts every arm from the production hot plan, 
 The workload is `ab-client.py` (greedy, fixed seed, fixed length). Always try `--dry-run` first: it
 prints every command and changes nothing.
 
+`--workload default` (essays + doc) or `mixed-thinking` (6 rounds of alternating thinking and plain
+requests; per-phase tok/s excludes round 1). Before each arm, and every ~10 s during it, the harness
+checks `nvidia-smi` for GPU processes outside the arm's unit: it waits `--gpu-wait-minutes` before an
+arm, and an arm that saw a foreign process is marked CONTAMINATED and excluded from the statistics.
+
 Results land in `/var/lib/longhorn/nvme-02/freetoken/results/ab-<UTC>/`: `report.md`,
 `summary.json`, and per run the command/env, client JSON, journal, NVMe bytes, major faults, adapt
 ticks and CPU temperature. A delta inside the larger arm's min-max spread is reported as

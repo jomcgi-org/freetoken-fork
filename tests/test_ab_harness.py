@@ -11,6 +11,12 @@ ROOT = Path(__file__).parents[1]
 FIXTURE = ROOT / "tests" / "bench_fixtures" / "60-root-runtime.conf"
 
 
+@pytest.fixture(autouse=True)
+def hermetic_trees(monkeypatch, tmp_path):
+    """Worktree dirs of earlier real runs (freetoken-bench/a, b) must not change what a dry run prints."""
+    monkeypatch.setattr(ab, "BENCH_TREES", tmp_path / "freetoken-bench")
+
+
 def load(name, file):
     spec = importlib.util.spec_from_file_location(name, ROOT / "bench" / file)
     mod = importlib.util.module_from_spec(spec)
@@ -80,7 +86,7 @@ def test_compare_verdicts():
 
 
 def fake_run(arm, wall, tok_s, gib, ticks, status="OK"):
-    tasks = [{"name": t, "wall": wall / 4, "tokens": int(tok_s * wall / 4), "nvme_gib": gib / 4} for t in ab.TASKS]
+    tasks = [{"name": t, "wall": wall / 4, "tokens": int(tok_s * wall / 4), "nvme_gib": gib / 4} for t in ["essay1", "essay2", "doc", "essay1b"]]
     return {"arm": arm, "status": status, "client": tasks, "nvme_gib": gib, "pgmajfault": 5,
             "adapt": {"ticks": {"prefill": ticks, "decode": 0, "idle": 0}}}
 
@@ -132,7 +138,7 @@ def test_dry_run_end_to_end_with_mocked_subprocess(monkeypatch, capsys, tmp_path
     assert all("--uid=jomcgi --collect" in l and "--port 18090" in l for l in launches)
     assert all("serve-qwen-flash-4090.sh" in l and "--max-extend-length 8192" in l for l in launches)
     assert "--setenv=FREETOKEN_CPU_MOE_DATAFLOW=1" in launches[1] and "FREETOKEN_CPU_MOE_DATAFLOW" not in launches[0]
-    assert all("/disks/nvme-02/src/freetoken-bench/" in l and "ab-prefix-cache-" in l for l in launches)
+    assert all("freetoken-bench/" in l and "ab-prefix-cache-" in l for l in launches)
     assert out.count("echo 3 > /proc/sys/vm/drop_caches") == 0  # warm run does not drop caches
     assert out.count("ab-client.py") == 4 and out.count("--warmup") == 4
     lines = out.splitlines()
@@ -152,3 +158,80 @@ def test_production_restarted_when_an_arm_is_interrupted(monkeypatch, capsys, tm
                   "--arm", "a=main", "--arm", "b=main", "--cache-state", "cold"])
     out = capsys.readouterr().out
     assert rc == 130 and "+ systemctl start freetoken-serve" in out
+
+
+def test_results_dir_is_created_owned_by_the_client_user(monkeypatch, tmp_path):
+    chowned = []
+    monkeypatch.setattr(ab.pwd, "getpwnam", lambda n: type("P", (), {"pw_uid": 1000, "pw_gid": 1001})())
+    monkeypatch.setattr(ab.os, "chown", lambda path, uid, gid: chowned.append((Path(path), uid, gid)))
+    args = ab.make_parser().parse_args(["--results-dir", str(tmp_path / "a" / "res"), "--arm", "a=x", "--arm", "b=x"])
+    runner = ab.Runner(args, ab.parse_arms(args), ab.parse_execstart(FIXTURE.read_text()))
+    runner.ensure_results_dir()
+    assert (tmp_path / "a" / "res").is_dir() and chowned == [(tmp_path / "a" / "res", 1000, 1001)]
+
+
+def test_gpu_apps_parse_and_foreign_detection(monkeypatch):
+    text = "1234, python, 22000 MiB\n77, /usr/bin/python3, 512 MiB\nbad line\n"
+    assert ab.parse_gpu_apps(text) == [(1234, "python", 22000), (77, "/usr/bin/python3", 512)]
+    monkeypatch.setattr(ab, "in_unit", lambda pid, unit: pid == 1234)
+    monkeypatch.setattr(ab.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, text, ""))
+    assert ab.foreign_gpu_apps("ft-ab-x") == [(77, "/usr/bin/python3", 512)]
+    assert len(ab.foreign_gpu_apps()) == 2
+
+
+def test_contaminated_runs_are_excluded_from_stats():
+    runs = [fake_run("a", 100, 5, 16, 4), fake_run("a", 300, 2, 16, 4, "CONTAMINATED"), fake_run("b", 101, 5, 16, 4)]
+    summary = ab.build_summary(runs, ["a", "b"])
+    assert summary["arms"]["a"]["n_ok"] == 1 and summary["arms"]["a"]["n_contaminated"] == 1
+    assert summary["arms"]["a"]["metrics"]["total_wall"]["mean"] == 100
+    assert any("contaminated" in w for w in summary["warnings"])
+
+
+def mixed_run(arm, think_tok_s, plain_tok_s):
+    rows = []
+    for rnd in range(1, 7):
+        for thinking, rate in ((True, think_tok_s), (False, plain_tok_s)):
+            rate = rate / 10 if rnd == 1 else rate  # warm-up round must not count
+            rows.append({"name": f"r{rnd}-{'think' if thinking else 'plain'}", "thinking": thinking, "round": rnd,
+                         "wall": 600 / rate, "tokens": 600, "nvme_gib": 0.5, "hot_pair_rate": 60.0 if thinking else 70.0})
+    return {"arm": arm, "status": "OK", "client": rows, "nvme_gib": 6.0, "pgmajfault": 1,
+            "adapt": {"ticks": {"prefill": 2, "decode": 9, "idle": 0}, "hot_pair_rate": {"mean": 65.0}}}
+
+
+def test_mixed_thinking_phase_metrics_and_report():
+    runs = [mixed_run("a", 20, 25), mixed_run("a", 21, 26), mixed_run("b", 20, 25), mixed_run("b", 22, 27)]
+    m = ab.run_metrics(runs[0])
+    assert m["phase.thinking.tok_s"] == pytest.approx(20) and m["phase.plain.tok_s"] == pytest.approx(25)
+    assert m["phase.thinking.hot_pair"] == 60.0 and m["wall.r2-plain"] == pytest.approx(24)
+    summary = ab.build_summary(runs, ["a", "b"])
+    meta = {"stamp": "t", "cache_state": "cold", "plan_mode": "backup", "adapt_interval": "150", "repeats": 1,
+            "workload": "mixed-thinking", "order_labels": ["a", "b"], "arms": {"a": {"sha": "1" * 40}, "b": {"sha": "2" * 40}}}
+    report = ab.render_report(meta, runs, summary)
+    assert "## Per phase" in report and "## Wall s per task" in report and "## NVMe GiB per task" in report
+    assert "r3-think" in report
+
+
+def test_hot_pair_rate_is_attached_per_request_by_timestamp():
+    adapt = load("adapt_ticks_check2", "adapt-ticks-check.py")
+    text = (ROOT / "tests" / "bench_fixtures" / "journal-ticks.log").read_text()
+    events = adapt.tick_events(text)
+    t = events[0][0]
+    rows = [{"name": "x", "t_start": t - 2, "t_end": t + 8, "wall": 10}, {"name": "y", "t_start": t + 3600, "t_end": t + 3700}]
+    ab.attach_hot_pair_rates(rows, text, adapt)
+    assert rows[0]["hot_pair_rate"] == pytest.approx((66.55 + 54.88) / 2)  # ticks at +0 s and +7 s
+    assert rows[1]["hot_pair_rate"] is None
+
+
+def test_client_mixed_workload_shape_and_disjoint_warmup():
+    assert len(client.MIXED) == 12 and [m[2] for m in client.MIXED] == [True, False] * 6
+    assert len({m[1] for m in client.MIXED}) == 12
+    client.check_disjoint(client.WARMUP, client.MIXED)
+
+
+def test_dry_run_mixed_thinking_end_to_end(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(ab.subprocess, "run", lambda cmd, *a, **k: subprocess.CompletedProcess(cmd, 0, "d" * 40, ""))
+    rc = ab.main(["--dry-run", "--dropin", str(FIXTURE), "--results-dir", str(tmp_path / "r"), "--workload", "mixed-thinking",
+                  "--arm", "a=main", "--arm", "b=main"])
+    out = capsys.readouterr().out
+    assert rc == 0 and out.count("--workload mixed-thinking") == 4 and out.count("GPU guard") == 4
+    assert "--max-tokens" not in out

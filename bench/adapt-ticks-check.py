@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Sum HOT adapter ticks from a server journal and judge whether a hot-set A/B arm is valid.
+"""Count HOT adapter ticks (per-tick log lines) in a server journal and judge whether a hot-set A/B arm is valid.
 
-The scheduler logs hot_adapt_ticks_{prefill,decode,idle} as deltas since the previous
-stats line, so an arm total is the sum over every line. A hot-set knob (prefill weight,
+Ticks are counted per boundary from "MoE HOT adaptation tick" lines (fallback: the
+hot_adapt_ticks_{prefill,decode,idle} stats, logged as deltas since the previous stats
+line, summed over every line). A hot-set knob (prefill weight,
 capacity policy, history split, aim) only changes what the adapter aims at, so an arm
 in which the adapter never ticked measures the stale starting plan and reads neutral
 (issue #23). Usage: adapt-ticks-check.py JOURNAL [--require] [--min-ticks N]
@@ -11,17 +12,45 @@ in which the adapter never ticked measures the stale starting plan and reads neu
 import argparse
 import re
 import sys
+import time
 
 _TICKS = re.compile(r"hot_adapt_ticks_(prefill|decode|idle): (\d+)")
 _INTERVAL = re.compile(r"hot_adapt_interval: (\d+)")
+# The production server logs one line per tick (the hot_adapt_ticks_* stats above are not logged):
+#   MoE HOT adaptation tick token=775, boundary=decode: decayed_hot_pair_rate=77.06%, ticks=1, ...
+_TICK_LINE = re.compile(r"MoE HOT adaptation tick .*?boundary=(\w+): decayed_hot_pair_rate=([\d.]+)%")
+_STAMP = re.compile(r"(\d{4}-\d\d-\d\d)\|(\d\d:\d\d:\d\d)\|")
+_BATCH_RATE = re.compile(r"(?<!decayed_)(?<!profiled )hot_pair_rate[:=] ?([\d.]+)%")
 _MODE = re.compile(r"MoE HOT adaptation intervals: mode=(\S+?),.*?current_interval=(\d+)")
 
 
+def tick_events(text):
+    """[(epoch or None, boundary, decayed_hot_pair_rate %)] for every per-tick log line (local time stamps)."""
+    events = []
+    for line in text.splitlines():
+        m = _TICK_LINE.search(line)
+        if not m:
+            continue
+        st = _STAMP.search(line)
+        epoch = time.mktime(time.strptime(f"{st.group(1)} {st.group(2)}", "%Y-%m-%d %H:%M:%S")) if st else None
+        events.append((epoch, m.group(1), float(m.group(2))))
+    return events
+
+
 def summarize(text):
-    """Return per-boundary tick sums plus the startup mode and last logged interval."""
+    """Return per-boundary tick counts plus the startup mode, last logged interval and hot pair rates.
+
+    Ticks are counted from the per-tick log lines; the older hot_adapt_ticks_* stats deltas are the fallback."""
     ticks = {"prefill": 0, "decode": 0, "idle": 0}
-    for kind, value in _TICKS.findall(text):
-        ticks[kind] += int(value)
+    events = tick_events(text)
+    if events:
+        for _, boundary, _ in events:
+            if boundary in ticks:
+                ticks[boundary] += 1
+    else:
+        for kind, value in _TICKS.findall(text):
+            ticks[kind] += int(value)
+    rates = [r for _, _, r in events] or [float(v) for v in _BATCH_RATE.findall(text)]
     mode = _MODE.search(text)
     intervals = _INTERVAL.findall(text)
     return {
@@ -29,6 +58,8 @@ def summarize(text):
         "mode": mode.group(1) if mode else None,
         "startup_interval": int(mode.group(2)) if mode else None,
         "last_interval": int(intervals[-1]) if intervals else None,
+        "hot_pair_rate": {"n": len(rates), "mean": sum(rates) / len(rates), "min": min(rates), "max": max(rates),
+                          "last": rates[-1]} if rates else None,
     }
 
 

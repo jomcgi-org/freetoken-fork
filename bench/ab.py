@@ -31,7 +31,7 @@ SERVE_SCRIPT = "scripts/serve-qwen-flash-4090.sh"
 ADAPT_FLAG = "--moe-hot-adapt-interval-steps"
 CLIENT = HERE / "ab-client.py"
 GIT_RO = ["git", "-c", "safe.directory=*"]  # read-only git as root in jomcgi-owned trees
-TASKS = ["essay1", "essay2", "doc", "essay1b"]
+GPU_QUERY = ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"]
 
 
 class Interrupted(BaseException):
@@ -123,17 +123,39 @@ def compare(base, other, lower_is_better):
 
 
 def run_metrics(rec):
-    """Flat metric dict for one OK run: total_wall, tok_s.<task>, nvme_gib, nvme.<task>, adapt_ticks, majflt."""
+    """Flat metric dict for one OK run: total_wall, wall./tok_s./nvme.<task>, nvme_gib, adapt_ticks,
+    hot_pair_rate, and for mixed-thinking phase.<thinking|plain>.{tok_s,hot_pair} (round 1 is warm-up)."""
     tasks = {t["name"]: t for t in rec.get("client", [])}
     m = {"total_wall": sum(t["wall"] for t in tasks.values()), "nvme_gib": rec.get("nvme_gib"),
          "pgmajfault": rec.get("pgmajfault")}
     for name, t in tasks.items():
+        m[f"wall.{name}"] = t["wall"]
         m[f"tok_s.{name}"] = t["tokens"] / t["wall"] if t["wall"] else 0.0
         m[f"nvme.{name}"] = t.get("nvme_gib")
-    t = (rec.get("adapt") or {}).get("ticks")
-    if t:
-        m["adapt_ticks"] = t["prefill"] + t["decode"]
+    for phase, flag in (("thinking", True), ("plain", False)):
+        rows = [t for t in tasks.values() if t.get("thinking") is flag and t.get("round", 1) > 1]
+        if rows:
+            m[f"phase.{phase}.tok_s"] = sum(t["tokens"] for t in rows) / sum(t["wall"] for t in rows)
+            rates = [t["hot_pair_rate"] for t in rows if t.get("hot_pair_rate") is not None]
+            if rates:
+                m[f"phase.{phase}.hot_pair"] = statistics.fmean(rates)
+    adapt = rec.get("adapt") or {}
+    if adapt.get("ticks"):
+        m["adapt_ticks"] = adapt["ticks"]["prefill"] + adapt["ticks"]["decode"]
+    if adapt.get("hot_pair_rate"):
+        m["hot_pair_rate"] = adapt["hot_pair_rate"]["mean"]
     return m
+
+
+def attach_hot_pair_rates(rows, journal_text, adapt):
+    """Per request: mean decayed_hot_pair_rate of the tick lines logged while it ran (None if no tick fired)."""
+    events = [e for e in adapt.tick_events(journal_text) if e[0] is not None]
+    for r in rows:
+        if "t_start" not in r:
+            continue
+        # journal stamps have 1 s resolution
+        hits = [rate for ts, _, rate in events if int(r["t_start"]) <= ts <= r["t_end"] + 1]
+        r["hot_pair_rate"] = sum(hits) / len(hits) if hits else None
 
 
 def summarize_runs(runs, arm_names):
@@ -150,12 +172,13 @@ def summarize_runs(runs, arm_names):
         out[name] = {"n_ok": sum(r["status"] == "OK" for r in mine),
                      "n_failed": sum(r["status"] == "FAILED" for r in mine),
                      "n_invalid": sum(r["status"] == "INVALID" for r in mine),
+                     "n_contaminated": sum(r["status"] == "CONTAMINATED" for r in mine),
                      "metrics": {k: stats(v) for k, v in vals.items()}}
     return out
 
 
 def lower_is_better(metric):
-    return not metric.startswith("tok_s.")
+    return "tok_s" not in metric and "hot_pair" not in metric
 
 
 def build_summary(runs, arm_names):
@@ -176,9 +199,10 @@ def build_summary(runs, arm_names):
             warnings.append(f"NVMe read differs {a['mean']:.1f} vs {b['mean']:.1f} GiB between {base} and {other}: "
                             "cache state is not comparable, treat the deltas as suspect")
     for name in arm_names:
-        if per_arm[name]["n_failed"] or per_arm[name]["n_invalid"]:
-            warnings.append(f"arm {name}: {per_arm[name]['n_failed']} failed and {per_arm[name]['n_invalid']} "
-                            "invalid run(s) excluded from the statistics")
+        p = per_arm[name]
+        if p["n_failed"] or p["n_invalid"] or p["n_contaminated"]:
+            warnings.append(f"arm {name}: {p['n_failed']} failed, {p['n_invalid']} invalid and {p['n_contaminated']} "
+                            "contaminated (foreign GPU process) run(s) excluded from the statistics")
     return {"arms": per_arm, "baseline": base, "deltas": deltas, "warnings": warnings}
 
 
@@ -192,29 +216,47 @@ def render_report(meta, runs, summary):
     arms = list(summary["arms"])
     L = [f"# A/B report {meta['stamp']}", "",
          f"cache-state={meta['cache_state']} plan-mode={meta['plan_mode']} adapt-interval={meta['adapt_interval']} "
-         f"repeats={meta['repeats']} order={' '.join(meta['order_labels'])}", ""]
+         f"workload={meta.get('workload', 'default')} repeats={meta['repeats']} order={' '.join(meta['order_labels'])}", ""]
     for w in summary["warnings"]:
         L.append(f"> WARNING: {w}")
     L += ["", "Cells are mean (min-max) over OK runs. Wall in seconds, tok/s per task.", "",
-          "## Per arm", "", "| arm | revision | ok/fail/invalid | total wall s | NVMe GiB | adapt ticks | major faults |",
+          "## Per arm", "", "| arm | revision | ok/fail/invalid/contaminated | total wall s | NVMe GiB | adapt ticks | major faults |",
           "|---|---|---|---|---|---|---|"]
     for a in arms:
         s, m = summary["arms"][a], summary["arms"][a]["metrics"]
-        L.append(f"| {a} | {meta['arms'][a]['sha'][:12]} | {s['n_ok']}/{s['n_failed']}/{s['n_invalid']} | "
+        L.append(f"| {a} | {meta['arms'][a]['sha'][:12]} | {s['n_ok']}/{s['n_failed']}/{s['n_invalid']}/{s['n_contaminated']} | "
                  f"{_f(m.get('total_wall'))} | {_f(m.get('nvme_gib'))} | {_f(m.get('adapt_ticks'), '{:.0f}')} | "
                  f"{_f(m.get('pgmajfault'), '{:.0f}')} |")
-    L += ["", "## tok/s per task", "", "| arm | " + " | ".join(TASKS) + " |", "|---|" + "---|" * len(TASKS)]
-    for a in arms:
-        L.append(f"| {a} | " + " | ".join(_f(summary['arms'][a]['metrics'].get(f'tok_s.{t}'), '{:.2f}') for t in TASKS) + " |")
-    L += ["", "NVMe GiB per task (cache-state check):", "", "| arm | " + " | ".join(TASKS) + " |", "|---|" + "---|" * len(TASKS)]
-    for a in arms:
-        L.append(f"| {a} | " + " | ".join(_f(summary['arms'][a]['metrics'].get(f'nvme.{t}'), '{:.2f}') for t in TASKS) + " |")
+    tasks = []
+    for r in runs:
+        for t in r.get("client", []):
+            if t["name"] not in tasks:
+                tasks.append(t["name"])
+
+    def task_table(title, key, fmt):
+        L.extend(["", title, "", "| arm | " + " | ".join(tasks) + " |", "|---|" + "---|" * len(tasks)])
+        for a in arms:
+            L.append(f"| {a} | " + " | ".join(_f(summary["arms"][a]["metrics"].get(f"{key}.{t}"), fmt) for t in tasks) + " |")
+
+    task_table("## tok/s per task", "tok_s", "{:.2f}")
+    task_table("## Wall s per task (mean (min-max): per-task variance under identical conditions)", "wall", "{:.1f}")
+    task_table("## NVMe GiB per task (cache-state check)", "nvme", "{:.2f}")
+    if any(k.startswith("phase.") for a in arms for k in summary["arms"][a]["metrics"]):
+        L += ["", "## Per phase (mixed-thinking; round 1 excluded as warm-up)", "",
+              "| arm | thinking tok/s | plain tok/s | thinking hot pair % | plain hot pair % |", "|---|---|---|---|---|"]
+        for a in arms:
+            m = summary["arms"][a]["metrics"]
+            L.append(f"| {a} | " + " | ".join(_f(m.get(f"phase.{p}.{k}"), "{:.2f}") for k in ("tok_s", "hot_pair")
+                                               for p in ("thinking", "plain")) + " |")
+        L += ["", "Reasoning vs content tokens per request are in summary.json (`runs[].client[]`)."]
+    L += ["", "Mean decayed hot pair rate over all adapt ticks, %: " + ", ".join(
+        f"{a}={_f(summary['arms'][a]['metrics'].get('hot_pair_rate'))}" for a in arms)]
     L += ["", f"## Delta vs {summary['baseline']}", "",
           "Delta is other minus baseline on the means; neutral when inside the larger arm's min-max spread.", "",
           "| arm | metric | delta | % | verdict |", "|---|---|---|---|---|"]
     for other, ds in summary["deltas"].items():
         for metric, d in ds.items():
-            if metric.startswith(("total_wall", "tok_s.")):
+            if metric.startswith(("total_wall", "tok_s.", "wall.", "phase.")) and "hot_pair" not in metric:
                 pct = f"{d['pct']:+.1f}%" if d["pct"] is not None else "n/a"
                 L.append(f"| {other} | {metric} | {d['delta']:+.2f} | {pct} | {d['verdict']} |")
     L += ["", "## Runs", "", "| # | arm | status | wall s | NVMe GiB | major faults | Cached start GiB | ticks p/d/i | cpu C min-max | note |",
@@ -331,6 +373,33 @@ def port_listening(port):
     with socket.socket() as s:
         s.settimeout(1)
         return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def parse_gpu_apps(text):
+    """[(pid, name, MiB)] from `nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader`."""
+    apps = []
+    for line in text.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3 and parts[0].isdigit():
+            mib = re.match(r"\d+", parts[2])
+            apps.append((int(parts[0]), parts[1], int(mib.group()) if mib else 0))
+    return apps
+
+
+def in_unit(pid, unit):
+    """True when the process belongs to the arm's systemd unit; a vanished process counts as ours (no verdict)."""
+    try:
+        return f"{unit}.service" in Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return True
+
+
+def foreign_gpu_apps(unit=None):
+    """GPU compute processes that are not part of `unit` (all of them when unit is None)."""
+    out = subprocess.run(GPU_QUERY, capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        raise RuntimeError(f"nvidia-smi failed: {out.stderr.strip()}")
+    return [a for a in parse_gpu_apps(out.stdout) if unit is None or not in_unit(a[0], unit)]
 
 
 # ---------------------------------------------------------------- runner
@@ -480,6 +549,19 @@ class Runner:
         cmd, env = self.build_unit_cmd(arm, unit, cache_dir)
         rec["command"], rec["unit_env"] = cmd, env
         self.say(f"--- run {slot + 1}/{len(self.order)} arm {name} ({unit})")
+        if self.dry:
+            print(f"# GPU guard: wait up to {self.args.gpu_wait_minutes} min until `{' '.join(GPU_QUERY)}` lists "
+                  "no process, else FAILED", flush=True)
+        else:
+            busy = self.wait_gpu_free()
+            if busy:
+                rec.update(status="FAILED", gpu_foreign=busy,
+                           reason=f"GPU not free after {self.args.gpu_wait_minutes} min: " +
+                                  ", ".join(f"pid {p} {n} {m} MiB" for p, n, m in busy))
+                self.say(f"{name}: {rec['reason']}")
+                (self.out / f"{tag}.run.json").write_text(json.dumps(rec, indent=1))
+                self.runs.append(rec)
+                return
         self.reset_plan()
         self.do(f"mkdir {cache_dir} (empty, owned by {USER})", self._mkcache, cache_dir)
         if self.args.cache_state == "cold":
@@ -487,7 +569,7 @@ class Runner:
             self.do("echo 3 > /proc/sys/vm/drop_caches", lambda: Path("/proc/sys/vm/drop_caches").write_text("3"))
         elif self.dry:
             print("# warm: client runs the cache-disjoint warmup prompts before the measured ones", flush=True)
-        temps, stop = [], threading.Event()
+        temps, stop, foreign = [], threading.Event(), {}
         pre = None if self.dry else dict(sectors=diskstats_sectors(self.model), maj=vmstat("pgmajfault"),
                                           cached=meminfo_kb("Cached"))
         rec["cached_kb_start"] = pre and pre["cached"]
@@ -499,12 +581,19 @@ class Runner:
                     t = read_cpu_temp()
                     if t is not None:
                         temps.append(t)
+                    try:
+                        for pid, pname, mib in foreign_gpu_apps(unit):
+                            foreign[pid] = {"pid": pid, "name": pname, "mib": max(mib, foreign.get(pid, {}).get("mib", 0))}
+                    except (RuntimeError, OSError, subprocess.SubprocessError):
+                        pass
                     stop.wait(10)
             sampler = threading.Thread(target=sample, daemon=True)
             sampler.start()
         client_log, client_json = self.out / f"{tag}.client.log", self.out / f"{tag}.client.json"
         client_cmd = ["sudo", "-n", "-u", USER, str(VENV / "python"), str(CLIENT), str(client_json),
-                      "--port", str(PORT), "--max-tokens", str(self.args.max_tokens), "--request-cap", str(self.args.request_cap)]
+                      "--workload", self.args.workload, "--port", str(PORT), "--request-cap", str(self.args.request_cap)]
+        if self.args.max_tokens:
+            client_cmd += ["--max-tokens", str(self.args.max_tokens)]
         if self.args.cache_state == "warm":
             client_cmd.append("--warmup")
         try:
@@ -539,7 +628,13 @@ class Runner:
         rec["cached_kb_end"] = meminfo_kb("Cached")
         rec["temp_min"], rec["temp_max"] = (min(temps), max(temps)) if temps else (None, None)
         rec["journal"] = str(jr)
-        rec["adapt"] = self.adapt.summarize(Path(jr).read_text(errors="ignore"))
+        jtext = Path(jr).read_text(errors="ignore")
+        rec["adapt"] = self.adapt.summarize(jtext)
+        attach_hot_pair_rates(rec.get("client", []), jtext, self.adapt)
+        rec["gpu_foreign"] = sorted(foreign.values(), key=lambda f: f["pid"])
+        if foreign and rec["status"] in ("OK", "INVALID"):
+            rec.update(status="CONTAMINATED", reason="foreign GPU process during the arm: " +
+                       ", ".join(f"pid {f['pid']} {f['name']} {f['mib']} MiB" for f in rec["gpu_foreign"]))
         if rec["status"] == "OK" and self.args.hotset_knob and self.adapt.verdict(rec["adapt"], self.args.min_adapt_ticks) == "INVALID":
             rec.update(status="INVALID", reason=f"fewer than {self.args.min_adapt_ticks} non-idle adapt ticks (issue #23)")
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -547,6 +642,24 @@ class Runner:
         self.runs.append(rec)
         self.say(f"{name}: {rec['status']} wall={rec['arm_wall']:.0f}s nvme={rec['nvme_gib']:.1f}GiB "
                  f"ticks={rec['adapt']['ticks']} {rec.get('reason', '')}")
+
+    def ensure_results_dir(self):
+        pw = pwd.getpwnam(USER)
+        self.out.mkdir(parents=True, exist_ok=True)
+        os.chown(self.out, pw.pw_uid, pw.pw_gid)
+
+    def wait_gpu_free(self):
+        """Wait up to --gpu-wait-minutes for the GPU to have no compute processes; returns the blockers or []."""
+        deadline = time.time() + self.args.gpu_wait_minutes * 60
+        while True:
+            try:
+                apps = foreign_gpu_apps()
+            except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+                return [(0, f"GPU query failed: {e}", 0)]
+            if not apps or time.time() >= deadline:
+                return apps
+            self.say(f"GPU busy ({apps}); waiting")
+            time.sleep(15)
 
     def _mkcache(self, d):
         pw = pwd.getpwnam(USER)
@@ -602,9 +715,10 @@ class Runner:
         names = list(self.arms)
         self.order = balanced_order(names, self.args.repeats)
         meta = {"stamp": self.stamp, "cache_state": self.args.cache_state, "plan_mode": self.args.plan_mode,
-                "adapt_interval": self.args.adapt_interval, "repeats": self.args.repeats, "order_labels": self.order}
+                "adapt_interval": self.args.adapt_interval, "workload": self.args.workload, "repeats": self.args.repeats, "order_labels": self.order}
         print(f"results dir: {self.out}\norder: {' '.join(self.order)}", flush=True)
-        self.do(f"mkdir -p {self.out}", lambda: self.out.mkdir(parents=True, exist_ok=True))
+        self.do(f"mkdir -p {self.out} (owned by {USER}: the client runs as {USER} and writes its JSON there)",
+                self.ensure_results_dir)
         lock = None
         if self.dry:
             print(f"# flock -xn {LOCK} for the whole run", flush=True)
@@ -662,7 +776,11 @@ def make_parser():
     p.add_argument("--min-adapt-ticks", type=int, default=3)
     p.add_argument("--dropin", default=DROPIN)
     p.add_argument("--results-dir")
-    p.add_argument("--max-tokens", type=int, default=1000)
+    p.add_argument("--workload", choices=["default", "mixed-thinking"], default="default",
+                   help="default: essays + doc, 1000 tokens; mixed-thinking: 6 rounds of thinking/plain, 600 tokens")
+    p.add_argument("--gpu-wait-minutes", type=int, default=10,
+                   help="before each arm, wait this long for other GPU processes to exit, then fail the arm")
+    p.add_argument("--max-tokens", type=int, default=None, help="override the workload's output length")
     p.add_argument("--ready-timeout", type=int, default=900)
     p.add_argument("--request-cap", type=int, default=900, help="per-request wall cap, seconds")
     p.add_argument("--no-progress-timeout", type=int, default=300)
