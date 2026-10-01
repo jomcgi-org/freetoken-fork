@@ -21,6 +21,10 @@ class SchedulerStatusReporter:
     clock: Callable[[], float] = time.perf_counter
     decode_log_interval: int = 40
     disk_prefix_store: object | None = None
+    # HostCacheMonitor, sampled once per decode status line and at most once per
+    # prefill_sample_interval_s of prefill chunks; never per decode step.
+    host_monitor: object | None = None
+    prefill_sample_interval_s: float = 1.0
     _last_prefill_time: float = field(init=False)
     _last_decode_time: float = field(init=False)
     _decode_forward_count: int = field(default=0, init=False)
@@ -31,6 +35,8 @@ class SchedulerStatusReporter:
     _decode_timing_totals: dict[str, float] = field(default_factory=dict, init=False)
     _constrained_requests: int = field(default=0, init=False)
     _mask_us: float = field(default=0.0, init=False)
+    _prefill_chunks_unsampled: int = field(default=0, init=False)
+    _last_prefill_sample: float | None = field(default=None, init=False)
     oom_aborts: int = field(default=0, init=False)
     client_aborts: int = field(default=0, init=False)
 
@@ -127,6 +133,7 @@ class SchedulerStatusReporter:
             f"{', ' if queue_priority_bands is not None else ''}"
             f"input throughput (token/s): {input_throughput:.2f}"
             f"{self._disk_prefix_msg()}"
+            f"{self._host_cache_msg('prefill', now)}"
         )
 
     def _report_decode(
@@ -253,7 +260,31 @@ class SchedulerStatusReporter:
             f", constrained_requests: {constrained_requests}, mask_us: {mask_us:.0f}"
             f"{timing_msg}"
             f"{self._disk_prefix_msg()}"
+            f"{self._host_cache_msg('decode', now)}"
         )
+
+    def _host_cache_msg(self, kind: str, now: float) -> str:
+        """Sample the host page-cache counters and format the new status fields.
+
+        Decode samples once per status line (``decode_log_interval`` steps). Prefill
+        samples once per ``prefill_sample_interval_s`` of chunks, so a burst of tiny
+        prefills does not read procfs per request.
+        """
+        monitor = self.host_monitor
+        if monitor is None:
+            return ""
+        if kind == "decode":
+            snap = monitor.sample("decode", self.decode_log_interval)
+        else:
+            monitor.note_prefill()
+            self._prefill_chunks_unsampled += 1
+            last = self._last_prefill_sample
+            if last is not None and now - last < self.prefill_sample_interval_s:
+                return ""
+            self._last_prefill_sample = now
+            chunks, self._prefill_chunks_unsampled = self._prefill_chunks_unsampled, 0
+            snap = monitor.sample("prefill", chunks)
+        return monitor.status_fragment(snap)
 
     def _disk_prefix_msg(self) -> str:
         if self.disk_prefix_store is None:

@@ -557,3 +557,234 @@ def govern_host_memory(
         )
 
     return budgets
+
+
+# Major faults per decode step above which the DISK tier is treated as crawling.
+# Half of --moe-cpu-willneed-fault-ceiling (2000), the rate at which the CPU
+# executor already abandons its own WILLNEED optimisation as unsafe: warning
+# there would be too late to be useful, while healthy decode with warm banks
+# faults orders of magnitude less. Not calibrated on hardware; see #82.
+DEFAULT_PRESSURE_MAJFLT_PER_STEP = 1000.0
+_PRESSURE_WARN_INTERVAL_S = 300.0
+_GIB = 2**30
+
+
+def _read_kv_kib(path: Path, keys: tuple[str, ...]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        key, _, raw = line.partition(":")
+        if key in keys:
+            fields = raw.split()
+            if fields:
+                out[key] = int(fields[0]) / 2**20  # kB -> GiB
+    return out
+
+
+def _read_self_faults(proc: Path) -> tuple[int, int] | None:
+    """``(minflt, majflt)`` of this process from ``/proc/self/stat``."""
+    try:
+        tail = (proc / "self/stat").read_text(encoding="utf-8").rpartition(") ")[2].split()
+        return int(tail[7]), int(tail[9])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _read_pgmajfault(proc: Path) -> int | None:
+    try:
+        for line in (proc / "vmstat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("pgmajfault "):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+class HostCacheMonitor:
+    """Live page-cache counters and the file-cache pressure flag.
+
+    Reads a handful of procfs files per :meth:`sample`; callers invoke it at most
+    once per status-line interval or prefill chunk, never per decode step.
+    ``steps`` is the number of decode forwards (or prefill chunks) since the last
+    sample, which turns the fault delta into a per-step rate.
+
+    Pressure is true when the memory the DISK tier's page cache can occupy
+    (``MemAvailable``: free plus reclaimable cache; pinned and locked pages are
+    not in it) is below the startup estimate ``disk_tier_cache + prefix-cache
+    headroom``, or when decode major faults per step exceed ``max_majflt_per_step``.
+    A flip to true logs one WARNING, rate-limited to ``warn_interval_s``.
+    """
+
+    def __init__(
+        self,
+        *,
+        reserve_gib: float = 0.0,
+        disk_tier_cache_gib: float = 0.0,
+        prefix_cache_headroom_gib: float = 0.0,
+        max_majflt_per_step: float = DEFAULT_PRESSURE_MAJFLT_PER_STEP,
+        warn=None,
+        warn_interval_s: float = _PRESSURE_WARN_INTERVAL_S,
+        proc_root: str | os.PathLike[str] = "/proc",
+        clock=None,
+    ) -> None:
+        import time
+
+        self.reserve_gib = float(reserve_gib)
+        self.disk_tier_cache_gib = float(disk_tier_cache_gib)
+        self.prefix_cache_headroom_gib = float(prefix_cache_headroom_gib)
+        self.max_majflt_per_step = float(max_majflt_per_step)
+        self._warn = warn if warn is not None else logger.warning_rank0
+        self._warn_interval_s = warn_interval_s
+        self._proc = Path(proc_root)
+        self._clock = clock or time.monotonic
+        self._base_faults: tuple[int, int] | None = None
+        self._base_pgmajfault: int | None = None
+        self._last_warn: float | None = None
+        self._dirty = False
+        self._prefill_since_sample = False
+        self._fault_reason: str | None = None
+        self.pressure = False
+        self.reasons: list[str] = []
+        self.latest: dict | None = None
+
+    @classmethod
+    def from_budgets(cls, budgets: HostMemoryBudgets, **kwargs) -> "HostCacheMonitor":
+        return cls(
+            reserve_gib=budgets.reserve_gib,
+            disk_tier_cache_gib=budgets.disk_tier_cache_gib,
+            prefix_cache_headroom_gib=budgets.prefix_cache_headroom_gib,
+            **kwargs,
+        )
+
+    @property
+    def demand_gib(self) -> float:
+        return self.disk_tier_cache_gib + self.prefix_cache_headroom_gib
+
+    def note_prefill(self) -> None:
+        """A prefill chunk ran since the last sample (its faults are not decode's)."""
+        self._prefill_since_sample = True
+
+    def sample(self, kind: str, steps: int = 1) -> dict:
+        """Read the counters, update the pressure flag and return the snapshot.
+
+        ``kind`` is ``"decode"`` or ``"prefill"``. The per-step fault rate is only
+        meaningful, and only judged against the threshold, for a decode sample
+        whose window held no prefill chunk.
+        """
+        now = self._clock()
+        faults = _read_self_faults(self._proc)
+        pgmajfault = _read_pgmajfault(self._proc)
+        mem = _read_kv_kib(self._proc / "meminfo", ("Cached", "MemAvailable"))
+        majflt_delta = None
+        if faults is not None and self._base_faults is not None:
+            majflt_delta = faults[1] - self._base_faults[1]
+        minflt_delta = (
+            faults[0] - self._base_faults[0]
+            if faults is not None and self._base_faults is not None else None
+        )
+        sys_majflt_delta = (
+            pgmajfault - self._base_pgmajfault
+            if pgmajfault is not None and self._base_pgmajfault is not None else None
+        )
+        self._base_faults, self._base_pgmajfault = faults, pgmajfault
+        steps = max(1, int(steps))
+        majflt_per_step = None
+        if majflt_delta is not None and kind == "decode" and not self._prefill_since_sample:
+            majflt_per_step = majflt_delta / steps
+        self._prefill_since_sample = False
+
+        available = mem.get("MemAvailable")
+        reasons: list[str] = []
+        if (
+            available is not None
+            and self.demand_gib > 0
+            and available < self.demand_gib
+        ):
+            reasons.append(
+                f"MemAvailable {available:.2f} GiB is below the estimated DISK-tier "
+                f"page-cache demand {self.demand_gib:.2f} GiB "
+                f"(disk_tier_cache={self.disk_tier_cache_gib:.2f} + "
+                f"prefix_cache_headroom={self.prefix_cache_headroom_gib:.2f})"
+            )
+        if majflt_per_step is not None:
+            # Only a clean decode window re-judges the fault condition; any other
+            # sample keeps the last verdict rather than clearing it.
+            self._fault_reason = (
+                f"{majflt_per_step:.0f} major faults per decode step exceeds "
+                f"{self.max_majflt_per_step:.0f}"
+                if majflt_per_step > self.max_majflt_per_step else None
+            )
+        if self._fault_reason:
+            reasons.append(self._fault_reason)
+        flipped = bool(reasons) and not self.pressure
+        self.pressure, self.reasons = bool(reasons), reasons
+        if flipped and (
+            self._last_warn is None or now - self._last_warn >= self._warn_interval_s
+        ):
+            self._last_warn = now
+            self._warn(
+                "HOST FILE CACHE PRESSURE (live): " + "; ".join(reasons) + ". "
+                "DISK-tier reads are likely page-cache misses; lower "
+                "--moe-hot-expert-budget-gib / --kv-reserve-tokens or raise "
+                "--host-cache-reserve-gib."
+            )
+        self.latest = {
+            "kind": kind,
+            "pressure": self.pressure,
+            "pressure_reasons": list(reasons),
+            "majflt_per_step": majflt_per_step,
+            "majflt_delta": majflt_delta,
+            "minflt_delta": minflt_delta,
+            "system_pgmajfault_delta": sys_majflt_delta,
+            "cached_gib": mem.get("Cached"),
+            "mem_available_gib": available,
+            "steps": steps,
+        }
+        self._dirty = True
+        return self.latest
+
+    def pop_fresh(self) -> dict | None:
+        """The ``host_memory`` block for a snapshot not yet handed out, else ``None``."""
+        if not self._dirty:
+            return None
+        self._dirty = False
+        return self.stats_block()
+
+    def stats_block(self) -> dict:
+        """The ``host_memory`` document: the startup estimate beside live values."""
+        live = dict(self.latest or {})
+        return {
+            "estimate": {
+                "reserve_gib": round(self.reserve_gib, 2),
+                "disk_tier_cache_gib": round(self.disk_tier_cache_gib, 2),
+                "prefix_cache_headroom_gib": round(self.prefix_cache_headroom_gib, 2),
+            },
+            "live": live or None,
+            "pressure": bool(live.get("pressure", False)),
+            "pressure_reasons": list(live.get("pressure_reasons", [])),
+            "max_majflt_per_step": self.max_majflt_per_step,
+        }
+
+    def status_fragment(self, snap: dict) -> str:
+        """Fields appended to a status line: only what the line did not carry."""
+        parts = []
+        if snap.get("kind") == "decode":
+            rate = snap.get("majflt_per_step")
+            parts.append(
+                "majflt_per_step: " + ("n/a" if rate is None else f"{rate:.1f}")
+            )
+        else:
+            delta = snap.get("majflt_delta")
+            parts.append(
+                "majflt_per_chunk: "
+                + ("n/a" if delta is None else f"{delta / snap['steps']:.1f}")
+            )
+        for key, name in (("cached_gib", "cached_gib"),
+                          ("mem_available_gib", "mem_available_gib")):
+            value = snap.get(key)
+            parts.append(f"{name}: " + ("n/a" if value is None else f"{value:.2f}"))
+        parts.append(f"host_cache_pressure: {int(bool(snap.get('pressure')))}")
+        return ", " + ", ".join(parts)

@@ -438,3 +438,62 @@ def test_disk_status_includes_harness_anchor_counters():
     assert "harness_anchor_persisted_last_message: 7" in line
     assert "harness_anchor_skipped_last_message_shallow: 8" in line
     assert "harness_anchor_skipped_last_message_unaligned: 9" in line
+
+
+class _FakeMonitor:
+    def __init__(self):
+        self.calls: list[tuple[str, int]] = []
+        self.prefills = 0
+
+    def note_prefill(self):
+        self.prefills += 1
+
+    def sample(self, kind, steps=1):
+        self.calls.append((kind, steps))
+        return {"kind": kind, "steps": steps, "majflt_delta": 80, "majflt_per_step": 2.0,
+                "cached_gib": 12.0, "mem_available_gib": 30.0, "pressure": False}
+
+    def status_fragment(self, snap):
+        return f", host={snap['kind']}"
+
+
+def _reporter_with_monitor(interval=2):
+    monitor = _FakeMonitor()
+    logs: list[str] = []
+    clock = {"t": 0.0}
+    rep = SchedulerStatusReporter(
+        log=logs.append, clock=lambda: clock["t"], decode_log_interval=interval,
+        host_monitor=monitor, prefill_sample_interval_s=1.0,
+    )
+    return rep, monitor, logs, clock
+
+
+_KW = dict(running_reqs=1, queue_reqs=0, kv_used_pages=1, kv_total_pages=10, page_size=16)
+
+
+def test_host_monitor_is_sampled_once_per_decode_status_line_not_per_step():
+    rep, monitor, logs, clock = _reporter_with_monitor(interval=3)
+    for _ in range(7):
+        rep.report_batch(_decode_batch(1), **_KW)
+    assert len(logs) == 2  # steps 3 and 6
+    assert monitor.calls == [("decode", 3), ("decode", 3)]
+    assert all(line.endswith(", host=decode") for line in logs)
+
+
+def test_host_monitor_prefill_sampling_is_throttled_by_wall_time():
+    rep, monitor, logs, clock = _reporter_with_monitor()
+    for t in (0.0, 0.2, 0.4, 1.3, 1.4):
+        clock["t"] = t
+        rep.report_batch(_prefill_batch(8, 0, 1), **_KW)
+    assert monitor.prefills == 5  # every chunk marks the decode window dirty
+    # sampled at the first chunk, then at 1.3s covering the 4 chunks since
+    assert monitor.calls == [("prefill", 1), ("prefill", 3)]
+    assert logs[0].endswith(", host=prefill") and ", host=" not in logs[1]
+    assert logs[3].endswith(", host=prefill")
+
+
+def test_status_lines_are_unchanged_without_a_monitor():
+    rep, logs, clock = _reporter(interval=1)
+    rep.report_batch(_decode_batch(1), **_KW)
+    rep.report_batch(_prefill_batch(8, 0, 1), **_KW)
+    assert not any("majflt" in line or "host_cache_pressure" in line for line in logs)

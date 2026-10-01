@@ -165,6 +165,9 @@ class EngineConfig:
     # Host expert-tier budgets are resolved together at engine startup. The pin
     # budget is internal; its explicit input remains FREETOKEN_PIN_BUDGET_GB.
     host_cache_reserve_gib: float | None = None
+    # Live "starts but crawls" detector: decode major faults per step above this
+    # raise the host file-cache pressure flag (see HostCacheMonitor).
+    host_cache_pressure_majflt_per_step: float = 1000.0
     moe_pager_budget_gib: float | None = None
     moe_pin_budget_gib: float | None = field(default=None, init=False, repr=False)
     # Hybrid MoE backend (--moe-backend hybrid): max experts fetched over PCIe per
@@ -562,6 +565,13 @@ class EngineConfig:
         ):
             raise ValueError(
                 "--host-cache-reserve-gib must be a finite non-negative number"
+            )
+        if (
+            not math.isfinite(float(self.host_cache_pressure_majflt_per_step))
+            or self.host_cache_pressure_majflt_per_step <= 0
+        ):
+            raise ValueError(
+                "--host-cache-pressure-majflt-per-step must be a finite positive number"
             )
         if self.moe_pager_budget_gib is not None and (
             not math.isfinite(float(self.moe_pager_budget_gib))

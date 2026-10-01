@@ -37,6 +37,10 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        # Last host_memory block the scheduler attached to a reply (it samples once per
+        # status-line interval, so this is stale while idle) and when it arrived.
+        self.host_memory: dict | None = None
+        self.host_memory_at: float | None = None
 
     @property
     def active(self) -> int:
@@ -74,6 +78,10 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        host_memory = getattr(reply, "host_memory", None)
+        if host_memory:
+            self.host_memory = host_memory
+            self.host_memory_at = t
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -152,7 +160,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "page_size": sps}
         if tr.swa_total_tokens > 0 else None
     )
-    return {
+    doc = {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),
         "uptime_s": uptime_s,
@@ -174,3 +182,11 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "completion_tokens_total": tr.completion_tokens_total,
         },
     }
+    # null off the offload backends (no host-memory governor); otherwise the #111
+    # estimate beside the last live sample. age_s says how stale the sample is.
+    if tr.host_memory is not None:
+        age = time.monotonic() - tr.host_memory_at if tr.host_memory_at is not None else None
+        doc["host_memory"] = {**tr.host_memory, "age_s": None if age is None else round(age, 1)}
+    else:
+        doc["host_memory"] = None
+    return doc

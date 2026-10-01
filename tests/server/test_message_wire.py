@@ -172,6 +172,19 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
 
 
+def test_host_memory_block_round_trips_through_detokenize_and_reply():
+    block = {
+        "estimate": {"reserve_gib": 9.29, "disk_tier_cache_gib": 3.64,
+                     "prefix_cache_headroom_gib": 3.0},
+        "live": {"majflt_per_step": None, "mem_available_gib": 40.5, "pressure": False},
+        "pressure": False, "pressure_reasons": [], "max_majflt_per_step": 1000.0,
+    }
+    msg = DetokenizeMsg(uid=3, next_token=42, finished=False, host_memory=block)
+    decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+    assert decoded.host_memory == block
+    assert DetokenizeMsg(uid=3, next_token=42, finished=False).host_memory is None
+
+
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
     """Tool JSON Schemas and chat_template_kwargs are free-form client data. A field literally
     named ``__type__`` (a common discriminator) must not be read back as a serialized class --

@@ -1381,6 +1381,18 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--host-cache-pressure-majflt-per-step",
+        type=_positive_float,
+        default=ServerArgs.host_cache_pressure_majflt_per_step,
+        help=(
+            "Decode major faults per step above which the live host file-cache "
+            "pressure flag is raised (a rate-limited warning, /v1/stats host_memory, "
+            "and the status line). Default 1000, half of "
+            "--moe-cpu-willneed-fault-ceiling."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-pager-budget-gib",
         type=float,
         default=ServerArgs.moe_pager_budget_gib,

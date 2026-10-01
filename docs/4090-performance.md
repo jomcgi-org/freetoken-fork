@@ -256,3 +256,12 @@ are pinned; `free` understates what locked pages hold.
 Knobs: lower `--moe-hot-expert-budget-gib` or `--kv-reserve-tokens` (less pinned
 memory), or raise `--host-cache-reserve-gib`. An explicit reserve is never
 raised automatically.
+
+While serving, the same condition is watched live. Each decode status line and
+(at most once a second) prefill status line carries `majflt_per_step` (or
+`majflt_per_chunk`), `cached_gib`, `mem_available_gib` and `host_cache_pressure`,
+and `/v1/stats` has a `host_memory` block with the startup estimate beside the
+last live sample. `host_cache_pressure` goes to 1, with one rate-limited
+`HOST FILE CACHE PRESSURE (live)` warning, when `MemAvailable` drops below
+`disk_tier_cache + prefix_cache_headroom` or decode faults exceed
+`--host-cache-pressure-majflt-per-step` (default 1000).
