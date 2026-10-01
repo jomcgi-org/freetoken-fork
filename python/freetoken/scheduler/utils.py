@@ -24,6 +24,8 @@ class PendingReq:
     expert_profile: Any | None = None
     cache_anchor_len: int | None = None
     cache_anchor_kind: str | None = None
+    # Aligned boundary that opens the last message (kind "last_message").
+    cache_last_anchor_len: int | None = None
 
     @property
     def input_len(self) -> int:

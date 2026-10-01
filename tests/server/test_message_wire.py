@@ -120,6 +120,7 @@ def test_request_priority_messages_roundtrip():
         arrival_time=123.5,
         cache_anchor_len=1024,
         cache_anchor_kind="opencode",
+        cache_last_anchor_len=4096,
     )
     decoded_backend = BaseBackendMsg.decoder(backend.encoder())
     assert (decoded_backend.priority, decoded_backend.arrival_time) == (9, 123.5)
@@ -127,6 +128,7 @@ def test_request_priority_messages_roundtrip():
         1024,
         "opencode",
     )
+    assert decoded_backend.cache_last_anchor_len == 4096
 
 
 def test_user_reply_token_deltas_round_trip():

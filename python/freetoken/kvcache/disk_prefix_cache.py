@@ -345,6 +345,9 @@ class DiskPrefixStore:
             "harness_anchor_skipped_final_chunk": 0,
             "harness_anchor_skipped_no_store": 0,
             "harness_anchor_skipped_unaligned": 0,
+            "harness_anchor_persisted_last_message": 0,
+            "harness_anchor_skipped_last_message_shallow": 0,
+            "harness_anchor_skipped_last_message_unaligned": 0,
         }
         self._prefill_tokens_per_s = 0.0
         self._lock = threading.Lock()
@@ -478,6 +481,9 @@ class DiskPrefixStore:
             "harness_anchor_skipped_final_chunk",
             "harness_anchor_skipped_no_store",
             "harness_anchor_skipped_unaligned",
+            "harness_anchor_persisted_last_message",
+            "harness_anchor_skipped_last_message_shallow",
+            "harness_anchor_skipped_last_message_unaligned",
         ):
             raise ValueError(f"unknown harness anchor outcome {outcome!r}")
         with self._lock:

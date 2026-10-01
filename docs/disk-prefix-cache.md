@@ -86,6 +86,30 @@ Scheduler status lines expose `harness_anchor_persisted`, its
 `harness_anchor_skipped_final_chunk`, `harness_anchor_skipped_no_store`, and
 `harness_anchor_skipped_unaligned` alongside the other disk-prefix counters.
 
+### Last-message anchor
+
+Recurrent state cannot be cut back to a shorter prefix, so a cache point must be chosen
+before prefill. Agent loops resend the same history plus one new message, so the most
+reusable point is the boundary that opens the **last** message. The tokenizer renders the
+request a second time with the last message's content replaced by a probe string, finds the
+first differing character, and takes the token right after the last special or added token
+(turn markup) in the text before it. The result is checked against the real prompt's tokens
+and is skipped if the template is not prefix-stable. Nothing about the probe is sent to the
+model, and any failure leaves normal tokenization intact.
+
+The scheduler aligns the boundary to both the hybrid recurrence grid and the disk page size
+(`lcm`), and plans it only when it is at least `LAST_MESSAGE_ANCHOR_MIN_GAIN` (512) tokens
+deeper than the harness root anchor and than the request's cache hit. When both anchors would
+fall inside one prefill chunk, the chunk is ended on the first chunk edge past the root so each
+anchor is snapshotted in its own chunk; persistence then reuses the root-anchor mechanism and
+dedup (`contains`) unchanged. The last-message anchor applies to any chat request, not only
+configured harnesses.
+
+`--kv-last-message-anchor on|off` (default `on`) controls it. It is active only where the
+root anchor is: a hybrid model with `--kv-disk-cache-gib` positive. Status lines add
+`harness_anchor_persisted_last_message`, `harness_anchor_skipped_last_message_shallow` and
+`harness_anchor_skipped_last_message_unaligned`.
+
 ### Single-chunk restart validation on node-4
 
 On 2026-09-22, revision `06f30d8` passed a real serving check with the Qwen

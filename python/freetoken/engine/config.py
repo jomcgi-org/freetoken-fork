@@ -211,6 +211,10 @@ class EngineConfig:
         "opencode=You are OpenCode,",
         "pi=You are a focused coding agent.",
     )
+    # Also persist the state at the boundary that opens each request's last message, so
+    # an agent loop that resends its history plus one new message resumes there. Active
+    # only where the harness root anchor is (hybrid model, disk cache enabled).
+    kv_last_message_anchor: str = "on"
     # Demand-load page-indexed disk QSA KV. Older entries without an index fall back to eager.
     lazy_restore: str = "on"
     # Window/full ratio for the SWA radix cache (`--cache-type radix` on SWA models) and the DSV4
@@ -307,6 +311,8 @@ class EngineConfig:
                     "--kv-harness-prefixes entries must use non-empty kind=prefix syntax, "
                     f"got {entry!r}"
                 )
+        if self.kv_last_message_anchor not in ("on", "off"):
+            raise ValueError("--kv-last-message-anchor must be 'on' or 'off'")
         if self.lazy_restore not in ("on", "off"):
             raise ValueError(
                 f"--lazy-restore must be 'on' or 'off', got {self.lazy_restore!r}"

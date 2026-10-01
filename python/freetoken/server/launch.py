@@ -196,15 +196,13 @@ def launch_server(
         world_size = server_args.tp_info.size
         ack_queue: mp.Queue = mp.Queue()
         processes: list[mp.Process] = []
-        harness_prefixes = (
-            server_args.kv_harness_prefixes
-            if (
-                server_args.kv_disk_cache_gib > 0
-                and server_args.cache_type != "naive"
-                and server_args.model_config.has_linear_attention
-            )
-            else ()
+        anchors_enabled = (
+            server_args.kv_disk_cache_gib > 0
+            and server_args.cache_type != "naive"
+            and server_args.model_config.has_linear_attention
         )
+        harness_prefixes = server_args.kv_harness_prefixes if anchors_enabled else ()
+        last_message_anchor = anchors_enabled and server_args.kv_last_message_anchor == "on"
 
         for i in range(world_size):
             new_args = replace(server_args, tp_info=DistributedInfo(i, world_size))
@@ -230,6 +228,7 @@ def launch_server(
                 "create": server_args.tokenizer_create_addr,
                 "tokenizer_id": num_tokenizers,
                 "harness_prefixes": harness_prefixes,
+                "last_message_anchor": last_message_anchor,
                 "ack_queue": ack_queue,
             },
             daemon=False,
@@ -250,6 +249,7 @@ def launch_server(
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
                     "harness_prefixes": harness_prefixes,
+                    "last_message_anchor": last_message_anchor,
                     "ack_queue": ack_queue,
                 },
                 daemon=False,

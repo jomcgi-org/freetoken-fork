@@ -92,6 +92,9 @@ def test_store_round_trip_with_synthetic_hybrid_state(tmp_path):
     assert stats["harness_anchor_skipped_final_chunk"] == 0
     assert stats["harness_anchor_skipped_no_store"] == 0
     assert stats["harness_anchor_skipped_unaligned"] == 0
+    assert stats["harness_anchor_persisted_last_message"] == 0
+    assert stats["harness_anchor_skipped_last_message_shallow"] == 0
+    assert stats["harness_anchor_skipped_last_message_unaligned"] == 0
     store.close()
 
 

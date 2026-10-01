@@ -272,6 +272,13 @@ def test_repeated_harness_prefix_flags_replace_defaults():
     )
 
 
+def test_last_message_anchor_flag_defaults_on_and_can_be_disabled():
+    base = ["--model", ANON_PATH, "--dtype", "bfloat16"]
+    assert parse_args(base)[0].kv_last_message_anchor == "on"
+    off = parse_args([*base, "--kv-last-message-anchor", "off"])[0]
+    assert off.kv_last_message_anchor == "off"
+
+
 def test_hot_adapt_boundary_cap_flag_reaches_server_config():
     args, _ = parse_args(
         [
