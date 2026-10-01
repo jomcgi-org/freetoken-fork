@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -622,6 +623,20 @@ void batch_nvfp4_i8_vnni_rows(float* out, const uint8_t* packed,
 // (no clamp; 0 disables): the per-machine optimum can sit past the safe default (+20%
 // at 4 KB on a 24-thread Ice Lake with 256B rows), so the escape hatch must reach it.
 // Prefetch never faults, so overshooting a row/bank tail is safe.
+// Fork-join tuning for grouped decode (all default off: today's schedule).
+//  FREETOKEN_CPU_MOE_FUSE=1: fewer barriers (pass-1 row prep and the pass-2/3 combine
+//    run inside the work-stealing passes instead of behind extra barriers).
+//  FREETOKEN_CPU_MOE_BYTES_PER_WORKER=N (>0): wake only ceil(layer weight bytes / N)
+//    workers (min 1, max all) so the fork-join cost scales with the layer's work.
+//  FREETOKEN_CPU_MOE_P1_BALANCE=1: pick the pass-1 tile height (32/16/8 rows) that
+//    divides the work items evenly over the awake workers.
+//  FREETOKEN_CPU_MOE_SYNC_SPIN_US=N: the flag coordinator spins up to N us for pool
+//    completion before parking on the condition variable.
+static int64_t cpu_moe_env_i64(const char* name, int64_t dflt) {
+  const char* s = getenv(name);
+  return (s && s[0]) ? static_cast<int64_t>(atoll(s)) : dflt;
+}
+
 static int nvfp4_pf_blocks() {
   static const int v = [] {
     const char* s = getenv("FREETOKEN_CPU_MOE_PF_BLOCKS");
@@ -1716,6 +1731,28 @@ struct CpuMoeExecutor {
   std::condition_variable sync_cv;
 
   bool stop = false;
+  // Per-worker wake slots, used instead of the shared task_cv when
+  // FREETOKEN_CPU_MOE_BYTES_PER_WORKER > 0 so a small layer wakes only some workers.
+  struct WorkerSlot {
+    std::mutex m;
+    std::condition_variable cv;
+    uint64_t gen = 0;
+    MoeTask* task = nullptr;
+  };
+  std::vector<std::unique_ptr<WorkerSlot>> worker_slots;
+  std::atomic<bool> stop_slots{false};
+  int64_t bytes_per_worker = 0;
+  bool fuse_enabled = false;
+  bool p1_balance = false;
+  int64_t sync_spin_ns = 0;
+  std::atomic<int> active_n{1};  // workers taking part in the current task
+  bool fuse_active = false;      // this task runs the fused schedule (set in submit)
+  int iblk_cur = IBLK;           // pass-1 tile height of this task
+  // Fused schedule counters: pass-1 blocks finished per distinct expert, pass-2
+  // blocks finished per output tile. Sized lazily in submit.
+  std::unique_ptr<std::atomic<int>[]> fx_p1_done;
+  std::unique_ptr<std::atomic<int>[]> fx_p2_done;
+  size_t fx_p1_cap = 0, fx_p2_cap = 0;
   uint64_t cur_gen = 0;
   MoeTask* cur_task = nullptr;
   std::atomic<uint64_t> submitted{0};
@@ -1881,6 +1918,17 @@ struct CpuMoeExecutor {
       xas_scratch.assign(static_cast<size_t>(max_tokens) * (H / 32), 0);
       gi8_scratch.assign(static_cast<size_t>(max_tokens) * top_k * I, 0);
       gas_scratch.assign(static_cast<size_t>(max_tokens) * top_k * (I / 32), 0);
+    }
+    bytes_per_worker = std::max<int64_t>(
+        0, cpu_moe_env_i64("FREETOKEN_CPU_MOE_BYTES_PER_WORKER", 0));
+    fuse_enabled = cpu_moe_env_i64("FREETOKEN_CPU_MOE_FUSE", 0) != 0;
+    p1_balance = cpu_moe_env_i64("FREETOKEN_CPU_MOE_P1_BALANCE", 0) != 0;
+    sync_spin_ns = std::max<int64_t>(
+        0, cpu_moe_env_i64("FREETOKEN_CPU_MOE_SYNC_SPIN_US", 0)) * 1000;
+    active_n.store(num_threads, std::memory_order_relaxed);
+    if (bytes_per_worker > 0) {
+      for (int t = 0; t < num_threads; ++t)
+        worker_slots.emplace_back(new WorkerSlot());
     }
     for (int t = 0; t < num_threads; ++t) {
       if (timed_worker_mode)
@@ -2076,7 +2124,12 @@ struct CpuMoeExecutor {
       std::lock_guard<std::mutex> lk(task_mtx);
       stop = true;
     }
+    stop_slots.store(true, std::memory_order_release);
     task_cv.notify_all();
+    for (auto& slot : worker_slots) {
+      { std::lock_guard<std::mutex> lk(slot->m); }
+      slot->cv.notify_all();
+    }
     for (auto& th : workers)
       if (th.joinable()) th.join();
     for (MoeTask* t : owned_tasks) delete t;
@@ -2148,7 +2201,7 @@ struct CpuMoeExecutor {
 
   void barrier(int& local_sense) {
     local_sense ^= 1;
-    if (bar_count.fetch_add(1) + 1 == num_threads) {
+    if (bar_count.fetch_add(1) + 1 == active_n.load(std::memory_order_relaxed)) {
       bar_count.store(0);
       bar_sense.store(local_sense);
     } else {
@@ -2189,8 +2242,8 @@ struct CpuMoeExecutor {
                      : use_q4a8 ? xas_scratch.data() + (size_t)tok * (H / 32)
                                   : nullptr;
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
-    const int i0 = static_cast<int>(ib) * IBLK;
-    const int i1 = std::min(I, i0 + IBLK);
+    const int i0 = static_cast<int>(ib) * iblk_cur;
+    const int i1 = std::min(I, i0 + iblk_cur);
     const bool swigluoai = act == ACT_SWIGLUOAI;
     const bool clamped_silu = act == ACT_CLAMPED_SILU;
     const float lim = swiglu_limit, alpha = swiglu_alpha;
@@ -2354,8 +2407,8 @@ struct CpuMoeExecutor {
     const uint8_t* gp = gu_packed_l + (size_t)e * N2 * Hh;
     const uint8_t* gs = gu_scale_l + (size_t)e * N2 * Hs;
     bf16_t* g_row = g_scratch.data() + ((size_t)tok * top_k + k) * I;
-    const int i0 = static_cast<int>(ib) * IBLK;
-    const int i1 = std::min(I, i0 + IBLK);
+    const int i0 = static_cast<int>(ib) * iblk_cur;
+    const int i1 = std::min(I, i0 + iblk_cur);
     const float lim = swiglu_limit;
     for (int i = i0; i < i1; ++i) {
       // gate_up is stored bf16 by the reference GEMV before swiglu; round to match.
@@ -2691,6 +2744,117 @@ struct CpuMoeExecutor {
     }
   }
 
+  // Grouped decode with one barrier instead of two or three. Every block computes
+  // exactly what the unfused schedule computes, so results are bit-identical.
+  //  - Row prep (ds_fp4 round-trip / deinterleave / int8 quant of the intermediate)
+  //    needs all of one route's pass-1 tiles, and a route belongs to one expert: the
+  //    worker that finishes an expert's last pass-1 tile preps that expert's routes
+  //    (acq_rel counter, so it sees every tile). One barrier then separates pass 1
+  //    from pass 2, replacing the pass-1 and prep barriers.
+  //  - Pass 3 for output tile hb needs the pass-2 results of every distinct expert at
+  //    hb. Pass 2 is claimed tile-major (hb = p / nd), and the worker that finishes
+  //    the last expert's tile hb runs pass 3 for that tile, replacing the pass-2
+  //    barrier. The per-element top-k summation is the unchanged do_pass3_grouped.
+  void run_fused_grouped(const MoeTask* t, int& local_sense) {
+    const bool prep = needs_di || use_q4a8;
+    for (;;) {
+      const int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
+      if (p >= p1_total) break;
+      do_pass1_grouped(t, p);
+      if (prep) {
+        const int di = static_cast<int>(p / n_iblk);
+        if (fx_p1_done[di].fetch_add(1, std::memory_order_acq_rel) + 1 == n_iblk) {
+          const int e = distinct_experts[di];
+          for (int pos = expert_offsets[e]; pos < expert_offsets[e + 1]; ++pos)
+            prep_g_row(grouped_routes[pos]);
+        }
+      }
+    }
+    barrier(local_sense);
+    const int nd = static_cast<int>(distinct_experts.size());
+    for (;;) {
+      const int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
+      if (p >= p2_total) break;
+      const int hb = static_cast<int>(p / nd);
+      do_pass2_grouped(t, static_cast<int64_t>(p % nd) * n_hblk + hb);
+      if (fx_p2_done[hb].fetch_add(1, std::memory_order_acq_rel) + 1 == nd) {
+        for (int tok = 0; tok < t->num_tokens; ++tok)
+          do_pass3_grouped(t, static_cast<int64_t>(tok) * n_hblk + hb);
+      }
+    }
+  }
+
+  // Block until a task newer than my_gen is published. False on shutdown.
+  bool wait_for_task(int tid, uint64_t& my_gen, MoeTask*& t) {
+    if (worker_slots.empty()) {
+      std::unique_lock<std::mutex> lk(task_mtx);
+      task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
+      if (stop) return false;
+      my_gen = cur_gen;
+      t = cur_task;
+      return true;
+    }
+    WorkerSlot& slot = *worker_slots[tid];
+    std::unique_lock<std::mutex> lk(slot.m);
+    slot.cv.wait(lk, [&] { return stop_slots.load(std::memory_order_acquire) || slot.gen != my_gen; });
+    if (stop_slots.load(std::memory_order_acquire)) return false;
+    my_gen = slot.gen;
+    t = slot.task;
+    return true;
+  }
+
+  // Publish a task to the first `k` workers (all of them without per-worker slots).
+  void publish_task(MoeTask* t, int k) {
+    uint64_t gen;
+    active_n.store(k, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lk(task_mtx);
+      cur_task = t;
+      gen = ++cur_gen;
+      submitted.store(gen, std::memory_order_release);
+    }
+    if (worker_slots.empty()) {
+      task_cv.notify_all();
+      return;
+    }
+    for (int i = 0; i < k; ++i) {
+      WorkerSlot& slot = *worker_slots[i];
+      {
+        std::lock_guard<std::mutex> lk(slot.m);
+        slot.task = t;
+        slot.gen = gen;
+      }
+      slot.cv.notify_one();
+    }
+  }
+
+  // Workers to wake for a grouped decode layer with `routes` valid routes.
+  int workers_for_layer(size_t routes) const {
+    if (bytes_per_worker <= 0) return num_threads;
+    const int64_t bytes = static_cast<int64_t>(routes) *
+                          static_cast<int64_t>(expert_weight_bytes());
+    const int64_t k = (bytes + bytes_per_worker - 1) / bytes_per_worker;
+    return static_cast<int>(std::min<int64_t>(std::max<int64_t>(k, 1), num_threads));
+  }
+
+  // Pass-1 tile height (rows of the intermediate) for `nd` distinct experts on `k`
+  // workers: the largest of 32/16/8 whose item count wastes the least of the last
+  // round. Pass-1 rows are independent dots, so the tile height never changes results.
+  int pass1_tile_rows(int nd, int k) const {
+    int best = IBLK;
+    double best_eff = 0.0;
+    for (int blk : {IBLK, IBLK / 2, IBLK / 4}) {
+      const int64_t items = static_cast<int64_t>(nd) * ((I + blk - 1) / blk);
+      const int64_t rounds = (items + k - 1) / k;
+      const double eff = static_cast<double>(items) / static_cast<double>(rounds * k);
+      if (eff > best_eff + 0.02) {
+        best = blk;
+        best_eff = eff;
+      }
+    }
+    return best;
+  }
+
   void run_task_body(const MoeTask* t) {
     if (t->prefill_batch) {
       for (;;) {
@@ -2701,6 +2865,10 @@ struct CpuMoeExecutor {
       return;
     }
     int local_sense = 0;
+    if (fuse_active) {
+      run_fused_grouped(t, local_sense);
+      return;
+    }
     for (;;) {
       int64_t p = p1_next.fetch_add(1, std::memory_order_relaxed);
       if (p >= p1_total) break;
@@ -2740,15 +2908,9 @@ struct CpuMoeExecutor {
     uint64_t my_gen = 0;
     for (;;) {
       MoeTask* t;
-      {
-        std::unique_lock<std::mutex> lk(task_mtx);
-        task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
-        if (stop) return;
-        my_gen = cur_gen;
-        t = cur_task;
-      }
+      if (!wait_for_task(tid, my_gen, t)) return;
       run_task_body(t);
-      if (done_count.fetch_add(1) + 1 == num_threads) {
+      if (done_count.fetch_add(1) + 1 == active_n.load(std::memory_order_relaxed)) {
         completed.store(my_gen, std::memory_order_release);
         {
           std::lock_guard<std::mutex> lk(sync_mtx);
@@ -2771,13 +2933,7 @@ struct CpuMoeExecutor {
     uint64_t my_gen = 0;
     for (;;) {
       MoeTask* t;
-      {
-        std::unique_lock<std::mutex> lk(task_mtx);
-        task_cv.wait(lk, [&] { return stop || cur_gen != my_gen; });
-        if (stop) return;
-        my_gen = cur_gen;
-        t = cur_task;
-      }
+      if (!wait_for_task(tid, my_gen, t)) return;
       if (t->timing_active) {
         int64_t expected = 0;
         if (t->t_first_worker_ns.compare_exchange_strong(
@@ -2786,7 +2942,7 @@ struct CpuMoeExecutor {
         }
       }
       run_task_body(t);
-      if (done_count.fetch_add(1) + 1 == num_threads) {
+      if (done_count.fetch_add(1) + 1 == active_n.load(std::memory_order_relaxed)) {
         if (t->timing_active)
           t->t_compute_done_ns.store(steady_now_ns(), std::memory_order_release);
         completed.store(my_gen, std::memory_order_release);
@@ -3051,16 +3207,14 @@ struct CpuMoeExecutor {
       p2_total = p3_total = prt_total = 0;
       p1_next.store(0, std::memory_order_relaxed);
       done_count.store(0, std::memory_order_relaxed);
-      {
-        std::lock_guard<std::mutex> lk(task_mtx);
-        cur_task = t;
-        ++cur_gen;
-        submitted.store(cur_gen, std::memory_order_release);
-      }
-      task_cv.notify_all();
+      publish_task(t, num_threads);
       return;
     }
-    n_iblk = (I + IBLK - 1) / IBLK;
+    const int nd_groups = static_cast<int>(distinct_experts.size());
+    const int wake_n = t->group_routes ? workers_for_layer(grouped_routes.size()) : num_threads;
+    iblk_cur = (p1_balance && t->group_routes && fmt != WF_MXFP4 && nd_groups > 0)
+                   ? pass1_tile_rows(nd_groups, wake_n) : IBLK;
+    n_iblk = (I + iblk_cur - 1) / iblk_cur;
     n_hblk = (H + HBLK - 1) / HBLK;
     // Grow the per-token intermediate scratch if a larger batch shows up than the
     // construction-time hint. Decode graph warmup covers its fixed batch sizes;
@@ -3085,6 +3239,22 @@ struct CpuMoeExecutor {
     done_count.store(0, std::memory_order_relaxed);
     bar_count.store(0, std::memory_order_relaxed);
     bar_sense.store(0, std::memory_order_relaxed);
+    // An empty route set keeps the unfused schedule: its pass 3 writes the zero rows.
+    fuse_active = fuse_enabled && t->group_routes && nd_groups > 0;
+    if (fuse_active) {
+      if (fx_p1_cap < static_cast<size_t>(num_experts)) {
+        fx_p1_done.reset(new std::atomic<int>[num_experts]);
+        fx_p1_cap = num_experts;
+      }
+      if (fx_p2_cap < static_cast<size_t>(n_hblk)) {
+        fx_p2_done.reset(new std::atomic<int>[n_hblk]);
+        fx_p2_cap = n_hblk;
+      }
+      for (int di = 0; di < nd_groups; ++di)
+        fx_p1_done[di].store(0, std::memory_order_relaxed);
+      for (int hb = 0; hb < n_hblk; ++hb)
+        fx_p2_done[hb].store(0, std::memory_order_relaxed);
+    }
     // ds_fp4: FP8 round-trip the per-token input once, up front (single-threaded;
     // tiny for decode, and done before the workers are woken below).
     if (needs_di) {
@@ -3132,13 +3302,7 @@ struct CpuMoeExecutor {
                    xas_scratch.data() + (size_t)tok * (H / 32));
     }
     if (time_task) step_timing_inflight.fetch_add(1, std::memory_order_relaxed);
-    {
-      std::lock_guard<std::mutex> lk(task_mtx);
-      cur_task = t;
-      ++cur_gen;
-      submitted.store(cur_gen, std::memory_order_release);
-    }
-    task_cv.notify_all();
+    publish_task(t, wake_n);
     if (time_task) t->t_notified_ns.store(steady_now_ns(), std::memory_order_release);
     if (defer_pre_callback) {
       // Group construction finishes before notify. Workers only read these vectors,
@@ -3161,8 +3325,20 @@ struct CpuMoeExecutor {
     }
   }
 
-  void sync(MoeTask* timing_task = nullptr) {
+  void sync(MoeTask* timing_task = nullptr, bool spin = false) {
     const uint64_t target = submitted.load(std::memory_order_acquire);
+    if (spin && sync_spin_ns > 0) {
+      // Only the pinned flag coordinator spins (it already busy-polls for doorbells),
+      // never a CUDA host-func thread.
+      const int64_t deadline = steady_now_ns() + sync_spin_ns;
+      unsigned polls = 0;
+      while (completed.load(std::memory_order_acquire) < target) {
+#if CPU_MOE_X86
+        _mm_pause();
+#endif
+        if ((++polls & 255u) == 0 && steady_now_ns() >= deadline) break;
+      }
+    }
     std::unique_lock<std::mutex> lk(sync_mtx);
     sync_cv.wait(lk, [&] { return completed.load(std::memory_order_acquire) >= target; });
     (void)timing_task;
@@ -3271,7 +3447,7 @@ struct CpuMoeExecutor {
               t->t_seen_ns.store(0, std::memory_order_relaxed);
             }
             submit(t, true, true);
-            if (!t->empty_step) sync(t);
+            if (!t->empty_step) sync(t, true);
           }
           // Release: the workers' y stores are visible before the GPU sees done.
           flag_store_release(&done_flags[L], 1);
